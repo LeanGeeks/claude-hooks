@@ -41,3 +41,12 @@
     border-color: rgba(92, 167, 255, 0.6);
 }
 
+/* Countdown Indicator */
+.ai-countdown-indicator {
+    opacity: 0.9;
+}
+
+.ai-countdown-indicator:hover {
+    opacity: 1.0;
+}
+

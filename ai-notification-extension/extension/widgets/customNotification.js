@@ -2,6 +2,7 @@ import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
+import { CountdownIndicator } from './countdownIndicator.js';
 
 /**
  * Custom notification with vertical button support
@@ -24,6 +25,9 @@ export const CustomNotification = GObject.registerClass({
 
         this._actionLayout = params.actionLayout || 'horizontal';
         this._verticalButtonBox = null;
+        this._countdownIndicator = null;
+        this._countdownTimeoutId = null;
+        this._expireTimeoutMs = params.expireTimeoutMs || 0;
     }
 
     /**
@@ -33,12 +37,50 @@ export const CustomNotification = GObject.registerClass({
         // Call parent to create basic banner
         const banner = super.createBanner();
 
+        // Add countdown indicator if expiring
+        if (this._expireTimeoutMs > 0) {
+            this._setupCountdownIndicator(banner);
+        }
+
         // If we have many actions, use vertical layout
         if (this._actionLayout === 'vertical' && this._actions && this._actions.length > 0) {
             this._setupVerticalButtons(banner);
         }
 
         return banner;
+    }
+
+    /**
+     * Setup countdown indicator
+     */
+    _setupCountdownIndicator(banner) {
+        const indicator = new CountdownIndicator({
+            radius: 10,
+            x_align: Clutter.ActorAlign.START,
+            y_align: Clutter.ActorAlign.CENTER,
+            margin_left: 8,
+        });
+
+        // Add to banner using public API only
+        banner.add_child(indicator);
+
+        this._countdownIndicator = indicator;
+
+        // Ensure countdown stops when banner is destroyed
+        banner.connect('destroy', () => this._stopCountdown());
+
+        // Start countdown
+        this._countdownTimeoutId = indicator.startCountdown(this._expireTimeoutMs);
+    }
+
+    /**
+     * Stop countdown (when notification is destroyed or action taken)
+     */
+    _stopCountdown() {
+        if (this._countdownTimeoutId) {
+            this._countdownIndicator.stopCountdown(this._countdownTimeoutId);
+            this._countdownTimeoutId = null;
+        }
     }
 
     /**
@@ -94,11 +136,22 @@ export const CustomNotification = GObject.registerClass({
      * Emit action signal
      */
     _emitAction(index) {
+        // Stop countdown when action is taken
+        this._stopCountdown();
+
         if (this._actions && this._actions[index]) {
             const action = this._actions[index];
             if (action.callback) {
                 action.callback();
             }
         }
+    }
+
+    /**
+     * Destroy handler - stop countdown
+     */
+    vfunc_destroy() {
+        this._stopCountdown();
+        super.vfunc_destroy();
     }
 });

@@ -43,6 +43,8 @@ export class NotificationManager {
 
         // Create notification (custom or standard)
         let notification;
+        const expireTimeoutMs = options.expireTimeoutMs || 0;
+
         if (useVertical && actions.length > 0) {
             // Use custom notification for vertical buttons
             notification = new CustomNotification({
@@ -51,6 +53,22 @@ export class NotificationManager {
                 body: body,
                 urgency: this._mapUrgency(options.urgency || 'normal'),
                 actionLayout: 'vertical',
+                expireTimeoutMs: expireTimeoutMs,
+            });
+
+            // Add actions to the custom notification
+            for (const callback of actionCallbacks) {
+                notification.addAction(callback.label, callback.callback);
+            }
+        } else if (expireTimeoutMs > 0) {
+            // Use custom notification for countdown indicator even with horizontal buttons
+            notification = new CustomNotification({
+                source: source,
+                title: options.title,
+                body: body,
+                urgency: this._mapUrgency(options.urgency || 'normal'),
+                actionLayout: 'horizontal',
+                expireTimeoutMs: expireTimeoutMs,
             });
 
             // Add actions to the custom notification
@@ -58,7 +76,7 @@ export class NotificationManager {
                 notification.addAction(callback.label, callback.callback);
             }
         } else {
-            // Use standard notification for horizontal buttons
+            // Use standard notification for horizontal buttons without countdown
             notification = new MessageTray.Notification({
                 source: source,
                 title: options.title,
@@ -84,7 +102,7 @@ export class NotificationManager {
 
         // Set expire timeout
         let expireTimeoutId = null;
-        if (options.expireTimeoutMs > 0) {
+        if (expireTimeoutMs > 0) {
             // Make notification resident (doesn't auto-dismiss)
             notification.setResident(true);
         }
@@ -99,10 +117,10 @@ export class NotificationManager {
         });
 
         // Set up expire timeout AFTER storing
-        if (options.expireTimeoutMs > 0) {
+        if (expireTimeoutMs > 0) {
             expireTimeoutId = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
-                options.expireTimeoutMs,
+                expireTimeoutMs,
                 () => {
                     const currentData = this._notifications.get(id);
                     if (currentData && !currentData.result) {
