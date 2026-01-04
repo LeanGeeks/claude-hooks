@@ -2,12 +2,14 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import GLib from 'gi://GLib';
 import { CustomNotification } from '../widgets/customNotification.js';
+import { TextFormatter } from './textFormatter.js';
 
 export class NotificationManager {
     constructor(dbusService) {
         this._dbusService = dbusService;
         this._notifications = new Map(); // id -> { notification, source, result, options, expireTimeoutId, _deletionTimeoutId }
         this._nextId = 0;
+        this._textFormatter = new TextFormatter();
     }
 
     /**
@@ -27,8 +29,15 @@ export class NotificationManager {
         // Create or get notification source
         const source = this._getOrCreateSource(options.title);
 
-        // Build notification body with code blocks
-        const body = this._formatBody(options.body || '', options.codeBlocks || []);
+        // Format body with code blocks and truncation
+        const formattedBody = this._textFormatter.formatBody(
+            options.body || '',
+            options.codeBlocks || [],
+            {
+                maxLines: options.maxLines || 0,
+                truncate: true,
+            }
+        );
 
         // Prepare action callbacks
         const actionCallbacks = [];
@@ -50,7 +59,7 @@ export class NotificationManager {
             notification = new CustomNotification({
                 source: source,
                 title: options.title,
-                body: body,
+                body: formattedBody,
                 urgency: this._mapUrgency(options.urgency || 'normal'),
                 actionLayout: 'vertical',
                 expireTimeoutMs: expireTimeoutMs,
@@ -65,7 +74,7 @@ export class NotificationManager {
             notification = new CustomNotification({
                 source: source,
                 title: options.title,
-                body: body,
+                body: formattedBody,
                 urgency: this._mapUrgency(options.urgency || 'normal'),
                 actionLayout: 'horizontal',
                 expireTimeoutMs: expireTimeoutMs,
@@ -80,7 +89,7 @@ export class NotificationManager {
             notification = new MessageTray.Notification({
                 source: source,
                 title: options.title,
-                body: body,
+                body: formattedBody,
                 urgency: this._mapUrgency(options.urgency || 'normal'),
             });
 
@@ -210,23 +219,6 @@ export class NotificationManager {
     _getOrCreateSource(sourceName) {
         // Use system source for simplicity
         return MessageTray.getSystemSource();
-    }
-
-    /**
-     * Format body with code blocks
-     */
-    _formatBody(body, codeBlocks) {
-        let formatted = GLib.markup_escape_text(body, -1);
-
-        if (codeBlocks.length > 0) {
-            formatted += '\n\n';
-            for (const code of codeBlocks) {
-                const escapedCode = GLib.markup_escape_text(code, -1);
-                formatted += `<tt>${escapedCode}</tt>\n`;
-            }
-        }
-
-        return formatted;
     }
 
     /**

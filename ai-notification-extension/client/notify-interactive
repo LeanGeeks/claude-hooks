@@ -3,6 +3,7 @@ import argparse
 import json
 import sys
 import time
+import re
 from gi.repository import GLib, Gio
 
 BUS_NAME = "org.gnome.Shell.Extensions.AINotifications"
@@ -130,36 +131,90 @@ class NotificationClient:
                 return None
             raise RuntimeError(f"D-Bus communication error: {e.message}") from e
 
+    def parse_code_blocks(self, text):
+        """Parse markdown-style code blocks from text"""
+        pattern = r'```(\w*)\n(.*?)```'
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        code_blocks = []
+        body = text
+
+        for lang, code in matches:
+            code_blocks.append(code.strip())
+            body = body.replace(f'```{lang}\n{code}```', '', 1)
+
+        return body.strip(), code_blocks
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Send interactive notifications")
+    parser = argparse.ArgumentParser(
+        description="Send interactive notifications",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Simple notification
+  %(prog)s "Hello" "World"
+
+  # With code blocks
+  %(prog)s "Deploy" "Confirm deployment:" --code "git push origin main"
+
+  # Parse markdown code blocks
+  %(prog)s "Review" "Check this:" --markdown <<'EOF'
+  Please review:
+  ```python
+  def hello():
+      print("world")
+  ```
+  EOF
+
+  # Multiple choice
+  %(prog)s "Background" "Choose style:" \\
+      --layout vertical \\
+      --action white "White" \\
+      --action dark "Dark" \\
+      --wait
+        """
+    )
     parser.add_argument("title", help="Notification title")
     parser.add_argument("body", help="Notification body")
     parser.add_argument("--urgency", choices=["low", "normal", "high", "critical"], default="normal")
     parser.add_argument("--expire", type=int, default=0, help="Expire timeout in milliseconds")
     parser.add_argument("--action", action="append", nargs=2, metavar=("ID", "LABEL"),
-                        help="Add action button (can be used multiple times)")
-    parser.add_argument("--code", action="append", help="Add code block (can be used multiple times)")
-    parser.add_argument("--layout", choices=["horizontal", "vertical"], default="horizontal",
-                        help="Button layout (default: horizontal)")
+                        help="Add action button")
+    parser.add_argument("--code", action="append", help="Add code block")
+    parser.add_argument("--markdown", action="store_true", help="Parse ```code blocks from body")
+    parser.add_argument("--max-lines", type=int, default=0, help="Max lines before truncation")
+    parser.add_argument("--layout", choices=["horizontal", "vertical"], default="horizontal")
     parser.add_argument("--wait", action="store_true", help="Wait for user interaction")
-    parser.add_argument("--timeout", type=int, default=300, help="Max time to wait (seconds, default: 300)")
+    parser.add_argument("--timeout", type=int, default=300, help="Max time to wait (seconds)")
 
     args = parser.parse_args()
 
     client = NotificationClient()
 
-    options = {"urgency": args.urgency}
+    # Parse code blocks from markdown if requested
+    body = args.body
+    code_blocks = args.code or []
+
+    if args.markdown:
+        body, parsed_blocks = client.parse_code_blocks(args.body)
+        code_blocks.extend(parsed_blocks)
+
+    options = {
+        "urgency": args.urgency,
+        "action_layout": args.layout,
+    }
+
     if args.expire > 0:
         options["expire_timeout_ms"] = args.expire
     if args.action:
         options["actions"] = [{"id": id, "label": label} for id, label in args.action]
-    if args.code:
-        options["code_blocks"] = args.code
-    if args.layout != 'horizontal':
-        options["action_layout"] = args.layout
+    if code_blocks:
+        options["code_blocks"] = code_blocks
+    if args.max_lines > 0:
+        options["max_lines"] = args.max_lines
 
-    notification_id = client.show_notification(args.title, args.body, options)
+    notification_id = client.show_notification(args.title, body, options)
     print(f"Notification ID: {notification_id}")
 
     if args.wait:
