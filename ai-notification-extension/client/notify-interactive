@@ -139,6 +139,7 @@ def main():
     parser.add_argument("--expire", type=int, default=0, help="Expire timeout in milliseconds")
     parser.add_argument("--action", action="append", nargs=2, metavar=("ID", "LABEL"),
                         help="Add action button (can be used multiple times)")
+    parser.add_argument("--code", action="append", help="Add code block (can be used multiple times)")
     parser.add_argument("--wait", action="store_true", help="Wait for user interaction")
     parser.add_argument("--timeout", type=int, default=300, help="Max time to wait (seconds, default: 300)")
 
@@ -151,6 +152,8 @@ def main():
         options["expire_timeout_ms"] = args.expire
     if args.action:
         options["actions"] = [{"id": id, "label": label} for id, label in args.action]
+    if args.code:
+        options["code_blocks"] = args.code
 
     notification_id = client.show_notification(args.title, args.body, options)
     print(f"Notification ID: {notification_id}")
