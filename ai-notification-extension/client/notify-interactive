@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import time
+from gi.repository import GLib, Gio
+
+BUS_NAME = "org.gnome.Shell.Extensions.AINotifications"
+OBJECT_PATH = "/org/gnome/Shell/Extensions/AINotifications"
+INTERFACE = "org.gnome.Shell.Extensions.AINotifications"
+
+class NotificationClient:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.results = {}
+
+    def show_notification(self, title, body, options=None):
+        """Show a notification and return its ID"""
+        if options is None:
+            options = {}
+
+        try:
+            # Build variant for options
+            options_builder = GLib.VariantBuilder(GLib.VariantType("a{sv}"))
+
+            for key, value in options.items():
+                if key == "actions":
+                    # Array of {id, label} dictionaries
+                    actions = []
+                    for action in value:
+                        action_dict = GLib.Variant("a{ss}", action)
+                        actions.append(action_dict)
+                    options_builder.add("{sv}", key, GLib.Variant("aa{ss}", actions))
+                elif key == "urgency":
+                    options_builder.add("{sv}", key, GLib.Variant("s", value))
+                elif key == "expire_timeout_ms":
+                    options_builder.add("{sv}", key, GLib.Variant("i", value))
+                elif key == "action_layout":
+                    options_builder.add("{sv}", key, GLib.Variant("s", value))
+                elif key == "max_lines":
+                    options_builder.add("{sv}", key, GLib.Variant("i", value))
+                elif key == "code_blocks":
+                    options_builder.add("{sv}", key, GLib.Variant("as", value))
+
+            # Call the method
+            result = self.bus.call_sync(
+                BUS_NAME,
+                OBJECT_PATH,
+                INTERFACE,
+                "ShowNotification",
+                GLib.Variant("(ssa{sv})", (title, body, options_builder.end())),
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+
+            if result is None:
+                raise RuntimeError("Failed to show notification: No response from extension")
+
+            notification_id = result.unpack()[0]
+            return notification_id
+        except GLib.Error as e:
+            if "org.freedesktop.DBus.Error.ServiceUnknown" in str(e) or "Name " + BUS_NAME + " was not provided" in str(e):
+                raise RuntimeError(
+                    f"AI Notifications extension is not available. "
+                    f"Please ensure the extension is installed and enabled in GNOME Shell.\n"
+                    f"Error: {e.message}"
+                )
+            raise RuntimeError(f"D-Bus communication error: {e.message}") from e
+
+    def get_result(self, notification_id, timeout=300):
+        """Wait for result with timeout"""
+        start_time = time.time()
+
+        # Subscribe to signals
+        signal_id = self.bus.signal_subscribe(
+            BUS_NAME,
+            INTERFACE,
+            "NotificationResult",
+            OBJECT_PATH,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self._on_result,
+            None
+        )
+
+        try:
+            # Poll for existing result
+            while time.time() - start_time < timeout:
+                result = self._poll_result(notification_id)
+                if result:
+                    return result
+
+                time.sleep(0.1)
+
+            return {"action_id": "expired", "timestamp": int(time.time() * 1000)}
+        finally:
+            self.bus.signal_unsubscribe(signal_id)
+
+    def _on_result(self, connection, sender_name, object_path, interface_name, signal_name, parameters, user_data):
+        notification_id, result = parameters.unpack()
+        self.results[notification_id] = result
+
+    def _poll_result(self, notification_id):
+        # Check local cache first
+        if notification_id in self.results:
+            return self.results[notification_id]
+
+        try:
+            # Query via D-Bus
+            result = self.bus.call_sync(
+                BUS_NAME,
+                OBJECT_PATH,
+                INTERFACE,
+                "GetResult",
+                GLib.Variant("(s)", (notification_id,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None
+            )
+
+            if result and result.get_child_value(0).is_of_type(GLib.VariantType('a{sv}')):
+                return result.unpack()[0]
+            return None
+        except GLib.Error as e:
+            # If the method doesn't exist or extension is not available, return None
+            if "org.freedesktop.DBus.Error.UnknownMethod" in str(e):
+                return None
+            raise RuntimeError(f"D-Bus communication error: {e.message}") from e
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Send interactive notifications")
+    parser.add_argument("title", help="Notification title")
+    parser.add_argument("body", help="Notification body")
+    parser.add_argument("--urgency", choices=["low", "normal", "high", "critical"], default="normal")
+    parser.add_argument("--expire", type=int, default=0, help="Expire timeout in milliseconds")
+    parser.add_argument("--action", action="append", nargs=2, metavar=("ID", "LABEL"),
+                        help="Add action button (can be used multiple times)")
+    parser.add_argument("--wait", action="store_true", help="Wait for user interaction")
+    parser.add_argument("--timeout", type=int, default=300, help="Max time to wait (seconds, default: 300)")
+
+    args = parser.parse_args()
+
+    client = NotificationClient()
+
+    options = {"urgency": args.urgency}
+    if args.expire > 0:
+        options["expire_timeout_ms"] = args.expire
+    if args.action:
+        options["actions"] = [{"id": id, "label": label} for id, label in args.action]
+
+    notification_id = client.show_notification(args.title, args.body, options)
+    print(f"Notification ID: {notification_id}")
+
+    if args.wait:
+        print("Waiting for user response...")
+        result = client.get_result(notification_id, args.timeout)
+        action_id = result.get("action_id", "unknown")
+        print(f"Result: {action_id}")
+        sys.exit(0 if action_id == "approve" else 1)
+
+
+if __name__ == "__main__":
+    main()
