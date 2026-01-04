@@ -1,6 +1,7 @@
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import GLib from 'gi://GLib';
+import { CustomNotification } from '../widgets/customNotification.js';
 
 export class NotificationManager {
     constructor(dbusService) {
@@ -18,19 +19,58 @@ export class NotificationManager {
         const id = `notif-${Date.now()}-${this._nextId++}`;
         log(`[AI Notification] Creating notification ${id}: ${options.title}`);
 
+        // Determine button layout
+        const actionLayout = options.actionLayout || 'horizontal';
+        const actions = options.actions || [];
+        const useVertical = actionLayout === 'vertical' || actions.length > 3;
+
         // Create or get notification source
         const source = this._getOrCreateSource(options.title);
 
         // Build notification body with code blocks
         const body = this._formatBody(options.body || '', options.codeBlocks || []);
 
-        // Create notification
-        const notification = new MessageTray.Notification({
-            source: source,
-            title: options.title,
-            body: body,
-            urgency: this._mapUrgency(options.urgency || 'normal'),
-        });
+        // Prepare action callbacks
+        const actionCallbacks = [];
+        for (const action of actions) {
+            actionCallbacks.push({
+                label: action.label,
+                callback: () => {
+                    this.setResult(id, { actionId: action.id });
+                },
+            });
+        }
+
+        // Create notification (custom or standard)
+        let notification;
+        if (useVertical && actions.length > 0) {
+            // Use custom notification for vertical buttons
+            notification = new CustomNotification({
+                source: source,
+                title: options.title,
+                body: body,
+                urgency: this._mapUrgency(options.urgency || 'normal'),
+                actionLayout: 'vertical',
+            });
+
+            // Add actions to the custom notification
+            for (const callback of actionCallbacks) {
+                notification.addAction(callback.label, callback.callback);
+            }
+        } else {
+            // Use standard notification for horizontal buttons
+            notification = new MessageTray.Notification({
+                source: source,
+                title: options.title,
+                body: body,
+                urgency: this._mapUrgency(options.urgency || 'normal'),
+            });
+
+            // Add up to 3 action buttons horizontally
+            for (const callback of actionCallbacks.slice(0, 3)) {
+                notification.addAction(callback.label, callback.callback);
+            }
+        }
 
         // Handle notification destruction
         notification.connect('destroy', (notif, reason) => {
@@ -41,17 +81,6 @@ export class NotificationManager {
         notification.connect('activated', (notif) => {
             this.setResult(id, { actionId: 'activated' });
         });
-
-        // Add action buttons
-        const actions = options.actions || [];
-        if (actions.length > 0) {
-            // For horizontal layout, use native addAction (max 3 buttons)
-            for (const action of actions.slice(0, 3)) {
-                notification.addAction(action.label, () => {
-                    this.setResult(id, { actionId: action.id });
-                });
-            }
-        }
 
         // Set expire timeout
         let expireTimeoutId = null;
@@ -89,7 +118,7 @@ export class NotificationManager {
         // Show the notification AFTER storing
         source.addNotification(notification);
 
-        log(`[AI Notification] Notification ${id} displayed`);
+        log(`[AI Notification] Notification ${id} displayed (${actionLayout} layout)`);
         return id;
     }
 

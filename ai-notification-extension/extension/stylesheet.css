@@ -2,3 +2,42 @@
 .ai-notification {
     /* Styles will be added as we build custom widgets */
 }
+
+/* AI Notification Extension Styles - Vertical Button Layout */
+
+.ai-notification-button-container {
+    min-width: 180px;
+}
+
+.ai-notification-button {
+    background-color: rgba(53, 132, 228, 0.1);
+    border: 1px solid rgba(53, 132, 228, 0.3);
+    border-radius: 6px;
+    padding: 8px 16px;
+    color: #3584e4;
+    font-weight: 500;
+    transition: all 150ms ease;
+}
+
+.ai-notification-button:hover {
+    background-color: rgba(53, 132, 228, 0.2);
+    border-color: rgba(53, 132, 228, 0.6);
+}
+
+.ai-notification-button:active {
+    background-color: rgba(53, 132, 228, 0.3);
+    transform: translateY(1px);
+}
+
+/* Dark theme support */
+.ai-notification-button.dark {
+    background-color: rgba(92, 167, 255, 0.15);
+    border-color: rgba(92, 167, 255, 0.4);
+    color: #5ca7ff;
+}
+
+.ai-notification-button.dark:hover {
+    background-color: rgba(92, 167, 255, 0.25);
+    border-color: rgba(92, 167, 255, 0.6);
+}
+
