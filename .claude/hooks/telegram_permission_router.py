@@ -248,35 +248,54 @@ def send_permission_message(
     return None
 
 
-def _format_command_summary(tool_name: str, tool_input: Dict[str, Any], max_length: int = 100) -> str:
+def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     """
-    Format a concise summary of the tool/command.
+    Format a summary of the tool/command for display in Telegram.
 
-    Args:
-        tool_name: Name of the tool being called
-        tool_input: Input parameters for the tool
-        max_length: Maximum length of the summary
-
-    Returns:
-        Formatted summary string
+    Shows up to 10 lines and up to 2KB of text. Full lines are never truncated
+    mid-line; only the last included line may be truncated if the 2KB budget is
+    reached, indicated by a trailing '...'.
     """
+    MAX_LINES = 10
+    MAX_BYTES = 2048
+
     if tool_name == 'Bash':
-        command = tool_input.get('command', '')
-        if len(command) > max_length:
-            return command[:max_length-3] + '...'
-        return command
+        raw = tool_input.get('command', '')
     elif tool_name in ('Read', 'Write', 'Edit'):
         file_path = tool_input.get('file_path', tool_input.get('path', ''))
-        return f"{tool_name}({file_path})"
+        raw = f"{tool_name}({file_path})"
     elif tool_name == 'WebFetch':
-        url = tool_input.get('url', '')
-        return f"WebFetch({url[:50]}...)" if len(url) > 50 else f"WebFetch({url})"
+        raw = f"WebFetch({tool_input.get('url', '')})"
     else:
-        # Generic format
-        input_str = json.dumps(tool_input)
-        if len(input_str) > max_length:
-            input_str = input_str[:max_length-3] + '...'
-        return f"{tool_name}: {input_str}"
+        raw = f"{tool_name}: {json.dumps(tool_input)}"
+
+    lines = raw.splitlines()
+    selected = lines[:MAX_LINES]
+
+    result_lines = []
+    budget = MAX_BYTES
+    for i, line in enumerate(selected):
+        encoded = line.encode('utf-8')
+        is_last_selected = (i == len(selected) - 1)
+        # Reserve 3 bytes for '...' suffix if we might need to truncate
+        if len(encoded) <= budget:
+            result_lines.append(line)
+            budget -= len(encoded) + 1  # +1 for the newline we'll join with
+        else:
+            # Truncate this line to fit within budget, append '...'
+            truncated = encoded[:max(0, budget - 3)].decode('utf-8', errors='ignore')
+            result_lines.append(truncated + '...')
+            break
+
+        if budget <= 0:
+            if not is_last_selected or len(lines) > MAX_LINES:
+                result_lines[-1] += '...'
+            break
+
+    if len(lines) > MAX_LINES and result_lines and not result_lines[-1].endswith('...'):
+        result_lines[-1] += '...'
+
+    return '\n'.join(result_lines)
 
 
 def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
