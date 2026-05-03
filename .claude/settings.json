@@ -256,6 +256,11 @@
       "Bash(poweroff)"
     ]
   },
+  "statusLine": {
+    "type": "command",
+    "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/statusline/statusline.py",
+    "refreshInterval": 30
+  },
   "hooks": {
     "PreToolUse": [
       {

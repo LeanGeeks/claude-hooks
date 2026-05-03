@@ -1,0 +1,16 @@
+{
+  "model": {"display_name": "claude-opus-4-7"},
+  "workspace": {"current_dir": "/tmp/project", "project_dir": "/tmp/project"},
+  "context_window": {
+    "used_percentage": 61,
+    "remaining_percentage": 39,
+    "current_usage": 305000,
+    "context_window_size": 500000
+  },
+  "rate_limits": {
+    "five_hour": {"used_percentage": 43, "resets_at": 1770003600},
+    "seven_day": {"used_percentage": 18, "resets_at": 1770604800}
+  },
+  "session_id": "test-claude-max",
+  "version": "1.0"
+}

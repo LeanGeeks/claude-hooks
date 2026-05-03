@@ -1,15 +1,19 @@
 #!/bin/bash
 # Installs Claude Code configuration globally
 # - Copies hooks from .claude/hooks/ to ~/.claude/hooks/
+# - Copies statusline from .claude/statusline/ to ~/.claude/statusline/
 # - Merges hooks configuration (PreToolUse and Notification) from project to global settings
+# - Merges statusLine configuration from project to global settings
 # - Merges allowedTools/disallowedTools from project to global settings
 # - Preserves all other settings in the global config
 
 set -euo pipefail
 
 PROJECT_HOOKS_DIR=".claude/hooks"
+PROJECT_STATUSLINE_DIR=".claude/statusline"
 PROJECT_CONFIG=".claude/settings.json"
 GLOBAL_HOOKS_DIR="$HOME/.claude/hooks"
+GLOBAL_STATUSLINE_DIR="$HOME/.claude/statusline"
 GLOBAL_CONFIG="$HOME/.claude/settings.json"
 BACKUP_DIR="$HOME/.claude/backups"
 
@@ -41,7 +45,7 @@ fi
 # STEP 1: Install Hooks
 # =============================================================================
 
-log_step "Step 1/3: Installing hooks"
+log_step "Step 1/4: Installing hooks"
 
 # Check project hooks directory exists
 if [[ ! -d "$PROJECT_HOOKS_DIR" ]]; then
@@ -96,10 +100,34 @@ else
 fi
 
 # =============================================================================
-# STEP 2: Validate and Backup Configs
+# STEP 2: Install Statusline
 # =============================================================================
 
-log_step "Step 2/3: Validating and backing up configs"
+log_step "Step 2/4: Installing statusline"
+
+STATUSLINE_INSTALLED=false
+if [[ ! -d "$PROJECT_STATUSLINE_DIR" ]]; then
+    log_warn "Project statusline directory not found: $PROJECT_STATUSLINE_DIR"
+    log_warn "Skipping statusline installation..."
+else
+    STATUSLINE_SCRIPT="$PROJECT_STATUSLINE_DIR/statusline.py"
+    if [[ ! -f "$STATUSLINE_SCRIPT" ]]; then
+        log_warn "statusline.py not found in $PROJECT_STATUSLINE_DIR"
+        log_warn "Skipping statusline installation..."
+    else
+        mkdir -p "$GLOBAL_STATUSLINE_DIR"
+        cp "$STATUSLINE_SCRIPT" "$GLOBAL_STATUSLINE_DIR/statusline.py"
+        chmod +x "$GLOBAL_STATUSLINE_DIR/statusline.py"
+        log_info "Installed: statusline.py → $GLOBAL_STATUSLINE_DIR/statusline.py"
+        STATUSLINE_INSTALLED=true
+    fi
+fi
+
+# =============================================================================
+# STEP 3: Validate and Backup Configs
+# =============================================================================
+
+log_step "Step 3/4: Validating and backing up configs"
 
 # Check project config exists
 if [[ ! -f "$PROJECT_CONFIG" ]]; then
@@ -138,10 +166,10 @@ cp "$GLOBAL_CONFIG" "$BACKUP_FILE"
 log_info "Backup created: $BACKUP_FILE"
 
 # =============================================================================
-# STEP 3: Merge Permissions and Hooks Configuration
+# STEP 4: Merge Permissions, Hooks, and Statusline Configuration
 # =============================================================================
 
-log_step "Step 3/3: Merging permissions and hooks configuration"
+log_step "Step 4/4: Merging permissions, hooks, and statusline configuration"
 
 # Extract permissions from project config (supports both old and new format)
 ALLOWED_TOOLS=$(jq '.allowedTools // .permissions.allow // []' "$PROJECT_CONFIG")
@@ -227,6 +255,15 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
     fi
 fi
 
+# Merge statusLine configuration if statusline was installed
+if [[ "$STATUSLINE_INSTALLED" == true ]]; then
+    MERGED=$(echo "$MERGED" | jq --arg cmd "python3 $GLOBAL_STATUSLINE_DIR/statusline.py" \
+        '. + {statusLine: {type: "command", command: $cmd, refreshInterval: 30}}')
+    log_info "StatusLine configuration merged:"
+    log_info "  - command: python3 $GLOBAL_STATUSLINE_DIR/statusline.py"
+    log_info "  - refreshInterval: 30"
+fi
+
 # Validate merged JSON
 if ! echo "$MERGED" | jq empty 2>/dev/null; then
     log_error "Merged config is not valid JSON!"
@@ -267,9 +304,16 @@ else
     echo "  - hooks: not installed (missing files)"
 fi
 
+# Show statusline status
+if [[ "$STATUSLINE_INSTALLED" == true ]]; then
+    echo "  - statusLine: installed and configured ($GLOBAL_STATUSLINE_DIR/statusline.py)"
+else
+    echo "  - statusLine: not installed (missing statusline.py)"
+fi
+
 echo ""
 log_info "Other settings preserved:"
-jq 'del(.permissions, .hooks, .description, .notes) | keys[]' "$GLOBAL_CONFIG" 2>/dev/null | while read -r key; do
+jq 'del(.permissions, .hooks, .statusLine, .description, .notes) | keys[]' "$GLOBAL_CONFIG" 2>/dev/null | while read -r key; do
     echo "  - $key"
 done || echo "  (none)"
 

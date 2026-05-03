@@ -1,0 +1,12 @@
+{
+  "model": {"display_name": "claude-sonnet-4-6"},
+  "workspace": {"current_dir": "/tmp/project"},
+  "context_window": {
+    "used_percentage": null,
+    "remaining_percentage": null,
+    "current_usage": null,
+    "context_window_size": 200000
+  },
+  "session_id": "test-early-session",
+  "version": "1.0"
+}
