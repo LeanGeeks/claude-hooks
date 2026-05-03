@@ -15,7 +15,7 @@
       "Glob",
       "Read(/tmp/**)",
       "Write(/tmp/**)",
-      "WebFetch(domain:*)",
+      "WebFetch",
       "NotebookRead",
       "NotebookEdit",
       "Grep",
