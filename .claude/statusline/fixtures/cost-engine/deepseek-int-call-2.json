@@ -1,0 +1,9 @@
+{
+  "model": {"display_name": "deepseek-v4-pro"},
+  "context_window": {
+    "used_percentage": 88,
+    "current_usage": 440000,
+    "context_window_size": 500000
+  },
+  "session_id": "deepseek-pricing-int-test"
+}

@@ -119,6 +119,18 @@ else
         cp "$STATUSLINE_SCRIPT" "$GLOBAL_STATUSLINE_DIR/statusline.py"
         chmod +x "$GLOBAL_STATUSLINE_DIR/statusline.py"
         log_info "Installed: statusline.py → $GLOBAL_STATUSLINE_DIR/statusline.py"
+
+        # Copy pricing config alongside the script. statusline.py loads
+        # this file relative to its own location; without it every API
+        # model renders as "cost ?".
+        PRICING_DEFAULT="$PROJECT_STATUSLINE_DIR/pricing.default.json"
+        if [[ -f "$PRICING_DEFAULT" ]]; then
+            cp "$PRICING_DEFAULT" "$GLOBAL_STATUSLINE_DIR/pricing.default.json"
+            log_info "Installed: pricing.default.json → $GLOBAL_STATUSLINE_DIR/pricing.default.json"
+        else
+            log_warn "pricing.default.json not found in $PROJECT_STATUSLINE_DIR — API cost will render as 'cost ?'"
+        fi
+
         STATUSLINE_INSTALLED=true
     fi
 fi

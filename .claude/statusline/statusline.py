@@ -6,6 +6,7 @@ Reads Claude Code session JSON from stdin, prints a compact one-line status.
 Set CC_STATUS_DEBUG=1 to emit diagnostic output on stderr.
 """
 
+import datetime
 import hashlib
 import json
 import os
@@ -30,6 +31,7 @@ class StatusEnvironment:
     billing: str   # subscription | api | local
     profile: str   # free-form label, e.g. claude-max / glm-plan / deepseek-api
     model: str     # normalized display name
+    pricing_key: str = ""  # raw model identifier used for pricing lookup (e.g. "deepseek-v4-pro")
 
 
 @dataclass
@@ -57,7 +59,7 @@ def load_status_input(stdin_text: str) -> dict:
 # Provider / billing detection
 # ---------------------------------------------------------------------------
 
-_KNOWN_PROVIDERS = {"claude", "zai", "local", "deepseek", "fireworks", "minimax", "kimi", "unknown"}
+_KNOWN_PROVIDERS = {"claude", "zai", "local", "deepseek", "fireworks", "minimax", "kimi", "mock", "unknown"}
 _KNOWN_BILLINGS = {"subscription", "api", "local"}
 
 _PROFILE_DEFAULTS = {
@@ -159,11 +161,21 @@ def detect_environment(env: dict, status_input: dict) -> StatusEnvironment:
     )
     if raw_model:
         model = _normalize_model_name(raw_model, provider)
+        pricing_key = _pricing_key(raw_model)
     else:
         json_name = (status_input.get("model") or {}).get("display_name", "")
         model = _normalize_model_name(json_name, provider) if json_name else "Claude"
+        pricing_key = _pricing_key(json_name) if json_name else ""
 
-    return StatusEnvironment(provider=provider, billing=billing, profile=profile, model=model)
+    return StatusEnvironment(
+        provider=provider, billing=billing, profile=profile, model=model, pricing_key=pricing_key
+    )
+
+
+def _pricing_key(raw_model: str) -> str:
+    """Strip context suffix (e.g. '[500k]') and lowercase, for pricing config lookup."""
+    cleaned = re.sub(r'\[.*?\]', '', raw_model).strip().lower()
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +224,246 @@ def format_claude_rate_limits(status_input: dict) -> list:
     return segments
 
 
-def format_api_cost_placeholder(env: StatusEnvironment) -> list:
-    """Placeholder until task 06-03 adds per-provider pricing."""
-    return ["cost pending"]
+_BUCKET_KEYS = ("input", "output", "cache_write", "cache_read")
+_BUCKET_FIELD_MAP = {
+    "input_tokens": "input",
+    "output_tokens": "output",
+    "cache_creation_input_tokens": "cache_write",
+    "cache_read_input_tokens": "cache_read",
+}
+_PRICE_FIELD_MAP = {
+    "input": "input_per_million",
+    "output": "output_per_million",
+    "cache_write": "cache_write_per_million",
+    "cache_read": "cache_read_per_million",
+}
+
+
+def _safe_session_key(session_id: Optional[str]) -> str:
+    if not session_id:
+        return "no-session"
+    return hashlib.sha256(str(session_id).encode()).hexdigest()[:16]
+
+
+def _atomic_write_json(path: str, data: dict) -> None:
+    cache_dir = os.path.dirname(path)
+    os.makedirs(cache_dir, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=cache_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def load_pricing_config() -> dict:
+    """Load repo default pricing, then merge user override on top."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    default_path = os.path.join(here, "pricing.default.json")
+    user_path = os.path.expanduser("~/.config/claude-statusline/pricing.json")
+
+    config: dict = {"version": 1, "currency": "USD", "providers": {}}
+    for path in (default_path, user_path):
+        try:
+            with open(path) as f:
+                loaded = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        _merge_pricing(config, loaded)
+    return config
+
+
+def _merge_pricing(base: dict, overlay: dict) -> None:
+    """Deep-merge overlay providers/models into base; overlay wins per-model."""
+    for key in ("version", "currency"):
+        if key in overlay:
+            base[key] = overlay[key]
+    overlay_providers = overlay.get("providers") or {}
+    base_providers = base.setdefault("providers", {})
+    for provider, pdata in overlay_providers.items():
+        if not isinstance(pdata, dict):
+            continue
+        bp = base_providers.setdefault(provider, {"models": {}})
+        ov_models = pdata.get("models") or {}
+        bp_models = bp.setdefault("models", {})
+        for model_key, model_price in ov_models.items():
+            if isinstance(model_price, dict):
+                bp_models[model_key] = dict(model_price)
+
+
+def lookup_model_pricing(config: dict, provider: str, pricing_key: str) -> Optional[dict]:
+    """Return the pricing dict for (provider, pricing_key) or None."""
+    if not provider or not pricing_key:
+        return None
+    providers = config.get("providers") or {}
+    pdata = providers.get(provider) or {}
+    models = pdata.get("models") or {}
+    return models.get(pricing_key)
+
+
+def extract_usage(status_input: dict):
+    """
+    Return (kind, value) where kind is one of:
+      - "none": no usage available
+      - "int": value is an int total token count
+      - "buckets": value is a dict with bucket keys (input/output/cache_write/cache_read)
+    """
+    ctx = status_input.get("context_window") or {}
+    raw = ctx.get("current_usage")
+    if raw is None:
+        return "none", None
+    if isinstance(raw, int):
+        return "int", raw
+    if isinstance(raw, dict):
+        buckets = {k: 0 for k in _BUCKET_KEYS}
+        any_field = False
+        for src, dest in _BUCKET_FIELD_MAP.items():
+            v = raw.get(src)
+            if isinstance(v, int):
+                buckets[dest] = v
+                any_field = True
+        if any_field:
+            return "buckets", buckets
+        return "none", None
+    return "none", None
+
+
+def _cost_state_path(session_key: str) -> str:
+    cache_dir = os.path.expanduser("~/.cache/claude-statusline")
+    return os.path.join(cache_dir, f"cost-{session_key}.json")
+
+
+def _read_cost_state(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _format_cost(amount: float) -> str:
+    if amount <= 0:
+        return "$0.00"
+    if amount >= 0.01:
+        return f"${amount:.2f}"
+    # compact precision below 1 cent
+    return f"${amount:.3f}" if amount >= 0.001 else f"${amount:.4f}"
+
+
+def _has_all_bucket_prices(price: dict) -> bool:
+    return all(isinstance(price.get(_PRICE_FIELD_MAP[b]), (int, float)) for b in _BUCKET_KEYS)
+
+
+def compute_api_cost(status_input: dict, env: StatusEnvironment) -> list:
+    """
+    Run the cost engine for an API-billed render.
+    Returns a list of segments (typically one element).
+    """
+    kind, value = extract_usage(status_input)
+    if kind == "none":
+        # No usage yet — emit nothing rather than a placeholder.
+        return []
+
+    pricing = load_pricing_config()
+    price = lookup_model_pricing(pricing, env.provider, env.pricing_key)
+    if not isinstance(price, dict):
+        return ["cost ?"]
+
+    blended_rate = price.get("blended_per_million")
+    has_blended = isinstance(blended_rate, (int, float))
+    has_buckets = _has_all_bucket_prices(price)
+
+    # Determine whether we can price this render.
+    if kind == "int" and not has_blended:
+        return ["cost ?"]
+    if kind == "buckets" and not has_buckets:
+        # Fall back to blended on the sum, if available.
+        if not has_blended:
+            return ["cost ?"]
+
+    session_id = status_input.get("session_id")
+    session_key = _safe_session_key(session_id)
+    state_path = _cost_state_path(session_key)
+    state = _read_cost_state(state_path)
+
+    total_cost = float(state.get("total_cost_usd") or 0.0)
+    total_tokens = state.get("total_tokens") or {k: 0 for k in _BUCKET_KEYS}
+    last_total = int(state.get("last_usage_total") or 0)
+    last_buckets = state.get("last_buckets") or {k: 0 for k in _BUCKET_KEYS}
+    fingerprints = list(state.get("seen_usage_fingerprints") or [])
+
+    delta_cost = 0.0
+    new_last_total = last_total
+    new_last_buckets = dict(last_buckets)
+    new_total_tokens = dict(total_tokens)
+
+    if kind == "int":
+        current_total = int(value)
+        fp = hashlib.sha256(f"{env.provider}|{env.pricing_key}|{session_id}|int:{current_total}"
+                            .encode()).hexdigest()[:16]
+        if current_total > last_total and fp not in fingerprints:
+            delta = current_total - last_total
+            delta_cost = (delta / 1_000_000.0) * float(blended_rate)
+            new_last_total = current_total
+            new_total_tokens["input"] = int(new_total_tokens.get("input", 0)) + delta
+            fingerprints.append(fp)
+        else:
+            # Repeated render or non-monotonic value: skip accumulation.
+            pass
+    else:  # buckets
+        deltas = {}
+        any_increase = False
+        for b in _BUCKET_KEYS:
+            cur = int(value.get(b, 0))
+            prev = int(last_buckets.get(b, 0))
+            d = cur - prev if cur >= prev else 0
+            if d > 0:
+                any_increase = True
+            deltas[b] = d
+        canon = json.dumps({k: int(value.get(k, 0)) for k in _BUCKET_KEYS}, sort_keys=True)
+        fp = hashlib.sha256(f"{env.provider}|{env.pricing_key}|{session_id}|buckets:{canon}"
+                            .encode()).hexdigest()[:16]
+        if any_increase and fp not in fingerprints:
+            if has_buckets:
+                for b in _BUCKET_KEYS:
+                    rate = float(price[_PRICE_FIELD_MAP[b]])
+                    delta_cost += (deltas[b] / 1_000_000.0) * rate
+            else:
+                # blended fallback on summed delta
+                summed = sum(deltas.values())
+                delta_cost = (summed / 1_000_000.0) * float(blended_rate)
+            for b in _BUCKET_KEYS:
+                new_last_buckets[b] = int(value.get(b, 0))
+                new_total_tokens[b] = int(new_total_tokens.get(b, 0)) + deltas[b]
+            fingerprints.append(fp)
+
+    total_cost += delta_cost
+
+    # Persist updated state. Cap fingerprint history.
+    fingerprints = fingerprints[-100:]
+    new_state = {
+        "version": 1,
+        "session_id": session_id,
+        "provider": env.provider,
+        "model": env.model,
+        "pricing_key": env.pricing_key,
+        "total_cost_usd": round(total_cost, 6),
+        "total_tokens": new_total_tokens,
+        "last_usage_total": new_last_total,
+        "last_buckets": new_last_buckets,
+        "seen_usage_fingerprints": fingerprints,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        _atomic_write_json(state_path, new_state)
+    except Exception:
+        pass
+
+    return [_format_cost(total_cost)]
 
 
 # ---------------------------------------------------------------------------
@@ -468,10 +717,66 @@ def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
         elif env.provider == "zai":
             parts.extend(format_glm_subscription_quota(env))
     elif env.billing == "api":
-        parts.extend(format_api_cost_placeholder(env))
+        parts.extend(compute_api_cost(status_input, env))
     # local: no extras
 
     return " | ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics  (CC_STATUS_DIAGNOSTIC=1)
+# ---------------------------------------------------------------------------
+
+def _build_diagnostic_record(status_input: dict, env: StatusEnvironment) -> dict:
+    """
+    Build a sanitized snapshot safe for appending to the diagnostic JSONL.
+    Excluded: workspace paths, cwd, prompts, completions, command text, tokens.
+    """
+    ctx = status_input.get("context_window") or {}
+    raw_cost = status_input.get("cost")
+    cost_usd = None
+    if isinstance(raw_cost, dict):
+        cost_usd = raw_cost.get("total_cost_usd")
+
+    session_id = status_input.get("session_id")
+    if session_id:
+        session_key = hashlib.sha256(str(session_id).encode()).hexdigest()[:12]
+    else:
+        session_key = "no-session"
+
+    # current_usage may be null, int, or dict depending on Claude Code version
+    current_usage = ctx.get("current_usage")
+
+    return {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "session_key": session_key,
+        "provider": env.provider,
+        "billing": env.billing,
+        "model": env.model,
+        "context_window": {
+            "used_percentage": ctx.get("used_percentage"),
+            "context_window_size": ctx.get("context_window_size"),
+            "current_usage": current_usage,
+        },
+        "cost": {
+            "total_cost_usd": cost_usd,
+        },
+    }
+
+
+def maybe_write_diagnostic(status_input: dict, env: StatusEnvironment) -> None:
+    """Append one diagnostic record if CC_STATUS_DIAGNOSTIC=1. Never raises."""
+    if os.environ.get("CC_STATUS_DIAGNOSTIC", "") != "1":
+        return
+    try:
+        record = _build_diagnostic_record(status_input, env)
+        diag_dir = os.path.expanduser("~/.cache/claude-statusline/diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        diag_file = os.path.join(diag_dir, f"{record['session_key']}.jsonl")
+        with open(diag_file, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +797,7 @@ def main():
         if debug:
             print(f"[CC_STATUS_DEBUG] env: {env}", file=sys.stderr)
 
+        maybe_write_diagnostic(status_input, env)
         print(render_status_line(status_input, env))
     except Exception as exc:
         if os.environ.get("CC_STATUS_DEBUG", "") == "1":

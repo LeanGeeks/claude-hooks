@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-05-03T13:01:44Z",
+  "session_key": "a1b2c3d4e5f6",
+  "provider": "deepseek",
+  "billing": "api",
+  "model": "DeepSeek",
+  "context_window": {
+    "used_percentage": 22,
+    "context_window_size": 500000,
+    "current_usage": 110000
+  },
+  "cost": {
+    "total_cost_usd": null
+  },
+  "_fixture_note": "Synthetic. A second status line render 30s after the first, with no new API call in between. context_window values are identical to deepseek-after-call-1.json, confirming that repeated renders repeat the same cumulative values rather than delta values."
+}

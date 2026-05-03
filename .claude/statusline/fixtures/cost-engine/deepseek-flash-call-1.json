@@ -1,0 +1,9 @@
+{
+  "model": {"display_name": "deepseek-v4-flash"},
+  "context_window": {
+    "used_percentage": 20,
+    "current_usage": 100000,
+    "context_window_size": 500000
+  },
+  "session_id": "deepseek-pricing-flash-test"
+}

@@ -1,0 +1,9 @@
+{
+  "model": {"display_name": "mock-model"},
+  "context_window": {
+    "used_percentage": null,
+    "current_usage": null,
+    "context_window_size": 500000
+  },
+  "session_id": "test-mock-null"
+}

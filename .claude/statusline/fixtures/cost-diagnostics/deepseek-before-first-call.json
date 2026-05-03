@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-05-03T13:00:00Z",
+  "session_key": "a1b2c3d4e5f6",
+  "provider": "deepseek",
+  "billing": "api",
+  "model": "DeepSeek",
+  "context_window": {
+    "used_percentage": null,
+    "context_window_size": 500000,
+    "current_usage": null
+  },
+  "cost": {
+    "total_cost_usd": null
+  },
+  "_fixture_note": "Synthetic. Represents state before the first API call: context fields are null."
+}

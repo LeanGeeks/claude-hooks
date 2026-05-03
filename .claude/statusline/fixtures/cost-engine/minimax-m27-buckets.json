@@ -1,0 +1,14 @@
+{
+  "model": {"display_name": "MiniMax"},
+  "context_window": {
+    "used_percentage": 38,
+    "current_usage": {
+      "input_tokens": 100000,
+      "output_tokens": 5000,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0
+    },
+    "context_window_size": 205000
+  },
+  "session_id": "minimax-m27-test"
+}
