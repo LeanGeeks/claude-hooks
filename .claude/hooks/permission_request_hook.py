@@ -49,6 +49,7 @@ from permission_state_store import (
 from telegram_permission_router import (
     load_telegram_config,
     send_permission_message,
+    send_question_message,
     process_whitelist_update,
 )
 from telegram_daemon import start_daemon_if_needed
@@ -222,6 +223,21 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
             }
         }
 
+    elif action == 'answer':
+        # AskUserQuestion answers — inject `answers` into tool input so the
+        # tool short-circuits without prompting the user.
+        updated_input = decision.get('updatedInput', {})
+        debug_log(f"Processing answer action with {len(updated_input.get('answers', {}))} answer(s)")
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'PermissionRequest',
+                'decision': {
+                    'behavior': 'allow',
+                    'updatedInput': updated_input,
+                }
+            }
+        }
+
     # Unknown action - fall back to terminal
     debug_log(f"Unknown action: {action}")
     return None
@@ -277,6 +293,102 @@ def wait_for_response(request_id: str, ttl_seconds: int = REQUEST_TTL) -> Option
     return None
 
 
+def handle_ask_user_question(
+    session_id: str,
+    cwd: str,
+    tool_input: Dict[str, Any],
+    workspace_name: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Handle AskUserQuestion: send each question to Telegram, race the terminal,
+    build {question: answer} on success.
+
+    Returns a hook output dict (with `updatedInput.answers`) on Telegram win,
+    or None to fall through to terminal (which handles the native UI).
+    """
+    questions = tool_input.get('questions', [])
+    if not questions:
+        return None
+
+    # One child request per question. Each gets its own Telegram message and
+    # state-store entry; the daemon's existing `qa{N}:` callback and reply
+    # handlers resolve them independently.
+    children = []  # list of (PermissionRequest, question_dict, message_id)
+    for i, q in enumerate(questions):
+        child = create_request(
+            session_id=session_id,
+            cwd=cwd,
+            tool_name='AskUserQuestion',
+            tool_input={
+                'question': q.get('question', ''),
+                'header': q.get('header', ''),
+                'options': q.get('options', []),
+                'multiSelect': q.get('multiSelect', False),
+            },
+            permission_suggestions=[],
+            ttl_seconds=REQUEST_TTL,
+        )
+        msg_id = send_question_message(child, workspace_name, i, len(questions))
+        if not msg_id:
+            error_log(f"Failed to send AskUserQuestion message for child {child.request_id}; falling back to terminal")
+            return None
+        children.append((child, q, msg_id))
+
+    debug_log(f"Sent {len(children)} question messages; polling for answers")
+
+    # Poll until each child is resolved.
+    answers: Dict[str, str] = {}
+    deadline = time.time() + REQUEST_TTL
+    pending_ids = {c[0].request_id for c in children}
+
+    while pending_ids and time.time() < deadline:
+        for child, q, _msg_id in children:
+            if child.request_id not in pending_ids:
+                continue
+            current = get_request(child.request_id)
+            if not current:
+                # Expired between polls
+                pending_ids.discard(child.request_id)
+                continue
+            if current.state == RequestState.RESOLVED_TERMINAL.value:
+                debug_log(f"Child {child.request_id} resolved via terminal; revoking siblings")
+                # Revoke siblings' Telegram messages and mark them resolved so
+                # late button presses don't write into orphaned state.
+                for sib, _sq, sib_msg in children:
+                    if sib.request_id == child.request_id:
+                        continue
+                    sib_state = get_request(sib.request_id)
+                    if sib_state and sib_state.state == RequestState.PENDING.value:
+                        from permission_state_store import resolve_via_terminal
+                        resolve_via_terminal(sib.request_id)
+                        try:
+                            from telegram_permission_router import remove_inline_buttons, set_message_reaction
+                            remove_inline_buttons(sib_msg)
+                            set_message_reaction(sib_msg, '✅')
+                        except Exception as e:
+                            debug_log(f"Failed to revoke sibling message {sib_msg}: {e}")
+                return None
+            if current.state == RequestState.REPLY.value:
+                ans = (current.decision or {}).get('reply_text') or current.reply_text or ''
+                answers[q.get('question', '')] = ans
+                pending_ids.discard(child.request_id)
+        if pending_ids:
+            time.sleep(POLL_INTERVAL)
+
+    if pending_ids:
+        debug_log(f"Timed out with {len(pending_ids)} unanswered question(s); falling back to terminal")
+        return None
+
+    # All answered via Telegram — build updatedInput preserving original question structure.
+    return {
+        'action': 'answer',
+        'updatedInput': {
+            **tool_input,
+            'answers': answers,
+        },
+    }
+
+
 def get_wait_before_telegram(tool_name: str) -> int:
     """
     Return pre-send delay before posting Telegram request.
@@ -330,6 +442,19 @@ def main():
         if not daemon_started:
             debug_log("Failed to start daemon, falling back to terminal")
             error_log("Failed to start telegram_daemon; falling back to terminal prompt")
+            sys.exit(0)
+
+        # AskUserQuestion takes a different shape (questions[] instead of a single
+        # tool input) and resolves with `updatedInput.answers` instead of allow/deny.
+        if tool_name == 'AskUserQuestion':
+            workspace_name = get_workspace_name(cwd)
+            decision = handle_ask_user_question(session_id, cwd, tool_input, workspace_name)
+            output = build_output_decision(decision, request=None)  # type: ignore[arg-type]
+            if output:
+                debug_log(f"AskUserQuestion returning: {json.dumps(output)[:200]}")
+                print(json.dumps(output), flush=True)
+            else:
+                debug_log("AskUserQuestion: no Telegram answer; native UI will handle")
             sys.exit(0)
 
         # Create request in state store

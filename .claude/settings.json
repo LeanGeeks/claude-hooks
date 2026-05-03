@@ -23,7 +23,6 @@
       "Task",
       "TaskOutput",
       "TodoWrite",
-      "AskUserQuestion",
       "ExitPlanMode",
       "EnterPlanMode",
       "Skill",
@@ -260,60 +259,5 @@
     "type": "command",
     "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/statusline/statusline.py",
     "refreshInterval": 30
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/hooks/pretool_hook.py"
-          }
-        ]
-      }
-    ],
-    "PermissionRequest": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/hooks/permission_request_hook.py"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "permission_prompt",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/hooks/notification_hook.py"
-          }
-        ]
-      },
-      {
-        "matcher": "idle_prompt",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/hooks/notification_hook.py"
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/hooks/posttool_hook.py"
-          }
-        ]
-      }
-    ]
   }
 }

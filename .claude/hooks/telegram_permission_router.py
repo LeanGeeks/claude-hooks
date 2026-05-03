@@ -248,6 +248,128 @@ def send_permission_message(
     return None
 
 
+# Option labels that signal "I want to type a custom answer".
+# Daemon checks these on button-press to decide whether to ask for free text
+# instead of treating the label itself as the answer.
+FREE_TEXT_TRIGGER_LABELS = frozenset({
+    'let me type it', 'other', 'custom', 'type it',
+    'write it', 'free text', 'type your answer',
+    'enter text', 'specify', 'something else',
+})
+
+
+def is_free_text_trigger(label: str) -> bool:
+    """True if an option label signals the user wants to type a custom answer."""
+    if not label:
+        return False
+    normalized = label.lower().strip().rstrip('.')
+    return normalized in FREE_TEXT_TRIGGER_LABELS or label.strip().endswith('...')
+
+
+def send_question_message(
+    request: PermissionRequest,
+    workspace_name: str,
+    index: int,
+    total: int,
+) -> Optional[int]:
+    """
+    Send one AskUserQuestion question to Telegram.
+
+    `request.tool_input` is expected to have shape:
+        {question, header?, options: [{label, description?}], multiSelect?}
+
+    Buttons use callback_data `qa{N}:{request_id}` where N is the option index.
+    Free-text questions (no options) get force_reply.
+    """
+    if not TELEGRAM_ENABLED:
+        return None
+
+    ti = request.tool_input or {}
+    question_text = ti.get('question', '')
+    header = ti.get('header', '')
+    options = ti.get('options', [])
+    multi_select = ti.get('multiSelect', False)
+
+    import html as _html
+    def esc(s: str) -> str:
+        return _html.escape(s or "", quote=False)
+
+    lines: List[str] = []
+    if index == 0 and total > 1:
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
+    if total > 1:
+        lines.append(f"<b>[{index + 1}/{total}] Question</b> — {esc(workspace_name)}")
+    else:
+        lines.append(f"<b>Question</b> — {esc(workspace_name)}")
+    lines.append("")
+    if header:
+        lines += [f"<b><i>{esc(header)}</i></b>", ""]
+    lines.append(esc(question_text))
+    if options:
+        lines += ["", "<i>Tap an option, or reply with text:</i>"]
+        if multi_select:
+            lines.append("<i>(multi-select not supported via Telegram — first answer wins)</i>")
+    else:
+        lines += ["", "<i>Reply to this message with your answer.</i>"]
+    if total > 1 and index == total - 1:
+        lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━"]
+
+    reply_markup: Dict[str, Any]
+    if options:
+        rows: List[List[Dict[str, Any]]] = []
+        row: List[Dict[str, Any]] = []
+        for i, opt in enumerate(options):
+            label = opt.get('label', str(opt)) if isinstance(opt, dict) else str(opt)
+            row.append({"text": label, "callback_data": f"qa{i}{CALLBACK_DATA_SEPARATOR}{request.request_id}"})
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        reply_markup = {"inline_keyboard": rows}
+    else:
+        reply_markup = {"force_reply": True, "selective": False}
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": "\n".join(lines),
+        "parse_mode": "HTML",
+        "disable_notification": False,
+        "reply_markup": reply_markup,
+    }
+
+    result = _telegram_api_request("sendMessage", payload)
+    if not result:
+        return None
+
+    message_id = result.get('message_id')
+    set_telegram_message_id(request.request_id, message_id)
+    debug_log(f"Sent question message_id={message_id} for request {request.request_id}")
+    return message_id
+
+
+def send_freetext_followup(request_id: str, workspace_name: str) -> Optional[int]:
+    """
+    Send a follow-up message asking the user to type their custom answer.
+    Updates `request_id`'s telegram_message_id so the reply routes back to it.
+    """
+    if not TELEGRAM_ENABLED:
+        return None
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": f"*{workspace_name}*\n\n_Please type your answer:_",
+        "parse_mode": "Markdown",
+        "reply_markup": {"force_reply": True, "selective": False},
+    }
+    result = _telegram_api_request("sendMessage", payload)
+    if not result:
+        return None
+    message_id = result.get('message_id')
+    set_telegram_message_id(request_id, message_id)
+    return message_id
+
+
 def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     """
     Format a summary of the tool/command for display in Telegram.
@@ -266,6 +388,21 @@ def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
         raw = f"{tool_name}({file_path})"
     elif tool_name == 'WebFetch':
         raw = f"WebFetch({tool_input.get('url', '')})"
+    elif tool_name == 'AskUserQuestion':
+        questions = tool_input.get('questions', [])
+        if questions:
+            parts = []
+            for q in questions:
+                text = q.get('question', '')
+                opts = q.get('options', [])
+                if opts:
+                    labels = ', '.join(o.get('label', str(o)) for o in opts)
+                    parts.append(f"{text}\n  Options: {labels}")
+                else:
+                    parts.append(text)
+            raw = "\n\n".join(parts)
+        else:
+            raw = f"AskUserQuestion: {json.dumps(tool_input)}"
     else:
         raw = f"{tool_name}: {json.dumps(tool_input)}"
 

@@ -208,7 +208,58 @@ def handle_callback_query(callback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         telegram_permission_router.answer_callback_query(callback['id'], "Request not found or expired")
         return None
 
-    # Validate action
+    # Handle AskUserQuestion button answer: callback data is qa{N}:{request_id}
+    # where N is the 0-based index into tool_input['options'].
+    if action.startswith('qa') and action[2:].isdigit():
+        option_index = int(action[2:])
+        options = (request.tool_input or {}).get('options', [])
+        if option_index < len(options):
+            opt = options[option_index]
+            answer = opt.get('label', str(opt)) if isinstance(opt, dict) else str(opt)
+        else:
+            answer = str(option_index)
+
+        # Free-text trigger label (e.g. "Let me type it..."): don't resolve;
+        # follow up with a force_reply prompt and reroute the request to the new message.
+        if telegram_permission_router.is_free_text_trigger(answer):
+            daemon_log(f"Free-text trigger button: {answer!r}; sending follow-up")
+            telegram_permission_router.answer_callback_query(callback['id'], "Type your answer below")
+            telegram_permission_router.remove_inline_buttons(message_id)
+            from pathlib import Path
+            workspace_name = Path(request.cwd or '').name or 'workspace'
+            new_msg_id = telegram_permission_router.send_freetext_followup(
+                request.request_id, workspace_name
+            )
+            if not new_msg_id:
+                daemon_log("Failed to send free-text follow-up; resolving with literal label")
+                decision = {'action': 'reply', 'reply_text': answer}
+                update_request_state(
+                    request.request_id,
+                    RequestState.REPLY,
+                    decision=decision,
+                    reply_text=answer,
+                    actor_user_id=user_id,
+                    resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+                )
+                return decision
+            return None  # Wait for user reply to new_msg_id (handled by handle_text_reply)
+
+        daemon_log(f"Question answer: index={option_index}, answer={answer!r}")
+        telegram_permission_router.answer_callback_query(callback['id'], f"Answered: {answer}")
+
+        decision = {'action': 'reply', 'reply_text': answer}
+        update_request_state(
+            request.request_id,
+            RequestState.REPLY,
+            decision=decision,
+            reply_text=answer,
+            actor_user_id=user_id,
+            resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+        )
+        _update_message_after_action(message_id, request.request_id, 'reply')
+        return decision
+
+    # Validate permission action
     valid_actions = ['allow', 'deny', 'stop', 'whitelist']
     if action not in valid_actions:
         daemon_log(f"Invalid action: {action}")

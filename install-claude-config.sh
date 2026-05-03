@@ -199,17 +199,11 @@ MERGED=$(jq --argjson allowed "$ALLOWED_TOOLS" \
             "$GLOBAL_CONFIG")
 
 # Merge hooks configuration if hooks were installed
+# Note: hooks are NOT defined in project settings.json to avoid duplication
+# (Claude Code merges project + global settings, so defining hooks in both fires them twice).
+# The install script always writes hooks to global settings unconditionally.
 if [[ "$HOOKS_INSTALLED" == true ]]; then
-    # Extract hooks config from project
-    HOOKS_CONFIG=$(jq '.hooks // {}' "$PROJECT_CONFIG")
-
-    # Check if project has hooks configuration
-    HOOKS_COUNT=$(echo "$HOOKS_CONFIG" | jq 'length')
-    if [[ "$HOOKS_COUNT" -gt 0 ]]; then
-        log_info "Found hooks configuration in project config"
-
-        # Convert relative hook path to absolute path for global use
-        # Build the hooks config with absolute path
+        # Build the hooks config with absolute paths
         HOOKS_CONFIG=$(jq -n --arg pretool_path "$GLOBAL_HOOKS_DIR/pretool_hook.py" \
                        --arg notification_path "$GLOBAL_HOOKS_DIR/notification_hook.py" \
                        --arg permission_path "$GLOBAL_HOOKS_DIR/permission_request_hook.py" \
@@ -261,10 +255,6 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
         log_info "  - PermissionRequest: python3 $GLOBAL_HOOKS_DIR/permission_request_hook.py"
         log_info "  - PostToolUse: python3 $GLOBAL_HOOKS_DIR/posttool_hook.py"
         log_info "  - Notification: python3 $GLOBAL_HOOKS_DIR/notification_hook.py"
-    else
-        log_warn "No hooks configuration found in project config"
-        log_warn "Hooks were installed but not configured in settings.json"
-    fi
 fi
 
 # Merge statusLine configuration if statusline was installed
