@@ -56,15 +56,16 @@ class NotificationClient:
         if max_lines > 0:
             options["max_lines"] = max_lines
 
-        options_builder = self._build_options_variant(options)
+        # Build parameters using VariantBuilder to avoid embedding issues
+        params = self._build_params_variant(title, body, options)
 
         result = self.bus.call_sync(
             BUS_NAME,
             OBJECT_PATH,
             INTERFACE,
             "ShowNotification",
-            GLib.Variant("(ssa{sv})", (title, body, options_builder)),
-            None,
+            params,
+            GLib.VariantType("(s)"),  # Specify return type
             Gio.DBusCallFlags.NONE,
             -1,
             None,
@@ -124,7 +125,7 @@ class NotificationClient:
             INTERFACE,
             "GetResult",
             GLib.Variant("(s)", (notification_id,)),
-            None,
+            GLib.VariantType("(a{sv})"),  # Specify return type
             Gio.DBusCallFlags.NONE,
             -1,
             None,
@@ -134,21 +135,31 @@ class NotificationClient:
             return result.unpack()[0]
         return None
 
+    def _build_params_variant(self, title: str, body: str, options: Dict[str, Any]) -> GLib.Variant:
+        """Build the complete (ssa{sv}) parameter variant"""
+        # Build using new_tuple to avoid Python 3.13 GLib.Variant tuple issues
+        return GLib.Variant.new_tuple(
+            GLib.Variant.new_string(title),
+            GLib.Variant.new_string(body),
+            self._build_options_variant(options)
+        )
+
     def _build_options_variant(self, options: Dict[str, Any]) -> GLib.Variant:
         """Build D-Bus variant for options dictionary"""
         builder = GLib.VariantBuilder(GLib.VariantType("a{sv}"))
 
         for key, value in options.items():
             if key == "actions":
-                # Array of {id, label} dictionaries
-                action_variants = []
+                # Array of {id, label} dictionaries - use VariantBuilder for array
+                actions_builder = GLib.VariantBuilder(GLib.VariantType("aa{ss}"))
                 for action in value:
-                    action_dict = GLib.Variant("a{ss}", action)
-                    action_variants.append(action_dict)
-                builder.add("{sv}", key, GLib.Variant("aa{ss}", action_variants))
+                    actions_builder.add_value(GLib.Variant("a{ss}", action))
+                entry = GLib.Variant("{sv}", (key, actions_builder.end()))
+                builder.add_value(entry)
 
             elif key == "code_blocks":
-                builder.add("{sv}", key, GLib.Variant("as", value))
+                entry = GLib.Variant("{sv}", (key, GLib.Variant("as", value)))
+                builder.add_value(entry)
 
             else:
                 # Map types to GVariant types
@@ -159,7 +170,8 @@ class NotificationClient:
                     "max_lines": "i",
                 }
                 if key in type_map:
-                    builder.add("{sv}", key, GLib.Variant(type_map[key], value))
+                    entry = GLib.Variant("{sv}", (key, GLib.Variant(type_map[key], value)))
+                    builder.add_value(entry)
 
         return builder.end()
 

@@ -21,13 +21,25 @@ export const CustomNotification = GObject.registerClass({
     },
 }, class CustomNotification extends MessageTray.Notification {
     constructor(params) {
-        super(params);
+        // Extract expire-timeout-ms before passing params to super
+        // (it's not a GObject property, so we need to handle it separately)
+        const expireTimeoutMs = params['expire-timeout-ms'] || 0;
+        const { ['expire-timeout-ms']: _, ...cleanParams } = params;
 
-        this._actionLayout = params.actionLayout || 'horizontal';
+        super(cleanParams);
+
+        this._actionLayout = params['action-layout'] || 'horizontal';
         this._verticalButtonBox = null;
         this._countdownIndicator = null;
         this._countdownTimeoutId = null;
-        this._expireTimeoutMs = params.expireTimeoutMs || 0;
+        this._expireTimeoutMs = expireTimeoutMs;
+
+        // Connect to destroy signal for cleanup (GNOME 49)
+        this.connect('destroy', this._onDestroy.bind(this));
+    }
+
+    _onDestroy() {
+        this._stopCountdown();
     }
 
     /**
@@ -145,13 +157,5 @@ export const CustomNotification = GObject.registerClass({
                 action.callback();
             }
         }
-    }
-
-    /**
-     * Destroy handler - stop countdown
-     */
-    vfunc_destroy() {
-        this._stopCountdown();
-        super.vfunc_destroy();
     }
 });

@@ -3,7 +3,7 @@
   "description": "Interactive notifications with action buttons for AI agent approval",
   "uuid": "ai-notification-extension@local",
   "version": 1,
-  "shell-version": ["46", "47", "48"],
+  "shell-version": ["46", "47", "48", "49"],
   "url": "https://github.com/yourusername/ai-notification-extension",
   "author": "Your Name"
 }

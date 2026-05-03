@@ -19,6 +19,16 @@ export class TextFormatter {
      * @returns {string} Formatted body
      */
     formatBody(body, codeBlocks = [], options = {}) {
+        // Handle GLib.Variant or non-string inputs for body
+        if (typeof body !== 'string') {
+            if (body?.unpack && typeof body.unpack === 'function') {
+                body = body.unpack();
+            } else {
+                body = body !== null && body !== undefined ? String(body) : '';
+            }
+        }
+        if (!body) body = '';
+
         const maxLines = options.maxLines ?? this.maxLines;
         const truncate = options.truncate ?? true;
 
@@ -45,6 +55,16 @@ export class TextFormatter {
      * Format a single code block
      */
     _formatCodeBlock(code, index = 0) {
+        // Handle GLib.Variant or non-string inputs
+        if (typeof code !== 'string') {
+            if (code.unpack && typeof code.unpack === 'function') {
+                code = code.unpack();
+            } else {
+                code = String(code);
+            }
+        }
+        if (!code) return '';
+
         // Trim leading/trailing whitespace but preserve indentation
         const trimmed = code.trim();
 
@@ -98,6 +118,16 @@ export class TextFormatter {
      * Escape text for Pango markup
      */
     _escapeText(text) {
+        // Handle GLib.Variant or non-string inputs
+        if (!text) return '';
+        if (typeof text !== 'string') {
+            // Try to unpack GLib.Variant or convert to string
+            if (text.unpack && typeof text.unpack === 'function') {
+                text = text.unpack();
+            } else {
+                text = String(text);
+            }
+        }
         if (!text) return '';
 
         return text

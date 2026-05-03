@@ -10,6 +10,7 @@ export class NotificationManager {
         this._notifications = new Map(); // id -> { notification, source, result, options, expireTimeoutId, _deletionTimeoutId }
         this._nextId = 0;
         this._textFormatter = new TextFormatter();
+        this._source = null; // Custom notification source
     }
 
     /**
@@ -53,31 +54,23 @@ export class NotificationManager {
         // Create notification (custom or standard)
         let notification;
         const expireTimeoutMs = options.expireTimeoutMs || 0;
+        const hasCodeBlocks = options.codeBlocks && options.codeBlocks.length > 0;
 
-        if (useVertical && actions.length > 0) {
-            // Use custom notification for vertical buttons
+        // Use CustomNotification when:
+        // - Vertical layout with actions, OR
+        // - Has countdown timer, OR
+        // - Has code blocks (need custom rendering for proper code display)
+        const useCustom = useVertical || expireTimeoutMs > 0 || hasCodeBlocks;
+
+        if (useCustom) {
+            // Use custom notification for vertical buttons, countdown, or code blocks
             notification = new CustomNotification({
                 source: source,
                 title: options.title,
                 body: formattedBody,
                 urgency: this._mapUrgency(options.urgency || 'normal'),
-                actionLayout: 'vertical',
-                expireTimeoutMs: expireTimeoutMs,
-            });
-
-            // Add actions to the custom notification
-            for (const callback of actionCallbacks) {
-                notification.addAction(callback.label, callback.callback);
-            }
-        } else if (expireTimeoutMs > 0) {
-            // Use custom notification for countdown indicator even with horizontal buttons
-            notification = new CustomNotification({
-                source: source,
-                title: options.title,
-                body: formattedBody,
-                urgency: this._mapUrgency(options.urgency || 'normal'),
-                actionLayout: 'horizontal',
-                expireTimeoutMs: expireTimeoutMs,
+                'action-layout': useVertical ? 'vertical' : 'horizontal',
+                'expire-timeout-ms': expireTimeoutMs,
             });
 
             // Add actions to the custom notification
@@ -85,7 +78,7 @@ export class NotificationManager {
                 notification.addAction(callback.label, callback.callback);
             }
         } else {
-            // Use standard notification for horizontal buttons without countdown
+            // Use standard notification for horizontal buttons without countdown or code blocks
             notification = new MessageTray.Notification({
                 source: source,
                 title: options.title,
@@ -145,7 +138,13 @@ export class NotificationManager {
         // Show the notification AFTER storing
         source.addNotification(notification);
 
-        log(`[AI Notification] Notification ${id} displayed (${actionLayout} layout)`);
+        const features = [];
+        if (hasCodeBlocks) features.push('code-blocks');
+        if (expireTimeoutMs > 0) features.push('countdown');
+        if (useVertical) features.push('vertical');
+        features.push(actionLayout + '-layout');
+
+        log(`[AI Notification] Notification ${id} displayed (${features.join(', ')})`);
         return id;
     }
 
@@ -217,8 +216,27 @@ export class NotificationManager {
      * Get or create notification source
      */
     _getOrCreateSource(sourceName) {
-        // Use system source for simplicity
-        return MessageTray.getSystemSource();
+        if (!this._source) {
+            // Create a custom source for AI Notifications
+            this._source = new MessageTray.Source({
+                title: 'AI Notifications',
+                iconName: 'dialog-information',
+            });
+            Main.messageTray.add(this._source);
+            log('[AI Notification] Created custom notification source');
+        }
+        return this._source;
+    }
+
+    /**
+     * Cleanup - destroy the notification source
+     */
+    destroy() {
+        if (this._source) {
+            this._source.destroy();
+            this._source = null;
+            log('[AI Notification] Destroyed custom notification source');
+        }
     }
 
     /**

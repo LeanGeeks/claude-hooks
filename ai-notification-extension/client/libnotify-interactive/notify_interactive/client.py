@@ -63,7 +63,8 @@ class NotificationClient:
         if actions:
             opts_dict["actions"] = [{"id": a.id, "label": a.label} for a in actions]
 
-        options_variant = self._build_options_variant(opts_dict)
+        # Build parameters using VariantBuilder to avoid GLib embedding issues
+        params = self._build_params_variant(title, body, opts_dict)
 
         try:
             result = self.bus.call_sync(
@@ -71,7 +72,7 @@ class NotificationClient:
                 OBJECT_PATH,
                 INTERFACE,
                 "ShowNotification",
-                GLib.Variant("(ssa{sv})", (title, body, options_variant)),
+                params,
                 None,
                 Gio.DBusCallFlags.NONE,
                 -1,
@@ -209,21 +210,31 @@ class NotificationClient:
 
         return None
 
+    def _build_params_variant(self, title: str, body: str, options: dict) -> GLib.Variant:
+        """Build the complete (ssa{sv}) parameter variant"""
+        # Build using new_tuple to avoid Python 3.13 GLib.Variant tuple issues
+        return GLib.Variant.new_tuple(
+            GLib.Variant.new_string(title),
+            GLib.Variant.new_string(body),
+            self._build_options_variant(options)
+        )
+
     def _build_options_variant(self, options: dict) -> GLib.Variant:
         """Build D-Bus variant for options dictionary"""
         builder = GLib.VariantBuilder(GLib.VariantType("a{sv}"))
 
         for key, value in options.items():
             if key == "actions":
-                # Array of {id, label} dictionaries
-                action_variants = [
-                    GLib.Variant("a{ss}", {"id": a["id"], "label": a["label"]})
-                    for a in value
-                ]
-                builder.add("{sv}", key, GLib.Variant("aa{ss}", action_variants))
+                # Array of {id, label} dictionaries - use VariantBuilder for array
+                actions_builder = GLib.VariantBuilder(GLib.VariantType("aa{ss}"))
+                for a in value:
+                    actions_builder.add_value(GLib.Variant("a{ss}", {"id": a["id"], "label": a["label"]}))
+                entry = GLib.Variant("{sv}", (key, actions_builder.end()))
+                builder.add_value(entry)
 
             elif key == "code_blocks":
-                builder.add("{sv}", key, GLib.Variant("as", value))
+                entry = GLib.Variant("{sv}", (key, GLib.Variant("as", value)))
+                builder.add_value(entry)
 
             else:
                 # Primitive types
@@ -234,6 +245,7 @@ class NotificationClient:
                     "max_lines": "i",
                 }
                 if key in type_map:
-                    builder.add("{sv}", key, GLib.Variant(type_map[key], value))
+                    entry = GLib.Variant("{sv}", (key, GLib.Variant(type_map[key], value)))
+                    builder.add_value(entry)
 
         return builder.end()

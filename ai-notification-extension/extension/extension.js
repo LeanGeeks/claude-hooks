@@ -53,7 +53,10 @@ export default class AiNotificationExtension {
             this._dbusService = null;
         }
 
-        this._notificationManager = null;
+        if (this._notificationManager) {
+            this._notificationManager.destroy();
+            this._notificationManager = null;
+        }
 
         if (this._source) {
             this._source.destroy();

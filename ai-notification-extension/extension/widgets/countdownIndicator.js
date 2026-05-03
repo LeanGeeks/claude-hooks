@@ -1,8 +1,14 @@
 import GObject from 'gi://GObject';
 import Clutter from 'gi://Clutter';
-import Cairo from 'gi://Cairo';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
+
+// Cairo constants (hardcoded to avoid Cairo typelib dependency)
+const Cairo = {
+    LineCap: { ROUND: 2 },
+    FontSlant: { NORMAL: 0 },
+    FontWeight: { BOLD: 1 }
+};
 
 /**
  * Circular countdown indicator
@@ -46,6 +52,12 @@ export const CountdownIndicator = GObject.registerClass({
 
         // Connect to redraw signal
         this.connect('repaint', this._repaint.bind(this));
+        // Connect to destroy signal for cleanup
+        this.connect('destroy', this._onDestroy.bind(this));
+    }
+
+    _onDestroy() {
+        // Cleanup if needed
     }
 
     get progress() {
@@ -172,13 +184,5 @@ export const CountdownIndicator = GObject.registerClass({
         } finally {
             cr.$dispose();
         }
-    }
-
-    /**
-     * Destroy the indicator
-     */
-    vfunc_destroy() {
-        // Cleanup if needed
-        super.vfunc_destroy();
     }
 });

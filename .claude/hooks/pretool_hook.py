@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+PreToolUse Hook: Compound Bash Command Validator
+
+Validates compound bash commands (with |, &&, ||, ;) by:
+1. Splitting into sub-commands
+2. Checking each against allowed/denied patterns
+3. Allowing if ALL sub-commands are allowed
+
+Features:
+- Auto-approves known-safe command combinations
+- Logs commands requiring manual confirmation to ~/.claude/bash_manual_confirm.log
+- Supports replay mode for testing edge cases from logged commands
+
+Replay Mode Usage:
+    cat ~/.claude/bash_manual_confirm.log | head -n 5 | pretool_hook.py --dry-run
+    CLAUDE_HOOK_REPLAY=1 cat commands.log | pretool_hook.py
+"""
+
+import io
+import json
+import sys
+import os
+from datetime import datetime
+from typing import Dict, List, Any
+
+# Import our modules
+try:
+    from bash_command_parser import BashCommandParser
+    from settings_loader import SettingsLoader
+except ImportError:
+    # If running from different directory, try adding hooks dir to path
+    import pathlib
+    hooks_dir = pathlib.Path(__file__).parent.absolute()
+    sys.path.insert(0, str(hooks_dir))
+    from bash_command_parser import BashCommandParser
+    from settings_loader import SettingsLoader
+
+
+# Debug logging
+DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
+DEBUG_LOG = os.path.expanduser('~/.claude/bash_hook_debug.log')
+
+# Manual confirmation log - stores commands that were not auto-approved
+MANUAL_CONFIRM_LOG = os.path.expanduser('~/.claude/bash_manual_confirm.log')
+TMP_ALLOWED_ROOT = '/tmp'
+
+
+def debug_log(message: str):
+    """Log debug message if debug mode is enabled"""
+    if DEBUG:
+        try:
+            with open(DEBUG_LOG, 'a') as f:
+                timestamp = datetime.now().isoformat()
+                f.write(f"[{timestamp}] {message}\n")
+        except Exception as e:
+            print(f"Debug log error: {e}", file=sys.stderr)
+
+
+def resolve_workspace_dir(input_data: Dict[str, Any]) -> str:
+    """
+    Resolve the workspace directory for this hook invocation.
+
+    Claude provides the active working directory in the hook payload. That is
+    more reliable than the process cwd, which can point at the hooks directory
+    or another launcher-specific location.
+    """
+    candidates = [
+        os.environ.get('CLAUDE_WORKSPACE_DIR', ''),
+        input_data.get('cwd', ''),
+        os.getcwd(),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return os.path.abspath(candidate)
+    return os.path.abspath(os.getcwd())
+
+
+def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir: str, session_id: str = None):
+    """
+    Log a command that required manual confirmation (was not auto-approved)
+
+    Args:
+        command: The raw bash command string
+        result: The validation result dictionary
+        workspace_dir: The workspace directory where command was run
+        session_id: Optional session ID for correlation
+    """
+    try:
+        log_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'session_id': session_id or os.environ.get('CLAUDE_SESSION_ID', ''),
+            'workspace': workspace_dir,
+            'command': command,
+            'decision': result['decision'],
+            'reason': result['reason'],
+            'sub_commands': result.get('sub_commands', []),
+            'validation_results': result.get('validation_results', [])
+        }
+        with open(MANUAL_CONFIRM_LOG, 'a') as f:
+            f.write(json.dumps(log_entry) + '\n')
+    except Exception as e:
+        debug_log(f"Failed to write manual confirm log: {e}")
+
+
+def replay_from_log(stdin_lines=None):
+    """
+    Debug mode: Read and replay commands from stdin (one JSON entry per line)
+
+    This allows testing edge cases by piping the log file:
+        cat commands.log | grep -v grep | head -n 5 | pretool_hook.py
+
+    Expected input format: one JSON object per line with at least a 'command' field
+
+    Args:
+        stdin_lines: Optional list of strings to process (for internal use when
+                     stdin has already been read for peek detection)
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Replay commands from log for testing')
+    parser.add_argument('--dry-run', '-n', action='store_true',
+                        help='Show validation results without processing')
+    args = parser.parse_args()
+
+    workspace_dir = os.environ.get('CLAUDE_WORKSPACE_DIR', os.getcwd())
+    settings_loader = SettingsLoader(workspace_dir)
+    cmd_parser = BashCommandParser()
+    validator = BashPermissionValidator(settings_loader, cmd_parser, workspace_dir)
+
+    print(f"=== Replay Mode ===", file=sys.stderr)
+    print(f"Workspace: {workspace_dir}", file=sys.stderr)
+    print(f"Allowed patterns: {len(validator.allowed_patterns)}", file=sys.stderr)
+    print(f"Denied patterns: {len(validator.denied_patterns)}", file=sys.stderr)
+    print(f"==================\n", file=sys.stderr)
+
+    # Use provided lines or read from stdin
+    lines = stdin_lines if stdin_lines is not None else sys.stdin.readlines()
+
+    debug_log(f"Replay: processing {len(lines)} lines")
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            entry = json.loads(line)
+            command = entry.get('command', '')
+
+            if not command:
+                print(f"Skipping entry without command: {entry}", file=sys.stderr)
+                continue
+
+            print(f"\n--- Command: {command!r} ---", file=sys.stderr)
+            result = validator.validate_bash_command(command)
+
+            print(f"Decision: {result['decision']}", file=sys.stderr)
+            print(f"Reason: {result['reason']}", file=sys.stderr)
+            print(f"Sub-commands: {result['sub_commands']}", file=sys.stderr)
+
+            if args.dry_run:
+                continue
+
+            # Simulate the hook decision
+            if result['decision'] == 'allow':
+                output = {
+                    'hookSpecificOutput': {
+                        'hookEventName': 'PreToolUse',
+                        'permissionDecision': 'allow'
+                    }
+                }
+                print(json.dumps(output))
+            elif result['decision'] == 'ask':
+                output = {
+                    'hookSpecificOutput': {
+                        'hookEventName': 'PreToolUse',
+                        'permissionDecision': 'ask',
+                        'permissionDecisionReason': result['reason']
+                    }
+                }
+                print(json.dumps(output))
+
+        except json.JSONDecodeError as e:
+            print(f"Invalid JSON line: {line[:100]}... Error: {e}", file=sys.stderr)
+            continue
+        except Exception as e:
+            print(f"Error processing command: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            continue
+
+    sys.exit(0)
+
+
+class BashPermissionValidator:
+    """Validate bash commands against Claude settings"""
+
+    def __init__(self, settings_loader: SettingsLoader, command_parser: BashCommandParser, workspace_dir: str = None):
+        """
+        Initialize validator
+
+        Args:
+            settings_loader: Settings loader instance
+            command_parser: Command parser instance
+            workspace_dir: The workspace directory for checking local binaries
+        """
+        self.parser = command_parser
+        self.settings = settings_loader.load_all_settings()
+        self.allowed_patterns = self.settings.get('permissions', {}).get('allow', [])
+        self.denied_patterns = self.settings.get('permissions', {}).get('deny', [])
+        self.workspace_dir = os.path.abspath(workspace_dir or os.getcwd())
+
+        debug_log(f"Loaded {len(self.allowed_patterns)} allow patterns, {len(self.denied_patterns)} deny patterns")
+        debug_log(f"Workspace dir: {self.workspace_dir}")
+
+    def validate_bash_command(self, command: str) -> Dict[str, Any]:
+        """
+        Validate compound command
+
+        Args:
+            command: Full bash command to validate
+
+        Returns:
+            Dictionary with:
+            - decision: 'allow' | 'deny' | 'defer'
+            - reason: Explanation string
+            - sub_commands: List of parsed sub-commands
+            - validation_results: List of validation results for each sub-command
+        """
+        debug_log(f"Validating command: {command!r}")
+
+        # Parse compound command
+        sub_commands = self.parser.parse_compound_command(command)
+        debug_log(f"Parsed into {len(sub_commands)} sub-commands: {sub_commands}")
+
+        # Validate each sub-command
+        results = []
+        for cmd in sub_commands:
+            result = self._check_single_command(cmd)
+            results.append(result)
+            debug_log(f"  Sub-command {cmd!r}: allowed={result['allowed']}, denied={result['denied']}")
+
+        # Make decision
+        any_denied = any(r['denied'] for r in results)
+        all_allowed = all(r['allowed'] for r in results)
+
+        if any_denied:
+            # ANY denied → ask (let PermissionRequest handle it or user decide)
+            decision = 'ask'
+            reason = f"Contains denied command: {[r['command'] for r in results if r['denied']]}"
+        elif all_allowed and len(sub_commands) > 0:
+            # ALL allowed → explicitly allow
+            decision = 'allow'
+            reason = "All sub-commands are allowed"
+        else:
+            # Some unknown or empty → ask (let PermissionRequest handle it)
+            decision = 'ask'
+            reason = "Contains unknown or empty commands"
+
+        debug_log(f"Decision: {decision} - {reason}")
+
+        return {
+            'decision': decision,
+            'reason': reason,
+            'sub_commands': sub_commands,
+            'validation_results': results
+        }
+
+    def _is_workspace_binary(self, cmd: str) -> bool:
+        """
+        Check if command is a binary/script located inside the workspace.
+
+        Supports:
+        - Relative paths: ./script.sh, ./bin/app, ../dir/tool
+        - Absolute paths: /workspace/bin/app (if inside workspace)
+
+        Args:
+            cmd: Normalized command string
+
+        Returns:
+            True if command appears to be a workspace binary
+        """
+        # Extract the first word (the binary/command)
+        first_word = cmd.split()[0] if cmd.split() else cmd
+
+        # Check for path-like commands
+        is_path_like = (
+            first_word.startswith('./') or
+            first_word.startswith('../') or
+            (first_word.startswith('/') and self.workspace_dir in first_word)
+        )
+
+        if not is_path_like:
+            return False
+
+        try:
+            # Resolve the path
+            if first_word.startswith('/'):
+                # Absolute path - check if it's inside workspace
+                resolved = os.path.abspath(first_word)
+            else:
+                # Relative path - resolve from workspace
+                resolved = os.path.abspath(os.path.join(self.workspace_dir, first_word))
+
+            # Check if resolved path is inside workspace (using real paths to handle symlinks)
+            # Only resolve the directory with realpath — don't dereference the binary itself,
+            # since venv python is a symlink to the system interpreter outside the workspace.
+            real_workspace = os.path.realpath(self.workspace_dir)
+            real_cmd_dir = os.path.realpath(os.path.dirname(resolved))
+
+            is_inside = real_cmd_dir.startswith(real_workspace + os.sep) or real_cmd_dir == real_workspace
+            debug_log(f"Workspace binary check: {first_word!r} -> dir={real_cmd_dir} (inside {real_workspace}): {is_inside}")
+            return is_inside
+        except Exception as e:
+            debug_log(f"Error checking workspace binary: {e}")
+            return False
+
+    def _is_path_inside_workspace(self, path: str) -> bool:
+        """
+        Check if a path (relative or absolute) is inside the workspace.
+
+        Args:
+            path: A file path (can be relative like 'file.txt' or absolute like '/workspace/file.txt')
+
+        Returns:
+            True if path resolves inside workspace
+        """
+        try:
+            if path.startswith('/'):
+                resolved = os.path.realpath(path)
+            else:
+                resolved = os.path.realpath(os.path.join(self.workspace_dir, path))
+
+            real_workspace = os.path.realpath(self.workspace_dir)
+            return resolved.startswith(real_workspace + os.sep) or resolved == real_workspace
+        except Exception:
+            return False
+
+    def _is_path_inside_allowed_rm_roots(self, path: str) -> bool:
+        """
+        Check if a path is allowed for rm operations.
+
+        We allow deletions inside the active workspace and inside /tmp.
+        """
+        try:
+            if path.startswith('/'):
+                resolved = os.path.realpath(path)
+            else:
+                resolved = os.path.realpath(os.path.join(self.workspace_dir, path))
+
+            allowed_roots = [
+                os.path.realpath(self.workspace_dir),
+                os.path.realpath(TMP_ALLOWED_ROOT),
+            ]
+
+            for root in allowed_roots:
+                if resolved == root or resolved.startswith(root + os.sep):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _is_workspace_rm(self, cmd: str) -> bool:
+        """
+        Check if command is 'rm' targeting files inside the workspace.
+
+        Supports:
+        - rm file.txt
+        - rm -rf dir/
+        - rm ./file.txt
+        - rm /workspace/file.txt (if inside workspace)
+
+        Args:
+            cmd: Normalized command string
+
+        Returns:
+            True if all rm targets are inside workspace
+        """
+        parts = cmd.split()
+        if not parts or parts[0] != 'rm':
+            return False
+
+        # Extract file arguments (skip flags like -rf, -r, -f, --)
+        targets = []
+        for part in parts[1:]:
+            if part.startswith('-'):
+                continue  # Skip flags
+            targets.append(part)
+
+        if not targets:
+            return False  # No targets specified
+
+        # Check ALL targets are inside workspace
+        for target in targets:
+            if not self._is_path_inside_allowed_rm_roots(target):
+                debug_log(f"rm target {target!r} is outside workspace and /tmp")
+                return False
+
+        debug_log(f"rm command {cmd!r} - all targets inside workspace or /tmp")
+        return True
+
+    def _check_single_command(self, cmd: str) -> Dict[str, Any]:
+        """
+        Check if single command matches any pattern
+
+        Args:
+            cmd: Normalized command string
+
+        Returns:
+            Dictionary with:
+            - command: The command checked
+            - allowed: Boolean - matches an allow pattern
+            - denied: Boolean - matches a deny pattern
+            - matched_patterns: List of patterns that matched
+        """
+        matched_allow = []
+        matched_deny = []
+
+        # First check: workspace binaries are always allowed
+        if self._is_workspace_binary(cmd):
+            debug_log(f"Command {cmd!r} is a workspace binary - auto-allowing")
+            return {
+                'command': cmd,
+                'allowed': True,
+                'denied': False,
+                'matched_allow_patterns': ['workspace_binary'],
+                'matched_deny_patterns': []
+            }
+
+        # Second check: rm for workspace files is allowed
+        if self._is_workspace_rm(cmd):
+            debug_log(f"Command {cmd!r} is workspace rm - auto-allowing")
+            return {
+                'command': cmd,
+                'allowed': True,
+                'denied': False,
+                'matched_allow_patterns': ['workspace_rm'],
+                'matched_deny_patterns': []
+            }
+
+        # Check deny patterns first (deny takes precedence)
+        for pattern in self.denied_patterns:
+            if self._matches_pattern(cmd, pattern):
+                matched_deny.append(pattern)
+
+        # Check allow patterns
+        for pattern in self.allowed_patterns:
+            if self._matches_pattern(cmd, pattern):
+                matched_allow.append(pattern)
+
+        return {
+            'command': cmd,
+            'allowed': len(matched_allow) > 0,
+            'denied': len(matched_deny) > 0,
+            'matched_allow_patterns': matched_allow,
+            'matched_deny_patterns': matched_deny
+        }
+
+    def _matches_pattern(self, command: str, pattern: str) -> bool:
+        """
+        Check if command matches a Bash(...) pattern
+
+        Args:
+            command: Command string (e.g. "git diff file.txt")
+            pattern: Pattern from settings (e.g. "Bash(git diff:*)")
+
+        Returns:
+            True if matches, False otherwise
+
+        Examples:
+            command='git diff file.txt', pattern='Bash(git diff:*)' → True
+            command='git status', pattern='Bash(git diff:*)' → False
+            command='pwd', pattern='Bash(pwd)' → True
+        """
+        # Only match Bash patterns
+        if not pattern.startswith('Bash('):
+            return False
+
+        # Extract inner pattern from Bash(...)
+        if not pattern.endswith(')'):
+            return False
+
+        inner = pattern[5:-1]  # Remove 'Bash(' and ')'
+
+        # Check for wildcard suffix
+        if inner.endswith(':*'):
+            prefix = inner[:-2]
+            matches = command.startswith(prefix)
+            debug_log(f"    Pattern {pattern!r}: prefix match {prefix!r} → {matches}")
+            return matches
+        else:
+            # Exact match
+            matches = command == inner
+            debug_log(f"    Pattern {pattern!r}: exact match → {matches}")
+            return matches
+
+
+def main():
+    """Main hook entry point"""
+
+    # Check for replay mode (for testing edge cases)
+    # Set CLAUDE_HOOK_REPLAY=1 or pass --replay flag via arguments
+    if os.environ.get('CLAUDE_HOOK_REPLAY', '0') == '1':
+        replay_from_log()
+        return
+
+    # Also check if we're being called with command-line args suggesting replay
+    if len(sys.argv) > 1 and '--help' not in sys.argv:
+        # If there are command line args, assume replay mode
+        replay_from_log()
+        return
+
+    # Check if stdin looks like JSON log lines (replay mode detection)
+    # Try to peek at first line to detect format
+    # Note: We need to read all stdin since we can't seek on a pipe
+    try:
+        # Save the original stdin for potential replay use
+        full_stdin = sys.stdin.read()
+        sys.stdin = io.StringIO(full_stdin)
+
+        if full_stdin:
+            first_line = full_stdin.split('\n')[0]
+            if first_line:
+                # Try to parse as JSON - if it has 'command' field and no 'tool_name',
+                # it's likely a log entry for replay
+                try:
+                    peek_entry = json.loads(first_line.strip())
+                    if 'command' in peek_entry and 'tool_name' not in peek_entry:
+                        # Looks like a log entry, use replay mode
+                        # Pass the pre-read lines to replay_from_log
+                        replay_from_log(full_stdin.splitlines())
+                        return
+                except json.JSONDecodeError:
+                    # Not JSON, continue with normal hook mode
+                    pass
+    except Exception:
+        # Can't peek, continue with normal hook mode
+        pass
+
+    try:
+        # Read hook input from stdin
+        raw_input = sys.stdin.read()
+        debug_log(f"=== Hook called ===")
+        debug_log(f"Raw input: {raw_input[:500]}...")  # First 500 chars
+
+        input_data = json.loads(raw_input)
+        debug_log(f"Parsed input: {json.dumps(input_data, indent=2)}")
+
+        # Extract tool info
+        tool_name = input_data.get('tool_name', '')
+        tool_input = input_data.get('tool_input', {})
+
+        # Extract session info for correlation
+        session_id = input_data.get('session_id', '')
+
+        # Only process Bash tool
+        if tool_name != 'Bash':
+            debug_log(f"Not a Bash tool (got {tool_name!r}), allowing")
+            sys.exit(0)
+
+        # Get command
+        command = tool_input.get('command', '')
+        if not command:
+            debug_log("No command found, allowing")
+            sys.exit(0)
+
+        # Get workspace directory from the hook payload when available.
+        workspace_dir = resolve_workspace_dir(input_data)
+        debug_log(f"Workspace: {workspace_dir}")
+
+        # Initialize components
+        settings_loader = SettingsLoader(workspace_dir)
+        parser = BashCommandParser()
+        validator = BashPermissionValidator(settings_loader, parser, workspace_dir)
+
+        # Validate command
+        result = validator.validate_bash_command(command)
+
+        debug_log(f"Validation result: {json.dumps(result, indent=2)}")
+
+        # Log commands that were NOT auto-approved (ask or deny)
+        # These require manual confirmation from the user
+        if result['decision'] != 'allow':
+            log_manual_confirmation(command, result, workspace_dir, session_id)
+
+        # Make decision
+        if result['decision'] == 'allow':
+            # Explicitly allow - bypass normal permission system
+            output = {
+                'hookSpecificOutput': {
+                    'hookEventName': 'PreToolUse',
+                    'permissionDecision': 'allow'
+                }
+            }
+            print(json.dumps(output))
+            debug_log(f"ALLOWING command (bypassing normal permissions)")
+            sys.exit(0)
+        elif result['decision'] == 'ask':
+            # Ask user via native Claude permission flow
+            # This triggers the PermissionRequest hook for additional handling
+            output = {
+                'hookSpecificOutput': {
+                    'hookEventName': 'PreToolUse',
+                    'permissionDecision': 'ask',
+                    'permissionDecisionReason': result['reason']
+                }
+            }
+            print(json.dumps(output))
+            debug_log(f"ASKING for permission: {result['reason']}")
+            sys.exit(0)
+        else:
+            # Fallback (should not reach here normally)
+            debug_log(f"Unexpected decision '{result['decision']}': {result['reason']}")
+            sys.exit(0)
+
+    except Exception as e:
+        # On error, allow (fail open to avoid breaking things)
+        debug_log(f"ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        debug_log(f"Traceback:\n{traceback.format_exc()}")
+        sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
