@@ -2,7 +2,7 @@
 # Installs Claude Code configuration globally
 # - Copies hooks from .claude/hooks/ to ~/.claude/hooks/
 # - Copies statusline from .claude/statusline/ to ~/.claude/statusline/
-# - Merges hooks configuration (PreToolUse and Notification) from project to global settings
+# - Merges hooks configuration (PreToolUse, PermissionRequest, PostToolUse, and idle Notification) from project to global settings
 # - Merges statusLine configuration from project to global settings
 # - Merges allowedTools/disallowedTools from project to global settings
 # - Preserves all other settings in the global config
@@ -230,22 +230,13 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                         command: ("python3 " + $posttool_path)
                     }]
                 }],
-                Notification: [
-                    {
-                        matcher: "permission_prompt",
-                        hooks: [{
-                            type: "command",
-                            command: ("python3 " + $notification_path)
-                        }]
-                    },
-                    {
-                        matcher: "idle_prompt",
-                        hooks: [{
-                            type: "command",
-                            command: ("python3 " + $notification_path)
-                        }]
-                    }
-                ]
+                Notification: [{
+                    matcher: "idle_prompt",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $notification_path)
+                    }]
+                }]
             }')
 
         # Merge hooks into global config
@@ -301,7 +292,7 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
     echo "    - PreToolUse: Bash command interception"
     echo "    - PermissionRequest: Telegram-gated permission approval"
     echo "    - PostToolUse: Telegram message cleanup on terminal response"
-    echo "    - Notification: permission_prompt and idle_prompt notifications"
+    echo "    - Notification: idle_prompt notifications"
 else
     echo "  - hooks: not installed (missing files)"
 fi

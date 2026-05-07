@@ -4,7 +4,6 @@ Claude Code Notification Hook - Escalate to Mobile
 
 Sends desktop notifications that escalate to mobile if not dismissed.
 Triggers on:
-- permission_prompt: When Claude needs permission to continue
 - idle_prompt: When Claude is waiting for user input
 
 Usage (configured in .claude/settings.json):
@@ -12,7 +11,7 @@ Usage (configured in .claude/settings.json):
   "hooks": {
     "Notification": [
       {
-        "matcher": "permission_prompt|idle_prompt",
+        "matcher": "idle_prompt",
         "hooks": [
           {
             "type": "command",
@@ -270,8 +269,9 @@ def main():
         debug_log(f"CWD: {cwd}")
         debug_log(f"Transcript path: {transcript_path}")
 
-        # Only process permission_prompt and idle_prompt
-        if notification_type not in ('permission_prompt', 'idle_prompt'):
+        # Permission requests are forwarded through the PermissionRequest
+        # Telegram flow; keep this hook limited to idle notifications.
+        if notification_type != 'idle_prompt':
             debug_log(f"Skipping notification type: {notification_type}")
             sys.exit(0)
 
@@ -283,13 +283,6 @@ def main():
 
         # Build title
         title = get_title(cwd, session_id)
-
-        # Build message
-        if notification_type == 'permission_prompt':
-            # Truncate message if too long
-            if len(message) > 200:
-                message = message[:197] + "..."
-        # idle_prompt already has a good message
 
         # Send notification
         send_notification(title, message)
