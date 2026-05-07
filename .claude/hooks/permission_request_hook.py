@@ -61,7 +61,8 @@ ERROR_LOG = Path.home() / ".claude" / "permission_telegram_errors.log"
 
 # Configuration
 WAIT_BEFORE_TELEGRAM = 0  # seconds to wait before sending Telegram message
-REQUEST_TTL = 300  # 5 minutes TTL for pending requests
+REQUEST_TTL = 3600  # 1 hour TTL for pending requests
+MAX_WAIT_FOR_RESPONSE = REQUEST_TTL  # Backwards-compatible name for tests/importers
 POLL_INTERVAL = 0.5  # seconds between state store polls
 
 

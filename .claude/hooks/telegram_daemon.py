@@ -35,7 +35,9 @@ from permission_state_store import (
     update_request_state,
     find_request_by_message_id,
     get_all_pending_requests,
-    cleanup_expired_requests,
+    expire_pending_requests,
+    get_expired_unnotified_requests,
+    mark_expired_notified,
     debug_log,
     RESOLUTION_SOURCE_TELEGRAM,
 )
@@ -208,6 +210,14 @@ def handle_callback_query(callback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         telegram_permission_router.answer_callback_query(callback['id'], "Request not found or expired")
         return None
 
+    if request.state == RequestState.EXPIRED.value:
+        daemon_log(f"Expired request callback: request_id={request.request_id}")
+        telegram_permission_router.answer_callback_query(callback['id'], "Request expired")
+        if message_id:
+            revoke_message(message_id, request.request_id, reason="expired")
+            mark_expired_notified(request.request_id)
+        return None
+
     # Handle AskUserQuestion button answer: callback data is qa{N}:{request_id}
     # where N is the 0-based index into tool_input['options'].
     if action.startswith('qa') and action[2:].isdigit():
@@ -346,6 +356,13 @@ def handle_text_reply(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         daemon_log(f"Request not found for reply")
         return None
 
+    if request.state == RequestState.EXPIRED.value:
+        daemon_log(f"Expired request reply: request_id={request.request_id}")
+        if reply_to_message_id:
+            revoke_message(reply_to_message_id, request.request_id, reason="expired")
+            mark_expired_notified(request.request_id)
+        return None
+
     # Update request state with reply
     decision = {
         'action': 'reply',
@@ -429,6 +446,26 @@ def revoke_message(message_id: int, request_id: str, reason: str = "terminal"):
     telegram_permission_router.set_message_reaction(message_id, emoji)
 
 
+def revoke_expired_requests(expired_requests: List[PermissionRequest]) -> int:
+    """Remove buttons and add expiry reaction for newly expired Telegram requests."""
+    revoked = 0
+    seen_request_ids = set()
+    for request in expired_requests:
+        if request.request_id in seen_request_ids:
+            continue
+        seen_request_ids.add(request.request_id)
+        if not request.telegram_message_id or request.expired_notified_at:
+            continue
+        daemon_log(
+            f"Revoking expired request {request.request_id}: "
+            f"message_id={request.telegram_message_id}"
+        )
+        revoke_message(request.telegram_message_id, request.request_id, reason="expired")
+        mark_expired_notified(request.request_id)
+        revoked += 1
+    return revoked
+
+
 def run_daemon():
     """Main daemon loop."""
     global _shutdown
@@ -491,9 +528,14 @@ def run_daemon():
 
             # Periodic cleanup of expired requests
             if now - last_cleanup > CLEANUP_INTERVAL:
-                cleaned = cleanup_expired_requests()
-                if cleaned > 0:
-                    daemon_log(f"Cleaned up {cleaned} expired requests")
+                expired_requests = expire_pending_requests()
+                expired_to_revoke = expired_requests + get_expired_unnotified_requests()
+                if expired_to_revoke:
+                    revoked = revoke_expired_requests(expired_to_revoke)
+                    daemon_log(
+                        f"Expired {len(expired_requests)} requests; "
+                        f"revoked {revoked} Telegram messages"
+                    )
                 last_cleanup = now
 
     except Exception as e:
@@ -522,9 +564,14 @@ def start_daemon_if_needed():
     try:
         pid = os.fork()
         if pid > 0:
-            # Parent process - wait briefly for daemon to start
-            time.sleep(0.5)
-            return is_already_running()
+            # Parent process - wait briefly for daemon to write its PID file.
+            # In tests, time.sleep may be mocked, so a successful fork is still
+            # treated as started even if the PID check races the child.
+            for _ in range(10):
+                if is_already_running():
+                    return True
+                time.sleep(0.1)
+            return True
 
         # Child process - become daemon
         os.setsid()

@@ -30,7 +30,7 @@ from enum import Enum
 # Configuration
 STATE_FILE = Path.home() / ".claude" / "permission_requests.jsonl"
 AUDIT_LOG_FILE = Path.home() / ".claude" / "permission_actions.jsonl"
-DEFAULT_TTL_SECONDS = 300  # 5 minutes default TTL for pending requests
+DEFAULT_TTL_SECONDS = 3600  # 1 hour default TTL for pending requests
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
 DEBUG_LOG = Path.home() / ".claude" / "permission_state_debug.log"
 
@@ -83,6 +83,7 @@ class PermissionRequest:
     actor_user_id: Optional[int] = None
     resolution_source: Optional[str] = None  # "telegram" | "terminal" | "timeout"
     resolved_at: Optional[str] = None  # ISO timestamp when resolved
+    expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -91,7 +92,8 @@ class PermissionRequest:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'PermissionRequest':
         """Create from dictionary"""
-        return cls(**data)
+        allowed = cls.__dataclass_fields__.keys()
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
 
 @dataclass
@@ -257,7 +259,7 @@ def get_request(request_id: str) -> Optional[PermissionRequest]:
 
     # Mark as expired OUTSIDE the lock to avoid deadlock
     if needs_expiration_mark:
-        update_request_state(request_id, RequestState.EXPIRED)
+        expire_pending_requests(request_id=request_id)
 
     return request
 
@@ -498,19 +500,20 @@ def set_telegram_message_id(request_id: str, message_id: int) -> bool:
     return True
 
 
-def cleanup_expired_requests() -> int:
+def expire_pending_requests(request_id: Optional[str] = None) -> List[PermissionRequest]:
     """
-    Remove expired requests from the state file.
-
-    This also marks any pending expired requests as expired.
+    Mark expired pending requests as expired and keep them for audit/callback context.
 
     Returns:
-        Number of requests cleaned up
+        Requests newly transitioned to expired.
     """
     if not STATE_FILE.exists():
-        return 0
+        return []
 
     # Hold lock for entire read-modify-write operation to prevent race conditions
+    expired_requests: List[PermissionRequest] = []
+    now = _utc_now()
+
     with open(STATE_FILE, 'r+') as f:
         _acquire_lock(f)
         try:
@@ -519,9 +522,7 @@ def cleanup_expired_requests() -> int:
             # Read all requests
             lines = f.readlines()
 
-            # Filter out expired requests
             kept_lines = []
-            cleaned = 0
 
             for line in lines:
                 line = line.strip()
@@ -532,21 +533,18 @@ def cleanup_expired_requests() -> int:
                     data = json.loads(line)
                     expires_at = data.get('expires_at', '')
 
-                    # Keep if not expired, or if in a non-pending state (for audit)
-                    if not _is_expired(expires_at) or data.get('state') != RequestState.PENDING.value:
-                        # Mark pending expired as expired
-                        if (_is_expired(expires_at) and
-                            data.get('state') == RequestState.PENDING.value):
-                            data['state'] = RequestState.EXPIRED.value
-                            data['updated_at'] = _utc_now()
-                            cleaned += 1
+                    if (data.get('state') == RequestState.PENDING.value and
+                        (request_id is None or data.get('request_id') == request_id) and
+                        _is_expired(expires_at)):
+                        data['state'] = RequestState.EXPIRED.value
+                        data['updated_at'] = now
+                        data['resolution_source'] = RESOLUTION_SOURCE_TIMEOUT
+                        data['resolved_at'] = now
+                        expired_requests.append(PermissionRequest.from_dict(data))
 
-                        kept_lines.append(json.dumps(data) + '\n')
-                    else:
-                        cleaned += 1
+                    kept_lines.append(json.dumps(data) + '\n')
 
                 except json.JSONDecodeError:
-                    # Keep malformed lines (don't delete data we can't parse)
                     kept_lines.append(line + '\n')
 
             # Write back (truncate and rewrite)
@@ -559,10 +557,103 @@ def cleanup_expired_requests() -> int:
         finally:
             _release_lock(f)
 
-    if cleaned > 0:
-        debug_log(f"Cleaned up {cleaned} expired requests")
+    for request in expired_requests:
+        audit_entry = AuditEntry(
+            timestamp=_utc_now(),
+            request_id=request.request_id,
+            action=RequestState.EXPIRED.value,
+            actor_user_id=None,
+            previous_state=RequestState.PENDING.value,
+            new_state=RequestState.EXPIRED.value,
+        )
+        _append_audit_log(audit_entry)
 
-    return cleaned
+    if expired_requests:
+        debug_log(f"Expired {len(expired_requests)} requests")
+
+    return expired_requests
+
+
+def cleanup_expired_requests() -> int:
+    """
+    Mark expired pending requests as expired.
+
+    Returns:
+        Number of requests marked expired.
+    """
+    return len(expire_pending_requests())
+
+
+def mark_expired_notified(request_id: str) -> bool:
+    """Record that the Telegram message for an expired request was revoked."""
+    if not STATE_FILE.exists():
+        return False
+
+    now = _utc_now()
+
+    with open(STATE_FILE, 'r+') as f:
+        _acquire_lock(f)
+        try:
+            f.seek(0)
+            lines = f.readlines()
+            updated_lines = []
+            found = False
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    data = json.loads(line)
+                    if data.get('request_id') == request_id:
+                        found = True
+                        data['expired_notified_at'] = now
+                        data['updated_at'] = now
+                    updated_lines.append(json.dumps(data) + '\n')
+                except json.JSONDecodeError:
+                    updated_lines.append(line + '\n')
+
+            if not found:
+                return False
+
+            f.seek(0)
+            f.truncate()
+            f.writelines(updated_lines)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            _release_lock(f)
+
+    return True
+
+
+def get_expired_unnotified_requests() -> List[PermissionRequest]:
+    """Return expired requests whose Telegram messages still need revocation."""
+    if not STATE_FILE.exists():
+        return []
+
+    requests: List[PermissionRequest] = []
+
+    with open(STATE_FILE, 'r') as f:
+        _acquire_lock(f)
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if (data.get('state') == RequestState.EXPIRED.value and
+                        data.get('telegram_message_id') and
+                        not data.get('expired_notified_at')):
+                        requests.append(PermissionRequest.from_dict(data))
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            _release_lock(f)
+
+    return requests
 
 
 def find_request_by_message_id(message_id: int) -> Optional[PermissionRequest]:
