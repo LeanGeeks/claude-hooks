@@ -97,6 +97,27 @@ class TestPreToolUseHook(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
         self.assertEqual(len(result["sub_commands"]), 3)
 
+    def test_allowed_subshell_groups(self):
+        """Test allowed commands wrapped in subshell grouping parentheses."""
+        command = (
+            '(cd apps/contributor && npx tsc --noEmit 2>&1 | head -40) '
+            '&& echo "---PRESENTATION---" '
+            '&& (cd apps/presentation && npx tsc --noEmit 2>&1 | head -40)'
+        )
+
+        result = self.validator.validate_bash_command(command)
+
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["sub_commands"], [
+            "cd apps/contributor",
+            "npx tsc --noEmit",
+            "head -40",
+            'echo "---PRESENTATION---"',
+            "cd apps/presentation",
+            "npx tsc --noEmit",
+            "head -40",
+        ])
+
     def test_sub_command_parsing(self):
         """Test that compound commands are correctly split."""
         test_cases = [

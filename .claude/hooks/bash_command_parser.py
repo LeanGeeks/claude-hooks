@@ -448,6 +448,7 @@ class BashCommandParser:
         Convert tokens back to normalized command string
 
         - Strips environment variables
+        - Strips grouping parentheses left behind by subshell syntax
         - Joins remaining tokens with spaces
         - Normalizes whitespace
 
@@ -473,7 +474,35 @@ class BashCommandParser:
 
         # Join and normalize whitespace
         result = ' '.join(words)
-        return result.strip()
+        return self._strip_grouping_parentheses(result.strip())
+
+    def _strip_grouping_parentheses(self, command: str) -> str:
+        """
+        Remove shell grouping parentheses that can remain at command boundaries.
+
+        The parser splits on operators like && and |, so a subshell command such
+        as `(cd app && npm test)` can leave fragments like `(cd app` and
+        `npm test)`. Parentheses at those boundaries do not change the command
+        being validated, so strip them before matching permission patterns.
+        """
+        if not command:
+            return command
+
+        words = command.split()
+        if not words:
+            return command
+
+        while words and words[0].startswith('('):
+            words[0] = words[0][1:]
+            if not words[0]:
+                words.pop(0)
+
+        while words and words[-1].endswith(')'):
+            words[-1] = words[-1][:-1]
+            if not words[-1]:
+                words.pop()
+
+        return ' '.join(words).strip()
 
 
 # For testing
@@ -521,6 +550,8 @@ if __name__ == '__main__':
         ('GOWORK=$(pwd)/go.work go build ./activecdn-module/... ./caddy-apps/... 2>&1 | head -60', ["go build ./activecdn-module/... ./caddy-apps/...", "head -60", "pwd"]),
         ('RESULT=`grep foo file.txt` echo bar', ["echo bar", "grep foo file.txt"]),
         ('PATH=$(dirname $0)/bin:$PATH python app.py', ["python app.py", "dirname $0"]),
+        ('(cd apps/contributor && npx tsc --noEmit 2>&1 | head -40) && echo "---PRESENTATION---" && (cd apps/presentation && npx tsc --noEmit 2>&1 | head -40)', ["cd apps/contributor", "npx tsc --noEmit", "head -40", 'echo "---PRESENTATION---"', "cd apps/presentation", "npx tsc --noEmit", "head -40"]),
+        ('(git status; git diff | head -20)', ["git status", "git diff", "head -20"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")
