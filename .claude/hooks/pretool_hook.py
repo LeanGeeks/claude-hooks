@@ -269,17 +269,12 @@ class BashPermissionValidator:
 
     def _is_workspace_binary(self, cmd: str) -> bool:
         """
-        Check if command is a binary/script located inside the workspace.
+        Check if command is a binary/script located inside the workspace or /tmp.
 
         Supports:
         - Relative paths: ./script.sh, ./bin/app, ../dir/tool
         - Absolute paths: /workspace/bin/app (if inside workspace)
-
-        Args:
-            cmd: Normalized command string
-
-        Returns:
-            True if command appears to be a workspace binary
+        - /tmp paths: /tmp/foo.sh
         """
         # Extract the first word (the binary/command)
         first_word = cmd.split()[0] if cmd.split() else cmd
@@ -288,7 +283,11 @@ class BashPermissionValidator:
         is_path_like = (
             first_word.startswith('./') or
             first_word.startswith('../') or
-            (first_word.startswith('/') and self.workspace_dir in first_word)
+            (first_word.startswith('/') and (
+                self.workspace_dir in first_word or
+                first_word.startswith(TMP_ALLOWED_ROOT + os.sep) or
+                first_word == TMP_ALLOWED_ROOT
+            ))
         )
 
         if not is_path_like:
@@ -297,21 +296,25 @@ class BashPermissionValidator:
         try:
             # Resolve the path
             if first_word.startswith('/'):
-                # Absolute path - check if it's inside workspace
                 resolved = os.path.abspath(first_word)
             else:
-                # Relative path - resolve from workspace
                 resolved = os.path.abspath(os.path.join(self.workspace_dir, first_word))
 
-            # Check if resolved path is inside workspace (using real paths to handle symlinks)
+            # Check if resolved path is inside an allowed root (using real paths to handle symlinks).
             # Only resolve the directory with realpath — don't dereference the binary itself,
             # since venv python is a symlink to the system interpreter outside the workspace.
-            real_workspace = os.path.realpath(self.workspace_dir)
             real_cmd_dir = os.path.realpath(os.path.dirname(resolved))
+            allowed_roots = [
+                os.path.realpath(self.workspace_dir),
+                os.path.realpath(TMP_ALLOWED_ROOT),
+            ]
 
-            is_inside = real_cmd_dir.startswith(real_workspace + os.sep) or real_cmd_dir == real_workspace
-            debug_log(f"Workspace binary check: {first_word!r} -> dir={real_cmd_dir} (inside {real_workspace}): {is_inside}")
-            return is_inside
+            for root in allowed_roots:
+                if real_cmd_dir == root or real_cmd_dir.startswith(root + os.sep):
+                    debug_log(f"Binary check: {first_word!r} -> dir={real_cmd_dir} inside {root}")
+                    return True
+            debug_log(f"Binary check: {first_word!r} -> dir={real_cmd_dir} not in allowed roots {allowed_roots}")
+            return False
         except Exception as e:
             debug_log(f"Error checking workspace binary: {e}")
             return False

@@ -212,6 +212,21 @@ class TestPreToolUseHookProcess(unittest.TestCase):
         output = json.loads(result.stdout)
         self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
 
+    def test_hook_allows_tmp_binary_execution(self):
+        """Test hook allows executing scripts located in /tmp."""
+        payload = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "/tmp/my-script.sh --flag"},
+            "session_id": "test-session-tmp-bin",
+            "cwd": self.workspace_dir,
+        }
+
+        result = self.run_hook(payload)
+
+        self.assertEqual(result.returncode, 0)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["hookSpecificOutput"]["permissionDecision"], "allow")
+
     def test_hook_allows_workspace_and_tmp_rm(self):
         """Test hook allows rm targets in workspace plus /tmp."""
         payload = {
