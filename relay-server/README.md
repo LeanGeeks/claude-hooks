@@ -91,11 +91,12 @@ TLS automatically via Let's Encrypt).
 
 ```bash
 # Create the shared Docker network that caddy-docker-proxy listens on.
+# The relay defaults to `front-proxy`; override via CADDY_NETWORK in .env.
 # Skip this if the network already exists.
-docker network create caddy
+docker network create front-proxy
 ```
 
-Ensure caddy-docker-proxy is running in the `caddy` network. A minimal
+Ensure caddy-docker-proxy is running in the same network. A minimal
 compose snippet for that service:
 
 ```yaml
@@ -110,11 +111,11 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - caddy-data:/data
     networks:
-      - caddy
+      - front-proxy
 volumes:
   caddy-data:
 networks:
-  caddy:
+  front-proxy:
     external: true
 ```
 
@@ -138,7 +139,8 @@ container and automatically provisions a TLS certificate via ACME / Let's
 Encrypt.
 
 There is **no `ports:` mapping** in the compose file — Caddy reaches the
-container on port 8080 through the shared `caddy` Docker network.
+container on port 8080 through the shared external Docker network
+(default name `front-proxy`, override with `CADDY_NETWORK` in `.env`).
 
 ### Logs and status
 

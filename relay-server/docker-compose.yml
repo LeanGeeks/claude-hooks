@@ -2,8 +2,9 @@
 #
 # Prerequisites:
 #   1. Copy .env.example to .env and fill in your values.
-#   2. Create the shared Caddy network once per Docker host:
-#        docker network create caddy
+#   2. Create the shared Caddy network once per Docker host (default name
+#      is `front-proxy`; override with CADDY_NETWORK in .env):
+#        docker network create front-proxy
 #      (caddy-docker-proxy must be running in that network for TLS/routing.)
 #   3. docker compose up -d --build
 
@@ -43,3 +44,4 @@ volumes:
 networks:
   caddy:
     external: true
+    name: ${CADDY_NETWORK:-front-proxy}
