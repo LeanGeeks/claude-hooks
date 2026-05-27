@@ -1,231 +1,190 @@
 #!/usr/bin/env python3
 """
-Integration Tests: PermissionRequest Hook with Mocked Telegram
+Integration Tests: PermissionRequest Hook
 
-Tests the PermissionRequest hook with:
-- Simulated stdin payloads
-- Mocked Telegram API responses
-- Simulated callback delivery
-- Timeout behavior
+Tests the PermissionRequest hook output mapping and verifies that the
+Telegram helpers route through RelayClient (Phase 4 of task 08).
 """
 
-import json
 import io
-import os
+import json
 import sys
-import tempfile
-import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
-from datetime import datetime, timezone, timedelta
+from unittest.mock import MagicMock, patch
 
-# Add paths for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "hooks"))
 
-# Import test fixtures
-from fixtures import (
-    PERMISSION_REQUEST_PAYLOADS,
-    TELEGRAM_CALLBACKS,
-    TELEGRAM_TEXT_REPLIES,
-    EXPECTED_HOOK_OUTPUTS,
-)
-
-from permission_request_hook import (
+from permission_request_hook import (  # noqa: E402
     build_output_decision,
-    get_workspace_name,
     get_wait_before_telegram,
+    get_workspace_name,
     WAIT_BEFORE_TELEGRAM,
-    MAX_WAIT_FOR_RESPONSE,
 )
-import permission_request_hook
-from permission_state_store import (
-    PermissionRequest,
-    RequestState,
-    create_request,
-    get_request,
-    update_request_state,
-    cleanup_expired_requests,
-)
-from telegram_permission_router import (
-    parse_callback_data,
-    handle_callback_query,
-    handle_text_reply,
-    generate_whitelist_pattern,
-    wait_for_response,
-    load_telegram_config,
-    send_permission_message,
-)
+import permission_request_hook  # noqa: E402
+from permission_state_store import PermissionRequest  # noqa: E402
 
 
-class TestPermissionRequestHook(unittest.TestCase):
-    """Integration tests for PermissionRequest hook."""
+def _make_request(**overrides):
+    base = dict(
+        request_id="test-id",
+        session_id="test-session",
+        cwd="/test",
+        tool_name="Bash",
+        tool_input={"command": "ls"},
+        permission_suggestions=["Bash(ls:*)"],
+        state="pending",
+        created_at="2024-01-01T00:00:00Z",
+        updated_at="2024-01-01T00:00:00Z",
+        expires_at="2024-01-01T00:05:00Z",
+    )
+    base.update(overrides)
+    return PermissionRequest(**base)
 
-    def test_build_output_allow(self):
-        """Test building output for allow decision."""
-        request = PermissionRequest(
-            request_id="test-allow",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "ls"},
-            permission_suggestions=["Bash(ls:*)"],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
-        )
-        decision = {"action": "allow"}
 
-        output = build_output_decision(decision, request)
+class TestBuildOutputDecision(unittest.TestCase):
+    """Decision -> hook output mapping (transport-agnostic)."""
 
-        expected = EXPECTED_HOOK_OUTPUTS["allow"]
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "allow")
+    def test_allow(self):
+        out = build_output_decision({"action": "allow"}, _make_request())
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "allow")
 
-    def test_build_output_deny(self):
-        """Test building output for deny decision."""
-        request = PermissionRequest(
-            request_id="test-deny",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "rm"},
-            permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
-        )
-        decision = {"action": "deny"}
+    def test_deny(self):
+        out = build_output_decision({"action": "deny"}, _make_request())
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertNotIn("interrupt", out["hookSpecificOutput"]["decision"])
 
-        output = build_output_decision(decision, request)
+    def test_stop(self):
+        out = build_output_decision({"action": "stop"}, _make_request())
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertTrue(out["hookSpecificOutput"]["decision"]["interrupt"])
 
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        self.assertNotIn("interrupt", output["hookSpecificOutput"]["decision"])
-
-    def test_build_output_stop(self):
-        """Test building output for stop decision."""
-        request = PermissionRequest(
-            request_id="test-stop",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "cmd"},
-            permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
-        )
-        decision = {"action": "stop"}
-
-        output = build_output_decision(decision, request)
-
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        self.assertTrue(output["hookSpecificOutput"]["decision"]["interrupt"])
-
-    def test_build_output_whitelist(self):
-        """Test building output for whitelist decision."""
-        request = PermissionRequest(
-            request_id="test-whitelist",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
+    def test_whitelist(self):
+        req = _make_request(
             tool_input={"command": "custom_cmd"},
             permission_suggestions=["Bash(custom_cmd:*)"],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
         )
         decision = {
             "action": "whitelist",
-            "updatedPermissions": {"add": ["Bash(custom_cmd:*)"]}
+            "updatedPermissions": ["Bash(custom_cmd:*)"],
         }
-
         with patch("permission_request_hook.process_whitelist_update", return_value=True):
-            output = build_output_decision(decision, request)
+            out = build_output_decision(decision, req)
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "allow")
+        self.assertIn("updatedPermissions", out["hookSpecificOutput"]["decision"])
 
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "allow")
-        self.assertIn("updatedPermissions", output["hookSpecificOutput"]["decision"])
-
-    def test_build_output_reply(self):
-        """Test building output for reply decision."""
-        request = PermissionRequest(
-            request_id="test-reply",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "cmd"},
-            permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
+    def test_reply(self):
+        out = build_output_decision(
+            {"action": "reply", "reply_text": "Use a different approach"},
+            _make_request(),
         )
-        decision = {
-            "action": "reply",
-            "reply_text": "Use a different approach"
-        }
-
-        output = build_output_decision(decision, request)
-
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        self.assertIn("Use a different approach", output["hookSpecificOutput"]["decision"]["reason"])
-
-    def test_timeout_fallback(self):
-        """Test that timeout returns None (falls back to terminal)."""
-        request = PermissionRequest(
-            request_id="test-timeout",
-            session_id="test-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "cmd"},
-            permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertIn(
+            "Use a different approach",
+            out["hookSpecificOutput"]["decision"]["reason"],
         )
 
-        # No decision = timeout
-        output = build_output_decision(None, request)
-        self.assertIsNone(output)
+    def test_no_decision_returns_none(self):
+        self.assertIsNone(build_output_decision(None, _make_request()))
 
-    def test_wait_before_telegram_by_tool(self):
-        """All tools send immediately to maximize response window."""
-        self.assertEqual(WAIT_BEFORE_TELEGRAM, 0)
-        self.assertEqual(get_wait_before_telegram("Bash"), 0)
-        self.assertEqual(get_wait_before_telegram("Read"), 0)
-        self.assertEqual(get_wait_before_telegram("mcp__plugin_figma_figma__get_design_context"), 0)
+
+class TestRouting(unittest.TestCase):
+    """Smoke tests confirming hook helpers route through RelayClient.
+
+    The relay client is monkeypatched on ``telegram_permission_router`` to
+    avoid any HTTP, and we assert the right methods are called with the
+    right arguments. Deeper coverage of the wire protocol lives in
+    ``relay-server/tests/test_relay_client.py``.
+    """
+
+    def setUp(self):
+        from telegram_permission_router import MessageHandle  # noqa: WPS433
+        self.MessageHandle = MessageHandle
+
+    def test_send_permission_message_calls_relay(self):
+        import telegram_permission_router as tpr
+
+        fake_client = MagicMock()
+        fake_client.send_message.return_value = self.MessageHandle(
+            message_id=42, telegram_message_id=99
+        )
+        with patch.object(tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(tpr, "_relay_client", fake_client), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            mid = tpr.send_permission_message(_make_request(), "workspace", "session")
+
+        self.assertEqual(mid, 42)
+        fake_client.send_message.assert_called_once()
+        kwargs = fake_client.send_message.call_args.kwargs
+        self.assertEqual(kwargs["kind"], "permission")
+        # Keyboard contains allow/deny/stop/whitelist by ``value``.
+        values = [btn["value"] for row in kwargs["keyboard"] for btn in row]
+        self.assertEqual(set(values), {"allow", "deny", "stop", "whitelist"})
+
+    def test_remove_inline_buttons_cancels_relay_message(self):
+        import telegram_permission_router as tpr
+
+        fake_client = MagicMock()
+        with patch.object(tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(tpr, "_relay_client", fake_client):
+            ok = tpr.remove_inline_buttons(123)
+        self.assertTrue(ok)
+        fake_client.cancel_message.assert_called_once_with(123)
+
+    def test_relay_answer_to_decision_button_allow(self):
+        import telegram_permission_router as tpr
+
+        decision = tpr.relay_answer_to_decision(
+            _make_request(),
+            {"via": "button", "value": "allow", "label": "Allow", "option_idx": 0},
+        )
+        self.assertEqual(decision, {"action": "allow"})
+
+    def test_relay_answer_to_decision_freetext(self):
+        import telegram_permission_router as tpr
+
+        decision = tpr.relay_answer_to_decision(
+            _make_request(), {"via": "reply", "text": "please clarify"}
+        )
+        self.assertEqual(decision, {"action": "reply", "reply_text": "please clarify"})
+
+    def test_relay_answer_to_decision_question_button(self):
+        import telegram_permission_router as tpr
+
+        req = _make_request(
+            tool_name="AskUserQuestion",
+            tool_input={
+                "question": "pick one",
+                "options": [{"label": "A"}, {"label": "B"}],
+            },
+        )
+        decision = tpr.relay_answer_to_decision(
+            req, {"via": "button", "value": "qa1", "label": "B", "option_idx": 1}
+        )
+        self.assertEqual(decision, {"action": "reply", "reply_text": "B"})
+
+
+class TestHookMainPath(unittest.TestCase):
+    """Smoke test that ``permission_request_hook.main`` no longer talks to a daemon."""
 
     @patch("permission_request_hook.cleanup_expired_requests")
     @patch("permission_request_hook.send_permission_message", return_value=12345)
     @patch("permission_request_hook.wait_for_response", return_value={"action": "allow"})
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.time.sleep")
-    def test_main_uses_runtime_telegram_enabled_flag(
+    def test_main_routes_through_relay(
         self,
-        _mock_sleep,
+        _sleep,
         mock_create_request,
-        _mock_wait_for_response,
-        _mock_send_permission_message,
-        _mock_cleanup,
+        _wait,
+        _send,
+        _cleanup,
     ):
-        """Ensure main checks TELEGRAM_ENABLED from router module at runtime."""
-        request = PermissionRequest(
-            request_id="runtime-flag",
-            session_id="test-session",
-            cwd="/tmp/workspace",
-            tool_name="Bash",
+        mock_create_request.return_value = _make_request(
+            request_id="runtime",
             tool_input={"command": "unknown_cmd"},
             permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
         )
-        mock_create_request.return_value = request
 
         payload = {
             "session_id": "test-session",
@@ -235,10 +194,10 @@ class TestPermissionRequestHook(unittest.TestCase):
             "permission_suggestions": [],
         }
 
-        def _enable_telegram():
+        def _enable():
             permission_request_hook.telegram_router.TELEGRAM_ENABLED = True
 
-        with patch("permission_request_hook.load_telegram_config", side_effect=_enable_telegram):
+        with patch("permission_request_hook.load_telegram_config", side_effect=_enable):
             with patch("sys.stdin", io.StringIO(json.dumps(payload))):
                 with patch("builtins.print"):
                     with self.assertRaises(SystemExit) as ctx:
@@ -246,223 +205,122 @@ class TestPermissionRequestHook(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 0)
         mock_create_request.assert_called_once()
-
-    @patch("permission_request_hook.cleanup_expired_requests")
-    @patch("permission_request_hook.send_permission_message", return_value=54321)
-    @patch("permission_request_hook.wait_for_response", return_value={"action": "deny"})
-    @patch("permission_request_hook.create_request")
-    @patch("permission_request_hook.time.sleep")
-    def test_main_processes_non_bash_permission_request(
-        self,
-        _mock_sleep,
-        mock_create_request,
-        _mock_wait_for_response,
-        _mock_send_permission_message,
-        _mock_cleanup,
-    ):
-        """Ensure non-Bash PermissionRequest events are also handled."""
-        request = PermissionRequest(
-            request_id="runtime-flag-read",
-            session_id="test-session-read",
-            cwd="/tmp/workspace",
-            tool_name="Read",
-            tool_input={"file_path": "/tmp/file.txt"},
-            permission_suggestions=[],
-            state="pending",
-            created_at="2024-01-01T00:00:00Z",
-            updated_at="2024-01-01T00:00:00Z",
-            expires_at="2024-01-01T00:05:00Z",
-        )
-        mock_create_request.return_value = request
-
-        payload = {
-            "session_id": "test-session-read",
-            "cwd": "/tmp/workspace",
-            "tool_name": "Read",
-            "tool_input": {"file_path": "/tmp/file.txt"},
-            "permission_suggestions": [],
-        }
-
-        def _enable_telegram():
-            permission_request_hook.telegram_router.TELEGRAM_ENABLED = True
-
-        with patch("permission_request_hook.load_telegram_config", side_effect=_enable_telegram):
-            with patch("sys.stdin", io.StringIO(json.dumps(payload))):
-                with patch("builtins.print"):
-                    with self.assertRaises(SystemExit) as ctx:
-                        permission_request_hook.main()
-
-        self.assertEqual(ctx.exception.code, 0)
-        mock_create_request.assert_called_once()
-
-
-class TestCallbackHandling(unittest.TestCase):
-    """Test Telegram callback handling."""
-
-    def setUp(self):
-        """Set up test fixtures."""
-        # Mock Telegram config
-        self.mock_chat_id = 123456789
-
-    def test_parse_callback_data(self):
-        """Test parsing callback data."""
-        test_cases = [
-            ("allow:abc123", ("allow", "abc123")),
-            ("deny:def456", ("deny", "def456")),
-            ("stop:ghi789", ("stop", "ghi789")),
-            ("whitelist:jkl012", ("whitelist", "jkl012")),
-            ("allow", ("allow", None)),
-        ]
-
-        for data, expected in test_cases:
-            with self.subTest(data=data):
-                result = parse_callback_data(data)
-                self.assertEqual(result, expected)
-
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    @patch("telegram_permission_router.TELEGRAM_ENABLED", True)
-    @patch("telegram_permission_router.answer_callback_query")
-    @patch("telegram_permission_router.edit_message_text")
-    @patch("telegram_permission_router.get_request")
-    def test_handle_allow_callback(self, mock_get_request, mock_edit, mock_answer):
-        """Test handling allow callback."""
-        # Create mock request
-        mock_request = MagicMock()
-        mock_request.request_id = "test-allow-cb"
-        mock_request.state = "pending"
-        mock_request.expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-        mock_get_request.return_value = mock_request
-
-        # Mock update_request_state
-        with patch("telegram_permission_router.update_request_state") as mock_update:
-            mock_updated = MagicMock()
-            mock_updated.request_id = "test-allow-cb"
-            mock_updated.state = "allow"
-            mock_update.return_value = mock_updated
-
-            callback = TELEGRAM_CALLBACKS["allow"].copy()
-            callback["from"]["id"] = 123456789  # Match mock_chat_id
-
-            decision = handle_callback_query(callback)
-
-        self.assertIsNotNone(decision)
-        self.assertEqual(decision["action"], "allow")
-
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    def test_unauthorized_user_rejected(self):
-        """Test that unauthorized users are rejected."""
-        callback = TELEGRAM_CALLBACKS["unauthorized_user"].copy()
-
-        with patch("telegram_permission_router.answer_callback_query") as mock_answer:
-            decision = handle_callback_query(callback)
-
-        self.assertIsNone(decision)
-        mock_answer.assert_called()
-
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    def test_invalid_action_rejected(self):
-        """Test that invalid actions are rejected."""
-        callback = TELEGRAM_CALLBACKS["invalid_action"].copy()
-        callback["from"]["id"] = 123456789
-
-        with patch("telegram_permission_router.answer_callback_query") as mock_answer:
-            with patch("telegram_permission_router.get_request") as mock_get:
-                mock_request = MagicMock()
-                mock_request.state = "pending"
-                mock_request.expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-                mock_get.return_value = mock_request
-
-                decision = handle_callback_query(callback)
-
-        self.assertIsNone(decision)
-
-
-class TestTextReplyHandling(unittest.TestCase):
-    """Test Telegram text reply handling."""
-
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    @patch("telegram_permission_router.TELEGRAM_ENABLED", True)
-    @patch("telegram_permission_router.edit_message_text")
-    @patch("telegram_permission_router.find_request_by_message_id")
-    def test_handle_text_reply(self, mock_find, mock_edit):
-        """Test handling text reply."""
-        mock_request = MagicMock()
-        mock_request.request_id = "test-reply-msg"
-        mock_find.return_value = mock_request
-
-        with patch("telegram_permission_router.update_request_state") as mock_update:
-            mock_updated = MagicMock()
-            mock_updated.request_id = "test-reply-msg"
-            mock_update.return_value = mock_updated
-
-            reply = TELEGRAM_TEXT_REPLIES["reply_to_permission"].copy()
-            reply["from"]["id"] = 123456789
-
-            decision = handle_text_reply(reply)
-
-        self.assertIsNotNone(decision)
-        self.assertEqual(decision["action"], "reply")
-        self.assertEqual(decision["reply_text"], "Please use a different approach")
-
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    def test_unauthorized_reply_rejected(self):
-        """Test that unauthorized replies are rejected."""
-        reply = TELEGRAM_TEXT_REPLIES["reply_unauthorized"].copy()
-
-        decision = handle_text_reply(reply)
-        self.assertIsNone(decision)
-
-
-class TestWaitForResponse(unittest.TestCase):
-    """Test wait_for_response behavior."""
-
-    @patch("telegram_permission_router.TELEGRAM_ENABLED", True)
-    @patch("telegram_permission_router.TELEGRAM_CHAT_ID", "123456789")
-    @patch("telegram_permission_router.get_updates")
-    def test_wait_for_response_timeout(self, mock_get_updates):
-        """Test that wait_for_response times out correctly."""
-        # Mock no updates (timeout)
-        mock_get_updates.return_value = []
-
-        # Create a real request in state store
-        request = create_request(
-            session_id="test-timeout-session",
-            cwd="/test",
-            tool_name="Bash",
-            tool_input={"command": "test"},
-            permission_suggestions=[],
-            ttl_seconds=60,
-        )
-
-        # Use very short timeout for testing
-        start_time = time.time()
-        decision = wait_for_response(
-            request_id=request.request_id,
-            message_id=12345,
-            timeout_seconds=1,  # 1 second timeout
-        )
-        elapsed = time.time() - start_time
-
-        self.assertIsNone(decision)  # No decision on timeout
-        self.assertLess(elapsed, 3)  # Should complete within reasonable time
 
 
 class TestWorkspaceNameExtraction(unittest.TestCase):
-    """Test workspace name extraction."""
-
     def test_get_workspace_name(self):
-        """Test workspace name extraction from cwd."""
-        test_cases = [
-            ("/home/user/project", "project"),
-            ("/home/user/my-project", "my-project"),
-            ("/tmp", "tmp"),
-            ("/", ""),
-        ]
+        self.assertEqual(get_workspace_name("/home/user/project"), "project")
+        self.assertEqual(get_workspace_name("/tmp"), "tmp")
+        self.assertEqual(get_workspace_name("/"), "")
 
-        for cwd, expected in test_cases:
-            with self.subTest(cwd=cwd):
-                result = get_workspace_name(cwd)
-                self.assertEqual(result, expected)
+    def test_wait_before_telegram_is_zero(self):
+        self.assertEqual(WAIT_BEFORE_TELEGRAM, 0)
+        self.assertEqual(get_wait_before_telegram("Bash"), 0)
+
+
+class TestTerminalResolutionRace(unittest.TestCase):
+    """Tests for the local-terminal-wins race in wait_for_response and
+    handle_ask_user_question."""
+
+    def setUp(self):
+        # Import here so the sys.path insert above is already in effect.
+        import permission_request_hook as hook
+        import telegram_permission_router as tpr
+        self.hook = hook
+        self.tpr = tpr
+
+    @patch("permission_request_hook.wait_for_relay_answer")
+    @patch("permission_request_hook.get_request")
+    @patch("permission_request_hook.remove_inline_buttons")
+    def test_wait_for_response_terminal_win_cancels_relay_message(
+        self,
+        mock_remove_buttons,
+        mock_get_request,
+        mock_wait_relay,
+    ):
+        """wait_for_response: when local state flips to RESOLVED_TERMINAL after
+        a 204 relay poll, cancel_message is called for the relay row and the
+        function returns None (terminal wins)."""
+        from permission_request_hook import wait_for_response
+        from permission_state_store import RequestState
+
+        # First poll returns 204 (no answer yet); second poll we've already
+        # exited via the terminal check, so this counter should only be 1.
+        mock_wait_relay.return_value = None  # 204 → keep polling
+
+        call_count = {"n": 0}
+
+        def _get_request_side_effect(request_id):
+            call_count["n"] += 1
+            req = _make_request(request_id=request_id)
+            # On the second state-store check, report RESOLVED_TERMINAL.
+            if call_count["n"] >= 2:
+                return _make_request(
+                    request_id=request_id,
+                    state=RequestState.RESOLVED_TERMINAL.value,
+                )
+            return req
+
+        mock_get_request.side_effect = _get_request_side_effect
+
+        result = wait_for_response("test-id", message_id=777, ttl_seconds=10)
+
+        self.assertIsNone(result)
+        mock_remove_buttons.assert_called_once_with(777)
+
+    @patch("permission_request_hook.wait_for_relay_answer")
+    @patch("permission_request_hook.create_request")
+    @patch("permission_request_hook.get_request")
+    @patch("permission_request_hook.remove_inline_buttons")
+    @patch("permission_request_hook.set_message_reaction")
+    def test_handle_ask_user_question_terminal_cancels_current_child_message(
+        self,
+        mock_set_reaction,
+        mock_remove_buttons,
+        mock_get_request,
+        mock_create_request,
+        mock_wait_relay,
+    ):
+        """handle_ask_user_question: when the current child resolves via
+        terminal, remove_inline_buttons is called for *that child's* message_id
+        before returning None."""
+        import telegram_permission_router as tpr
+        from permission_request_hook import handle_ask_user_question
+        from permission_state_store import RequestState
+
+        # Fake child requests created for each question.
+        child_req = _make_request(request_id="child-1")
+        mock_create_request.return_value = child_req
+
+        # send_question_message returns a relay message_id of 555.
+        with patch("permission_request_hook.send_question_message", return_value=555):
+            # The relay long-polls return None (204 — still waiting).
+            mock_wait_relay.return_value = None
+
+            call_count = {"n": 0}
+
+            def _get_request_side_effect(request_id):
+                call_count["n"] += 1
+                if call_count["n"] >= 2:
+                    # Second check: terminal resolved this child.
+                    return _make_request(
+                        request_id=request_id,
+                        state=RequestState.RESOLVED_TERMINAL.value,
+                    )
+                return _make_request(request_id=request_id)
+
+            mock_get_request.side_effect = _get_request_side_effect
+
+            result = handle_ask_user_question(
+                session_id="sess",
+                cwd="/tmp",
+                tool_input={"questions": [{"question": "Are you sure?", "options": []}]},
+                workspace_name="workspace",
+            )
+
+        self.assertIsNone(result)
+        # The current child's relay message (555) must have been cancelled.
+        mock_remove_buttons.assert_any_call(555)
 
 
 if __name__ == "__main__":

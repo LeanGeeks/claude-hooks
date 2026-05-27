@@ -1,260 +1,140 @@
 #!/usr/bin/env python3
 """
-Telegram Permission Router - Handles Telegram-side control plane for permissions
+Telegram Permission Router - Relay-backed transport for permission hooks.
 
-This module provides the Telegram integration for the PermissionRequest hook:
-- Sends messages with inline action buttons
-- Consumes button callbacks and text replies
-- Routes actions to state updates
-- Handles whitelist updates safely
+This module replaces the legacy direct-Bot-API transport with calls into the
+central relay server (``relay-server/``). The server owns the bot token and
+delivers callback answers via webhook; this client just speaks HTTP to it.
 
-Transport: Long polling (chosen for simplicity - no webhook server needed)
+Key differences vs the legacy router:
 
-Integration:
-- Called by permission_request_hook.py to send messages and wait for responses
-- Can run standalone for testing callback handling
+* No bot token or chat_id on disk — only a relay URL + installation token in
+  ``~/.config/claude-tg-relay/config.toml``.
+* No ``getUpdates`` polling. ``wait_for_relay_answer`` long-polls
+  ``RelayClient.wait_for_answer``; the relay's webhook handler is the single
+  source of truth for callback/reply attribution across all devices.
+* The ``telegram_daemon.py`` background process is gone (deleted).
+
+Helper signatures are preserved where call sites already exist:
+``send_permission_message``, ``send_question_message``, ``send_freetext_followup``
+return an integer message id (the relay's, not Telegram's — but the state-store
+field is named ``telegram_message_id`` for historical reasons and we reuse it
+unchanged).
 """
+
+from __future__ import annotations
 
 import json
 import os
 import sys
-import time
-import urllib.request
-import urllib.error
-import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Callable
+from typing import Any, Dict, List, Optional
 
 from permission_state_store import (
     PermissionRequest,
-    RequestState,
-    create_request,
-    get_request,
-    update_request_state,
     set_telegram_message_id,
-    find_request_by_message_id,
-    find_pending_request_by_session,
-    cleanup_expired_requests,
     debug_log,
 )
 
-# Configuration
-TELEGRAM_CONFIG_FILE = Path.home() / ".config/claude/telegram.conf"
-TELEGRAM_BOT_TOKEN = None
-TELEGRAM_CHAT_ID = None
-TELEGRAM_ENABLED = False
-TELEGRAM_CONFIG_SOURCE = "unknown"
+# Make the relay_server package importable when running hooks from the global
+# hooks dir (no editable install). The repo path is the fallback when the
+# package is not pip-installed.
+_REPO_RELAY = Path(__file__).resolve().parent.parent.parent / "relay-server"
+if _REPO_RELAY.exists() and str(_REPO_RELAY) not in sys.path:
+    sys.path.insert(0, str(_REPO_RELAY))
+
+try:
+    from relay_server.client import (  # type: ignore[import-not-found]
+        Answer,
+        MessageHandle,
+        NotBoundError,
+        RelayClient,
+        RelayError,
+    )
+except Exception:  # noqa: BLE001
+    RelayClient = None  # type: ignore[assignment]
+    Answer = None  # type: ignore[assignment]
+    MessageHandle = None  # type: ignore[assignment]
+    NotBoundError = Exception  # type: ignore[assignment,misc]
+    RelayError = Exception  # type: ignore[assignment,misc]
+
+
+# Configuration / runtime state
+RELAY_CONFIG_FILE = Path.home() / ".config" / "claude-tg-relay" / "config.toml"
 ERROR_LOG_FILE = Path.home() / ".claude" / "permission_telegram_errors.log"
 
-# Long polling configuration
-POLL_TIMEOUT = 5  # seconds per poll
-POLL_RETRY_DELAY = 1  # seconds between failed polls
+TELEGRAM_ENABLED = False
+RELAY_CONFIG_SOURCE = "unknown"
 
-# Callback data format: "action:request_id"
-CALLBACK_DATA_SEPARATOR = ":"
+# Module-level singleton RelayClient. Created lazily on first send so unit
+# tests can patch ``RelayClient`` before any HTTP call goes out.
+_relay_client: Optional["RelayClient"] = None  # type: ignore[type-arg]
+
+# Default TTL for relay messages (seconds). The hook still tracks its own
+# longer-running TTL in the state store; this is just how long the relay row
+# stays "open" before the server marks it expired.
+RELAY_MESSAGE_TTL = 3600
 
 
-def error_log(message: str):
-    """Always write Telegram permission integration errors."""
+def error_log(message: str) -> None:
+    """Always write Telegram permission integration errors to disk."""
     try:
         ERROR_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(ERROR_LOG_FILE, 'a') as f:
+        with open(ERROR_LOG_FILE, "a") as f:
             timestamp = datetime.now().isoformat()
             f.write(f"[{timestamp}] {message}\n")
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
 
-def load_telegram_config():
-    """Load Telegram configuration from file or environment."""
-    global TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_ENABLED, TELEGRAM_CONFIG_SOURCE
+def load_telegram_config() -> None:
+    """Discover relay credentials and set ``TELEGRAM_ENABLED`` accordingly.
 
-    # Try environment variables first
-    TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-    TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-    TELEGRAM_CONFIG_SOURCE = "env" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "unknown"
-
-    # Try config file if env vars not set
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        if TELEGRAM_CONFIG_FILE.exists():
-            try:
-                with open(TELEGRAM_CONFIG_FILE, 'r') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith('BOT_TOKEN='):
-                            TELEGRAM_BOT_TOKEN = line.split('=', 1)[1].strip().strip('"').strip("'")
-                        elif line.startswith('CHAT_ID='):
-                            TELEGRAM_CHAT_ID = line.split('=', 1)[1].strip().strip('"').strip("'")
-                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID and TELEGRAM_CONFIG_SOURCE != "env":
-                    TELEGRAM_CONFIG_SOURCE = str(TELEGRAM_CONFIG_FILE)
-            except Exception as e:
-                debug_log(f"Error loading Telegram config: {e}")
-                error_log(f"Failed loading Telegram config from {TELEGRAM_CONFIG_FILE}: {e}")
-        else:
-            error_log(
-                f"Telegram config missing: {TELEGRAM_CONFIG_FILE} "
-                "(and TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID env vars not set)"
-            )
-
-    # Minimal validation to make configuration issues visible.
-    if TELEGRAM_BOT_TOKEN and ":" not in TELEGRAM_BOT_TOKEN:
-        error_log("Invalid BOT_TOKEN format (expected '<id>:<token>')")
-        TELEGRAM_BOT_TOKEN = None
-
-    if TELEGRAM_CHAT_ID:
-        try:
-            int(str(TELEGRAM_CHAT_ID))
-        except ValueError:
-            error_log(f"Invalid CHAT_ID (must be integer): {TELEGRAM_CHAT_ID!r}")
-            TELEGRAM_CHAT_ID = None
-
-    TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
-    debug_log(f"Telegram enabled: {TELEGRAM_ENABLED}")
-    if not TELEGRAM_ENABLED:
-        error_log("Telegram integration disabled after config load")
-
-
-def _telegram_api_request(method: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    Name kept for call-site compatibility with the legacy router.
     """
-    Make a Telegram Bot API request.
+    global TELEGRAM_ENABLED, RELAY_CONFIG_SOURCE, _relay_client
 
-    Args:
-        method: API method name
-        payload: Request payload
+    if RelayClient is None:
+        TELEGRAM_ENABLED = False
+        RELAY_CONFIG_SOURCE = "unavailable"
+        error_log("relay_server package not importable; relay disabled")
+        return
 
-    Returns:
-        Response result dict if successful, None otherwise
-    """
-    if not TELEGRAM_ENABLED:
-        error_log(f"Telegram API call skipped ({method}): integration disabled")
-        return None
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if not RELAY_CONFIG_FILE.exists():
+        TELEGRAM_ENABLED = False
+        RELAY_CONFIG_SOURCE = "missing"
+        error_log(
+            f"Relay config missing: {RELAY_CONFIG_FILE}. "
+            "Run `relay-client config init` and `relay-client bind`."
+        )
+        return
 
     try:
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={'Content-Type': 'application/json'}
-        )
+        _relay_client = RelayClient.from_config(RELAY_CONFIG_FILE)
+        TELEGRAM_ENABLED = True
+        RELAY_CONFIG_SOURCE = str(RELAY_CONFIG_FILE)
+    except Exception as e:  # noqa: BLE001
+        TELEGRAM_ENABLED = False
+        RELAY_CONFIG_SOURCE = "error"
+        error_log(f"Failed loading relay config: {e}")
 
-        timeout = payload.get('timeout', 10) + 5 if 'timeout' in payload else 15
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            result = json.loads(response.read().decode('utf-8'))
-
-            if result.get('ok'):
-                return result.get('result')
-            else:
-                debug_log(f"Telegram API error: {result.get('description')}")
-                error_log(
-                    f"Telegram API error in {method}: "
-                    f"{result.get('description', 'unknown error')}"
-                )
-                return None
-
-    except urllib.error.URLError as e:
-        debug_log(f"Telegram URL error: {e}")
-        error_log(f"Telegram network error in {method}: {e}")
-        return None
-    except Exception as e:
-        debug_log(f"Telegram API request error: {e}")
-        error_log(f"Telegram request exception in {method}: {e}")
-        return None
+    debug_log(f"Relay enabled: {TELEGRAM_ENABLED} (source={RELAY_CONFIG_SOURCE})")
 
 
-def send_permission_message(
-    request: PermissionRequest,
-    workspace_name: str,
-    session_name: Optional[str] = None,
-) -> Optional[int]:
-    """
-    Send a Telegram message with action buttons for a permission request.
-
-    Args:
-        request: The permission request
-        workspace_name: Name of the workspace
-        session_name: Optional session name/slug
-
-    Returns:
-        Telegram message ID if successful, None otherwise
-    """
-    if not TELEGRAM_ENABLED:
-        debug_log("Telegram not enabled, skipping message send")
-        return None
-
-    # Build message text
-    title = f"*{workspace_name}*"
-    if session_name:
-        title += f" _{session_name}_"
-
-    # Format command summary
-    command_summary = _format_command_summary(
-        request.tool_name,
-        request.tool_input
-    )
-
-    message_lines = [
-        title,
-        "",
-        f"*Permission Request* `{request.request_id}`",
-        "",
-        "```",
-        command_summary,
-        "```",
-        "",
-        "Approve this command?"
-    ]
-
-    message_text = "\n".join(message_lines)
-
-    # Build inline buttons
-    inline_buttons = [
-        [
-            {"text": "Allow", "callback_data": f"allow{CALLBACK_DATA_SEPARATOR}{request.request_id}"},
-            {"text": "Deny", "callback_data": f"deny{CALLBACK_DATA_SEPARATOR}{request.request_id}"}
-        ],
-        [
-            {"text": "Stop", "callback_data": f"stop{CALLBACK_DATA_SEPARATOR}{request.request_id}"},
-            {"text": "Whitelist", "callback_data": f"whitelist{CALLBACK_DATA_SEPARATOR}{request.request_id}"}
-        ]
-    ]
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
-        "parse_mode": "Markdown",
-        "disable_notification": False,
-        "reply_markup": {
-            "inline_keyboard": inline_buttons
-        }
-    }
-
-    result = _telegram_api_request("sendMessage", payload)
-
-    if result:
-        message_id = result.get('message_id')
-        debug_log(
-            f"Telegram message sent: message_id={message_id}, "
-            f"chat_id={TELEGRAM_CHAT_ID}, source={TELEGRAM_CONFIG_SOURCE}"
-        )
-
-        # Update request with message ID
-        set_telegram_message_id(request.request_id, message_id)
-
-        return message_id
-
-    return None
+def _client() -> "RelayClient":
+    """Return the active relay client; raises if disabled."""
+    if not TELEGRAM_ENABLED or _relay_client is None:
+        raise RelayError("relay client not initialised")
+    return _relay_client
 
 
-# Option labels that signal "I want to type a custom answer".
-# Daemon checks these on button-press to decide whether to ask for free text
-# instead of treating the label itself as the answer.
+# ---- Option labels that signal "let me type a custom answer" ---------------
+
 FREE_TEXT_TRIGGER_LABELS = frozenset({
-    'let me type it', 'other', 'custom', 'type it',
-    'write it', 'free text', 'type your answer',
-    'enter text', 'specify', 'something else',
+    "let me type it", "other", "custom", "type it",
+    "write it", "free text", "type your answer",
+    "enter text", "specify", "something else",
 })
 
 
@@ -262,141 +142,54 @@ def is_free_text_trigger(label: str) -> bool:
     """True if an option label signals the user wants to type a custom answer."""
     if not label:
         return False
-    normalized = label.lower().strip().rstrip('.')
-    return normalized in FREE_TEXT_TRIGGER_LABELS or label.strip().endswith('...')
+    normalized = label.lower().strip().rstrip(".")
+    return normalized in FREE_TEXT_TRIGGER_LABELS or label.strip().endswith("...")
 
 
-def send_question_message(
-    request: PermissionRequest,
-    workspace_name: str,
-    index: int,
-    total: int,
-) -> Optional[int]:
-    """
-    Send one AskUserQuestion question to Telegram.
+# ---- Message senders -------------------------------------------------------
 
-    `request.tool_input` is expected to have shape:
-        {question, header?, options: [{label, description?}], multiSelect?}
-
-    Buttons use callback_data `qa{N}:{request_id}` where N is the option index.
-    Free-text questions (no options) get force_reply.
-    """
-    if not TELEGRAM_ENABLED:
-        return None
-
-    ti = request.tool_input or {}
-    question_text = ti.get('question', '')
-    header = ti.get('header', '')
-    options = ti.get('options', [])
-    multi_select = ti.get('multiSelect', False)
-
-    import html as _html
-    def esc(s: str) -> str:
-        return _html.escape(s or "", quote=False)
-
-    lines: List[str] = []
-    if index == 0 and total > 1:
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━")
-    if total > 1:
-        lines.append(f"<b>[{index + 1}/{total}] Question</b> — {esc(workspace_name)}")
-    else:
-        lines.append(f"<b>Question</b> — {esc(workspace_name)}")
-    lines.append("")
-    if header:
-        lines += [f"<b><i>{esc(header)}</i></b>", ""]
-    lines.append(esc(question_text))
-    if options:
-        lines += ["", "<i>Tap an option, or reply with text:</i>"]
-        if multi_select:
-            lines.append("<i>(multi-select not supported via Telegram — first answer wins)</i>")
-    else:
-        lines += ["", "<i>Reply to this message with your answer.</i>"]
-    if total > 1 and index == total - 1:
-        lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━"]
-
-    reply_markup: Dict[str, Any]
-    if options:
-        rows: List[List[Dict[str, Any]]] = []
-        row: List[Dict[str, Any]] = []
-        for i, opt in enumerate(options):
-            label = opt.get('label', str(opt)) if isinstance(opt, dict) else str(opt)
-            row.append({"text": label, "callback_data": f"qa{i}{CALLBACK_DATA_SEPARATOR}{request.request_id}"})
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        reply_markup = {"inline_keyboard": rows}
-    else:
-        reply_markup = {"force_reply": True, "selective": False}
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": "\n".join(lines),
-        "parse_mode": "HTML",
-        "disable_notification": False,
-        "reply_markup": reply_markup,
-    }
-
-    result = _telegram_api_request("sendMessage", payload)
-    if not result:
-        return None
-
-    message_id = result.get('message_id')
-    set_telegram_message_id(request.request_id, message_id)
-    debug_log(f"Sent question message_id={message_id} for request {request.request_id}")
-    return message_id
-
-
-def send_freetext_followup(request_id: str, workspace_name: str) -> Optional[int]:
-    """
-    Send a follow-up message asking the user to type their custom answer.
-    Updates `request_id`'s telegram_message_id so the reply routes back to it.
-    """
-    if not TELEGRAM_ENABLED:
-        return None
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": f"*{workspace_name}*\n\n_Please type your answer:_",
-        "parse_mode": "Markdown",
-        "reply_markup": {"force_reply": True, "selective": False},
-    }
-    result = _telegram_api_request("sendMessage", payload)
-    if not result:
-        return None
-    message_id = result.get('message_id')
-    set_telegram_message_id(request_id, message_id)
-    return message_id
+# Action labels are encoded as the button ``value`` so the relay's webhook
+# handler ships them back verbatim in the answer payload. The hook then maps
+# value -> action.
+_PERMISSION_ACTIONS: list[list[dict[str, str]]] = [
+    [
+        {"label": "Allow", "value": "allow"},
+        {"label": "Deny", "value": "deny"},
+    ],
+    [
+        {"label": "Stop", "value": "stop"},
+        {"label": "Whitelist", "value": "whitelist"},
+    ],
+]
 
 
 def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
-    """
-    Format a summary of the tool/command for display in Telegram.
+    """Format a summary of the tool/command for display in Telegram.
 
-    Shows up to 10 lines and up to 2KB of text. Full lines are never truncated
-    mid-line; only the last included line may be truncated if the 2KB budget is
-    reached, indicated by a trailing '...'.
+    Up to 10 lines and 2 KB of text. Lines are never truncated mid-line except
+    the last included one, which may end with ``...`` to signal truncation.
     """
     MAX_LINES = 10
     MAX_BYTES = 2048
 
-    if tool_name == 'Bash':
-        raw = tool_input.get('command', '')
-    elif tool_name in ('Read', 'Write', 'Edit'):
-        file_path = tool_input.get('file_path', tool_input.get('path', ''))
+    if tool_name == "Bash":
+        raw = tool_input.get("command", "")
+    elif tool_name in ("Read", "Write", "Edit"):
+        file_path = tool_input.get("file_path", tool_input.get("path", ""))
         raw = f"{tool_name}({file_path})"
-    elif tool_name == 'WebFetch':
+    elif tool_name == "WebFetch":
         raw = f"WebFetch({tool_input.get('url', '')})"
-    elif tool_name == 'AskUserQuestion':
-        questions = tool_input.get('questions', [])
+    elif tool_name == "AskUserQuestion":
+        questions = tool_input.get("questions", [])
         if questions:
             parts = []
             for q in questions:
-                text = q.get('question', '')
-                opts = q.get('options', [])
+                text = q.get("question", "")
+                opts = q.get("options", [])
                 if opts:
-                    labels = ', '.join(o.get('label', str(o)) for o in opts)
+                    labels = ", ".join(
+                        o.get("label", str(o)) for o in opts
+                    )
                     parts.append(f"{text}\n  Options: {labels}")
                 else:
                     parts.append(text)
@@ -409,646 +202,422 @@ def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     lines = raw.splitlines()
     selected = lines[:MAX_LINES]
 
-    result_lines = []
+    result_lines: list[str] = []
     budget = MAX_BYTES
     for i, line in enumerate(selected):
-        encoded = line.encode('utf-8')
-        is_last_selected = (i == len(selected) - 1)
-        # Reserve 3 bytes for '...' suffix if we might need to truncate
+        encoded = line.encode("utf-8")
+        is_last_selected = i == len(selected) - 1
         if len(encoded) <= budget:
             result_lines.append(line)
-            budget -= len(encoded) + 1  # +1 for the newline we'll join with
+            budget -= len(encoded) + 1
         else:
-            # Truncate this line to fit within budget, append '...'
-            truncated = encoded[:max(0, budget - 3)].decode('utf-8', errors='ignore')
-            result_lines.append(truncated + '...')
+            truncated = encoded[: max(0, budget - 3)].decode(
+                "utf-8", errors="ignore"
+            )
+            result_lines.append(truncated + "...")
             break
 
         if budget <= 0:
             if not is_last_selected or len(lines) > MAX_LINES:
-                result_lines[-1] += '...'
+                result_lines[-1] += "..."
             break
 
-    if len(lines) > MAX_LINES and result_lines and not result_lines[-1].endswith('...'):
-        result_lines[-1] += '...'
+    if (
+        len(lines) > MAX_LINES
+        and result_lines
+        and not result_lines[-1].endswith("...")
+    ):
+        result_lines[-1] += "..."
 
-    return '\n'.join(result_lines)
+    return "\n".join(result_lines)
 
 
-def answer_callback_query(callback_query_id: str, text: str = "") -> bool:
+def _send_relay(
+    *,
+    text: str,
+    keyboard: list[list[dict[str, str]]] | None,
+    kind: str,
+    reply_required: bool,
+    request_id: str,
+) -> Optional[int]:
+    """Common send helper. Returns the relay message_id or None on failure."""
+    if not TELEGRAM_ENABLED:
+        return None
+    try:
+        handle = _client().send_message(
+            text=text,
+            keyboard=keyboard,
+            kind=kind,
+            reply_required=reply_required,
+            ttl_sec=RELAY_MESSAGE_TTL,
+            idempotency_key=f"req:{request_id}:send",
+        )
+    except NotBoundError as e:
+        error_log(
+            f"Relay returned not_bound; run `relay-client bind` to re-attach: {e}"
+        )
+        return None
+    except RelayError as e:
+        error_log(f"Relay send failed: {e}")
+        return None
+    return handle.message_id
+
+
+def send_permission_message(
+    request: PermissionRequest,
+    workspace_name: str,
+    session_name: Optional[str] = None,
+) -> Optional[int]:
+    """Send a permission-request prompt with allow/deny/stop/whitelist buttons.
+
+    Returns the relay message id (stored as ``telegram_message_id`` on the
+    state-store row for legacy reasons).
     """
-    Answer a callback query to remove the loading state.
+    title = f"<b>{workspace_name}</b>"
+    if session_name:
+        title += f" <i>{session_name}</i>"
 
-    Args:
-        callback_query_id: ID of the callback query
-        text: Optional text to show as notification
+    summary = _format_command_summary(request.tool_name, request.tool_input)
 
-    Returns:
-        True if successful, False otherwise
+    text = "\n".join([
+        title,
+        "",
+        f"<b>Permission Request</b> <code>{request.request_id}</code>",
+        "",
+        "<pre>",
+        summary,
+        "</pre>",
+        "",
+        "Approve this command?",
+    ])
+
+    message_id = _send_relay(
+        text=text,
+        keyboard=_PERMISSION_ACTIONS,
+        kind="permission",
+        reply_required=True,
+        request_id=request.request_id,
+    )
+    if message_id is not None:
+        set_telegram_message_id(request.request_id, message_id)
+    return message_id
+
+
+def send_question_message(
+    request: PermissionRequest,
+    workspace_name: str,
+    index: int,
+    total: int,
+) -> Optional[int]:
+    """Send a single AskUserQuestion prompt; buttons map to option indices.
+
+    The button ``value`` is ``qa<N>`` (matches the legacy callback_data prefix)
+    so the answer-handling code can distinguish question answers from
+    permission actions when both routes share a state row.
     """
-    payload = {
-        "callback_query_id": callback_query_id,
-        "text": text,
-        "show_alert": False
-    }
+    ti = request.tool_input or {}
+    question_text = ti.get("question", "")
+    header = ti.get("header", "")
+    options = ti.get("options", [])
+    multi_select = ti.get("multiSelect", False)
 
-    result = _telegram_api_request("answerCallbackQuery", payload)
-    return result is not None
+    import html as _html
+
+    def esc(s: str) -> str:
+        return _html.escape(s or "", quote=False)
+
+    lines: list[str] = []
+    if index == 0 and total > 1:
+        lines.append("━" * 23)
+    if total > 1:
+        lines.append(
+            f"<b>[{index + 1}/{total}] Question</b> — {esc(workspace_name)}"
+        )
+    else:
+        lines.append(f"<b>Question</b> — {esc(workspace_name)}")
+    lines.append("")
+    if header:
+        lines += [f"<b><i>{esc(header)}</i></b>", ""]
+    lines.append(esc(question_text))
+    if options:
+        lines += ["", "<i>Tap an option, or reply with text:</i>"]
+        if multi_select:
+            lines.append(
+                "<i>(multi-select not supported via Telegram — first answer wins)</i>"
+            )
+    else:
+        lines += ["", "<i>Reply to this message with your answer.</i>"]
+    if total > 1 and index == total - 1:
+        lines += ["", "━" * 23]
+
+    keyboard: list[list[dict[str, str]]] | None
+    if options:
+        rows: list[list[dict[str, str]]] = []
+        row: list[dict[str, str]] = []
+        for i, opt in enumerate(options):
+            label = (
+                opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
+            )
+            row.append({"label": label, "value": f"qa{i}"})
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        keyboard = rows
+    else:
+        keyboard = None
+
+    message_id = _send_relay(
+        text="\n".join(lines),
+        keyboard=keyboard,
+        kind="question",
+        reply_required=True,
+        request_id=request.request_id,
+    )
+    if message_id is not None:
+        set_telegram_message_id(request.request_id, message_id)
+    return message_id
 
 
-def edit_message_text(message_id: int, text: str, inline_buttons: Optional[List] = None) -> bool:
-    """
-    Edit a Telegram message's text.
-
-    Args:
-        message_id: ID of the message to edit
-        text: New message text
-        inline_buttons: Optional new inline keyboard
-
-    Returns:
-        True if successful, False otherwise
-    """
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "Markdown",
-    }
-
-    if inline_buttons:
-        payload["reply_markup"] = {
-            "inline_keyboard": inline_buttons
-        }
-
-    result = _telegram_api_request("editMessageText", payload)
-    return result is not None
+def send_freetext_followup(request_id: str, workspace_name: str) -> Optional[int]:
+    """Send a follow-up free-text prompt and re-route the request to it."""
+    text = f"<b>{workspace_name}</b>\n\n<i>Please type your answer:</i>"
+    message_id = _send_relay(
+        text=text,
+        keyboard=None,
+        kind="question",
+        reply_required=True,
+        request_id=f"{request_id}:followup",
+    )
+    if message_id is not None:
+        set_telegram_message_id(request_id, message_id)
+    return message_id
 
 
-def delete_message(message_id: int) -> bool:
-    """
-    Delete a Telegram message.
-
-    Args:
-        message_id: ID of the message to delete
-
-    Returns:
-        True if successful, False otherwise
-    """
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id
-    }
-
-    result = _telegram_api_request("deleteMessage", payload)
-    return result is not None
-
-
-def set_message_reaction(message_id: int, emoji: str) -> bool:
-    """
-    Set a reaction on a Telegram message.
-
-    Args:
-        message_id: ID of the message to react to
-        emoji: Emoji reaction (e.g., "✅", "❌", "👍")
-
-    Returns:
-        True if successful, False otherwise
-    """
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "reaction": [
-            {"type": "emoji", "emoji": emoji}
-        ]
-    }
-
-    result = _telegram_api_request("setMessageReaction", payload)
-    return result is not None
+# ---- Message lifecycle helpers --------------------------------------------
 
 
 def remove_inline_buttons(message_id: int) -> bool:
+    """Cancel the relay message (server strips keyboard + marks cancelled).
+
+    Returns True on success. Kept under the legacy name so ``posttool_hook``
+    and the AskUserQuestion fan-out don't need to know about the swap.
     """
-    Remove inline buttons from a message without changing its text.
+    if not TELEGRAM_ENABLED or message_id is None:
+        return False
+    try:
+        _client().cancel_message(int(message_id))
+        return True
+    except RelayError as e:
+        error_log(f"Relay cancel_message failed: {e}")
+        return False
 
-    Args:
-        message_id: ID of the message to update
 
-    Returns:
-        True if successful, False otherwise
+def set_message_reaction(message_id: int, emoji: str) -> bool:
+    """No-op shim — the relay does not expose reactions.
+
+    The legacy daemon used reactions to mark a request as resolved in the chat
+    UI. The relay strips the keyboard via cancel/expire which is the more
+    important affordance; reactions are deferred.
     """
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "reply_markup": {
-            "inline_keyboard": []
-        }
-    }
-
-    result = _telegram_api_request("editMessageReplyMarkup", payload)
-    return result is not None
+    return True
 
 
-def get_updates(offset: Optional[int] = None, timeout: int = POLL_TIMEOUT) -> List[Dict[str, Any]]:
-    """
-    Get updates from Telegram Bot API using long polling.
-
-    Args:
-        offset: Update ID offset for acknowledgment
-        timeout: Long polling timeout in seconds
-
-    Returns:
-        List of update objects
-    """
-    if not TELEGRAM_ENABLED:
-        return []
-
-    payload = {"timeout": timeout}
-    if offset:
-        payload["offset"] = offset
-
-    result = _telegram_api_request("getUpdates", payload)
-    return result if result else []
-
-
-def parse_callback_data(callback_data: str) -> tuple[str, Optional[str]]:
-    """
-    Parse callback data into action and request_id.
-
-    Args:
-        callback_data: Callback data string (format: "action:request_id" or "action")
-
-    Returns:
-        Tuple of (action, request_id or None)
-    """
-    parts = callback_data.split(CALLBACK_DATA_SEPARATOR)
-    action = parts[0]
-    request_id = parts[1] if len(parts) > 1 else None
-    return action, request_id
-
-
-def handle_callback_query(callback: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Handle a callback query from inline button press.
-
-    Args:
-        callback: Callback query object from Telegram
-
-    Returns:
-        Decision dict if action was taken, None otherwise
-    """
-    # Verify user is authorized
-    from_user = callback.get('from', {})
-    user_id = from_user.get('id')
-    if str(user_id) != str(TELEGRAM_CHAT_ID):
-        debug_log(f"Unauthorized callback from user_id={user_id}")
-        answer_callback_query(callback['id'], "Unauthorized")
-        return None
-
-    # Parse callback data
-    callback_data = callback.get('data', '')
-    action, request_id = parse_callback_data(callback_data)
-    debug_log(f"Received callback: action={action}, request_id={request_id}")
-
-    # Find the request
-    message = callback.get('message', {})
-    message_id = message.get('message_id')
-
-    request = None
-    if request_id:
-        request = get_request(request_id)
-    elif message_id:
-        request = find_request_by_message_id(message_id)
-
-    if not request:
-        debug_log(f"Request not found for callback")
-        answer_callback_query(callback['id'], "Request not found or expired")
-        return None
-
-    # Validate action
-    valid_actions = ['allow', 'deny', 'stop', 'whitelist']
-    if action not in valid_actions:
-        debug_log(f"Invalid action: {action}")
-        answer_callback_query(callback['id'], f"Invalid action: {action}")
-        return None
-
-    # Build decision
-    decision = {'action': action}
-
-    # Handle whitelist action - echo permission_suggestions back as updatedPermissions.
-    # Also add session-scoped copies so the permission takes effect immediately in the
-    # current session (localSettings writes persist but may not be hot-reloaded).
-    if action == 'whitelist':
-        perms = list(request.permission_suggestions)
-        session_perms = [dict(p, destination='session') for p in perms
-                         if isinstance(p, dict) and p.get('destination') != 'session']
-        decision['updatedPermissions'] = perms + session_perms
-
-    # Update request state
-    # Map action string to RequestState enum (values are lowercase)
-    state_map = {
-        'allow': RequestState.ALLOW,
-        'deny': RequestState.DENY,
-        'stop': RequestState.STOP,
-        'whitelist': RequestState.WHITELIST,
-    }
-    new_state = state_map.get(action)
-    if new_state is None:
-        debug_log(f"Unknown action for state transition: {action}")
-        return None
-    updated = update_request_state(
-        request.request_id,
-        new_state,
-        decision=decision,
-        actor_user_id=user_id,
-    )
-
-    if updated:
-        # Answer callback
-        answer_callback_query(callback['id'], f"Action: {action}")
-
-        # Update message to show action taken
-        _update_message_after_action(message_id, request.request_id, action)
-
-        return decision
-    else:
-        # Already in terminal state
-        answer_callback_query(callback['id'], "Request already resolved")
-        return None
-
-
-def handle_text_reply(message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Handle a text reply message.
-
-    Text replies are classified as 'reply' action and the text is preserved.
-    The upstream hook maps this to deny-with-message or deny+interrupt.
-
-    Args:
-        message: Message object from Telegram
-
-    Returns:
-        Decision dict if action was taken, None otherwise
-    """
-    # Verify user is authorized
-    from_user = message.get('from', {})
-    user_id = from_user.get('id')
-    if str(user_id) != str(TELEGRAM_CHAT_ID):
-        debug_log(f"Unauthorized reply from user_id={user_id}")
-        return None
-
-    # Get reply text
-    reply_to = message.get('reply_to_message', {})
-    reply_to_message_id = reply_to.get('message_id')
-    text = message.get('text', '')
-
-    if not reply_to_message_id:
-        return None
-
-    debug_log(f"Received reply to message {reply_to_message_id}: {text[:50]}...")
-
-    # Find request by message ID
-    request = find_request_by_message_id(reply_to_message_id)
-
-    if not request:
-        debug_log(f"Request not found for reply")
-        return None
-
-    # Update request state with reply
-    decision = {
-        'action': 'reply',
-        'reply_text': text,
-    }
-
-    updated = update_request_state(
-        request.request_id,
-        RequestState.REPLY,
-        decision=decision,
-        reply_text=text,
-        actor_user_id=user_id,
-    )
-
-    if updated:
-        # Update message to show reply received
-        _update_message_after_action(
-            reply_to_message_id,
-            request.request_id,
-            'reply',
-            extra_text=f"\n\n_Reply: {text[:100]}..._" if len(text) > 100 else f"\n\n_Reply: {text}_"
-        )
-        return decision
-
-    return None
-
-
-def _update_message_after_action(
+def edit_message_text(
     message_id: int,
-    request_id: str,
-    action: str,
-    extra_text: str = ""
-):
-    """Update the Telegram message to show action was taken."""
-    status_emoji = {
-        'allow': 'allowed',
-        'deny': 'denied',
-        'stop': 'stopped',
-        'whitelist': 'whitelisted',
-        'reply': 'replied',
-    }
+    text: str,
+    inline_buttons: Optional[List] = None,
+) -> bool:
+    """Update a relay message's text. Keyboard edits are not supported."""
+    if not TELEGRAM_ENABLED or message_id is None:
+        return False
+    try:
+        _client().edit_message(int(message_id), text=text)
+        return True
+    except RelayError as e:
+        error_log(f"Relay edit_message failed: {e}")
+        return False
 
-    status = status_emoji.get(action, action)
 
-    new_text = f"*Permission Request* `{request_id}`\n\n_Action: {status}_{extra_text}"
+def delete_message(message_id: int) -> bool:
+    """Delete a relay message via the server."""
+    if not TELEGRAM_ENABLED or message_id is None:
+        return False
+    try:
+        _client().delete_message(int(message_id))
+        return True
+    except RelayError as e:
+        error_log(f"Relay delete_message failed: {e}")
+        return False
 
-    # Remove buttons after action
-    edit_message_text(message_id, new_text, inline_buttons=[])
+
+# ---- Whitelist / settings helpers (unchanged from legacy router) -----------
 
 
 def generate_whitelist_pattern(request: PermissionRequest) -> str:
-    """
-    Generate a permission pattern for whitelisting.
-
-    Prefers permission_suggestions from hook input, falls back to
-    conservative generated pattern.
-
-    Args:
-        request: The permission request
-
-    Returns:
-        Permission pattern string
-    """
-    # Prefer suggestions from hook input
+    """Pick the best Bash permission pattern for whitelisting this request."""
     if request.permission_suggestions:
-        # Use the first suggestion (most specific)
         return request.permission_suggestions[0]
 
-    # Fallback: Generate conservative pattern based on tool and command
-    if request.tool_name == 'Bash':
-        command = request.tool_input.get('command', '')
-
-        # Extract the base command (first word)
-        # Handle sudo, env vars, etc.
+    if request.tool_name == "Bash":
+        command = request.tool_input.get("command", "")
         parts = command.split()
         base_cmd = None
-
         for part in parts:
-            # Skip environment variable assignments
-            if '=' in part and not part.startswith('-'):
+            if "=" in part and not part.startswith("-"):
                 continue
-            # Skip sudo
-            if part == 'sudo':
+            if part == "sudo":
                 continue
             base_cmd = part
             break
-
         if base_cmd:
-            # Generate pattern: Bash(command:*)
             return f"Bash({base_cmd}:*)"
 
-    # Generic fallback - allow the specific tool
     return f"{request.tool_name}"
 
 
-def wait_for_response(
-    request_id: str,
-    message_id: int,
-    timeout_seconds: int = 60,
-    on_update: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Wait for a response to the permission request.
-
-    Uses long polling to receive updates. Handles both callback queries
-    (button presses) and text replies.
-
-    Args:
-        request_id: Unique identifier for this request
-        message_id: Telegram message ID to monitor
-        timeout_seconds: Maximum time to wait
-
-    Returns:
-        Decision dict with 'action' and optionally 'updatedPermissions', or None
-    """
-    if not TELEGRAM_ENABLED:
-        return None
-
-    start_time = time.time()
-    last_update_id = 0
-
-    debug_log(f"Waiting for Telegram response (request_id={request_id}, timeout={timeout_seconds}s)")
-
-    # Cleanup expired requests periodically
-    cleanup_expired_requests()
-
-    while time.time() - start_time < timeout_seconds:
-        # Get updates with long polling
-        updates = get_updates(offset=last_update_id + 1, timeout=POLL_TIMEOUT)
-
-        for update in updates:
-            last_update_id = update.get('update_id', 0)
-
-            # Check for callback query (button press)
-            callback = update.get('callback_query')
-            if callback:
-                # Verify it's for our message or request
-                message = callback.get('message', {})
-                cb_message_id = message.get('message_id')
-
-                # Parse callback data to get request_id
-                callback_data = callback.get('data', '')
-                action, cb_request_id = parse_callback_data(callback_data)
-
-                # Check if this callback is for our request
-                if cb_request_id == request_id or cb_message_id == message_id:
-                    decision = handle_callback_query(callback)
-                    if decision:
-                        debug_log(f"Got decision: {decision}")
-                        return decision
-
-            # Check for text reply
-            message = update.get('message')
-            if message:
-                reply_to = message.get('reply_to_message', {})
-                reply_to_message_id = reply_to.get('message_id')
-
-                # Check if this is a reply to our message
-                if reply_to_message_id == message_id:
-                    decision = handle_text_reply(message)
-                    if decision:
-                        debug_log(f"Got reply decision: {decision}")
-                        return decision
-
-            # Call on_update callback if provided
-            if on_update:
-                on_update(update)
-
-        # Small sleep to avoid tight loop (getUpdates already has long polling)
-        time.sleep(0.1)
-
-    debug_log("Telegram response timeout")
-    return None
-
-
-def update_settings_local_json(
-    workspace_dir: str,
-    permission_pattern: str,
-) -> bool:
-    """
-    Update .claude/settings.local.json with a new permission rule.
-
-    Safely writes the update while:
-    - Preserving existing JSON structure
-    - Deduplicating entries
-    - Using atomic write (write to temp, then rename)
-
-    Args:
-        workspace_dir: Path to workspace directory
-        permission_pattern: Permission pattern to add (e.g., "Bash(ls:*)")
-
-    Returns:
-        True if successful, False otherwise
-    """
+def update_settings_local_json(workspace_dir: str, permission_pattern: str) -> bool:
+    """Add a permission pattern to ``.claude/settings.local.json`` atomically."""
     settings_path = Path(workspace_dir) / ".claude" / "settings.local.json"
 
-    # Load existing settings or create new
-    settings = {}
+    settings: Dict[str, Any] = {}
     if settings_path.exists():
         try:
-            with open(settings_path, 'r') as f:
+            with open(settings_path, "r") as f:
                 settings = json.load(f)
         except json.JSONDecodeError as e:
             debug_log(f"Error parsing settings.local.json: {e}")
-            # Create backup of corrupted file
-            backup_path = settings_path.with_suffix('.json.backup')
+            backup_path = settings_path.with_suffix(".json.backup")
             settings_path.rename(backup_path)
             settings = {}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             debug_log(f"Error reading settings.local.json: {e}")
             settings = {}
 
-    # Ensure permissions structure exists
-    if 'permissions' not in settings:
-        settings['permissions'] = {}
-    if 'allow' not in settings['permissions']:
-        settings['permissions']['allow'] = []
+    if "permissions" not in settings:
+        settings["permissions"] = {}
+    if "allow" not in settings["permissions"]:
+        settings["permissions"]["allow"] = []
 
-    allow_list = settings['permissions']['allow']
-
-    # Check if pattern already exists (deduplication)
+    allow_list = settings["permissions"]["allow"]
     if permission_pattern in allow_list:
         debug_log(f"Permission pattern already exists: {permission_pattern}")
         return True
 
-    # Add new pattern
     allow_list.append(permission_pattern)
     debug_log(f"Added permission pattern: {permission_pattern}")
 
-    # Atomic write: write to temp file, then rename
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = settings_path.with_suffix('.json.tmp')
-
+    temp_path = settings_path.with_suffix(".json.tmp")
     try:
-        with open(temp_path, 'w') as f:
+        with open(temp_path, "w") as f:
             json.dump(settings, f, indent=2)
-
-        # Atomic rename
         temp_path.rename(settings_path)
-        debug_log(f"Updated {settings_path}")
         return True
-
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         debug_log(f"Error writing settings.local.json: {e}")
-        # Cleanup temp file
         if temp_path.exists():
             temp_path.unlink()
         return False
 
 
-def process_whitelist_update(request: PermissionRequest, decision: Dict[str, Any]) -> bool:
+def process_whitelist_update(
+    request: PermissionRequest, decision: Dict[str, Any]
+) -> bool:
+    """Apply a whitelist decision to ``settings.local.json``.
+
+    Mirrors the legacy semantics: string patterns are written locally; rule
+    objects (e.g. MCP addRules) are left to Claude Code to persist via
+    ``updatedPermissions``.
     """
-    Process a whitelist decision by updating settings.local.json.
-
-    Args:
-        request: The permission request
-        decision: The decision dict with updatedPermissions
-
-    Returns:
-        True if successful, False otherwise
-    """
-    # updatedPermissions is now the raw permission_suggestions array from Claude Code.
-    # Claude Code processes rule objects itself; we only write string patterns to
-    # settings.local.json as a local backup for Bash-style patterns.
-    updated_perms = decision.get('updatedPermissions', [])
-
-    # Handle legacy {"add": [...]} shape just in case
+    updated_perms = decision.get("updatedPermissions", [])
     if isinstance(updated_perms, dict):
-        updated_perms = updated_perms.get('add', [])
+        updated_perms = updated_perms.get("add", [])
 
     if not updated_perms:
         debug_log("No permission patterns to add")
-        return True  # Not an error — Claude Code handles rule objects itself
+        return True
 
     success = True
     for pattern in updated_perms:
         if isinstance(pattern, str):
-            # Legacy string pattern (e.g. "Bash(ls:*)") — write to settings.local.json
             if not update_settings_local_json(request.cwd, pattern):
                 success = False
         else:
-            # Rule object (e.g. MCP addRules) — Claude Code saves this via updatedPermissions
             debug_log(f"Skipping rule object (handled by Claude Code): {pattern}")
-
     return success
 
 
-# CLI interface for testing
-def main():
-    """Main entry point for CLI testing."""
-    import argparse
+# ---- Answer routing --------------------------------------------------------
 
-    parser = argparse.ArgumentParser(description='Telegram Permission Router')
-    parser.add_argument('--test-send', action='store_true', help='Test sending a message')
-    parser.add_argument('--test-poll', action='store_true', help='Test polling for updates')
-    parser.add_argument('--test-whitelist', type=str, help='Test whitelist update with pattern')
-    parser.add_argument('--cwd', type=str, default=os.getcwd(), help='Workspace directory')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
 
-    args = parser.parse_args()
+def relay_answer_to_decision(
+    request: PermissionRequest, answer: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Translate a relay answer payload into a hook decision dict.
 
-    # Enable debug if requested
-    if args.debug:
-        os.environ['CLAUDE_HOOK_DEBUG'] = '1'
+    Permission answers (allow/deny/stop/whitelist) arrive as button taps with
+    ``value`` set by ``_PERMISSION_ACTIONS``. AskUserQuestion answers arrive
+    either as a button tap (``value`` = ``qa<N>``) or a free-text reply.
+    """
+    via = answer.get("via")
+    if via == "button":
+        value = answer.get("value")
+        if value in ("allow", "deny", "stop"):
+            return {"action": value}
+        if value == "whitelist":
+            perms = list(request.permission_suggestions)
+            # Add session-scoped duplicates so the rule takes effect immediately
+            # without waiting for the settings file to be re-read.
+            session_perms = [
+                dict(p, destination="session")
+                for p in perms
+                if isinstance(p, dict) and p.get("destination") != "session"
+            ]
+            return {"action": "whitelist", "updatedPermissions": perms + session_perms}
+        if isinstance(value, str) and value.startswith("qa") and value[2:].isdigit():
+            options = (request.tool_input or {}).get("options", [])
+            idx = int(value[2:])
+            if 0 <= idx < len(options):
+                opt = options[idx]
+                label = (
+                    opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
+                )
+            else:
+                label = answer.get("label", value)
+            return {"action": "reply", "reply_text": label}
+        # Unknown button value — surface label as a reply for visibility.
+        label = answer.get("label", "")
+        return {"action": "reply", "reply_text": label}
 
-    load_telegram_config()
+    # Free-text reply (force_reply or fallback).
+    text = answer.get("text", "")
+    return {"action": "reply", "reply_text": text}
 
-    if args.test_send:
-        print("Testing message send...")
-        request = create_request(
-            session_id="test-session",
-            cwd=args.cwd,
-            tool_name="Bash",
-            tool_input={"command": "ls -la /tmp"},
-            permission_suggestions=["Bash(ls:*)"],
+
+def wait_for_relay_answer(
+    message_id: int,
+    timeout: float = 300.0,
+    long_poll_chunk: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """Long-poll the relay for an answer to ``message_id``.
+
+    Returns the raw answer dict on success, ``None`` on overall timeout, or a
+    sentinel ``{"_state": state}`` dict when the message terminated without a
+    user answer (expired or cancelled — the caller decides what to do).
+    """
+    if not TELEGRAM_ENABLED:
+        return None
+    try:
+        result = _client().wait_for_answer(
+            int(message_id), timeout=timeout, long_poll_chunk=long_poll_chunk
         )
-        message_id = send_permission_message(request, "test-workspace", "test-session")
-        print(f"Message ID: {message_id}")
-
-    elif args.test_poll:
-        print("Testing poll (press Ctrl+C to stop)...")
-        last_update_id = 0
-        while True:
-            updates = get_updates(offset=last_update_id + 1)
-            for update in updates:
-                last_update_id = update.get('update_id', 0)
-                print(f"Update: {json.dumps(update, indent=2)[:500]}")
-
-    elif args.test_whitelist:
-        print(f"Testing whitelist update with pattern: {args.test_whitelist}")
-        success = update_settings_local_json(args.cwd, args.test_whitelist)
-        print(f"Success: {success}")
-
-    else:
-        parser.print_help()
-
-
-if __name__ == '__main__':
-    main()
+    except RelayError as e:
+        error_log(f"wait_for_answer failed: {e}")
+        return None
+    if result is None:
+        return None
+    if result.state == "answered":
+        return result.answer or {}
+    return {"_state": result.state}

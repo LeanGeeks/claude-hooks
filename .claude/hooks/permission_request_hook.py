@@ -3,18 +3,19 @@
 PermissionRequest Hook - Telegram-Gated Permission Approval
 
 This hook is triggered when PreToolUse returns `ask` for a command.
-It sends a Telegram approval message with inline buttons and polls for responses.
+It sends a Telegram message via the central relay server and long-polls for
+the user's answer (button tap or text reply).
 
-The telegram_daemon.py background process handles:
-- Polling for button press callbacks
-- Updating request state when buttons are pressed
-- Keeping Telegram prompts alive indefinitely
+Transport: the relay server (``relay-server/``) owns the bot token and routes
+callbacks via webhook. This hook talks to it over HTTP via ``RelayClient``;
+there is no per-device ``getUpdates`` poller anymore.
 
 The posttool_hook.py handles:
 - Detecting when terminal prompt is used instead
-- Revoking Telegram messages when resolved via terminal
+- Cancelling the relay message (strips buttons) when resolved via terminal
 
-This hook polls the state store for responses from either source.
+This hook races the relay long-poll against the local state store for either
+source (Telegram answer or terminal resolution).
 
 Action mappings:
 - allow     -> behavior: "allow"
@@ -51,8 +52,11 @@ from telegram_permission_router import (
     send_permission_message,
     send_question_message,
     process_whitelist_update,
+    wait_for_relay_answer,
+    relay_answer_to_decision,
+    remove_inline_buttons,
+    set_message_reaction,
 )
-from telegram_daemon import start_daemon_if_needed
 
 # Debug logging
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
@@ -244,53 +248,79 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
     return None
 
 
-def wait_for_response(request_id: str, ttl_seconds: int = REQUEST_TTL) -> Optional[Dict[str, Any]]:
+def wait_for_response(
+    request_id: str,
+    message_id: Optional[int],
+    ttl_seconds: int = REQUEST_TTL,
+) -> Optional[Dict[str, Any]]:
+    """Race the relay long-poll against the local state store.
+
+    Two competing wakeups need to be reconciled:
+
+    * The relay sees a button tap / free-text reply (via webhook on the
+      server). We pick this up by long-polling ``wait_for_relay_answer`` in
+      short chunks.
+    * The user resolves the request through the terminal prompt. The
+      PostToolUse hook writes ``resolved_terminal`` to the local state store;
+      between long-poll chunks we check for that and bail out.
+
+    Returns a decision dict for Telegram answers, ``None`` if the request was
+    resolved via terminal, the message expired/cancelled, or the overall TTL
+    elapsed.
     """
-    Poll the state store for a response.
+    if message_id is None:
+        # No relay handle — only the state store can resolve this request.
+        # This path is exercised when Telegram is disabled or send failed.
+        return _wait_state_store_only(request_id, ttl_seconds)
 
-    This waits for either:
-    - Telegram response (daemon updates state)
-    - Terminal response (PostToolUse sets resolved_terminal)
+    request = get_request(request_id)
+    deadline = time.time() + ttl_seconds
+    while time.time() < deadline:
+        current = get_request(request_id)
+        if current and current.state == RequestState.RESOLVED_TERMINAL.value:
+            debug_log(f"Request {request_id} resolved via terminal, cancelling relay msg")
+            remove_inline_buttons(message_id)
+            return None
+        chunk = min(5, max(1, int(deadline - time.time())))
+        answer = wait_for_relay_answer(message_id, timeout=chunk, long_poll_chunk=chunk)
+        if answer is None:
+            continue
+        if "_state" in answer:
+            debug_log(f"Relay message terminal w/o user answer: {answer['_state']}")
+            return None
+        # We have a real user answer. Translate into a decision.
+        if request is None:
+            request = get_request(request_id)
+        decision = relay_answer_to_decision(request, answer) if request else None
+        if decision is None:
+            debug_log("Failed to translate relay answer to decision")
+            return None
+        debug_log(f"Request {request_id} resolved via relay: {decision}")
+        return decision
 
-    Args:
-        request_id: The request ID to poll for
-        ttl_seconds: Maximum time to wait
+    debug_log(f"Request {request_id} polling timed out after {ttl_seconds}s")
+    return None
 
-    Returns:
-        Decision dict if Telegram response received, None if terminal/expired
-    """
+
+def _wait_state_store_only(
+    request_id: str, ttl_seconds: int
+) -> Optional[Dict[str, Any]]:
+    """Legacy state-store-only wait used when no relay message exists."""
     start_time = time.time()
-
-    debug_log(f"Polling for response to request {request_id} (timeout: {ttl_seconds}s)")
-
     while time.time() - start_time < ttl_seconds:
-        # Get the current request state
         request = get_request(request_id)
-
         if request:
-            state = request.state
-            debug_log(f"Request {request_id} state: {state}")
-
-            # Check for terminal resolution - exit without decision
-            if state == RequestState.RESOLVED_TERMINAL.value:
-                debug_log(f"Request {request_id} resolved via terminal, exiting")
+            if request.state == RequestState.RESOLVED_TERMINAL.value:
                 return None
-
-            # Check for Telegram resolution with decision
-            if request.decision and state in [
+            if request.decision and request.state in [
                 RequestState.ALLOW.value,
                 RequestState.DENY.value,
                 RequestState.STOP.value,
                 RequestState.WHITELIST.value,
                 RequestState.REPLY.value,
             ]:
-                debug_log(f"Request {request_id} resolved via Telegram: {request.decision}")
                 return request.decision
-
-        # Poll interval
         time.sleep(POLL_INTERVAL)
-
-    debug_log(f"Request {request_id} polling timed out after {ttl_seconds}s")
     return None
 
 
@@ -311,9 +341,9 @@ def handle_ask_user_question(
     if not questions:
         return None
 
-    # One child request per question. Each gets its own Telegram message and
-    # state-store entry; the daemon's existing `qa{N}:` callback and reply
-    # handlers resolve them independently.
+    # One child request per question. Each gets its own relay message and
+    # state-store entry; relay button values ``qa<N>`` (or a free-text reply)
+    # are mapped to the originating child via ``relay_answer_to_decision``.
     children = []  # list of (PermissionRequest, question_dict, message_id)
     for i, q in enumerate(questions):
         child = create_request(
@@ -337,48 +367,65 @@ def handle_ask_user_question(
 
     debug_log(f"Sent {len(children)} question messages; polling for answers")
 
-    # Poll until each child is resolved.
+    # Race the relay long-poll for each child against the local state store's
+    # ``resolved_terminal`` signal. Process children in order so the UI feels
+    # sequential; the relay still attributes button taps to the right message.
     answers: Dict[str, str] = {}
     deadline = time.time() + REQUEST_TTL
-    pending_ids = {c[0].request_id for c in children}
-
-    while pending_ids and time.time() < deadline:
-        for child, q, _msg_id in children:
-            if child.request_id not in pending_ids:
-                continue
+    for child, q, child_msg_id in children:
+        if time.time() >= deadline:
+            return None
+        # Tight inner loop: short relay long-poll chunks interleaved with a
+        # terminal-resolution check on the local state store.
+        resolved = False
+        while time.time() < deadline and not resolved:
             current = get_request(child.request_id)
-            if not current:
-                # Expired between polls
-                pending_ids.discard(child.request_id)
-                continue
-            if current.state == RequestState.RESOLVED_TERMINAL.value:
-                debug_log(f"Child {child.request_id} resolved via terminal; revoking siblings")
-                # Revoke siblings' Telegram messages and mark them resolved so
-                # late button presses don't write into orphaned state.
+            if current and current.state == RequestState.RESOLVED_TERMINAL.value:
+                debug_log(
+                    f"Child {child.request_id} resolved via terminal; revoking siblings"
+                )
+                # Cancel this child's own relay message first — it was never
+                # answered via Telegram, so its buttons are still live. The
+                # posttool hook only cancels the *parent* permission request's
+                # message, not AskUserQuestion child messages.
+                try:
+                    remove_inline_buttons(child_msg_id)
+                except Exception as e:
+                    debug_log(f"Failed to cancel current child message {child_msg_id}: {e}")
+                from permission_state_store import resolve_via_terminal
                 for sib, _sq, sib_msg in children:
                     if sib.request_id == child.request_id:
                         continue
                     sib_state = get_request(sib.request_id)
                     if sib_state and sib_state.state == RequestState.PENDING.value:
-                        from permission_state_store import resolve_via_terminal
                         resolve_via_terminal(sib.request_id)
                         try:
-                            from telegram_permission_router import remove_inline_buttons, set_message_reaction
                             remove_inline_buttons(sib_msg)
                             set_message_reaction(sib_msg, '✅')
                         except Exception as e:
                             debug_log(f"Failed to revoke sibling message {sib_msg}: {e}")
                 return None
-            if current.state == RequestState.REPLY.value:
-                ans = (current.decision or {}).get('reply_text') or current.reply_text or ''
-                answers[q.get('question', '')] = ans
-                pending_ids.discard(child.request_id)
-        if pending_ids:
-            time.sleep(POLL_INTERVAL)
+            chunk = min(5, max(1, int(deadline - time.time())))
+            answer = wait_for_relay_answer(
+                child_msg_id, timeout=chunk, long_poll_chunk=chunk
+            )
+            if answer is None:
+                continue
+            if "_state" in answer:
+                # The relay marked this message expired/cancelled — fall back.
+                debug_log(
+                    f"Question {child.request_id} relay state={answer['_state']}; falling back"
+                )
+                return None
+            decision = relay_answer_to_decision(child, answer)
+            if not decision or decision.get('action') != 'reply':
+                debug_log(f"Unexpected decision shape for question: {decision}")
+                return None
+            answers[q.get('question', '')] = decision.get('reply_text', '')
+            resolved = True
 
-    if pending_ids:
-        debug_log(f"Timed out with {len(pending_ids)} unanswered question(s); falling back to terminal")
-        return None
+        if not resolved:
+            return None
 
     # All answered via Telegram — build updatedInput preserving original question structure.
     return {
@@ -438,13 +485,6 @@ def main():
             )
             sys.exit(0)
 
-        # Ensure the daemon is running to handle callbacks
-        daemon_started = start_daemon_if_needed()
-        if not daemon_started:
-            debug_log("Failed to start daemon, falling back to terminal")
-            error_log("Failed to start telegram_daemon; falling back to terminal prompt")
-            sys.exit(0)
-
         # AskUserQuestion takes a different shape (questions[] instead of a single
         # tool input) and resolves with `updatedInput.answers` instead of allow/deny.
         if tool_name == 'AskUserQuestion':
@@ -497,8 +537,12 @@ def main():
 
         debug_log(f"Telegram message sent with ID: {message_id}")
 
-        # Poll for response (from either Telegram daemon or terminal via PostToolUse)
-        decision = wait_for_response(request.request_id, ttl_seconds=REQUEST_TTL)
+        # Race relay long-poll against terminal resolution via state store.
+        decision = wait_for_response(
+            request.request_id,
+            message_id=message_id,
+            ttl_seconds=REQUEST_TTL,
+        )
 
         # Build output
         output = build_output_decision(decision, request)
