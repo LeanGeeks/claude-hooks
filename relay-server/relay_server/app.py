@@ -22,6 +22,7 @@ from .binding_codes import generate_code, normalise_code
 from .callback_data import decode as decode_callback_data
 from .config import RelayConfig, load_config
 from .db import connect, init_schema, run_in_thread
+from .reaper import reaper_loop
 from .models import (
     AnswerResponse,
     BindingRequestResponse,
@@ -126,9 +127,17 @@ def create_app(
             except Exception:  # noqa: BLE001
                 logger.exception("setWebhook failed for %s", url)
 
+        # Start the background reaper task.
+        reaper_task = asyncio.create_task(reaper_loop(app), name="reaper")
+
         try:
             yield
         finally:
+            reaper_task.cancel()
+            try:
+                await reaper_task
+            except asyncio.CancelledError:
+                pass
             conn.close()
             if isinstance(backend, HttpTelegramBackend):
                 await backend.aclose()
@@ -758,6 +767,15 @@ def create_app(
         # Park on the event up to `wait` seconds.
         notified = await waiters.wait(message_id, timeout=float(wait))
         if not notified:
+            # Timed out — but re-read the DB to guard against a TOCTOU race
+            # where the reaper (or any other writer) transitioned the message
+            # to a terminal state between our initial read and park.  If the
+            # message is now terminal we return it immediately; otherwise the
+            # client should retry (204 as before).
+            row = await _load_message(conn, message_id, installation["id"])
+            terminal = _terminal_response(row)
+            if terminal is not None:
+                return JSONResponse(terminal.model_dump(exclude_none=True))
             return Response(status_code=204)
 
         # Re-load and respond.

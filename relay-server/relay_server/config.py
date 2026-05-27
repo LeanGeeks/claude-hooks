@@ -30,6 +30,9 @@ class RelayConfig:
     listen: str = "127.0.0.1:8080"
     # When False, skip the setWebhook call on startup. Tests set this off.
     set_webhook_on_startup: bool = True
+    # Interval in seconds between reaper ticks. Defaults to 30 s; tests may
+    # set a shorter value to avoid slow test suites.
+    reaper_interval: float = 30.0
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -40,6 +43,12 @@ _ENV_MAP = {
     "RELAY_PUBLIC_URL": "public_url",
     "RELAY_DB_PATH": "db_path",
     "RELAY_LISTEN": "listen",
+    "RELAY_REAPER_INTERVAL": "reaper_interval",
+}
+
+# Type coercions for env vars whose field type is not str.
+_ENV_COERCE: dict[str, Any] = {
+    "reaper_interval": float,
 }
 
 
@@ -70,7 +79,9 @@ def load_config(
     # 2. Env vars.
     for env_key, attr in _ENV_MAP.items():
         if env_key in env and env[env_key]:
-            setattr(cfg, attr, env[env_key])
+            raw = env[env_key]
+            coerce = _ENV_COERCE.get(attr)
+            setattr(cfg, attr, coerce(raw) if coerce is not None else raw)
 
     # ``set_webhook_on_startup`` is intentionally not an env-mapped scalar
     # (it's only flipped from tests/callers via overrides) but we accept
