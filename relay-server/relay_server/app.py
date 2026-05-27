@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
+import logging
 import os
 import sqlite3
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from .callback_data import decode as decode_callback_data
+from .config import RelayConfig, load_config
 from .db import connect, init_schema, run_in_thread
 from .models import (
     AnswerResponse,
@@ -23,9 +28,20 @@ from .models import (
     InstallationMeResponse,
     PatchMessageRequest,
 )
-from .telegram_backend import FakeTelegramBackend, TelegramBackend
+from .telegram_backend import (
+    FakeTelegramBackend,
+    HttpTelegramBackend,
+    TelegramBackend,
+    TelegramForbidden,
+)
 from .tokens import hash_token
 from .waiters import WaiterRegistry
+
+logger = logging.getLogger(__name__)
+
+
+def secrets_compare(a: str, b: str) -> bool:
+    return hmac.compare_digest(a, b)
 
 
 def _utcnow() -> datetime:
@@ -45,20 +61,36 @@ def _canonical_body_hash(body: Any) -> str:
 def create_app(
     db_path: str | None = None,
     backend: TelegramBackend | None = None,
+    *,
+    config: RelayConfig | None = None,
 ) -> FastAPI:
-    db_path = db_path or os.environ.get("RELAY_DB_PATH", "relay.db")
-    backend = backend or FakeTelegramBackend()
-    enable_internal = (
-        os.environ.get("RELAY_ENABLE_INTERNAL_ENDPOINTS", "0").lower()
-        in {"1", "true", "yes", "on"}
-    )
+    # Config precedence: explicit args > config object > env/TOML defaults.
+    if config is None:
+        overrides: dict[str, Any] = {}
+        if db_path is not None:
+            overrides["db_path"] = db_path
+        config = load_config(overrides=overrides)
+    elif db_path is not None:
+        config.db_path = db_path
+
+    resolved_db_path = config.db_path
+
+    # If no backend supplied, prefer the real HTTP one when a bot token is
+    # configured; otherwise fall back to the recording fake (tests, dev).
+    if backend is None:
+        if config.bot_token:
+            backend = HttpTelegramBackend(config.bot_token)
+        else:
+            backend = FakeTelegramBackend()
+    webhook_secret = config.webhook_secret
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ANN001
-        conn = connect(db_path)
+        conn = connect(resolved_db_path)
         init_schema(conn)
         app.state.db = conn
         app.state.backend = backend
+        app.state.config = config
         app.state.waiters = WaiterRegistry()
         # Per-installation async lock guarding the idempotent create path so
         # two concurrent POSTs with the same Idempotency-Key in this process
@@ -66,10 +98,34 @@ def create_app(
         # response" sequence. Cross-process serialization is provided by the
         # PRIMARY KEY on idempotency_keys.
         app.state.idem_locks = defaultdict(asyncio.Lock)
+        # In-process LRU of recently-seen Telegram update_ids for webhook
+        # dedup. Telegram retries on non-2xx and sometimes on slow 2xx, so we
+        # bounce duplicates with a fixed-size insertion-ordered set.
+        app.state.seen_updates = OrderedDict()
+        app.state.seen_updates_max = 1024
+
+        # Install the webhook with Telegram if fully configured and not opted
+        # out (tests skip this). Errors are logged but non-fatal — we'd rather
+        # serve traffic and let an operator retry than refuse to start.
+        if (
+            config.set_webhook_on_startup
+            and isinstance(backend, HttpTelegramBackend)
+            and config.public_url
+            and config.webhook_secret
+        ):
+            url = f"{config.public_url.rstrip('/')}/telegram/webhook/{config.webhook_secret}"
+            try:
+                await backend.set_webhook(url)
+                logger.info("setWebhook OK for host %s", urlparse(url).netloc)
+            except Exception:  # noqa: BLE001
+                logger.exception("setWebhook failed for %s", url)
+
         try:
             yield
         finally:
             conn.close()
+            if isinstance(backend, HttpTelegramBackend):
+                await backend.aclose()
 
     app = FastAPI(title="Telegram Relay (Phase 1)", lifespan=lifespan)
 
@@ -109,6 +165,32 @@ def create_app(
         await run_in_thread(_touch)
         request.state.installation_id = row["id"]
         return row
+
+    # ---- Auto-unbind helper -----------------------------------------------
+
+    async def _unbind_installation(
+        conn: sqlite3.Connection, installation_id: int
+    ) -> None:
+        """Clear the chat binding after Telegram says we're not welcome.
+
+        We deliberately keep ``bound_user_id`` for audit history — the chat id
+        is the only field that controls whether we can talk; the user id is
+        record-keeping for who last bound the install.
+        """
+
+        def _w() -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE installations SET telegram_chat_id = NULL"
+                    " WHERE id = ?",
+                    (installation_id,),
+                )
+
+        await run_in_thread(_w)
+        logger.warning(
+            "auto-unbound installation %s after Telegram Forbidden",
+            installation_id,
+        )
 
     # ---- Idempotency helpers ----------------------------------------------
 
@@ -322,6 +404,21 @@ def create_app(
                     reply_required=body.reply_required,
                     message_id=message_id,
                 )
+            except TelegramForbidden:
+                # Bot was blocked or removed from the chat. Clear the binding
+                # and surface 409 not_bound to the client (same shape as the
+                # never-bound case) so it can re-run `relay-client bind`.
+                def _rollback_message() -> None:
+                    with conn:
+                        conn.execute(
+                            "DELETE FROM messages WHERE id = ?", (message_id,)
+                        )
+
+                await run_in_thread(_rollback_message)
+                await _unbind_installation(conn, installation_id)
+                if idempotency_key:
+                    await _idem_abandon(conn, installation_id, idempotency_key)
+                raise HTTPException(status_code=409, detail="not_bound")
             except Exception:
                 # Roll back: remove the placeholder message row and the
                 # pending idempotency sentinel so the client can retry from
@@ -374,20 +471,29 @@ def create_app(
             raise HTTPException(
                 status_code=400, detail="at_least_one_field_required"
             )
+        # Phase 2 deliberately refuses keyboard replacement via PATCH: the
+        # current Bot-API edit path can't see the originating message_id, so
+        # `_inline_keyboard_payload` would fall back to label/value strings
+        # for callback_data and the webhook decoder would reject taps. Clients
+        # that need to change buttons should cancel + send a new message.
+        if body.keyboard is not None:
+            raise HTTPException(
+                status_code=400, detail="keyboard_replace_not_supported"
+            )
         conn: sqlite3.Connection = request.app.state.db
         backend: TelegramBackend = request.app.state.backend
-        row = await _load_message(conn, message_id, installation["id"])
-        keyboard_dump = (
-            [[btn.model_dump() for btn in r] for r in body.keyboard]
-            if body.keyboard
-            else None
-        )
-        await backend.edit_message(
-            chat_id=row["telegram_chat_id"],
-            telegram_message_id=row["telegram_message_id"],
-            text=body.text,
-            keyboard=keyboard_dump,
-        )
+        installation_id = installation["id"]
+        row = await _load_message(conn, message_id, installation_id)
+        try:
+            await backend.edit_message(
+                chat_id=row["telegram_chat_id"],
+                telegram_message_id=row["telegram_message_id"],
+                text=body.text,
+                keyboard=None,
+            )
+        except TelegramForbidden:
+            await _unbind_installation(conn, installation_id)
+            raise HTTPException(status_code=409, detail="not_bound")
         return {}
 
     @app.delete("/v1/messages/{message_id}", status_code=204)
@@ -398,11 +504,16 @@ def create_app(
     ) -> Response:
         conn: sqlite3.Connection = request.app.state.db
         backend: TelegramBackend = request.app.state.backend
-        row = await _load_message(conn, message_id, installation["id"])
-        await backend.delete_message(
-            chat_id=row["telegram_chat_id"],
-            telegram_message_id=row["telegram_message_id"],
-        )
+        installation_id = installation["id"]
+        row = await _load_message(conn, message_id, installation_id)
+        try:
+            await backend.delete_message(
+                chat_id=row["telegram_chat_id"],
+                telegram_message_id=row["telegram_message_id"],
+            )
+        except TelegramForbidden:
+            await _unbind_installation(conn, installation_id)
+            raise HTTPException(status_code=409, detail="not_bound")
         return Response(status_code=204)
 
     @app.post("/v1/messages/{message_id}/cancel")
@@ -414,7 +525,8 @@ def create_app(
         conn: sqlite3.Connection = request.app.state.db
         backend: TelegramBackend = request.app.state.backend
         waiters: WaiterRegistry = request.app.state.waiters
-        row = await _load_message(conn, message_id, installation["id"])
+        installation_id = installation["id"]
+        row = await _load_message(conn, message_id, installation_id)
 
         def _cancel() -> None:
             with conn:
@@ -424,12 +536,17 @@ def create_app(
                 )
 
         await run_in_thread(_cancel)
-        # Strip the inline keyboard via the dedicated Bot-API-shaped method.
-        await backend.edit_reply_markup(
-            chat_id=row["telegram_chat_id"],
-            telegram_message_id=row["telegram_message_id"],
-            keyboard=None,
-        )
+        try:
+            # Strip the inline keyboard via the dedicated Bot-API-shaped method.
+            await backend.edit_reply_markup(
+                chat_id=row["telegram_chat_id"],
+                telegram_message_id=row["telegram_message_id"],
+                keyboard=None,
+            )
+        except TelegramForbidden:
+            waiters.notify(message_id)
+            await _unbind_installation(conn, installation_id)
+            raise HTTPException(status_code=409, detail="not_bound")
         waiters.notify(message_id)
         return {}
 
@@ -466,39 +583,47 @@ def create_app(
             return Response(status_code=204)
         return JSONResponse(terminal.model_dump(exclude_none=True))
 
-    # ---- Internal test/utility endpoint -----------------------------------
-    # Phase 2's webhook will call into the same code path. Exposing it here
-    # (auth'd) keeps Phase 1 end-to-end testable without inventing a webhook.
-    # GATED: only registered when RELAY_ENABLE_INTERNAL_ENDPOINTS is truthy,
-    # because an installation token alone must not be able to fabricate
-    # answers in production.
+    # ---- Telegram webhook --------------------------------------------------
 
-    if enable_internal:
+    @app.post("/telegram/webhook/{secret}")
+    async def telegram_webhook(secret: str, request: Request) -> Response:
+        # Constant-time compare to keep the secret-as-URL-path approach honest.
+        if (
+            not webhook_secret
+            or not secrets_compare(secret, webhook_secret)
+        ):
+            # 404, not 401: we don't want to advertise that the endpoint exists
+            # to anything probing.
+            raise HTTPException(status_code=404, detail="not_found")
+        try:
+            update = await request.json()
+        except Exception:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="invalid_json")
 
-        @app.post("/v1/_internal/record_answer/{message_id}")
-        async def record_answer(
-            message_id: int,
-            request: Request,
-            installation=Depends(require_installation),
-        ) -> dict[str, Any]:
-            conn: sqlite3.Connection = request.app.state.db
-            waiters: WaiterRegistry = request.app.state.waiters
-            body = await request.json()
-            row = await _load_message(conn, message_id, installation["id"])
-            if row["state"] != "open":
-                raise HTTPException(status_code=409, detail="not_open")
+        # Update_id dedup. Telegram retries on any non-2xx and sometimes on
+        # slow 2xx, so duplicates show up regularly. Keep an in-process LRU
+        # of recently-seen update_ids; persistence across restarts isn't
+        # worth the complexity since the duplicate window is short.
+        update_id = update.get("update_id")
+        if update_id is not None:
+            seen: OrderedDict = request.app.state.seen_updates
+            cap: int = request.app.state.seen_updates_max
+            if update_id in seen:
+                seen.move_to_end(update_id)
+                return JSONResponse({"ok": True})
+            seen[update_id] = None
+            while len(seen) > cap:
+                seen.popitem(last=False)
 
-            def _record() -> None:
-                with conn:
-                    conn.execute(
-                        "UPDATE messages SET state='answered',"
-                        " answer_json=?, answered_at=? WHERE id=?",
-                        (json.dumps(body), _utcnow_iso(), message_id),
-                    )
-
-            await run_in_thread(_record)
-            waiters.notify(message_id)
-            return {}
+        # Wrap routing so a bug in a handler can't make Telegram retry the
+        # same update forever. We log and still return 2xx.
+        try:
+            await _handle_update(request.app, update)
+        except Exception:  # noqa: BLE001
+            logger.exception("webhook handler failed for update %s", update_id)
+        # Telegram retries on non-2xx; always 200 once we've persisted
+        # whatever the update produced.
+        return Response(status_code=200)
 
     return app
 
@@ -532,3 +657,265 @@ def _terminal_response(row: sqlite3.Row) -> AnswerResponse | None:
         )
     # expired or cancelled
     return AnswerResponse(state=state)
+
+
+# ---- Telegram update routing ----------------------------------------------
+
+
+async def _record_answer(
+    conn: sqlite3.Connection,
+    waiters: WaiterRegistry,
+    message_id: int,
+    answer: dict[str, Any],
+) -> bool:
+    """Atomically transition an open message to ``answered`` and wake waiters.
+
+    Returns True if the row moved to ``answered`` (we did the write), False if
+    it was no longer open (already answered, expired, cancelled, or missing).
+    """
+    now_iso = _utcnow_iso()
+
+    def _w() -> int:
+        with conn:
+            cur = conn.execute(
+                "UPDATE messages SET state='answered',"
+                " answer_json=?, answered_at=? WHERE id=? AND state='open'",
+                (json.dumps(answer), now_iso, message_id),
+            )
+            return cur.rowcount
+
+    updated = await run_in_thread(_w)
+    if updated:
+        waiters.notify(message_id)
+        return True
+    return False
+
+
+async def _load_open_message_any(
+    conn: sqlite3.Connection, message_id: int
+) -> sqlite3.Row | None:
+    """Load a message by id without an installation filter (webhook path)."""
+
+    def _q() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+
+    return await run_in_thread(_q)
+
+
+async def _load_message_by_tg_id(
+    conn: sqlite3.Connection, chat_id: int, telegram_message_id: int
+) -> sqlite3.Row | None:
+    def _q() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM messages"
+            " WHERE telegram_chat_id = ? AND telegram_message_id = ?"
+            " AND state = 'open'"
+            " ORDER BY id DESC LIMIT 1",
+            (chat_id, telegram_message_id),
+        ).fetchone()
+
+    return await run_in_thread(_q)
+
+
+async def _load_last_open_in_chat(
+    conn: sqlite3.Connection, chat_id: int
+) -> sqlite3.Row | None:
+    """Fallback heuristic: most recently created open message in this chat.
+
+    Mirrors the per-chat "last awaiting" tracking the legacy daemon used so a
+    bound user can type a plain reply without quoting the prompt.
+    """
+
+    def _q() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM messages WHERE telegram_chat_id = ? AND state = 'open'"
+            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+
+    return await run_in_thread(_q)
+
+
+async def _load_installation_for_chat(
+    conn: sqlite3.Connection, chat_id: int
+) -> sqlite3.Row | None:
+    def _q() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM installations WHERE telegram_chat_id = ?"
+            " AND revoked_at IS NULL"
+            " ORDER BY id LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+
+    return await run_in_thread(_q)
+
+
+def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None:
+    try:
+        payload = json.loads(row["payload_json"])
+    except Exception:  # noqa: BLE001
+        return None
+    return payload.get("keyboard")
+
+
+async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
+    """Route a single Telegram ``Update`` to the right handler.
+
+    Three flavors matter to us:
+
+    * ``callback_query`` — inline button taps. ``data`` contains the encoded
+      message_id / option_idx. We answer the callback and record the answer.
+    * ``message`` with ``reply_to_message_id`` matching a known open message
+      → treat as a free-text answer.
+    * ``message`` from the bound user without a reply pointer → fallback to
+      "last awaiting open message in this chat", same as the legacy daemon.
+
+    ``/bind`` commands are explicitly ignored in Phase 2; Phase 3 handles them.
+    """
+    conn: sqlite3.Connection = app.state.db
+    backend: TelegramBackend = app.state.backend
+    waiters: WaiterRegistry = app.state.waiters
+
+    cbq = update.get("callback_query")
+    if cbq is not None:
+        await _handle_callback_query(conn, backend, waiters, cbq)
+        return
+
+    msg = update.get("message")
+    if msg is None:
+        return
+
+    text = (msg.get("text") or "").strip()
+    if text.startswith("/bind"):
+        # TODO(phase-3): record the binding here. Ignore for now so we don't
+        # eat the update with a placeholder.
+        logger.info("ignoring /bind command (phase 3 territory)")
+        return
+
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
+    # Free-text reply path: prefer explicit reply_to_message_id when present.
+    reply_to = msg.get("reply_to_message_id") or (
+        (msg.get("reply_to_message") or {}).get("message_id")
+    )
+    if reply_to is not None:
+        row = await _load_message_by_tg_id(conn, int(chat_id), int(reply_to))
+        if row is not None:
+            await _record_answer(
+                conn,
+                waiters,
+                row["id"],
+                {"text": msg.get("text", ""), "via": "reply"},
+            )
+            return
+
+    # Ignore other slash-commands so /start, /help, etc. don't accidentally
+    # become answers.
+    if text.startswith("/"):
+        return
+
+    # Fallback: attribute to the most recently created open message in this
+    # chat *iff* the sender is the user that bound the chat.
+    # This path also compensates for the send-time trade-off where a message
+    # with both `keyboard` and `reply_required` ends up without a force_reply
+    # prompt — bound users can still answer by typing.
+    sender_id = (msg.get("from") or {}).get("id")
+    install = await _load_installation_for_chat(conn, int(chat_id))
+    if install is None or install["bound_user_id"] is None:
+        return
+    if sender_id is None or int(sender_id) != int(install["bound_user_id"]):
+        return
+
+    row = await _load_last_open_in_chat(conn, int(chat_id))
+    if row is None:
+        return
+    await _record_answer(
+        conn,
+        waiters,
+        row["id"],
+        {"text": msg.get("text", ""), "via": "fallback"},
+    )
+
+
+async def _handle_callback_query(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    cbq: dict[str, Any],
+) -> None:
+    data = cbq.get("data") or ""
+    cb_id = cbq.get("id") or ""
+    parsed = decode_callback_data(data)
+    if parsed is None:
+        # Foreign or malformed callback data; ack so Telegram stops the
+        # client-side spinner but record nothing.
+        if cb_id:
+            try:
+                await backend.answer_callback_query(callback_query_id=cb_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("answer_callback_query failed")
+        return
+
+    row = await _load_open_message_any(conn, parsed.message_id)
+    if row is None:
+        if cb_id:
+            try:
+                await backend.answer_callback_query(
+                    callback_query_id=cb_id, text="Message no longer active"
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("answer_callback_query failed")
+        return
+
+    # Trust boundary: the callback message must originate from the chat that
+    # currently owns this message. Anyone in that chat may tap (per spec).
+    msg_obj = cbq.get("message") or {}
+    msg_chat = (msg_obj.get("chat") or {}).get("id")
+    if msg_chat is not None and int(msg_chat) != int(row["telegram_chat_id"]):
+        logger.warning(
+            "callback chat mismatch: cbq chat=%s message row chat=%s",
+            msg_chat,
+            row["telegram_chat_id"],
+        )
+        if cb_id:
+            try:
+                await backend.answer_callback_query(callback_query_id=cb_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("answer_callback_query failed")
+        return
+
+    keyboard = _payload_keyboard_for(row) or []
+    flat = [btn for r in keyboard for btn in r]
+    if not (0 <= parsed.option_idx < len(flat)):
+        if cb_id:
+            try:
+                await backend.answer_callback_query(
+                    callback_query_id=cb_id, text="Invalid option"
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("answer_callback_query failed")
+        return
+
+    chosen = flat[parsed.option_idx]
+    answer = {
+        "option_idx": parsed.option_idx,
+        "label": chosen.get("label"),
+        "value": chosen.get("value"),
+        "via": "button",
+    }
+
+    wrote = await _record_answer(conn, waiters, parsed.message_id, answer)
+
+    if cb_id:
+        try:
+            ack = f"Answered: {chosen.get('label', '')}" if wrote else "Already answered"
+            await backend.answer_callback_query(
+                callback_query_id=cb_id, text=ack
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("answer_callback_query failed")

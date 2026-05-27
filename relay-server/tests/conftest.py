@@ -12,9 +12,12 @@ import pytest
 import pytest_asyncio
 
 from relay_server.app import create_app
+from relay_server.config import RelayConfig
 from relay_server.db import connect, init_schema
 from relay_server.telegram_backend import FakeTelegramBackend
 from relay_server.tokens import generate_token, hash_token
+
+TEST_WEBHOOK_SECRET = "test-webhook-secret"
 
 
 @pytest.fixture
@@ -37,9 +40,10 @@ def seeded(db_path: str) -> dict[str, object]:
     unbound_token = generate_token()
     with conn:
         cur = conn.execute(
-            "INSERT INTO installations(label, token_hash, telegram_chat_id, created_at)"
-            " VALUES (?, ?, ?, datetime('now'))",
-            ("test", hash_token(token), 42),
+            "INSERT INTO installations(label, token_hash, telegram_chat_id,"
+            " bound_user_id, created_at)"
+            " VALUES (?, ?, ?, ?, datetime('now'))",
+            ("test", hash_token(token), 42, 7),
         )
         installation_id = cur.lastrowid
         conn.execute(
@@ -57,10 +61,47 @@ def seeded(db_path: str) -> dict[str, object]:
     return {
         "token": token,
         "installation_id": installation_id,
+        "chat_id": 42,
+        "bound_user_id": 7,
         "revoked_token": revoked_token,
         "unbound_token": unbound_token,
         "unbound_id": unbound_id,
     }
+
+
+def make_test_config(db_path: str) -> RelayConfig:
+    return RelayConfig(
+        db_path=db_path,
+        webhook_secret=TEST_WEBHOOK_SECRET,
+        set_webhook_on_startup=False,
+    )
+
+
+async def post_callback_query(
+    client: httpx.AsyncClient,
+    *,
+    callback_data: str,
+    chat_id: int,
+    callback_query_id: str = "cbq-1",
+    from_user_id: int = 7,
+    message_id: int = 1000,
+) -> httpx.Response:
+    """Send a Telegram-shaped callback_query update through the webhook."""
+    return await client.post(
+        f"/telegram/webhook/{TEST_WEBHOOK_SECRET}",
+        json={
+            "update_id": 1,
+            "callback_query": {
+                "id": callback_query_id,
+                "from": {"id": from_user_id},
+                "data": callback_data,
+                "message": {
+                    "message_id": message_id,
+                    "chat": {"id": chat_id},
+                },
+            },
+        },
+    )
 
 
 @asynccontextmanager
@@ -96,12 +137,8 @@ async def app_client(
     db_path: str,
     backend: FakeTelegramBackend,
     seeded: dict[str, object],
-    monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[httpx.AsyncClient]:
-    # Most tests exercise the long-poll path which depends on the internal
-    # record_answer endpoint; opt-in for the duration of the test.
-    monkeypatch.setenv("RELAY_ENABLE_INTERNAL_ENDPOINTS", "1")
-    app = create_app(db_path=db_path, backend=backend)
+    app = create_app(backend=backend, config=make_test_config(db_path))
     transport = httpx.ASGITransport(app=app)
     async with _run_lifespan(app):
         async with httpx.AsyncClient(

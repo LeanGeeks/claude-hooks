@@ -1,4 +1,8 @@
-"""Tests for long-poll wakeup on GET /v1/messages/{id}/answer."""
+"""Tests for long-poll wakeup on GET /v1/messages/{id}/answer.
+
+Phase 2: answers are delivered via the real ``/telegram/webhook/{secret}``
+endpoint by feeding it Telegram-shaped ``callback_query`` updates.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +11,12 @@ import asyncio
 import httpx
 import pytest
 
+from relay_server.callback_data import encode as encode_cb
 
-async def _create_message(
-    app_client: httpx.AsyncClient, token: str
-) -> int:
+from tests.conftest import post_callback_query  # type: ignore[attr-defined]
+
+
+async def _create_message(app_client: httpx.AsyncClient, token: str) -> int:
     body = {
         "kind": "question",
         "text": "?",
@@ -26,6 +32,20 @@ async def _create_message(
     return r.json()["message_id"]
 
 
+async def _deliver_callback(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    msg_id: int,
+    option_idx: int = 0,
+) -> httpx.Response:
+    return await post_callback_query(
+        app_client,
+        callback_data=encode_cb(msg_id, option_idx),
+        chat_id=int(seeded["chat_id"]),  # type: ignore[arg-type]
+        from_user_id=int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+    )
+
+
 @pytest.mark.asyncio
 async def test_answer_already_present_returns_immediately(
     app_client: httpx.AsyncClient, seeded: dict[str, object]
@@ -33,12 +53,7 @@ async def test_answer_already_present_returns_immediately(
     token = seeded["token"]
     msg_id = await _create_message(app_client, token)
 
-    # Record the answer first.
-    rec = await app_client.post(
-        f"/v1/_internal/record_answer/{msg_id}",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"value": "a"},
-    )
+    rec = await _deliver_callback(app_client, seeded, msg_id)
     assert rec.status_code == 200
 
     r = await app_client.get(
@@ -48,7 +63,8 @@ async def test_answer_already_present_returns_immediately(
     assert r.status_code == 200
     body = r.json()
     assert body["state"] == "answered"
-    assert body["answer"] == {"value": "a"}
+    assert body["answer"]["value"] == "a"
+    assert body["answer"]["via"] == "button"
 
 
 @pytest.mark.asyncio
@@ -60,11 +76,7 @@ async def test_long_poll_wakeup_on_answer(
 
     async def deliver_answer_soon() -> None:
         await asyncio.sleep(0.2)
-        await app_client.post(
-            f"/v1/_internal/record_answer/{msg_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"value": "later"},
-        )
+        await _deliver_callback(app_client, seeded, msg_id)
 
     deliver = asyncio.create_task(deliver_answer_soon())
     r = await app_client.get(
@@ -76,7 +88,7 @@ async def test_long_poll_wakeup_on_answer(
     assert r.status_code == 200
     body = r.json()
     assert body["state"] == "answered"
-    assert body["answer"] == {"value": "later"}
+    assert body["answer"]["value"] == "a"
 
 
 @pytest.mark.asyncio
