@@ -1,0 +1,31 @@
+# /etc/relay/config.toml — relay server configuration
+# Env var equivalents (higher precedence than this file) are shown in comments.
+
+# Required: Telegram bot token from @BotFather.
+# Env: RELAY_BOT_TOKEN
+bot_token = "123456789:AAXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+# Required: random string appended to the webhook URL path.
+# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Env: RELAY_WEBHOOK_SECRET
+webhook_secret = "change-me-long-random-string"
+
+# Required: public HTTPS base URL of this server (no trailing slash).
+# The server calls setWebhook with {public_url}/telegram/webhook/{webhook_secret}.
+# Env: RELAY_PUBLIC_URL
+public_url = "https://relay.example.com"
+
+# Path to the SQLite database file.
+# Default: relay.db (current working directory)
+# Env: RELAY_DB_PATH
+db_path = "/var/lib/relay/relay.db"
+
+# Address and port for uvicorn to bind.  Caddy proxies to this.
+# Default: 127.0.0.1:8080
+# Env: RELAY_LISTEN
+listen = "127.0.0.1:8080"
+
+# Seconds between reaper ticks (expires open messages, GC idempotency keys).
+# Default: 30
+# Env: RELAY_REAPER_INTERVAL
+reaper_interval = 30

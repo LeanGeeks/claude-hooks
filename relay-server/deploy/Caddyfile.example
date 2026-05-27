@@ -1,0 +1,26 @@
+relay.example.com {
+    # Automatic TLS via Let's Encrypt (Caddy default).
+    # Replace with your actual domain.
+
+    # Only the webhook path and /v1/* API need to be reachable externally.
+    # Everything else can be restricted at the firewall level.
+
+    reverse_proxy 127.0.0.1:8080
+
+    # Optional: rate-limit inbound requests to protect against abuse.
+    # Requires the caddy-ratelimit plugin.
+    # rate_limit {
+    #     zone relay {
+    #         key {remote_host}
+    #         events 60
+    #         window 1m
+    #     }
+    # }
+
+    log {
+        output file /var/log/caddy/relay.log {
+            roll_size 10MB
+            roll_keep 5
+        }
+    }
+}

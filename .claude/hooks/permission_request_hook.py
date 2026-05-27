@@ -481,7 +481,8 @@ def main():
             debug_log("Telegram not configured, falling back to terminal prompt")
             error_log(
                 "Telegram disabled; skipping permission-request message. "
-                "Check TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID or ~/.config/claude/telegram.conf"
+                "Check ~/.config/claude-tg-relay/config.toml exists and server_url is reachable. "
+                "Run `relay-client config init --server-url URL --token TOKEN` then `relay-client bind`."
             )
             sys.exit(0)
 

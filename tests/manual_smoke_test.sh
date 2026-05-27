@@ -53,9 +53,10 @@ test_telegram() {
     show_header "Telegram Notification Tests"
 
     echo "Prerequisites:"
-    echo "  1. Telegram bot token and chat ID configured in:"
-    echo "     ~/.config/claude/telegram.conf"
-    echo "     (or environment variables TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)"
+    echo "  1. Relay client configured:"
+    echo "     ~/.config/claude-tg-relay/config.toml"
+    echo "     Run: relay-client config init --server-url URL --token TOKEN"
+    echo "     Then: relay-client bind (send /bind <code> to the bot)"
     echo "  2. Claude Code running in a workspace with hooks enabled"
     echo ""
 

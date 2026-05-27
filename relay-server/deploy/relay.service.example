@@ -1,0 +1,32 @@
+[Unit]
+Description=Claude Code Telegram Relay Server
+After=network.target
+
+[Service]
+User=relay
+Group=relay
+WorkingDirectory=/opt/relay-server
+
+# Activate the virtualenv, then start uvicorn.
+# Adjust the virtualenv path if you installed differently.
+ExecStart=/opt/relay-server/venv/bin/uvicorn relay_server.app:app \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --no-access-log
+
+# Config is read from /etc/relay/config.toml by default.
+# You can override individual settings via env:
+#   Environment=RELAY_DB_PATH=/var/lib/relay/relay.db
+#   Environment=RELAY_LISTEN=127.0.0.1:8080
+
+Restart=on-failure
+RestartSec=5
+
+# Harden the process.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/relay
+
+[Install]
+WantedBy=multi-user.target

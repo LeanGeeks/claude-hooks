@@ -55,8 +55,10 @@ if [[ ! -d "$PROJECT_HOOKS_DIR" ]]; then
 else
     # Check for required hook files
     REQUIRED_HOOKS=("pretool_hook.py" "bash_command_parser.py" "settings_loader.py" "notification_hook.py" "permission_request_hook.py" "permission_state_store.py" "telegram_permission_router.py" "posttool_hook.py")
-    # Optional utility scripts
-    UTILITY_SCRIPTS=("get_telegram_chat_id.py")
+    # Optional utility scripts (none at present — get_telegram_chat_id.py was
+    # removed in Phase 6: the relay server owns the bot token, so direct
+    # getUpdates polling from a device is no longer needed).
+    UTILITY_SCRIPTS=()
     MISSING_HOOKS=()
 
     for hook in "${REQUIRED_HOOKS[@]}"; do
