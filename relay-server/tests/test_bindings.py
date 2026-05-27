@@ -3,6 +3,7 @@
 Coverage:
 - POST /v1/bindings/request happy path
 - POST /v1/bindings/request idempotent replay
+- POST /v1/bindings/request idempotency: in-flight 409
 - GET /v1/bindings/{code} → pending
 - GET /v1/bindings/{code} → bound
 - GET /v1/bindings/{code} → expired (410)
@@ -12,7 +13,9 @@ Coverage:
 - /bind webhook: already-consumed → reply "already used"
 - /bind webhook: valid → consumes, updates installations, sends confirmation
 - /bind webhook: rebinding overwrites previous chat_id
+- /bind webhook: concurrent duplicate — only one confirmation sent (TOCTOU fix)
 - relay-client CLI: subcommands exist; bind command calls the correct endpoints
+- relay-client CLI: 5xx transient retry during bind polling
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from click.testing import CliRunner
 from relay_server.app import create_app
 from relay_server.binding_codes import generate_code, normalise_code
 from relay_server.client_cli import cli as relay_client_cli
-from relay_server.db import connect, init_schema
+from relay_server.db import connect, connect as db_connect, init_schema
 from relay_server.telegram_backend import FakeTelegramBackend
 from relay_server.tokens import generate_token, hash_token
 
@@ -528,3 +531,260 @@ def test_normalise_code_case_insensitive() -> None:
 def test_normalise_code_rejects_garbage() -> None:
     assert normalise_code("not-a-code") is None
     assert normalise_code("BIND-000-0000") is None  # contains 0 which is excluded
+
+
+# ---------------------------------------------------------------------------
+# #1/#3 request_binding idempotency — in-flight 409
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_binding_idem_in_flight_409(
+    db_path: str, seeded: dict
+) -> None:
+    """If the idempotency sentinel is pending (response_json IS NULL) a second
+    concurrent caller must receive 409 idempotency_key_in_flight rather than
+    silently generating a second code."""
+    key = str(uuid.uuid4())
+    token = seeded["token"]
+    installation_id = seeded["installation_id"]
+
+    # The endpoint stores _canonical_body_hash({}) as the request_hash for
+    # this no-body endpoint.  Use the same value so the hash-mismatch guard
+    # doesn't fire before we reach the in-flight 409.
+    import hashlib
+    import json as _json
+    empty_hash = hashlib.sha256(
+        _json.dumps({}, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    # Manually insert a pending sentinel (response_json = NULL).
+    conn = db_connect(db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO idempotency_keys"
+            "(installation_id, key, request_hash, response_json, created_at)"
+            " VALUES (?, ?, ?, NULL, datetime('now'))",
+            (installation_id, key, empty_hash),
+        )
+    conn.close()
+
+    backend = FakeTelegramBackend()
+    app = create_app(backend=backend, config=make_test_config(db_path))
+    transport = httpx.ASGITransport(app=app)
+    async with _run_lifespan(app):
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as client:
+            r = await client.post(
+                "/v1/bindings/request",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Idempotency-Key": key,
+                },
+            )
+    assert r.status_code == 409
+    assert r.json()["detail"] == "idempotency_key_in_flight"
+
+
+# ---------------------------------------------------------------------------
+# #2 /bind consume TOCTOU — concurrent deliveries, only one confirmation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bind_webhook_concurrent_consume_sends_one_reply(
+    app_client: httpx.AsyncClient,
+    seeded: dict,
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Two concurrent /bind webhook deliveries for the same code must result in
+    exactly one 'Bound' confirmation reply sent to Telegram."""
+    unbound_token = seeded["unbound_token"]
+    r = await app_client.post(
+        "/v1/bindings/request",
+        headers={
+            "Authorization": f"Bearer {unbound_token}",
+            "Idempotency-Key": str(uuid.uuid4()),
+        },
+    )
+    assert r.status_code == 200
+    code = r.json()["code"]
+    chat_id = 55555
+
+    # Fire two webhook deliveries for the same code concurrently.
+    import asyncio as _asyncio
+
+    async def _send_bind(uid: int) -> httpx.Response:
+        return await _bind_msg(
+            app_client,
+            code=code,
+            chat_id=chat_id,
+            from_user_id=uid,
+            update_id=300 + uid,
+        )
+
+    results = await _asyncio.gather(_send_bind(10), _send_bind(11))
+
+    # Both HTTP responses must be 200 (webhook must always ack).
+    assert all(r.status_code == 200 for r in results)
+
+    # Exactly one 'Bound' confirmation reply must have been sent.
+    bound_replies = [
+        c
+        for c in backend.calls
+        if c.method == "send_text"
+        and "Bound" in c.kwargs.get("text", "")
+        and c.kwargs.get("chat_id") == chat_id
+    ]
+    assert len(bound_replies) == 1, (
+        f"Expected exactly 1 Bound reply, got {len(bound_replies)}: "
+        + str([c.kwargs for c in bound_replies])
+    )
+
+    # The binding_codes row must be consumed exactly once.
+    conn = db_connect(db_path)
+    rows = conn.execute(
+        "SELECT consumed_at FROM binding_codes WHERE code = ?", (code,)
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 1
+    assert rows[0]["consumed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# #4 CLI bind polling — 5xx transient retry
+# ---------------------------------------------------------------------------
+
+
+def test_cli_bind_poll_retries_on_5xx(tmp_path) -> None:
+    """The bind command must retry on 5xx and succeed on eventual 200."""
+    import relay_server.client_cli as cli_mod
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        'server_url = "http://fake-relay"\ninstallation_token = "rly_test"\n'
+    )
+
+    call_counts: dict[str, int] = {"post": 0, "get": 0}
+
+    class _FakeResp:
+        def __init__(self, status: int, body: dict | None = None):
+            self.status_code = status
+            self._body = body or {}
+
+        def json(self):
+            return self._body
+
+        @property
+        def text(self):
+            return str(self._body)
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, path, **kw):
+            call_counts["post"] += 1
+            return _FakeResp(200, {"code": "BIND-ABCD-EFGH", "expires_at": "2099-01-01T00:00:00+00:00"})
+
+        def get(self, path, **kw):
+            call_counts["get"] += 1
+            # First two calls return 503; third returns bound.
+            if call_counts["get"] <= 2:
+                return _FakeResp(503)
+            return _FakeResp(200, {"state": "bound", "chat_id": 99, "telegram_user_id": 7})
+
+    original_make_client = cli_mod._make_client
+    original_sleep = cli_mod.time.sleep
+
+    cli_mod._make_client = lambda cfg: _FakeClient()
+    cli_mod.time.sleep = lambda _: None  # skip all sleeps
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            relay_client_cli,
+            ["bind", "--config-path", str(cfg_path)],
+        )
+    finally:
+        cli_mod._make_client = original_make_client
+        cli_mod.time.sleep = original_sleep
+
+    assert result.exit_code == 0, result.output
+    assert "Bound" in result.output
+    # The first two 503s were retried and the third call succeeded.
+    assert call_counts["get"] == 3
+
+
+def test_cli_bind_poll_exits_after_max_5xx_retries(tmp_path) -> None:
+    """After _MAX_TRANSIENT_RETRIES consecutive 5xx, bind must exit non-zero."""
+    import relay_server.client_cli as cli_mod
+
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        'server_url = "http://fake-relay"\ninstallation_token = "rly_test"\n'
+    )
+
+    class _FakeResp:
+        def __init__(self, status: int):
+            self.status_code = status
+            self.text = "server error"
+
+        def json(self):
+            return {}
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def post(self, path, **kw):
+            return _FakeResp(200)
+
+        # Need json() for post response too.
+        def _post_resp(self):
+            class R:
+                status_code = 200
+                text = ""
+                def json(self):
+                    return {"code": "BIND-ABCD-EFGH", "expires_at": "2099-01-01T00:00:00"}
+            return R()
+
+        def __init__(self):
+            pass
+
+        def post(self, path, **kw):  # noqa: F811
+            r = object.__new__(_FakeResp)
+            r.status_code = 200
+            r.text = ""
+            r._body = {"code": "BIND-ABCD-EFGH", "expires_at": "2099-01-01T00:00:00"}
+            r.json = lambda: r._body
+            return r
+
+        def get(self, path, **kw):
+            return _FakeResp(500)
+
+    original_make_client = cli_mod._make_client
+    original_sleep = cli_mod.time.sleep
+
+    cli_mod._make_client = lambda cfg: _FakeClient()
+    cli_mod.time.sleep = lambda _: None
+
+    try:
+        runner = CliRunner()
+        result = runner.invoke(
+            relay_client_cli,
+            ["bind", "--config-path", str(cfg_path)],
+        )
+    finally:
+        cli_mod._make_client = original_make_client
+        cli_mod.time.sleep = original_sleep
+
+    assert result.exit_code != 0

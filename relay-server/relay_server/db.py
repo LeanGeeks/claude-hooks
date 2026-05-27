@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -168,6 +169,28 @@ def get_schema_version(conn: sqlite3.Connection) -> int:
     return int(row["version"]) if row else 0
 
 
+# Serialises access to the shared sqlite connection. ``sqlite3.Connection``
+# objects opened with ``check_same_thread=False`` can be used from multiple
+# threads, but only one operation may be in flight on the connection at a time
+# — concurrent calls can otherwise raise ``sqlite3.InterfaceError: bad
+# parameter or other API misuse`` or, worse, interleave a multi-statement
+# transaction with reads/writes from another thread. Because every DB call in
+# this module funnels through ``run_in_thread``, taking this lock here gives
+# us a single chokepoint where the connection is guaranteed to be used by at
+# most one thread, and lets handlers compose ``BEGIN IMMEDIATE`` / SELECT /
+# UPDATE / COMMIT sequences without worrying about cross-thread interference.
+_conn_lock = threading.Lock()
+
+
+def _run_locked(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    with _conn_lock:
+        return fn(*args, **kwargs)
+
+
 async def run_in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
-    """Run a blocking sqlite callable in the default threadpool."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    """Run a blocking sqlite callable in the default threadpool.
+
+    Serialises callers via ``_conn_lock`` so that the shared ``sqlite3``
+    connection is only ever touched by one worker thread at a time.
+    """
+    return await asyncio.to_thread(_run_locked, fn, *args, **kwargs)

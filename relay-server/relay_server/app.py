@@ -298,52 +298,118 @@ def create_app(
         conn: sqlite3.Connection = request.app.state.db
         installation_id = installation["id"]
 
-        # Idempotency: if the caller supplies the same key, replay the previous
-        # code rather than generating a new one.
-        if idempotency_key:
-            existing = await _idem_lookup(conn, installation_id, idempotency_key)
-            if existing is not None and existing["response_json"] is not None:
-                return JSONResponse(json.loads(existing["response_json"]))
-            # Claim the pending sentinel now so concurrent callers see the key.
-            if existing is None:
-                await _idem_claim_pending(
-                    conn, installation_id, idempotency_key, ""
-                )
+        # POST /v1/bindings/request has no body; use a stable hash of an empty
+        # dict so retries with the same key always match.
+        request_hash = _canonical_body_hash({}) if idempotency_key else ""
 
-        now = _utcnow()
-        expires_at = now + timedelta(minutes=_BINDING_TTL_MINUTES)
+        idem_locks: dict[tuple[int, str], asyncio.Lock] = (
+            request.app.state.idem_locks
+        )
+        lock_key = (installation_id, idempotency_key) if idempotency_key else None
+        lock = idem_locks[lock_key] if lock_key is not None else None
 
-        def _insert_code() -> str:
-            """Generate a unique code, retrying on collision (extremely rare)."""
-            for _ in range(10):
-                code = generate_code()
-                try:
-                    with conn:
-                        conn.execute(
-                            "INSERT INTO binding_codes"
-                            "(code, installation_id, created_at, expires_at)"
-                            " VALUES (?, ?, ?, ?)",
-                            (
-                                code,
-                                installation_id,
-                                now.isoformat(),
-                                expires_at.isoformat(),
-                            ),
+        async def _do_request() -> Response:
+            if idempotency_key:
+                existing = await _idem_lookup(conn, installation_id, idempotency_key)
+                if existing is not None:
+                    # Body hash is always "" for this endpoint; a mismatch would
+                    # only happen if the stored hash was somehow different (guard
+                    # for future-proofing, mirrors create_message pattern).
+                    if (
+                        existing["request_hash"] is not None
+                        and existing["request_hash"] != request_hash
+                    ):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="idempotency_key_reused_with_different_body",
                         )
-                    return code
-                except sqlite3.IntegrityError:
-                    continue  # collision, try again
-            raise RuntimeError("binding code generation failed after 10 retries")
+                    if existing["response_json"] is not None:
+                        # Completed previously — replay the stored response.
+                        return JSONResponse(json.loads(existing["response_json"]))
+                    # In-flight sentinel (response_json IS NULL): another worker
+                    # is generating the code right now.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency_key_in_flight",
+                    )
 
-        code = await run_in_thread(_insert_code)
-        response_body = BindingRequestResponse(
-            code=code, expires_at=expires_at.isoformat()
-        ).model_dump()
+                claimed = await _idem_claim_pending(
+                    conn, installation_id, idempotency_key, request_hash
+                )
+                if not claimed:
+                    # A concurrent caller raced us to INSERT the sentinel.
+                    existing = await _idem_lookup(
+                        conn, installation_id, idempotency_key
+                    )
+                    if existing is not None and existing["response_json"] is not None:
+                        return JSONResponse(json.loads(existing["response_json"]))
+                    raise HTTPException(
+                        status_code=409, detail="idempotency_key_in_flight"
+                    )
 
-        if idempotency_key:
-            await _idem_finalize(conn, installation_id, idempotency_key, response_body)
+            now = _utcnow()
+            expires_at = now + timedelta(minutes=_BINDING_TTL_MINUTES)
+            inserted_code: str | None = None
 
-        return JSONResponse(response_body)
+            def _insert_code() -> str:
+                """Generate a unique code, retrying on collision (extremely rare)."""
+                for _ in range(10):
+                    code = generate_code()
+                    try:
+                        with conn:
+                            conn.execute(
+                                "INSERT INTO binding_codes"
+                                "(code, installation_id, created_at, expires_at)"
+                                " VALUES (?, ?, ?, ?)",
+                                (
+                                    code,
+                                    installation_id,
+                                    now.isoformat(),
+                                    expires_at.isoformat(),
+                                ),
+                            )
+                        return code
+                    except sqlite3.IntegrityError:
+                        continue  # collision, try again
+                raise RuntimeError("binding code generation failed after 10 retries")
+
+            try:
+                code = await run_in_thread(_insert_code)
+                inserted_code = code
+            except Exception:
+                if idempotency_key:
+                    await _idem_abandon(conn, installation_id, idempotency_key)
+                raise
+
+            response_body = BindingRequestResponse(
+                code=code, expires_at=expires_at.isoformat()
+            ).model_dump()
+
+            if idempotency_key:
+                try:
+                    await _idem_finalize(
+                        conn, installation_id, idempotency_key, response_body
+                    )
+                except Exception:
+                    # Roll back the binding_codes row and sentinel so the
+                    # caller can retry from scratch.
+                    if inserted_code is not None:
+                        def _rollback_code() -> None:
+                            with conn:
+                                conn.execute(
+                                    "DELETE FROM binding_codes WHERE code = ?",
+                                    (inserted_code,),
+                                )
+                        await run_in_thread(_rollback_code)
+                    await _idem_abandon(conn, installation_id, idempotency_key)
+                    raise
+
+            return JSONResponse(response_body)
+
+        if lock is not None:
+            async with lock:
+                return await _do_request()
+        return await _do_request()
 
     @app.get("/v1/bindings/{code}")
     async def get_binding(
@@ -1032,22 +1098,41 @@ async def _handle_bind_command(app: FastAPI, msg: dict[str, Any]) -> None:
     label = row["installation_label"]
     now_iso = now.isoformat()
 
-    def _consume() -> None:
+    def _consume() -> bool:
+        """Atomically consume the code and update the installation.
+
+        Returns True if this caller won the consume race, False if a concurrent
+        webhook delivery already consumed the code (rowcount == 0).
+
+        Cross-thread atomicity of the SELECT/UPDATE/UPDATE sequence is
+        guaranteed by ``run_in_thread`` serialising access to the shared
+        sqlite connection. The ``consumed_at IS NULL`` guard on the first
+        UPDATE handles the consume race: the second caller observes
+        ``rowcount == 0`` and bails out without sending a reply.
+        """
         with conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE binding_codes"
                 " SET consumed_at = ?, bound_chat_id = ?, bound_user_id = ?"
-                " WHERE code = ?",
+                " WHERE code = ? AND consumed_at IS NULL",
                 (now_iso, int(chat_id), telegram_user_id, code),
             )
+            if cur.rowcount == 0:
+                # Already consumed by a concurrent delivery — abort silently;
+                # the winning delivery already sent a confirmation reply.
+                return False
             conn.execute(
                 "UPDATE installations"
                 " SET telegram_chat_id = ?, bound_user_id = ?"
                 " WHERE id = ?",
                 (int(chat_id), telegram_user_id, installation_id),
             )
+            return True
 
-    await run_in_thread(_consume)
+    consumed = await run_in_thread(_consume)
+    if not consumed:
+        # Another concurrent /bind webhook for the same code already handled it.
+        return
 
     if prev_chat_id is not None and int(prev_chat_id) != int(chat_id):
         reply = (

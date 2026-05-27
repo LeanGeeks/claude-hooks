@@ -169,20 +169,63 @@ def bind(config_path: str | None) -> None:
         )
 
         # Poll until consumed or expired.
+        # 5xx / connection errors are transient — retry up to 3 times with
+        # exponential backoff before giving up.  4xx are terminal.
+        _MAX_TRANSIENT_RETRIES = 3
         delay = _POLL_INITIAL
         while True:
             time.sleep(delay)
             delay = min(delay + 1, _POLL_CAP)
 
-            poll = client.get(f"/v1/bindings/{code}")
-            if poll.status_code == 410:
+            transient_attempts = 0
+            transient_delay = 2
+            while True:
+                try:
+                    poll = client.get(f"/v1/bindings/{code}")
+                    status = poll.status_code
+                except (httpx.ConnectError, httpx.TimeoutException, OSError) as exc:
+                    # Treat connection-level errors as transient.
+                    transient_attempts += 1
+                    if transient_attempts > _MAX_TRANSIENT_RETRIES:
+                        click.echo(
+                            f"Connection error after {_MAX_TRANSIENT_RETRIES} retries:"
+                            f" {exc}",
+                            err=True,
+                        )
+                        sys.exit(1)
+                    time.sleep(transient_delay)
+                    transient_delay = min(transient_delay * 2, 16)
+                    continue
+
+                if 500 <= status < 600:
+                    transient_attempts += 1
+                    if transient_attempts > _MAX_TRANSIENT_RETRIES:
+                        click.echo(
+                            f"Server error {status} after"
+                            f" {_MAX_TRANSIENT_RETRIES} retries: {poll.text}",
+                            err=True,
+                        )
+                        sys.exit(1)
+                    time.sleep(transient_delay)
+                    transient_delay = min(transient_delay * 2, 16)
+                    continue
+
+                # Non-5xx response — handle below.
+                break
+
+            if status == 410:
                 click.echo(
                     "✗ Code expired before /bind was received.", err=True
                 )
                 sys.exit(1)
-            if poll.status_code != 200:
+            if status == 404:
                 click.echo(
-                    f"Unexpected response: {poll.status_code} {poll.text}", err=True
+                    "✗ Binding code not found (expired or invalid).", err=True
+                )
+                sys.exit(1)
+            if status != 200:
+                click.echo(
+                    f"Unexpected response: {status} {poll.text}", err=True
                 )
                 sys.exit(1)
 
