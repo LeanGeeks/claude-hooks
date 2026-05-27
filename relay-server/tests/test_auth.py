@@ -56,3 +56,11 @@ async def test_malformed_header(app_client: httpx.AsyncClient) -> None:
         headers={"Authorization": "rly_no_bearer_prefix"},
     )
     assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint_unauthenticated(app_client: httpx.AsyncClient) -> None:
+    """GET /health must return 200 {"status": "ok"} without auth."""
+    r = await app_client.get("/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}

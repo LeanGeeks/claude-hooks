@@ -144,6 +144,12 @@ def create_app(
 
     app = FastAPI(title="Telegram Relay (Phase 1)", lifespan=lifespan)
 
+    # ---- Health check (unauthenticated) ------------------------------------
+
+    @app.get("/health", include_in_schema=False)
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
     # ---- Auth dependency ---------------------------------------------------
 
     async def require_installation(

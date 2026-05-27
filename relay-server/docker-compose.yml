@@ -1,0 +1,45 @@
+# Docker Compose stack for the relay-server.
+#
+# Prerequisites:
+#   1. Copy .env.example to .env and fill in your values.
+#   2. Create the shared Caddy network once per Docker host:
+#        docker network create caddy
+#      (caddy-docker-proxy must be running in that network for TLS/routing.)
+#   3. docker compose up -d --build
+
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Pin the DB path to the mounted volume regardless of .env value.
+      RELAY_DB_PATH: /var/lib/relay/relay.db
+    volumes:
+      - relay-data:/var/lib/relay
+    networks:
+      - caddy
+    # No ports: mapping — caddy-docker-proxy reaches the container on the
+    # internal Docker network via the labels below.
+    labels:
+      # caddy-docker-proxy: serve this container at the given hostname.
+      caddy: "${RELAY_PUBLIC_HOST}"
+      caddy.reverse_proxy: "{{upstreams 8080}}"
+      caddy.encode: "gzip"
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import httpx; httpx.get('http://127.0.0.1:8080/health', timeout=2).raise_for_status()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  relay-data:
+
+networks:
+  caddy:
+    external: true

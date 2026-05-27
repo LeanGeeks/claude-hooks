@@ -79,6 +79,83 @@ Full unit template: `deploy/relay.service.example`.
 
 ---
 
+## Deployment with Docker Compose + caddy-docker-proxy
+
+This is an alternative to the bare-metal systemd + Caddy setup above. It is
+the recommended path when you already run
+[caddy-docker-proxy](https://github.com/lucaslorentz/caddy-docker-proxy) on
+the host (it auto-generates Caddy configuration from Docker labels, handling
+TLS automatically via Let's Encrypt).
+
+### One-time host setup
+
+```bash
+# Create the shared Docker network that caddy-docker-proxy listens on.
+# Skip this if the network already exists.
+docker network create caddy
+```
+
+Ensure caddy-docker-proxy is running in the `caddy` network. A minimal
+compose snippet for that service:
+
+```yaml
+services:
+  caddy:
+    image: lucaslorentz/caddy-docker-proxy:ci-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - caddy-data:/data
+    networks:
+      - caddy
+volumes:
+  caddy-data:
+networks:
+  caddy:
+    external: true
+```
+
+### Deploy the relay
+
+```bash
+cd relay-server/
+
+# 1. Create your .env from the template.
+cp .env.example .env
+$EDITOR .env   # fill in RELAY_BOT_TOKEN, RELAY_WEBHOOK_SECRET,
+               # RELAY_PUBLIC_URL, RELAY_PUBLIC_HOST
+
+# 2. Start (builds the image if needed).
+docker compose up -d --build
+```
+
+`RELAY_PUBLIC_HOST` (e.g. `relay.example.com`) must resolve to the Docker
+host's public IP. caddy-docker-proxy reads the `caddy=` label on the relay
+container and automatically provisions a TLS certificate via ACME / Let's
+Encrypt.
+
+There is **no `ports:` mapping** in the compose file — Caddy reaches the
+container on port 8080 through the shared `caddy` Docker network.
+
+### Logs and status
+
+```bash
+docker compose logs -f relay
+docker compose ps
+```
+
+### Upgrades
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+---
+
 ## Admin Workflow
 
 The `relay-admin` CLI runs on the server box and talks to SQLite directly
@@ -103,6 +180,30 @@ If the `relay-admin` entry point is on `PATH`:
 
 ```bash
 relay-admin --db /var/lib/relay/relay.db issue --label workstation
+```
+
+### Admin CLI inside a Docker Compose container
+
+When running via Docker Compose, exec into the container and point the CLI at
+the volume mount:
+
+```bash
+# Issue a token for a new device.
+docker compose exec relay python -m relay_server.admin_cli \
+    --db /var/lib/relay/relay.db issue --label anton-laptop
+# Prints: Installation id: 1   Token: rly_8f3a2b...  (store safely)
+
+# List all installations.
+docker compose exec relay python -m relay_server.admin_cli \
+    --db /var/lib/relay/relay.db list
+
+# Revoke a token.
+docker compose exec relay python -m relay_server.admin_cli \
+    --db /var/lib/relay/relay.db revoke --id 2
+
+# Rotate a token.
+docker compose exec relay python -m relay_server.admin_cli \
+    --db /var/lib/relay/relay.db rotate --id 1
 ```
 
 ### Database backups

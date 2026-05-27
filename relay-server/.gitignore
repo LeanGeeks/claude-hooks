@@ -6,3 +6,5 @@ testserver
 .pytest_cache/
 __pycache__/
 *.egg-info/
+# Docker Compose secrets — copy from .env.example
+.env
