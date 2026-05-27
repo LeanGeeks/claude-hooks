@@ -9,6 +9,8 @@ from pydantic import BaseModel, Field
 MessageKind = Literal["question", "permission", "notification"]
 MessageState = Literal["open", "answered", "expired", "cancelled"]
 
+BindingState = Literal["pending", "bound", "expired"]
+
 
 class KeyboardButton(BaseModel):
     label: str
@@ -43,3 +45,14 @@ class InstallationMeResponse(BaseModel):
     label: str
     chat_bound: bool
     last_seen_at: str | None
+
+
+class BindingRequestResponse(BaseModel):
+    code: str
+    expires_at: str
+
+
+class BindingStatusResponse(BaseModel):
+    state: BindingState
+    chat_id: int | None = None
+    telegram_user_id: int | None = None

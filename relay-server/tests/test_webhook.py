@@ -232,18 +232,19 @@ async def test_fallback_ignores_other_users(
     assert ans.status_code == 204
 
 
-# ---- /bind command is a no-op in Phase 2 -----------------------------------
+# ---- /bind command is handled by Phase 3 (does NOT record an answer) -------
 
 
 @pytest.mark.asyncio
-async def test_bind_command_is_noop(
+async def test_bind_command_does_not_record_answer(
     app_client: httpx.AsyncClient,
     seeded: dict[str, object],
     backend: FakeTelegramBackend,
 ) -> None:
+    """A /bind update is routed to the bind handler; it must not record an answer
+    for any open relay message, regardless of whether the code is valid."""
     token = seeded["token"]
     msg_id = await _create_message(app_client, token)
-    before_calls = len(backend.calls)
     r = await _send_update(
         app_client,
         {
@@ -257,14 +258,12 @@ async def test_bind_command_is_noop(
         },
     )
     assert r.status_code == 200
-    # Message still open, no answer recorded.
+    # The relay message must still be open (no answer recorded).
     ans = await app_client.get(
         f"/v1/messages/{msg_id}/answer",
         headers={"Authorization": f"Bearer {token}"},
     )
     assert ans.status_code == 204
-    # No backend calls past the original send_message.
-    assert len(backend.calls) == before_calls
 
 
 # ---- update_id dedup -------------------------------------------------------

@@ -70,7 +70,10 @@ class TelegramBackend(Protocol):
         reply_required: bool,
         message_id: int,
     ) -> int:
-        """Send a message; return the Telegram-side message id."""
+        """Send a relay-tracked message; return the Telegram-side message id."""
+
+    async def send_text(self, *, chat_id: int, text: str) -> None:
+        """Send a plain text message that requires no relay tracking (e.g. /bind replies)."""
 
     async def edit_message(
         self,
@@ -149,6 +152,11 @@ class FakeTelegramBackend:
             )
         )
         return tg_id
+
+    async def send_text(self, *, chat_id: int, text: str) -> None:
+        self.calls.append(
+            FakeCall("send_text", {"chat_id": chat_id, "text": text})
+        )
 
     async def edit_message(
         self,
@@ -340,6 +348,13 @@ class HttpTelegramBackend:
             payload["reply_markup"] = {"force_reply": True, "selective": False}
         result = await self._call("sendMessage", payload)
         return int(result["message_id"])
+
+    async def send_text(self, *, chat_id: int, text: str) -> None:
+        """Send a plain text reply (no relay tracking)."""
+        await self._call(
+            "sendMessage",
+            {"chat_id": chat_id, "text": text, "parse_mode": PARSE_MODE},
+        )
 
     async def edit_message(
         self,

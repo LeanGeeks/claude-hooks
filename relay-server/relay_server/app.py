@@ -18,11 +18,14 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from .binding_codes import generate_code, normalise_code
 from .callback_data import decode as decode_callback_data
 from .config import RelayConfig, load_config
 from .db import connect, init_schema, run_in_thread
 from .models import (
     AnswerResponse,
+    BindingRequestResponse,
+    BindingStatusResponse,
     CreateMessageRequest,
     CreateMessageResponse,
     InstallationMeResponse,
@@ -36,6 +39,9 @@ from .telegram_backend import (
 )
 from .tokens import hash_token
 from .waiters import WaiterRegistry
+
+# Binding code TTL in minutes.
+_BINDING_TTL_MINUTES = 10
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +285,119 @@ def create_app(
             label=installation["label"],
             chat_bound=installation["telegram_chat_id"] is not None,
             last_seen_at=installation["last_seen_at"],
+        )
+
+    # ---- Binding routes -------------------------------------------------------
+
+    @app.post("/v1/bindings/request")
+    async def request_binding(
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        installation=Depends(require_installation),
+    ) -> Response:
+        conn: sqlite3.Connection = request.app.state.db
+        installation_id = installation["id"]
+
+        # Idempotency: if the caller supplies the same key, replay the previous
+        # code rather than generating a new one.
+        if idempotency_key:
+            existing = await _idem_lookup(conn, installation_id, idempotency_key)
+            if existing is not None and existing["response_json"] is not None:
+                return JSONResponse(json.loads(existing["response_json"]))
+            # Claim the pending sentinel now so concurrent callers see the key.
+            if existing is None:
+                await _idem_claim_pending(
+                    conn, installation_id, idempotency_key, ""
+                )
+
+        now = _utcnow()
+        expires_at = now + timedelta(minutes=_BINDING_TTL_MINUTES)
+
+        def _insert_code() -> str:
+            """Generate a unique code, retrying on collision (extremely rare)."""
+            for _ in range(10):
+                code = generate_code()
+                try:
+                    with conn:
+                        conn.execute(
+                            "INSERT INTO binding_codes"
+                            "(code, installation_id, created_at, expires_at)"
+                            " VALUES (?, ?, ?, ?)",
+                            (
+                                code,
+                                installation_id,
+                                now.isoformat(),
+                                expires_at.isoformat(),
+                            ),
+                        )
+                    return code
+                except sqlite3.IntegrityError:
+                    continue  # collision, try again
+            raise RuntimeError("binding code generation failed after 10 retries")
+
+        code = await run_in_thread(_insert_code)
+        response_body = BindingRequestResponse(
+            code=code, expires_at=expires_at.isoformat()
+        ).model_dump()
+
+        if idempotency_key:
+            await _idem_finalize(conn, installation_id, idempotency_key, response_body)
+
+        return JSONResponse(response_body)
+
+    @app.get("/v1/bindings/{code}")
+    async def get_binding(
+        code: str,
+        request: Request,
+        installation=Depends(require_installation),
+    ) -> Response:
+        conn: sqlite3.Connection = request.app.state.db
+        installation_id = installation["id"]
+
+        normalised = normalise_code(code)
+        if normalised is None:
+            raise HTTPException(status_code=404, detail="code_not_found")
+        code = normalised
+
+        def _lookup() -> sqlite3.Row | None:
+            return conn.execute(
+                "SELECT * FROM binding_codes WHERE code = ?", (code,)
+            ).fetchone()
+
+        row = await run_in_thread(_lookup)
+        if row is None:
+            raise HTTPException(status_code=404, detail="code_not_found")
+
+        # Security: don't reveal codes that belong to other installations.
+        if int(row["installation_id"]) != installation_id:
+            raise HTTPException(status_code=404, detail="code_not_found")
+
+        now = _utcnow()
+        if row["consumed_at"] is not None:
+            return JSONResponse(
+                BindingStatusResponse(
+                    state="bound",
+                    chat_id=row["bound_chat_id"],
+                    telegram_user_id=row["bound_user_id"],
+                ).model_dump(exclude_none=True)
+            )
+
+        # Parse expires_at (stored as ISO string).
+        try:
+            expires_at = datetime.fromisoformat(row["expires_at"])
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            expires_at = now  # treat unparseable as expired
+
+        if now > expires_at:
+            return JSONResponse(
+                BindingStatusResponse(state="expired").model_dump(exclude_none=True),
+                status_code=410,
+            )
+
+        return JSONResponse(
+            BindingStatusResponse(state="pending").model_dump(exclude_none=True)
         )
 
     @app.post("/v1/messages")
@@ -788,10 +907,8 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
         return
 
     text = (msg.get("text") or "").strip()
-    if text.startswith("/bind"):
-        # TODO(phase-3): record the binding here. Ignore for now so we don't
-        # eat the update with a placeholder.
-        logger.info("ignoring /bind command (phase 3 territory)")
+    if text.lower().startswith("/bind"):
+        await _handle_bind_command(app, msg)
         return
 
     chat = msg.get("chat") or {}
@@ -840,6 +957,107 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
         row["id"],
         {"text": msg.get("text", ""), "via": "fallback"},
     )
+
+
+async def _handle_bind_command(app: FastAPI, msg: dict[str, Any]) -> None:
+    """Handle a ``/bind <code>`` message sent by a Telegram user.
+
+    Parses the code, looks it up, and either records the binding or sends an
+    appropriate error reply in the originating chat.
+    """
+    conn: sqlite3.Connection = app.state.db
+    backend: TelegramBackend = app.state.backend
+
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
+    sender = msg.get("from") or {}
+    telegram_user_id = sender.get("id")
+
+    text = (msg.get("text") or "").strip()
+    # Strip the "/bind" prefix (case-insensitive) to extract the code token.
+    # Accept "/bind BIND-XXXX-XXXX" or "/bind@botname BIND-XXXX-XXXX".
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        await backend.send_text(chat_id=int(chat_id), text="Usage: /bind <code>")
+        return
+
+    raw_code = parts[1].strip()
+    code = normalise_code(raw_code)
+    if code is None:
+        await backend.send_text(chat_id=int(chat_id), text="Unknown bind code.")
+        return
+
+    def _lookup_code() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT bc.*, i.label AS installation_label,"
+            " i.telegram_chat_id AS prev_chat_id"
+            " FROM binding_codes bc"
+            " JOIN installations i ON i.id = bc.installation_id"
+            " WHERE bc.code = ?",
+            (code,),
+        ).fetchone()
+
+    row = await run_in_thread(_lookup_code)
+    if row is None:
+        await backend.send_text(chat_id=int(chat_id), text="Unknown bind code.")
+        return
+
+    if row["consumed_at"] is not None:
+        await backend.send_text(
+            chat_id=int(chat_id), text="This bind code was already used."
+        )
+        return
+
+    # Check expiry.
+    now = _utcnow()
+    try:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        expires_at = now
+
+    if now > expires_at:
+        await backend.send_text(
+            chat_id=int(chat_id), text="This bind code has expired."
+        )
+        return
+
+    # Valid pending code — consume it and update the installation.
+    installation_id = int(row["installation_id"])
+    prev_chat_id = row["prev_chat_id"]
+    label = row["installation_label"]
+    now_iso = now.isoformat()
+
+    def _consume() -> None:
+        with conn:
+            conn.execute(
+                "UPDATE binding_codes"
+                " SET consumed_at = ?, bound_chat_id = ?, bound_user_id = ?"
+                " WHERE code = ?",
+                (now_iso, int(chat_id), telegram_user_id, code),
+            )
+            conn.execute(
+                "UPDATE installations"
+                " SET telegram_chat_id = ?, bound_user_id = ?"
+                " WHERE id = ?",
+                (int(chat_id), telegram_user_id, installation_id),
+            )
+
+    await run_in_thread(_consume)
+
+    if prev_chat_id is not None and int(prev_chat_id) != int(chat_id):
+        reply = (
+            f"Bound. Notifications for installation {label} will go to this chat."
+            " (previous binding overwritten)"
+        )
+    else:
+        reply = f"Bound. Notifications for installation {label} will go to this chat."
+
+    await backend.send_text(chat_id=int(chat_id), text=reply)
 
 
 async def _handle_callback_query(

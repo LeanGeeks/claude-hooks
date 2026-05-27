@@ -23,6 +23,7 @@ dev = [
 
 [project.scripts]
 relay-admin = "relay_server.admin_cli:cli"
+relay-client = "relay_server.client_cli:cli"
 
 [tool.setuptools.packages.find]
 include = ["relay_server*"]
