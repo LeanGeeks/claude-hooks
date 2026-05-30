@@ -494,6 +494,20 @@ class BashCommandParser:
         fragments like `(cd app`, `{ git log`, `npm test)`, or `}`. Subshell
         `()` and brace-group `{}` tokens do not change the command being
         validated, so strip them before matching permission patterns.
+
+        Subshell '(' / ')' and brace-group '{' / '}' are handled differently
+        because bash treats them differently:
+
+        - '(' and ')' are metacharacters that self-delimit, so they glue to
+          adjacent words ("(cd app", "head -40)"). We strip them even when glued.
+        - '{' and '}' are reserved words recognized as a group ONLY when they
+          are standalone tokens ("{ cmd; }"). A '{' or '}' glued to a word is
+          brace/parameter expansion ("{a,b}", "${HOME}", "${arr[@]}") and must
+          be left intact. So we strip braces only when they are whole tokens.
+
+        Parens remain imperfect for glued non-grouping uses (arithmetic
+        "$((1+2))", extglob "@(a|b)", case patterns "foo)"); fully resolving
+        those needs paren-depth tracking in the tokenizer, not string stripping.
         """
         if not command:
             return command
@@ -502,15 +516,27 @@ class BashCommandParser:
         if not words:
             return command
 
-        while words and words[0][0] in '({':
-            words[0] = words[0][1:]
-            if not words[0]:
+        while words:
+            first = words[0]
+            if first[0] == '(':
+                words[0] = first[1:]
+                if not words[0]:
+                    words.pop(0)
+            elif first == '{':
                 words.pop(0)
+            else:
+                break
 
-        while words and words[-1][-1] in ')}':
-            words[-1] = words[-1][:-1]
-            if not words[-1]:
+        while words:
+            last = words[-1]
+            if last[-1] == ')':
+                words[-1] = last[:-1]
+                if not words[-1]:
+                    words.pop()
+            elif last == '}':
                 words.pop()
+            else:
+                break
 
         return ' '.join(words).strip()
 
@@ -581,6 +607,16 @@ if __name__ == '__main__':
         # A command after a heredoc must not merge into the heredoc command
         ('cat <<EOF\nline\nEOF\necho done', ["cat", "echo done"]),
         ('cat <<EOF\nbody\nEOF\nls -la | grep foo', ["cat", "ls -la", "grep foo"]),
+        # Brace GROUPS (standalone { } tokens) are stripped
+        ('{ git log; git status; }', ["git log", "git status"]),
+        ('{ echo hi; }', ["echo hi"]),
+        # Brace/parameter EXPANSION (glued braces) is NOT stripped
+        ('echo {a,b}', ["echo {a,b}"]),
+        ('echo ${HOME}', ["echo ${HOME}"]),
+        ('echo "${arr[@]}"', ['echo "${arr[@]}"']),
+        ('ls foo{1,2}.txt', ["ls foo{1,2}.txt"]),
+        # Subshell parens still strip even when glued
+        ('(cd app && npm test)', ["cd app", "npm test"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")
