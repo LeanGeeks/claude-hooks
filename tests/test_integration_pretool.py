@@ -86,6 +86,32 @@ class TestPreToolUseHook(unittest.TestCase):
         # Any unknown triggers 'ask'
         self.assertEqual(result["decision"], "ask")
 
+    def test_absolute_path_command_normalizes_to_basename(self):
+        """Path-qualified commands match the same Bash(<name>:*) allow rules."""
+        # The original real-world failure: stat/echo allowed but /bin/ls was not.
+        command = (
+            'stat /home/user/project/tests 2>&1; echo "---"; '
+            '/bin/ls -1f /home/user/project/tests 2>&1 | head -50'
+        )
+
+        result = self.validator.validate_bash_command(command)
+
+        self.assertEqual(result["decision"], "allow")
+
+    def test_absolute_path_respects_deny_list(self):
+        """A denied command stays denied even when invoked by absolute path."""
+        # 'dd' is in the deny list; /bin/dd must normalize and still match it.
+        result = self.validator.validate_bash_command("/bin/dd if=/dev/zero of=/dev/sda")
+
+        self.assertEqual(result["decision"], "ask")
+        self.assertIn("denied", result["reason"].lower())
+
+    def test_unknown_absolute_path_command_returns_ask(self):
+        """A path to an unrecognized binary outside the workspace still asks."""
+        result = self.validator.validate_bash_command("/usr/bin/some_unknown_tool --flag")
+
+        self.assertEqual(result["decision"], "ask")
+
     def test_complex_pipeline(self):
         """Test complex pipeline with multiple commands."""
         payload = PRETOOL_USE_PAYLOADS["complex_pipeline"]

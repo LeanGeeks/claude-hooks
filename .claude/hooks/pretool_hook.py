@@ -403,6 +403,37 @@ class BashPermissionValidator:
         debug_log(f"rm command {cmd!r} - all targets inside workspace or /tmp")
         return True
 
+    def _basename_variant(self, cmd: str) -> str:
+        """
+        Reduce an explicit-path command invocation to its bare basename.
+
+        If the first token contains a path separator (e.g. '/bin/ls',
+        '/usr/bin/grep', './tool'), return the command with that token replaced
+        by its basename ('ls', 'grep', 'tool') so it can match the same
+        Bash(<name>:*) patterns as a bare-name invocation. The argument tail is
+        preserved verbatim.
+
+        Returns the original command unchanged when the first token has no path
+        component (nothing to normalize).
+
+        Examples:
+            '/bin/ls -1f /tmp'      -> 'ls -1f /tmp'
+            '/usr/bin/grep -n foo'  -> 'grep -n foo'
+            '/bin/pwd'              -> 'pwd'
+            'ls -la'                -> 'ls -la' (unchanged)
+        """
+        parts = cmd.split(None, 1)  # first token + untouched remainder
+        if not parts:
+            return cmd
+        first = parts[0]
+        if '/' not in first:
+            return cmd  # already a bare command name
+        base = os.path.basename(first)
+        if not base or base == first:
+            return cmd
+        rest = parts[1] if len(parts) > 1 else ''
+        return f"{base} {rest}" if rest else base
+
     def _check_single_command(self, cmd: str) -> Dict[str, Any]:
         """
         Check if single command matches any pattern
@@ -442,14 +473,24 @@ class BashPermissionValidator:
                 'matched_deny_patterns': []
             }
 
+        # Build the candidate command strings to match against patterns.
+        # Path-qualified invocations (e.g. /bin/ls, /usr/bin/grep) are reduced to
+        # a bare-name variant (ls, grep) so they match the same Bash(<name>:*)
+        # patterns as the bare command. Generated commands vary in this way.
+        candidates = [cmd]
+        normalized = self._basename_variant(cmd)
+        if normalized != cmd:
+            candidates.append(normalized)
+            debug_log(f"Basename-normalized variant: {normalized!r}")
+
         # Check deny patterns first (deny takes precedence)
         for pattern in self.denied_patterns:
-            if self._matches_pattern(cmd, pattern):
+            if any(self._matches_pattern(c, pattern) for c in candidates):
                 matched_deny.append(pattern)
 
         # Check allow patterns
         for pattern in self.allowed_patterns:
-            if self._matches_pattern(cmd, pattern):
+            if any(self._matches_pattern(c, pattern) for c in candidates):
                 matched_allow.append(pattern)
 
         return {

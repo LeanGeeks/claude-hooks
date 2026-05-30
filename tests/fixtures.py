@@ -35,7 +35,7 @@ PRETOOL_USE_PAYLOADS: Dict[str, Dict[str, Any]] = {
     },
     "denied_command": {
         "tool_name": "Bash",
-        "tool_input": {"command": "git push origin main"},
+        "tool_input": {"command": "dd if=/dev/zero of=/dev/sda"},
         "session_id": "test-session-004",
         "cwd": "/home/user/project"
     },
