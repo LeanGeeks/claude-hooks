@@ -368,34 +368,48 @@ def send_question_message(
     if header:
         lines += [f"<b><i>{esc(header)}</i></b>", ""]
     lines.append(esc(question_text))
+
+    keyboard: list[list[dict[str, str]]] | None
     if options:
-        lines += ["", "<i>Tap an option, or reply with text:</i>"]
+        # Telegram inline buttons are narrow and truncate (never wrap) their
+        # text, so we render the *full* option label + description in the
+        # message body as a numbered list, where text wraps freely. Each button
+        # then only needs to carry its number (and as much of the label as
+        # fits) — the body is the source of truth for what each number means.
+        lines += ["", "<i>Tap a number below, or reply with text:</i>", ""]
         if multi_select:
             lines.append(
                 "<i>(multi-select not supported via Telegram — first answer wins)</i>"
             )
-    else:
-        lines += ["", "<i>Reply to this message with your answer.</i>"]
-    if total > 1 and index == total - 1:
-        lines += ["", "━" * 23]
+            lines.append("")
 
-    keyboard: list[list[dict[str, str]]] | None
-    if options:
         rows: list[list[dict[str, str]]] = []
-        row: list[dict[str, str]] = []
         for i, opt in enumerate(options):
-            label = (
-                opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
-            )
-            row.append({"label": label, "value": f"qa{i}"})
-            if len(row) == 2:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
+            if isinstance(opt, dict):
+                label = opt.get("label", str(opt))
+                description = opt.get("description", "")
+            else:
+                label = str(opt)
+                description = ""
+            num = i + 1
+            # Blank line between options for readability. Telegram HTML has no
+            # font-size control, so the contrast is bold label vs italic
+            # description (the user can't make text literally smaller).
+            if i > 0:
+                lines.append("")
+            lines.append(f"<b>{num}. {esc(label)}</b>")
+            if description:
+                lines.append(f"    <i>{esc(description)}</i>")
+            # One button per row for maximum width; the button shows the number
+            # plus the leading part of the label (Telegram trims the overflow).
+            rows.append([{"label": f"{num}. {label}", "value": f"qa{i}"}])
         keyboard = rows
     else:
+        lines += ["", "<i>Reply to this message with your answer.</i>"]
         keyboard = None
+
+    if total > 1 and index == total - 1:
+        lines += ["", "━" * 23]
 
     message_id = _send_relay(
         text="\n".join(lines),
