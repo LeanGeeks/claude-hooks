@@ -9,9 +9,11 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_HOOKS_DIR=".claude/hooks"
 PROJECT_STATUSLINE_DIR=".claude/statusline"
 PROJECT_CONFIG=".claude/settings.json"
+PROJECT_RELAY_DIR="$SCRIPT_DIR/relay-server"
 GLOBAL_HOOKS_DIR="$HOME/.claude/hooks"
 GLOBAL_STATUSLINE_DIR="$HOME/.claude/statusline"
 GLOBAL_CONFIG="$HOME/.claude/settings.json"
@@ -96,6 +98,30 @@ else
                 log_warn "  Optional utility not found: $util"
             fi
         done
+
+        # Make the relay_server package importable by the copied hooks. The
+        # hooks are flat copies under ~/.claude/hooks/, so they cannot locate the
+        # repo on their own (telegram_permission_router.py only finds the package
+        # via an env var, a checkout it can walk up to, or an importable install).
+        # Drop a user-site .pth pointing at the repo's relay-server dir so
+        # `import relay_server` works for the system python3 that runs the hooks
+        # — no pip and no --break-system-packages needed.
+        if [[ -f "$PROJECT_RELAY_DIR/relay_server/__init__.py" ]]; then
+            USER_SITE="$(python3 -m site --user-site 2>/dev/null)"
+            if [[ -n "$USER_SITE" ]]; then
+                mkdir -p "$USER_SITE"
+                echo "$PROJECT_RELAY_DIR" > "$USER_SITE/claude-relay-server.pth"
+                log_info "  Linked relay_server via $USER_SITE/claude-relay-server.pth"
+            else
+                log_warn "  Could not determine user site-packages; Telegram relay hooks may not import relay_server"
+            fi
+            # The relay client imports httpx at runtime; warn early if it's absent
+            # for the system python3 (the relay stays disabled without it).
+            if ! python3 -c "import httpx" 2>/dev/null; then
+                log_warn "  Python 'httpx' not available for system python3 — Telegram relay will stay disabled."
+                log_warn "  Install it with: sudo apt install python3-httpx   (or: pip install --user httpx)"
+            fi
+        fi
 
         HOOKS_INSTALLED=true
     fi

@@ -24,6 +24,7 @@ unchanged).
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import sys
@@ -37,12 +38,40 @@ from permission_state_store import (
     debug_log,
 )
 
-# Make the relay_server package importable when running hooks from the global
-# hooks dir (no editable install). The repo path is the fallback when the
-# package is not pip-installed.
-_REPO_RELAY = Path(__file__).resolve().parent.parent.parent / "relay-server"
-if _REPO_RELAY.exists() and str(_REPO_RELAY) not in sys.path:
-    sys.path.insert(0, str(_REPO_RELAY))
+# Make the ``relay_server`` package importable regardless of how this hook is
+# launched. Resolution order:
+#   1. Already importable — pip-installed, or via a user-site ``.pth`` written by
+#      install-claude-config.sh. Nothing to do.
+#   2. ``CLAUDE_RELAY_SERVER_PATH`` env var pointing at the ``relay-server`` dir.
+#   3. Walk up from this file looking for a ``relay-server/relay_server`` package
+#      (covers running hooks straight from a repo checkout, at any depth).
+#
+# The previous logic hard-coded ``parent.parent.parent / "relay-server"``, which
+# assumed hooks live at ``<repo>/.claude/hooks/``. Once copied to
+# ``~/.claude/hooks/`` it resolved to the nonexistent ``~/relay-server`` and the
+# import silently failed, disabling the relay.
+def _ensure_relay_server_on_path() -> None:
+    try:
+        if importlib.util.find_spec("relay_server") is not None:
+            return
+    except (ImportError, ValueError):
+        pass
+
+    candidates: List[Path] = []
+    env_path = os.environ.get("CLAUDE_RELAY_SERVER_PATH")
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    here = Path(__file__).resolve()
+    candidates.extend(parent / "relay-server" for parent in here.parents)
+
+    for cand in candidates:
+        if (cand / "relay_server" / "__init__.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.insert(0, str(cand))
+            return
+
+
+_ensure_relay_server_on_path()
 
 try:
     from relay_server.client import (  # type: ignore[import-not-found]
