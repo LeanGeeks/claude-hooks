@@ -147,6 +147,7 @@ class RelayClient:
         *,
         json_body: Any = None,
         headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
         timeout: float | httpx.Timeout | None = None,
     ) -> httpx.Response:
         """Send a request with bounded retries on transient failures.
@@ -162,6 +163,7 @@ class RelayClient:
                     path,
                     json=json_body,
                     headers=headers,
+                    params=params,
                     timeout=timeout,
                 )
             except (
@@ -290,6 +292,12 @@ class RelayClient:
                 f"/v1/messages/{message_id}/answer",
                 headers=None,
                 json_body=None,
+                # CRITICAL: pass ``wait`` as a query param so the server parks
+                # on the waiter for that long. Without it the server defaults
+                # to wait=0, returns 204 immediately, and this loop spins at
+                # ~1000+ req/s — which starves the hook and trips Claude Code's
+                # hook timeout before a human can answer.
+                params={"wait": wait},
                 # Add slack: the server may take up to ``wait`` seconds; the
                 # client must give it that plus network jitter.
                 timeout=httpx.Timeout(wait + 10.0, connect=5.0),

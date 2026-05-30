@@ -1240,7 +1240,19 @@ async def _handle_callback_query(
 
     if cb_id:
         try:
-            ack = f"Answered: {chosen.get('label', '')}" if wrote else "Already answered"
+            if wrote:
+                ack = f"Answered: {chosen.get('label', '')}"
+            else:
+                # The row was no longer ``open`` — distinguish *why* so a late
+                # tap doesn't read as a duplicate ("Already answered") when it
+                # actually expired or was cancelled.
+                fresh = await _load_open_message_any(conn, parsed.message_id)
+                state = fresh["state"] if fresh is not None else None
+                ack = {
+                    "answered": "Already answered",
+                    "expired": "⏱ Expired — no longer waiting",
+                    "cancelled": "Cancelled — handled in the terminal",
+                }.get(state, "No longer waiting for an answer")
             await backend.answer_callback_query(
                 callback_query_id=cb_id, text=ack
             )

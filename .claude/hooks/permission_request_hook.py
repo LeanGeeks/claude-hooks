@@ -65,7 +65,7 @@ ERROR_LOG = Path.home() / ".claude" / "permission_telegram_errors.log"
 
 # Configuration
 WAIT_BEFORE_TELEGRAM = 0  # seconds to wait before sending Telegram message
-REQUEST_TTL = 3600  # 1 hour TTL for pending requests
+REQUEST_TTL = 43200  # 12 hour TTL for pending requests
 MAX_WAIT_FOR_RESPONSE = REQUEST_TTL  # Backwards-compatible name for tests/importers
 POLL_INTERVAL = 0.5  # seconds between state store polls
 
@@ -281,7 +281,7 @@ def wait_for_response(
             debug_log(f"Request {request_id} resolved via terminal, cancelling relay msg")
             remove_inline_buttons(message_id)
             return None
-        chunk = min(5, max(1, int(deadline - time.time())))
+        chunk = min(25, max(1, int(deadline - time.time())))
         answer = wait_for_relay_answer(message_id, timeout=chunk, long_poll_chunk=chunk)
         if answer is None:
             continue
@@ -405,7 +405,7 @@ def handle_ask_user_question(
                         except Exception as e:
                             debug_log(f"Failed to revoke sibling message {sib_msg}: {e}")
                 return None
-            chunk = min(5, max(1, int(deadline - time.time())))
+            chunk = min(25, max(1, int(deadline - time.time())))
             answer = wait_for_relay_answer(
                 child_msg_id, timeout=chunk, long_poll_chunk=chunk
             )

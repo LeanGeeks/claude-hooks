@@ -228,6 +228,31 @@ def test_wait_for_answer_204_then_answered() -> None:
     assert calls["n"] == 2
 
 
+def test_wait_for_answer_sends_wait_query_param() -> None:
+    """Regression: the long-poll MUST send ``?wait=`` so the server parks on
+    the waiter instead of returning 204 immediately. Without it the client
+    busy-loops at ~1000+ req/s and starves the calling hook (see the relay
+    hook-timeout incident)."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["wait"] = request.url.params.get("wait")
+        return httpx.Response(
+            200, json={"state": "answered", "answer": {"label": "Yes"}}
+        )
+
+    rc = _make_client(handler)
+    try:
+        rc.wait_for_answer(1, timeout=10, long_poll_chunk=7)
+    finally:
+        rc.close()
+
+    # wait = min(long_poll_chunk, remaining) — bounded by the 7s chunk here.
+    assert captured["wait"] is not None, "wait query param was not sent"
+    assert 1 <= int(captured["wait"]) <= 7
+
+
 def test_wait_for_answer_expired_returns_state() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"state": "expired"})

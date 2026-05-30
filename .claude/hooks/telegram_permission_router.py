@@ -103,7 +103,7 @@ _relay_client: Optional["RelayClient"] = None  # type: ignore[type-arg]
 # Default TTL for relay messages (seconds). The hook still tracks its own
 # longer-running TTL in the state store; this is just how long the relay row
 # stays "open" before the server marks it expired.
-RELAY_MESSAGE_TTL = 3600
+RELAY_MESSAGE_TTL = 43200
 
 
 def error_log(message: str) -> None:

@@ -49,6 +49,28 @@ fi
 
 log_step "Step 1/4: Installing hooks"
 
+# ---------------------------------------------------------------------------
+# Legacy daemon cleanup. Pre-relay installs ran a long-lived telegram_daemon.py
+# that polled getUpdates directly. The relay server now owns the bot token via
+# a webhook, so a surviving daemon (a) gets HTTP 409 on every getUpdates and
+# (b) tries to revoke Telegram messages with relay message ids, failing with
+# HTTP 400. Stop any such process and remove its artifacts so it can't linger
+# across the migration. Idempotent: a no-op on clean installs.
+LEGACY_PIDFILE="$HOME/.claude/telegram_daemon.pid"
+if [[ -f "$LEGACY_PIDFILE" ]]; then
+    LEGACY_PID="$(cat "$LEGACY_PIDFILE" 2>/dev/null || true)"
+    if [[ -n "$LEGACY_PID" ]] && kill -0 "$LEGACY_PID" 2>/dev/null; then
+        log_info "Stopping legacy telegram daemon (pid $LEGACY_PID)"
+        kill "$LEGACY_PID" 2>/dev/null || true
+        sleep 1
+        kill -9 "$LEGACY_PID" 2>/dev/null || true
+    fi
+    rm -f "$LEGACY_PIDFILE"
+fi
+# Drop the orphaned daemon script if a previous install left it behind; nothing
+# in the relay architecture imports it.
+rm -f "$GLOBAL_HOOKS_DIR/telegram_daemon.py"
+
 # Check project hooks directory exists
 if [[ ! -d "$PROJECT_HOOKS_DIR" ]]; then
     log_warn "Project hooks directory not found: $PROJECT_HOOKS_DIR"
@@ -248,7 +270,11 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                     matcher: "*",
                     hooks: [{
                         type: "command",
-                        command: ("CLAUDE_HOOK_DEBUG=1 python3 " + $permission_path)
+                        command: ("CLAUDE_HOOK_DEBUG=1 python3 " + $permission_path),
+                        # Block up to 12h waiting for a Telegram approval. Must be
+                        # >= REQUEST_TTL in permission_request_hook.py, else Claude
+                        # Code kills the hook before the request can be answered.
+                        timeout: 43200
                     }]
                 }],
                 PostToolUse: [{
