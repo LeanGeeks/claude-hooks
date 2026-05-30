@@ -588,6 +588,11 @@ if __name__ == '__main__':
         ('PATH=$(dirname $0)/bin:$PATH python app.py', ["python app.py", "dirname $0"]),
         ('(cd apps/contributor && npx tsc --noEmit 2>&1 | head -40) && echo "---PRESENTATION---" && (cd apps/presentation && npx tsc --noEmit 2>&1 | head -40)', ["cd apps/contributor", "npx tsc --noEmit", "head -40", 'echo "---PRESENTATION---"', "cd apps/presentation", "npx tsc --noEmit", "head -40"]),
         ('(git status; git diff | head -20)', ["git status", "git diff", "head -20"]),
+        # Brace group with redirection (strip standalone { and } grouping tokens)
+        ('cd /tmp; { git log --oneline -3; echo "===STATUS==="; git status -s; } 2>&1', ["cd /tmp", "git log --oneline -3", 'echo "===STATUS==="', "git status -s"]),
+        ('{ git status; git diff | head -20; }', ["git status", "git diff", "head -20"]),
+        # Brace expansion / parameter expansion must NOT be stripped (not standalone)
+        ('cp file.{txt,bak} /tmp', ["cp file.{txt,bak} /tmp"]),
         # Unquoted newlines split commands (like ';')
         ('echo foo\necho bar', ["echo foo", "echo bar"]),
         ('cd /tmp\nls -la\ngit status', ["cd /tmp", "ls -la", "git status"]),

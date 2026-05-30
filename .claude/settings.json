@@ -250,7 +250,8 @@
       "Bash(tracepath:*)",
       "Bash(whois:*)",
       "Bash(dig:*)",
-      "Bash(magick:*)"
+      "Bash(magick:*)",
+      "Bash(whoami:*)"
     ],
     "deny": [
       "Bash(shred:*)",
