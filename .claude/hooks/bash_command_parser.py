@@ -17,8 +17,9 @@ class BashCommandParser:
     """Parse and split compound bash commands"""
 
     # Operators that separate commands
-    # Note: \n is NOT a command separator - it's whitespace
-    # Heredocs and multi-line constructs are handled specially
+    # Note: an unquoted newline IS a command separator (treated like ';').
+    # Escaped/continuation newlines, quoted newlines, heredoc bodies, and
+    # command-substitution newlines are handled specially and do NOT split.
     OPERATORS = ['&&', '||', '|', ';']
 
     # Redirection operators (NOT command separators)
@@ -127,11 +128,12 @@ class BashCommandParser:
                     i += 1
                     # Check if the delimiter appears at start of next line
                     if command[i:i+len(heredoc_delimiter)] == heredoc_delimiter:
-                        # Found the delimiter!
+                        # Found the delimiter! Consume it, but leave the newline
+                        # that follows so the newline handler can emit a command
+                        # separator — otherwise a command after the heredoc (e.g.
+                        # `cat <<EOF\n...\nEOF\necho done`) would merge into the
+                        # heredoc command.
                         i += len(heredoc_delimiter)
-                        # Skip the delimiter and any newline after it
-                        if i < len(command) and command[i] == '\n':
-                            i += 1
                         heredoc_delimiter = None
                         continue
                     # Not the delimiter, continue in heredoc mode
@@ -325,9 +327,16 @@ class BashCommandParser:
             # Newline handling
             if char == '\n':
                 flush_current()
-                # Track first newline after heredoc detection
+                # The newline that immediately follows a heredoc operator begins
+                # the heredoc body — it transitions us into content mode and is
+                # NOT a command separator.
                 if heredoc_delimiter is not None and not heredoc_seen_first_nl:
                     heredoc_seen_first_nl = True
+                else:
+                    # An unquoted newline separates commands, just like ';'.
+                    # (Quoted, escaped/continuation, heredoc, and command-subst
+                    # newlines are handled before reaching this point.)
+                    tokens.append(('OP', ';'))
                 i += 1
                 continue
 
@@ -474,16 +483,17 @@ class BashCommandParser:
 
         # Join and normalize whitespace
         result = ' '.join(words)
-        return self._strip_grouping_parentheses(result.strip())
+        return self._strip_grouping_tokens(result.strip())
 
-    def _strip_grouping_parentheses(self, command: str) -> str:
+    def _strip_grouping_tokens(self, command: str) -> str:
         """
-        Remove shell grouping parentheses that can remain at command boundaries.
+        Remove shell grouping tokens that can remain at command boundaries.
 
-        The parser splits on operators like && and |, so a subshell command such
-        as `(cd app && npm test)` can leave fragments like `(cd app` and
-        `npm test)`. Parentheses at those boundaries do not change the command
-        being validated, so strip them before matching permission patterns.
+        The parser splits on operators like && and |, so a grouped command such
+        as `(cd app && npm test)` or `{ git log; git status; }` can leave
+        fragments like `(cd app`, `{ git log`, `npm test)`, or `}`. Subshell
+        `()` and brace-group `{}` tokens do not change the command being
+        validated, so strip them before matching permission patterns.
         """
         if not command:
             return command
@@ -492,12 +502,12 @@ class BashCommandParser:
         if not words:
             return command
 
-        while words and words[0].startswith('('):
+        while words and words[0][0] in '({':
             words[0] = words[0][1:]
             if not words[0]:
                 words.pop(0)
 
-        while words and words[-1].endswith(')'):
+        while words and words[-1][-1] in ')}':
             words[-1] = words[-1][:-1]
             if not words[-1]:
                 words.pop()
@@ -552,6 +562,25 @@ if __name__ == '__main__':
         ('PATH=$(dirname $0)/bin:$PATH python app.py', ["python app.py", "dirname $0"]),
         ('(cd apps/contributor && npx tsc --noEmit 2>&1 | head -40) && echo "---PRESENTATION---" && (cd apps/presentation && npx tsc --noEmit 2>&1 | head -40)', ["cd apps/contributor", "npx tsc --noEmit", "head -40", 'echo "---PRESENTATION---"', "cd apps/presentation", "npx tsc --noEmit", "head -40"]),
         ('(git status; git diff | head -20)', ["git status", "git diff", "head -20"]),
+        # Unquoted newlines split commands (like ';')
+        ('echo foo\necho bar', ["echo foo", "echo bar"]),
+        ('cd /tmp\nls -la\ngit status', ["cd /tmp", "ls -la", "git status"]),
+        ('echo foo\n\n\necho bar', ["echo foo", "echo bar"]),  # Blank lines collapse
+        ('\necho foo\n', ["echo foo"]),  # Leading/trailing newlines ignored
+        # Newlines inside quotes are NOT separators (stays one sub-command;
+        # internal whitespace is collapsed by normalization, as always)
+        ('echo "line1\nline2"', ['echo "line1 line2"']),
+        # if/then/else/fi one-liner spread across lines
+        ('if git diff --quiet; then echo clean; else echo dirty; fi',
+         ["if git diff --quiet", "then echo clean", "else echo dirty", "fi"]),
+        ('if git diff --quiet\nthen echo clean\nfi',
+         ["if git diff --quiet", "then echo clean", "fi"]),
+        # Multi-line diagnostic script (the real-world failing case)
+        ('echo "A:"\nls src/ | grep foo\necho "B:"\ngit ls-files | grep bar || echo none',
+         ['echo "A:"', "ls src/", "grep foo", 'echo "B:"', "git ls-files", "grep bar", "echo none"]),
+        # A command after a heredoc must not merge into the heredoc command
+        ('cat <<EOF\nline\nEOF\necho done', ["cat", "echo done"]),
+        ('cat <<EOF\nbody\nEOF\nls -la | grep foo', ["cat", "ls -la", "grep foo"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")

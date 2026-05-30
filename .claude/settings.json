@@ -221,12 +221,17 @@
       "Bash(export:*)",
       "Bash(if:*)",
       "Bash(then:*)",
+      "Bash(elif:*)",
+      "Bash(else:*)",
       "Bash(fi:*)",
       "Bash(do:*)",
+      "Bash(done:*)",
       "Bash(for:*)",
       "Bash(seq:*)",
       "Bash(while:*)",
       "Bash(until:*)",
+      "Bash(case:*)",
+      "Bash(esac:*)",
       "Bash(read:*)",
       "Bash(true:*)",
       "Bash(zip:*)",
@@ -244,7 +249,8 @@
       "Bash(traceroute:*)",
       "Bash(tracepath:*)",
       "Bash(whois:*)",
-      "Bash(dig:*)"
+      "Bash(dig:*)",
+      "Bash(magick:*)"
     ],
     "deny": [
       "Bash(shred:*)",
