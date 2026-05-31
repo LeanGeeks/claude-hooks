@@ -86,6 +86,7 @@
       "Bash(head:*)",
       "Bash(tail:*)",
       "Bash(tee:*)",
+      "Bash(nl:*)",
       "Bash(diff:*)",
       "Bash(patch:*)",
       "Bash(ls:*)",
@@ -251,7 +252,8 @@
       "Bash(whois:*)",
       "Bash(dig:*)",
       "Bash(magick:*)",
-      "Bash(whoami:*)"
+      "Bash(whoami:*)",
+      "Bash(mktemp:*)"
     ],
     "deny": [
       "Bash(shred:*)",
