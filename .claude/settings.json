@@ -253,7 +253,8 @@
       "Bash(dig:*)",
       "Bash(magick:*)",
       "Bash(whoami:*)",
-      "Bash(mktemp:*)"
+      "Bash(mktemp:*)",
+      "Bash(exec:*)"
     ],
     "deny": [
       "Bash(shred:*)",
