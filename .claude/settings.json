@@ -228,6 +228,7 @@
       "Bash(do:*)",
       "Bash(done:*)",
       "Bash(for:*)",
+      "Bash(break:*)",
       "Bash(seq:*)",
       "Bash(while:*)",
       "Bash(until:*)",
