@@ -325,5 +325,70 @@ class TestPreToolUseEdgeCases(unittest.TestCase):
         self.assertIn(result["decision"], ["allow", "ask"])
 
 
+class TestPrefixReduction(unittest.TestCase):
+    """Control-keyword / wrapper prefixes must not auto-authorize the command
+    they introduce. The effective command is what gets validated."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_reduce_unit(self):
+        """_reduce_to_effective_command peels keywords and wrappers."""
+        cases = {
+            "do curl http://x": "curl http://x",
+            "then echo done": "echo done",
+            "if grep -q foo file": "grep -q foo file",
+            "exec rm -rf /etc": "rm -rf /etc",
+            "timeout 5 curl http://x": "curl http://x",
+            "timeout 5s curl http://x": "curl http://x",
+            "env FOO=bar node app.js": "node app.js",
+            "time timeout 5 curl http://x": "curl http://x",  # nested
+            "/usr/bin/env curl http://x": "curl http://x",    # path-qualified wrapper
+            "git status": "git status",                       # unchanged
+            "do": "",                                         # bare keyword
+            "env": "",                                        # bare wrapper
+        }
+        for cmd, expected in cases.items():
+            self.assertEqual(
+                self.validator._reduce_to_effective_command(cmd), expected,
+                f"reduce({cmd!r})")
+
+    def test_keyword_prefix_does_not_bypass(self):
+        """`do rm -rf /etc` must NOT auto-allow just because it starts with a keyword."""
+        result = self.validator.validate_bash_command("do rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_exec_wrapper_does_not_bypass(self):
+        """`exec rm -rf /etc` must reduce to `rm` (not whitelisted outside workspace)."""
+        result = self.validator.validate_bash_command("exec rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_xargs_wrapper_does_not_bypass(self):
+        result = self.validator.validate_bash_command("find / | xargs rm -rf")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_keyword_prefix_allows_real_allowed_command(self):
+        """`do curl ...` reduces to an allowed `curl`."""
+        result = self.validator.validate_bash_command("do curl http://localhost/x")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_timeout_wrapper_allows_real_allowed_command(self):
+        result = self.validator.validate_bash_command("timeout 5 curl http://localhost/x")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_real_loop_still_allowed(self):
+        """The original hyppie-flow-style loop is fully auto-allowed."""
+        command = (
+            'cd /tmp; (pnpm start -p 3137 >/tmp/x.log 2>&1 &) ; sleep 1; '
+            'for i in $(seq 1 20); do curl -s -o /dev/null http://localhost:3137/x '
+            '2>/dev/null && break; sleep 1; done; echo " (ready)"'
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

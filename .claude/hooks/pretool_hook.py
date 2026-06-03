@@ -45,6 +45,34 @@ DEBUG_LOG = os.path.expanduser('~/.claude/bash_hook_debug.log')
 MANUAL_CONFIRM_LOG = os.path.expanduser('~/.claude/bash_manual_confirm.log')
 TMP_ALLOWED_ROOT = '/tmp'
 
+# Tokens that merely INTRODUCE or WRAP another command and must therefore be
+# transparent to permission checking: the command that follows is the thing that
+# actually runs and must be the thing we validate. Whitelisting any of these as
+# Bash(<word>:*) would auto-authorize whatever comes after them (e.g. the parser
+# splits `for i in ...; do curl ...; done` into a sub-command `do curl ...`, and
+# `Bash(do:*)` would then green-light an arbitrary `curl`). Instead we peel these
+# prefixes off and validate the effective command underneath.
+
+# Shell control keywords that are directly followed by a command. NOT included:
+# `for`/`case`/`select`/`in` (followed by a word/list, not a command) and the
+# terminators `done`/`fi`/`esac` (nothing dangerous follows them).
+CONTROL_KEYWORD_PREFIXES = {
+    'if', 'elif', 'while', 'until', 'then', 'else', 'do', '!',
+}
+
+# Wrapper binaries that exec another command, possibly after their own flags and
+# a fixed number of leading positional args. The value is how many non-flag
+# positional args to skip after the wrapper's flags (e.g. `timeout <duration>`,
+# `flock <lockfile>`). `sudo` is deliberately EXCLUDED — privilege escalation
+# should always prompt, never auto-allow.
+WRAPPER_PREFIXES = {
+    'exec': 0, 'time': 0, 'env': 0, 'xargs': 0, 'nohup': 0, 'setsid': 0,
+    'command': 0, 'builtin': 0, 'stdbuf': 0, 'nice': 0, 'ionice': 0,
+    'chrt': 0, 'watch': 0,
+    'timeout': 1,  # leading <duration>
+    'flock': 1,    # leading <lockfile|fd>
+}
+
 
 def debug_log(message: str):
     """Log debug message if debug mode is enabled"""
@@ -434,6 +462,62 @@ class BashPermissionValidator:
         rest = parts[1] if len(parts) > 1 else ''
         return f"{base} {rest}" if rest else base
 
+    def _reduce_to_effective_command(self, cmd: str) -> str:
+        """
+        Peel leading control-keyword and wrapper prefixes off a sub-command so we
+        validate the command that actually runs, not the token that introduces it.
+
+        Without this, the parser leaves prefixes glued to their command (e.g.
+        `do curl ...`, `exec rm ...`, `timeout 5 curl ...`), and whitelisting the
+        prefix (`Bash(do:*)`, `Bash(exec:*)`) would auto-authorize anything after
+        it. Peeling reduces those to `curl ...` / `rm ...` / `curl ...`, which are
+        then matched against the allowlist on their own merits.
+
+        Handles nesting (`exec env curl`, `time timeout 5 curl`) by looping. For
+        wrappers, skips the wrapper's own flags (`-x`, `--x=y`) and `KEY=VALUE`
+        assignments, plus a fixed number of leading positional args (the duration
+        for `timeout`, the lockfile for `flock`). Anything it can't confidently
+        peel is left in place, so the worst case is a safe defer, never a bypass.
+
+        Returns the effective command string, or '' when the sub-command is a bare
+        prefix with nothing after it (e.g. `do`, `env`) — harmless on its own.
+
+        Examples:
+            'do curl http://x'        -> 'curl http://x'
+            'exec rm -rf /etc'        -> 'rm -rf /etc'
+            'timeout 5 curl http://x' -> 'curl http://x'
+            'env FOO=bar node app.js' -> 'node app.js'
+            'if grep -q foo file'     -> 'grep -q foo file'
+            'git status'              -> 'git status' (unchanged)
+        """
+        tokens = cmd.split()
+        guard = 0
+        while tokens and guard < 20:
+            guard += 1
+            head = tokens[0]
+
+            if head in CONTROL_KEYWORD_PREFIXES:
+                tokens = tokens[1:]
+                continue
+
+            name = os.path.basename(head)
+            if name in WRAPPER_PREFIXES:
+                positional = WRAPPER_PREFIXES[name]
+                tokens = tokens[1:]
+                # Skip the wrapper's own flags and KEY=VALUE assignments.
+                while tokens and (tokens[0].startswith('-')
+                                  or BashCommandParser._is_env_prefix(tokens[0])):
+                    tokens = tokens[1:]
+                # Skip the wrapper's fixed leading positional args (e.g. duration).
+                for _ in range(positional):
+                    if tokens and not tokens[0].startswith('-'):
+                        tokens = tokens[1:]
+                continue
+
+            break
+
+        return ' '.join(tokens)
+
     def _check_single_command(self, cmd: str) -> Dict[str, Any]:
         """
         Check if single command matches any pattern
@@ -450,6 +534,24 @@ class BashPermissionValidator:
         """
         matched_allow = []
         matched_deny = []
+
+        # Reduce wrappers/keywords to the command that actually runs, so we never
+        # authorize an arbitrary command just because its introducer is allowed.
+        effective = self._reduce_to_effective_command(cmd)
+        if effective != cmd:
+            debug_log(f"Reduced {cmd!r} to effective command {effective!r}")
+        if not effective:
+            # Bare control keyword / wrapper with no command after it (e.g. 'do',
+            # 'env'). Nothing runs, so it's harmless on its own.
+            debug_log(f"Command {cmd!r} is a bare prefix - auto-allowing")
+            return {
+                'command': cmd,
+                'allowed': True,
+                'denied': False,
+                'matched_allow_patterns': ['control_prefix'],
+                'matched_deny_patterns': []
+            }
+        cmd = effective
 
         # First check: workspace binaries are always allowed
         if self._is_workspace_binary(cmd):
