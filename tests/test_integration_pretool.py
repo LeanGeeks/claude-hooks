@@ -347,6 +347,12 @@ class TestPrefixReduction(unittest.TestCase):
             "env FOO=bar node app.js": "node app.js",
             "time timeout 5 curl http://x": "curl http://x",  # nested
             "/usr/bin/env curl http://x": "curl http://x",    # path-qualified wrapper
+            "command node app.js": "node app.js",             # `command` exec form
+            "command -p git status": "git status",            # exec form, -p flag
+            "command -v chromium": "",                        # lookup, runs nothing
+            "command -V git": "",                             # lookup (verbose)
+            "command -pv chromium": "",                       # combined -p with -v
+            "exec command -v node": "",                       # nested lookup
             "git status": "git status",                       # unchanged
             "do": "",                                         # bare keyword
             "env": "",                                        # bare wrapper
@@ -377,6 +383,33 @@ class TestPrefixReduction(unittest.TestCase):
 
     def test_timeout_wrapper_allows_real_allowed_command(self):
         result = self.validator.validate_bash_command("timeout 5 curl http://localhost/x")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_command_lookup_is_auto_allowed(self):
+        """`command -v X` is a lookup (like which/type), not an execution of X,
+        so it must auto-allow even when X is not whitelisted."""
+        result = self.validator.validate_bash_command("command -v chromium chromium-browser google-chrome")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_command_exec_form_validates_operand(self):
+        """`command rm -rf /etc` is an execution and must NOT bypass — it reduces
+        to `rm` (not whitelisted outside the workspace)."""
+        result = self.validator.validate_bash_command("command rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_command_exec_form_allows_real_allowed_command(self):
+        """`command node app.js` reduces to an allowed `node`."""
+        result = self.validator.validate_bash_command("command node app.js")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_command_lookup_probe_pipeline_allowed(self):
+        """The original chromium-probe one-liner is fully auto-allowed."""
+        command = (
+            '(command -v chromium chromium-browser google-chrome 2>/dev/null; '
+            'ls node_modules/.bin/playwright 2>/dev/null; echo "---try---"; '
+            'node -e "require(\'playwright\')" 2>&1 | tail -3)'
+        )
+        result = self.validator.validate_bash_command(command)
         self.assertEqual(result["decision"], "allow")
 
     def test_real_loop_still_allowed(self):

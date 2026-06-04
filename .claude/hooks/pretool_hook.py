@@ -65,13 +65,24 @@ CONTROL_KEYWORD_PREFIXES = {
 # positional args to skip after the wrapper's flags (e.g. `timeout <duration>`,
 # `flock <lockfile>`). `sudo` is deliberately EXCLUDED — privilege escalation
 # should always prompt, never auto-allow.
+#
+# `command` is handled separately (see _reduce_to_effective_command): it has a
+# dual nature — `command NAME ...` execs NAME (a wrapper, like the entries here),
+# but `command -v/-V NAME` is a lookup that runs nothing, so it must not be peeled
+# down to NAME and validated as an execution.
 WRAPPER_PREFIXES = {
     'exec': 0, 'time': 0, 'env': 0, 'xargs': 0, 'nohup': 0, 'setsid': 0,
-    'command': 0, 'builtin': 0, 'stdbuf': 0, 'nice': 0, 'ionice': 0,
+    'builtin': 0, 'stdbuf': 0, 'nice': 0, 'ionice': 0,
     'chrt': 0, 'watch': 0,
     'timeout': 1,  # leading <duration>
     'flock': 1,    # leading <lockfile|fd>
 }
+
+# Flags that switch the `command` builtin from exec mode to lookup mode. With any
+# of these present, `command` behaves like `which`/`type` — it prints where NAME
+# would resolve and runs nothing — so the operand must NOT be validated as if it
+# were executed. Bash spells these `-v` and `-V` (combinable with `-p`, e.g. -pv).
+COMMAND_LOOKUP_FLAGS = {'v', 'V'}
 
 
 def debug_log(message: str):
@@ -479,8 +490,14 @@ class BashPermissionValidator:
         for `timeout`, the lockfile for `flock`). Anything it can't confidently
         peel is left in place, so the worst case is a safe defer, never a bypass.
 
-        Returns the effective command string, or '' when the sub-command is a bare
-        prefix with nothing after it (e.g. `do`, `env`) — harmless on its own.
+        The `command` builtin is special-cased: `command NAME ...` is an exec
+        wrapper and peels to `NAME ...`, but `command -v/-V NAME` is a lookup that
+        runs nothing (like `which`/`type`), so it reduces to '' (auto-allow)
+        instead of being validated as if NAME were executed.
+
+        Returns the effective command string, or '' when the sub-command runs
+        nothing dangerous on its own: a bare prefix (e.g. `do`, `env`) or a
+        `command -v` lookup.
 
         Examples:
             'do curl http://x'        -> 'curl http://x'
@@ -488,6 +505,8 @@ class BashPermissionValidator:
             'timeout 5 curl http://x' -> 'curl http://x'
             'env FOO=bar node app.js' -> 'node app.js'
             'if grep -q foo file'     -> 'grep -q foo file'
+            'command -v chromium'     -> ''            (lookup, runs nothing)
+            'command node app.js'     -> 'node app.js' (exec form)
             'git status'              -> 'git status' (unchanged)
         """
         tokens = cmd.split()
@@ -501,6 +520,24 @@ class BashPermissionValidator:
                 continue
 
             name = os.path.basename(head)
+
+            if name == 'command':
+                # Split `command`'s own leading flags from the operand.
+                rest = tokens[1:]
+                flags = []
+                while rest and rest[0].startswith('-') and rest[0] != '--':
+                    flags.append(rest[0])
+                    rest = rest[1:]
+                if rest[:1] == ['--']:
+                    rest = rest[1:]
+                # `-v`/`-V` (e.g. `command -v X`, `command -pv X`) => lookup mode:
+                # nothing runs, so the operand is irrelevant — treat as harmless.
+                if any(set(f.lstrip('-')) & COMMAND_LOOKUP_FLAGS for f in flags):
+                    return ''
+                # Exec mode (`command [-p] NAME ...`): validate the operand.
+                tokens = rest
+                continue
+
             if name in WRAPPER_PREFIXES:
                 positional = WRAPPER_PREFIXES[name]
                 tokens = tokens[1:]
@@ -541,9 +578,9 @@ class BashPermissionValidator:
         if effective != cmd:
             debug_log(f"Reduced {cmd!r} to effective command {effective!r}")
         if not effective:
-            # Bare control keyword / wrapper with no command after it (e.g. 'do',
-            # 'env'). Nothing runs, so it's harmless on its own.
-            debug_log(f"Command {cmd!r} is a bare prefix - auto-allowing")
+            # Nothing dangerous runs: a bare control keyword / wrapper with no
+            # command after it (e.g. 'do', 'env'), or a `command -v/-V` lookup.
+            debug_log(f"Command {cmd!r} runs nothing (bare prefix or lookup) - auto-allowing")
             return {
                 'command': cmd,
                 'allowed': True,
