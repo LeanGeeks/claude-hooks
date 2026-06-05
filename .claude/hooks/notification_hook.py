@@ -43,6 +43,8 @@ import hashlib
 import html
 import json
 import os
+import shutil
+import subprocess
 import sys
 import re
 from pathlib import Path
@@ -62,6 +64,11 @@ TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "canceled", "error
 # leaving headroom for the title and markers. Budget is measured on the escaped
 # string so we never overflow even when the text is escape-heavy.
 MAX_ESCAPED_BODY = 3800
+
+# amux launches each session in a tmux session named ``amux-<CC_NAME>``. We use
+# this to detect amux-hosted sessions and recover the amux session name so a
+# Telegram reply can be injected back via ``amux send`` (task 09).
+AMUX_TMUX_PREFIX = "amux-"
 
 
 def debug_log(message: str):
@@ -338,6 +345,74 @@ def build_notification_text(
     return "\n".join(lines)
 
 
+def resolve_amux_session() -> str | None:
+    """Return this session's amux name, or None if it is not amux-hosted.
+
+    amux starts each session in a tmux session named ``amux-<CC_NAME>``, so the
+    *current pane's* tmux session name is the source of truth. We deliberately do
+    not use cwd or env: ``CC_DIR``/``CC_NAME`` are not exported into the session,
+    and a session's cwd can differ from its registered ``CC_DIR``.
+
+    Returns the bare amux name (``hyppie-flow``), or None when there's no tmux,
+    no ``$TMUX_PANE``, or the session isn't an ``amux-`` one (e.g. a bare
+    ``claude`` in tmux) — in which case replies can't be injected and we stay
+    notify-only.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane or not shutil.which("tmux"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{session_name}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"tmux display-message failed: {e}")
+        return None
+    if result.returncode != 0:
+        debug_log(f"tmux display-message rc={result.returncode}: {result.stderr.strip()}")
+        return None
+    session_name = result.stdout.strip()
+    if not session_name.startswith(AMUX_TMUX_PREFIX):
+        debug_log(f"Not an amux session (tmux session={session_name!r})")
+        return None
+    amux_name = session_name[len(AMUX_TMUX_PREFIX):]
+    return amux_name or None
+
+
+def spawn_reply_injector(message_id: int, amux_name: str) -> None:
+    """Detach a ``reply_injector.py`` process for this idle notification.
+
+    The injector long-polls the relay for this one message and, on a text reply,
+    injects it into the amux session. We spawn it detached (``start_new_session``)
+    and return immediately so the idle hook never blocks the session.
+    """
+    script = Path(__file__).with_name("reply_injector.py")
+    if not script.exists():
+        debug_log(f"reply_injector.py not found at {script}; skipping injection")
+        return
+    try:
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(script),
+                "--message-id",
+                str(message_id),
+                "--amux",
+                amux_name,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        debug_log(f"Spawned reply injector for message {message_id} → amux:{amux_name}")
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"Failed to spawn reply injector: {e}")
+
+
 def main():
     """Main hook entry point"""
     try:
@@ -391,6 +466,12 @@ def main():
             fallback=message,
         )
 
+        # An amux-hosted session can receive a reply back (task 09): we send the
+        # notification as a force-reply so the user can answer in-thread, then
+        # arm a detached injector. A non-amux session stays notify-only.
+        amux_name = resolve_amux_session()
+        reply_enabled = amux_name is not None
+
         # Derive the dedupe key from the composed message itself: an idle prompt
         # re-fired for the same state produces identical text, so the relay's
         # idempotency layer replays the original send instead of double-posting.
@@ -398,11 +479,19 @@ def main():
         # new key and a fresh notification.
         body_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         dedupe_key = f"idle:{session_id or 'unknown'}:{body_hash}"
-        message_id = send_idle_notification(text, dedupe_key)
+        message_id = send_idle_notification(
+            text, dedupe_key, reply_required=reply_enabled
+        )
         if message_id is None:
             debug_log("Idle notification send failed (relay returned no id)")
+        elif reply_enabled:
+            spawn_reply_injector(message_id, amux_name)
+            debug_log(
+                f"Idle notification {message_id} sent; reply injector armed "
+                f"for amux:{amux_name}"
+            )
         else:
-            debug_log(f"Idle notification sent: relay message {message_id}")
+            debug_log(f"Idle notification sent: relay message {message_id} (notify-only)")
 
         # Always exit 0 - notification failure shouldn't block Claude
         sys.exit(0)

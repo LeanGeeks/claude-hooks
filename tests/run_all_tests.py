@@ -26,6 +26,7 @@ TEST_MODULES = {
     "unit_state": "test_unit_state_store",
     "unit_whitelist": "test_unit_whitelist",
     "unit_notification": "test_unit_notification_hook",
+    "unit_reply_injector": "test_unit_reply_injector",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }

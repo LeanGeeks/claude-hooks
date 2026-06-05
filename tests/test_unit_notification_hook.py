@@ -116,7 +116,59 @@ class TestBuildNotificationText(unittest.TestCase):
         self.assertNotIn("<blockquote>", text)
 
 
+class TestResolveAmuxSession(unittest.TestCase):
+    def test_returns_name_for_amux_session(self):
+        completed = type("R", (), {"returncode": 0, "stdout": "amux-hyppie-flow\n", "stderr": ""})()
+        with patch.dict(os.environ, {"TMUX_PANE": "%5"}), \
+             patch.object(nh.shutil, "which", lambda _: "/usr/bin/tmux"), \
+             patch.object(nh.subprocess, "run", lambda *a, **k: completed):
+            self.assertEqual(nh.resolve_amux_session(), "hyppie-flow")
+
+    def test_none_when_not_amux_prefixed(self):
+        completed = type("R", (), {"returncode": 0, "stdout": "my-plain-session\n", "stderr": ""})()
+        with patch.dict(os.environ, {"TMUX_PANE": "%5"}), \
+             patch.object(nh.shutil, "which", lambda _: "/usr/bin/tmux"), \
+             patch.object(nh.subprocess, "run", lambda *a, **k: completed):
+            self.assertIsNone(nh.resolve_amux_session())
+
+    def test_none_when_no_tmux_pane(self):
+        env = {k: v for k, v in os.environ.items() if k != "TMUX_PANE"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(nh.shutil, "which", lambda _: "/usr/bin/tmux"):
+            self.assertIsNone(nh.resolve_amux_session())
+
+    def test_none_when_tmux_missing(self):
+        with patch.dict(os.environ, {"TMUX_PANE": "%5"}), \
+             patch.object(nh.shutil, "which", lambda _: None):
+            self.assertIsNone(nh.resolve_amux_session())
+
+    def test_none_on_tmux_error(self):
+        completed = type("R", (), {"returncode": 1, "stdout": "", "stderr": "no server"})()
+        with patch.dict(os.environ, {"TMUX_PANE": "%5"}), \
+             patch.object(nh.shutil, "which", lambda _: "/usr/bin/tmux"), \
+             patch.object(nh.subprocess, "run", lambda *a, **k: completed):
+            self.assertIsNone(nh.resolve_amux_session())
+
+
 class TestMainRouting(unittest.TestCase):
+    """main() routing. We patch resolve_amux_session + spawn_reply_injector so
+    these never depend on the host being amux or spawn real injector processes;
+    amux-specific wiring is asserted explicitly per test."""
+
+    def setUp(self):
+        # Default: non-amux host (notify-only) + injector spawn recorded.
+        self._resolve = patch.object(nh, "resolve_amux_session", lambda: None)
+        self.spawned = []
+        self._spawn = patch.object(
+            nh, "spawn_reply_injector", lambda mid, name: self.spawned.append((mid, name))
+        )
+        self._resolve.start()
+        self._spawn.start()
+
+    def tearDown(self):
+        self._resolve.stop()
+        self._spawn.stop()
+
     def _run_main(self, payload):
         with patch("sys.stdin", io.StringIO(json.dumps(payload))):
             try:
@@ -136,9 +188,10 @@ class TestMainRouting(unittest.TestCase):
         }
         captured = {}
 
-        def fake_send(text, dedupe_key):
+        def fake_send(text, dedupe_key, *, reply_required=False):
             captured["text"] = text
             captured["key"] = dedupe_key
+            captured["reply_required"] = reply_required
             return 7
 
         with patch.object(nh, "load_telegram_config", lambda: None), \
@@ -149,6 +202,49 @@ class TestMainRouting(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("awaiting your call", captured["text"])
         self.assertTrue(captured["key"].startswith("idle:s1:"))
+        # Non-amux host → notify-only, no injector.
+        self.assertFalse(captured["reply_required"])
+        self.assertEqual(self.spawned, [])
+
+    def test_amux_session_force_reply_and_injector(self):
+        t = _write_transcript([_assistant("need a decision")])
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": "s1",
+            "cwd": "/tmp/myrepo",
+            "transcript_path": t,
+        }
+        captured = {}
+
+        def fake_send(text, dedupe_key, *, reply_required=False):
+            captured["reply_required"] = reply_required
+            return 42
+
+        with patch.object(nh, "resolve_amux_session", lambda: "hyppie-flow"), \
+             patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", fake_send):
+            self._run_main(payload)
+
+        # amux-hosted → force-reply + injector armed with (message_id, name).
+        self.assertTrue(captured["reply_required"])
+        self.assertEqual(self.spawned, [(42, "hyppie-flow")])
+
+    def test_amux_session_send_failure_no_injector(self):
+        t = _write_transcript([_assistant("hi")])
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": "s1",
+            "cwd": "/tmp/x",
+            "transcript_path": t,
+        }
+        with patch.object(nh, "resolve_amux_session", lambda: "hyppie-flow"), \
+             patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", lambda *a, **k: None):
+            self._run_main(payload)
+        # Relay send failed → nothing to wait on, no injector.
+        self.assertEqual(self.spawned, [])
 
     def test_dedupe_key_is_deterministic_for_same_state(self):
         t = _write_transcript([_assistant("same message")])
@@ -160,7 +256,7 @@ class TestMainRouting(unittest.TestCase):
         }
         keys = []
 
-        def fake_send(text, dedupe_key):
+        def fake_send(text, dedupe_key, *, reply_required=False):
             keys.append(dedupe_key)
             return 1
 
@@ -179,7 +275,7 @@ class TestMainRouting(unittest.TestCase):
         payload = {"notification_type": "other", "session_id": "s", "cwd": "/tmp/x"}
         with patch.object(nh, "load_telegram_config", lambda: None), \
              patch.object(tr, "TELEGRAM_ENABLED", True), \
-             patch.object(nh, "send_idle_notification", lambda *a: called.append(1)):
+             patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
             self._run_main(payload)
         self.assertEqual(called, [])
 
@@ -194,7 +290,7 @@ class TestMainRouting(unittest.TestCase):
         called = []
         with patch.object(nh, "load_telegram_config", lambda: None), \
              patch.object(tr, "TELEGRAM_ENABLED", False), \
-             patch.object(nh, "send_idle_notification", lambda *a: called.append(1)):
+             patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
             self._run_main(payload)
         self.assertEqual(called, [])
 
@@ -212,7 +308,7 @@ class TestMainRouting(unittest.TestCase):
         called = []
         with patch.object(nh, "load_telegram_config", lambda: None), \
              patch.object(tr, "TELEGRAM_ENABLED", True), \
-             patch.object(nh, "send_idle_notification", lambda *a: called.append(1)):
+             patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
             self._run_main(payload)
         self.assertEqual(called, [])
 

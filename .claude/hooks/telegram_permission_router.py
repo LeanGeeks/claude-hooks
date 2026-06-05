@@ -434,14 +434,24 @@ def send_question_message(
     return message_id
 
 
-def send_idle_notification(text: str, dedupe_key: str) -> Optional[int]:
-    """Send a fire-and-forget idle notification (no buttons, no reply).
+def send_idle_notification(
+    text: str, dedupe_key: str, *, reply_required: bool = False
+) -> Optional[int]:
+    """Send an idle notification carrying the agent's last message.
 
-    Used by ``notification_hook.py`` to forward the agent's last message when a
-    session goes idle. ``kind="notification"`` + ``reply_required=False`` tells
-    the relay this row never expects an answer, so it is delivered and forgotten
-    (no waiter, no keyboard). ``dedupe_key`` seeds the idempotency key so a
+    Used by ``notification_hook.py``. ``kind="notification"`` keeps it out of the
+    permission/question flows; ``dedupe_key`` seeds the idempotency key so a
     re-fired idle prompt for the same state won't double-post.
+
+    ``reply_required`` controls answerability:
+
+    * ``False`` (default) — fire-and-forget. No force-reply prompt; the message
+      is delivered and forgotten. Used for non-amux sessions where a reply can't
+      be injected anyway.
+    * ``True`` — the relay attaches a Telegram force-reply prompt so the user can
+      reply in-thread, and the message stays answerable (answerability is
+      per-message, not gated by kind). ``notification_hook`` uses this for
+      amux-hosted sessions and hands the returned id to ``reply_injector.py``.
 
     Returns the relay message id, or None if the relay is disabled / send fails.
     """
@@ -449,7 +459,7 @@ def send_idle_notification(text: str, dedupe_key: str) -> Optional[int]:
         text=text,
         keyboard=None,
         kind="notification",
-        reply_required=False,
+        reply_required=reply_required,
         request_id=dedupe_key,
     )
 
