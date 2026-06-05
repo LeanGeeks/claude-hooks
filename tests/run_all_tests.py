@@ -25,6 +25,7 @@ TEST_MODULES = {
     "unit_decision": "test_unit_decision_mapper",
     "unit_state": "test_unit_state_store",
     "unit_whitelist": "test_unit_whitelist",
+    "unit_notification": "test_unit_notification_hook",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }

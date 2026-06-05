@@ -434,6 +434,26 @@ def send_question_message(
     return message_id
 
 
+def send_idle_notification(text: str, dedupe_key: str) -> Optional[int]:
+    """Send a fire-and-forget idle notification (no buttons, no reply).
+
+    Used by ``notification_hook.py`` to forward the agent's last message when a
+    session goes idle. ``kind="notification"`` + ``reply_required=False`` tells
+    the relay this row never expects an answer, so it is delivered and forgotten
+    (no waiter, no keyboard). ``dedupe_key`` seeds the idempotency key so a
+    re-fired idle prompt for the same state won't double-post.
+
+    Returns the relay message id, or None if the relay is disabled / send fails.
+    """
+    return _send_relay(
+        text=text,
+        keyboard=None,
+        kind="notification",
+        reply_required=False,
+        request_id=dedupe_key,
+    )
+
+
 def send_freetext_followup(request_id: str, workspace_name: str) -> Optional[int]:
     """Send a follow-up free-text prompt and re-route the request to it."""
     text = f"<b>{workspace_name}</b>\n\n<i>Please type your answer:</i>"
