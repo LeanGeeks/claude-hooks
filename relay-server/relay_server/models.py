@@ -23,6 +23,15 @@ class CreateMessageRequest(BaseModel):
     keyboard: list[list[KeyboardButton]] | None = None
     reply_required: bool = False
     ttl_sec: int = Field(gt=0, le=24 * 3600)
+    # Re-answerable group: when ``group_id`` is set, the message is editable
+    # (taps update a provisional choice and re-render the keyboard with the
+    # selection highlighted) until every message sharing the same ``group_id``
+    # has an answer. At that point the relay finalizes the whole group — strips
+    # all keyboards and bakes each choice into the message text. ``group_total``
+    # is how many messages the group will contain (the relay can't count rows
+    # that aren't inserted yet). Both None for ordinary one-shot messages.
+    group_id: str | None = None
+    group_total: int | None = Field(default=None, gt=0)
 
 
 class CreateMessageResponse(BaseModel):

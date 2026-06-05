@@ -82,6 +82,7 @@ class TelegramBackend(Protocol):
         telegram_message_id: int,
         text: str | None,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None: ...
 
     async def delete_message(
@@ -94,11 +95,17 @@ class TelegramBackend(Protocol):
         chat_id: int,
         telegram_message_id: int,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None:
         """Replace (or strip, when ``keyboard`` is None) the inline keyboard.
 
         Distinct from ``edit_message`` so cancel/expiry paths can unambiguously
         request keyboard removal against the real Bot API.
+
+        ``relay_message_id`` is the relay-side message id used to re-encode each
+        button's ``callback_data`` so taps on a re-rendered keyboard still route
+        back to this message. Pass None to keep the legacy value/label fallback
+        (only safe when stripping the keyboard entirely).
         """
 
     async def answer_callback_query(
@@ -165,6 +172,7 @@ class FakeTelegramBackend:
         telegram_message_id: int,
         text: str | None,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None:
         self.calls.append(
             FakeCall(
@@ -174,6 +182,7 @@ class FakeTelegramBackend:
                     "telegram_message_id": telegram_message_id,
                     "text": text,
                     "keyboard": keyboard,
+                    "relay_message_id": relay_message_id,
                 },
             )
         )
@@ -197,6 +206,7 @@ class FakeTelegramBackend:
         chat_id: int,
         telegram_message_id: int,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None:
         self.calls.append(
             FakeCall(
@@ -205,6 +215,7 @@ class FakeTelegramBackend:
                     "chat_id": chat_id,
                     "telegram_message_id": telegram_message_id,
                     "keyboard": keyboard,
+                    "relay_message_id": relay_message_id,
                 },
             )
         )
@@ -363,6 +374,7 @@ class HttpTelegramBackend:
         telegram_message_id: int,
         text: str | None,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None:
         if text is not None:
             payload: dict[str, Any] = {
@@ -371,15 +383,20 @@ class HttpTelegramBackend:
                 "text": text,
                 "parse_mode": PARSE_MODE,
             }
-            markup = _inline_keyboard_payload(keyboard, message_id=None)
+            markup = _inline_keyboard_payload(
+                keyboard, message_id=relay_message_id
+            )
             if markup is not None:
                 payload["reply_markup"] = markup
+            # editMessageText with no ``reply_markup`` removes any existing
+            # inline keyboard — that's how group finalization strips buttons.
             await self._call("editMessageText", payload)
         elif keyboard is not None:
             await self.edit_reply_markup(
                 chat_id=chat_id,
                 telegram_message_id=telegram_message_id,
                 keyboard=keyboard,
+                relay_message_id=relay_message_id,
             )
 
     async def edit_reply_markup(
@@ -388,12 +405,13 @@ class HttpTelegramBackend:
         chat_id: int,
         telegram_message_id: int,
         keyboard: list[list[dict[str, Any]]] | None,
+        relay_message_id: int | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
             "message_id": telegram_message_id,
         }
-        markup = _inline_keyboard_payload(keyboard, message_id=None)
+        markup = _inline_keyboard_payload(keyboard, message_id=relay_message_id)
         if markup is not None:
             payload["reply_markup"] = markup
         await self._call("editMessageReplyMarkup", payload)

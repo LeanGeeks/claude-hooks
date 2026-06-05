@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -961,12 +962,169 @@ async def _load_installation_for_chat(
     return await run_in_thread(_q)
 
 
-def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None:
+def _payload_for(row: sqlite3.Row) -> dict[str, Any]:
     try:
-        payload = json.loads(row["payload_json"])
+        return json.loads(row["payload_json"])
     except Exception:  # noqa: BLE001
-        return None
-    return payload.get("keyboard")
+        return {}
+
+
+def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None:
+    return _payload_for(row).get("keyboard")
+
+
+# ---- Re-answerable message groups -----------------------------------------
+#
+# AskUserQuestion fans a single prompt out into N sibling messages tagged with
+# a shared ``group_id``. Each stays editable — taps update a provisional choice
+# and re-render the keyboard with the selection marked — until every sibling
+# has an answer, at which point the relay finalizes the whole group: strips all
+# keyboards and bakes each choice into the message text. See models.py.
+
+_SELECTED_PREFIX = "✅ "
+_REPLY_PREFIX = "✍️ "
+
+
+def _esc(s: str) -> str:
+    """Escape user/option text baked into a message body. All outbound text is
+    sent with ``parse_mode=HTML`` (see telegram_backend.PARSE_MODE), so a stray
+    ``<``/``>``/``&`` in an option label or a typed reply would otherwise make
+    the edit fail as malformed HTML and leave the keyboard un-stripped."""
+    return html.escape(s or "", quote=False)
+
+
+def _group_info(row: sqlite3.Row) -> tuple[str | None, int | None]:
+    """Return ``(group_id, group_total)`` for a re-answerable message.
+
+    ``(None, None)`` for ordinary one-shot messages (permissions, single
+    notifications) so callers can branch on ``group_id is not None``.
+    """
+    payload = _payload_for(row)
+    gid = payload.get("group_id")
+    if gid is None:
+        return None, None
+    return gid, payload.get("group_total")
+
+
+def _highlighted_keyboard(
+    keyboard: list[list[dict[str, Any]]], selected_idx: int
+) -> list[list[dict[str, Any]]]:
+    """Copy ``keyboard`` (relay ``[[{label,value}]]`` shape), marking the button
+    at flat row-major index ``selected_idx`` as selected.
+
+    Always built from the pristine stored keyboard, so switching selections is
+    idempotent (the marker never stacks) and ``selected_idx < 0`` yields an
+    unmarked copy (used when the user answered with custom text instead).
+    """
+    out: list[list[dict[str, Any]]] = []
+    flat = 0
+    for kb_row in keyboard:
+        out_row: list[dict[str, Any]] = []
+        for btn in kb_row:
+            label = btn.get("label", "")
+            if flat == selected_idx:
+                label = _SELECTED_PREFIX + label
+            out_row.append({"label": label, "value": btn.get("value", "")})
+            flat += 1
+        out.append(out_row)
+    return out
+
+
+def _answer_line(answer: dict[str, Any]) -> str:
+    """The trailing line baked into a message body when its group finalizes."""
+    if answer.get("via") == "button":
+        return f"\n\n{_SELECTED_PREFIX}{_esc(answer.get('label', ''))}"
+    return f"\n\n{_REPLY_PREFIX}{_esc(answer.get('text', ''))}"
+
+
+async def _record_provisional(
+    conn: sqlite3.Connection, message_id: int, answer: dict[str, Any]
+) -> bool:
+    """Store/replace the provisional answer on an *open* message without making
+    it terminal. Returns True iff the row was open and we wrote it."""
+    now_iso = _utcnow_iso()
+
+    def _w() -> int:
+        with conn:
+            cur = conn.execute(
+                "UPDATE messages SET answer_json=?, answered_at=?"
+                " WHERE id=? AND state='open'",
+                (json.dumps(answer), now_iso, message_id),
+            )
+            return cur.rowcount
+
+    return bool(await run_in_thread(_w))
+
+
+async def _load_group_members(
+    conn: sqlite3.Connection, chat_id: int, group_id: str
+) -> list[sqlite3.Row]:
+    def _q() -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM messages WHERE telegram_chat_id = ?"
+            " AND json_extract(payload_json, '$.group_id') = ?"
+            " ORDER BY id",
+            (chat_id, group_id),
+        ).fetchall()
+
+    return await run_in_thread(_q)
+
+
+async def _finalize_group_if_complete(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    chat_id: int,
+    group_id: str,
+    group_total: int | None,
+) -> bool:
+    """If every message in ``group_id`` now has a provisional answer, flip the
+    whole group to ``answered``, strip all keyboards, bake each choice into the
+    message body, and wake the long-pollers. Returns True iff *this* call did
+    the finalizing (so the caller can pick the right callback toast)."""
+    members = await _load_group_members(conn, chat_id, group_id)
+    if not members:
+        return False
+    # Guard against finalizing before all siblings have even been created.
+    if group_total is not None and len(members) < group_total:
+        return False
+    if any(m["answer_json"] is None for m in members):
+        return False
+
+    ids = [int(m["id"]) for m in members]
+
+    def _flip() -> int:
+        placeholders = ",".join("?" * len(ids))
+        with conn:
+            cur = conn.execute(
+                f"UPDATE messages SET state='answered'"
+                f" WHERE id IN ({placeholders}) AND state='open'",
+                ids,
+            )
+            return cur.rowcount
+
+    flipped = await run_in_thread(_flip)
+    if not flipped:
+        # A concurrent tap already claimed finalization for this group.
+        return False
+
+    # Re-load to capture the latest provisional answer for each member, then
+    # render the terminal view: answer baked into the text, keyboard removed.
+    members = await _load_group_members(conn, chat_id, group_id)
+    for m in members:
+        answer = json.loads(m["answer_json"]) if m["answer_json"] else {}
+        body = (_payload_for(m).get("text") or "") + _answer_line(answer)
+        try:
+            await backend.edit_message(
+                chat_id=chat_id,
+                telegram_message_id=int(m["telegram_message_id"]),
+                text=body,
+                keyboard=None,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("group finalize edit failed for message %s", m["id"])
+        waiters.notify(int(m["id"]))
+    return True
 
 
 async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
@@ -1013,11 +1171,8 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     if reply_to is not None:
         row = await _load_message_by_tg_id(conn, int(chat_id), int(reply_to))
         if row is not None:
-            await _record_answer(
-                conn,
-                waiters,
-                row["id"],
-                {"text": msg.get("text", ""), "via": "reply"},
+            await _apply_text_answer(
+                conn, backend, waiters, row, msg.get("text", ""), "reply"
             )
             return
 
@@ -1041,11 +1196,8 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     row = await _load_last_open_in_chat(conn, int(chat_id))
     if row is None:
         return
-    await _record_answer(
-        conn,
-        waiters,
-        row["id"],
-        {"text": msg.get("text", ""), "via": "fallback"},
+    await _apply_text_answer(
+        conn, backend, waiters, row, msg.get("text", ""), "fallback"
     )
 
 
@@ -1169,6 +1321,131 @@ async def _handle_bind_command(app: FastAPI, msg: dict[str, Any]) -> None:
     await backend.send_text(chat_id=int(chat_id), text=reply)
 
 
+async def _safe_answer_cb(
+    backend: TelegramBackend, cb_id: str, text: str | None = None
+) -> None:
+    if not cb_id:
+        return
+    try:
+        await backend.answer_callback_query(callback_query_id=cb_id, text=text)
+    except Exception:  # noqa: BLE001
+        logger.exception("answer_callback_query failed")
+
+
+async def _handle_grouped_button(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    row: sqlite3.Row,
+    option_idx: int,
+    chosen: dict[str, Any],
+    cb_id: str,
+    group_id: str,
+    group_total: int | None,
+) -> None:
+    """A tap on a re-answerable grouped message: record the provisional choice,
+    re-render with it highlighted, and finalize the group once all are in."""
+    chat_id = int(row["telegram_chat_id"])
+    answer = {
+        "option_idx": option_idx,
+        "label": chosen.get("label"),
+        "value": chosen.get("value"),
+        "via": "button",
+    }
+    wrote = await _record_provisional(conn, int(row["id"]), answer)
+    if not wrote:
+        # No longer open — the group finalized, expired, or was cancelled.
+        fresh = await _load_open_message_any(conn, int(row["id"]))
+        state = fresh["state"] if fresh is not None else None
+        ack = {
+            "answered": "Already submitted",
+            "expired": "⏱ Expired — no longer waiting",
+            "cancelled": "Cancelled — handled in the terminal",
+        }.get(state, "No longer waiting for an answer")
+        await _safe_answer_cb(backend, cb_id, ack)
+        return
+
+    if await _finalize_group_if_complete(
+        conn, backend, waiters, chat_id, group_id, group_total
+    ):
+        await _safe_answer_cb(backend, cb_id, "Submitted ✓")
+        return
+
+    # Group still incomplete — just highlight this message's selection. Render
+    # from the pristine stored keyboard so re-selecting doesn't stack markers,
+    # threading the relay message id so re-encoded taps still route back here.
+    keyboard = _payload_keyboard_for(row) or []
+    highlighted = _highlighted_keyboard(keyboard, option_idx)
+    try:
+        await backend.edit_message(
+            chat_id=chat_id,
+            telegram_message_id=int(row["telegram_message_id"]),
+            text=_payload_for(row).get("text") or "",
+            keyboard=highlighted,
+            relay_message_id=int(row["id"]),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("grouped highlight edit failed for message %s", row["id"])
+    await _safe_answer_cb(
+        backend, cb_id, f"Selected: {chosen.get('label', '')}"
+    )
+
+
+async def _handle_grouped_reply(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    row: sqlite3.Row,
+    text: str,
+) -> None:
+    """A custom text answer to a re-answerable grouped message: record it,
+    reflect it in the body (keyboard kept, un-highlighted), and finalize the
+    group once all siblings are answered."""
+    chat_id = int(row["telegram_chat_id"])
+    group_id, group_total = _group_info(row)
+    if group_id is None:
+        return
+    wrote = await _record_provisional(
+        conn, int(row["id"]), {"text": text, "via": "reply"}
+    )
+    if not wrote:
+        return
+    if await _finalize_group_if_complete(
+        conn, backend, waiters, chat_id, group_id, group_total
+    ):
+        return
+    # Still collecting — show the typed answer and leave the buttons available
+    # (un-highlighted) so the user can still switch to a preset option.
+    body = (_payload_for(row).get("text") or "") + f"\n\n{_REPLY_PREFIX}{_esc(text)}"
+    try:
+        await backend.edit_message(
+            chat_id=chat_id,
+            telegram_message_id=int(row["telegram_message_id"]),
+            text=body,
+            keyboard=_payload_keyboard_for(row),
+            relay_message_id=int(row["id"]),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("grouped reply reflect failed for message %s", row["id"])
+
+
+async def _apply_text_answer(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    row: sqlite3.Row,
+    text: str,
+    via: str,
+) -> None:
+    """Route a free-text answer: provisional+grouped flow for re-answerable
+    messages, the legacy terminal ``_record_answer`` otherwise."""
+    group_id, _ = _group_info(row)
+    if group_id is not None:
+        await _handle_grouped_reply(conn, backend, waiters, row, text)
+    else:
+        await _record_answer(conn, waiters, int(row["id"]), {"text": text, "via": via})
+
+
 async def _handle_callback_query(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
@@ -1229,6 +1506,24 @@ async def _handle_callback_query(
         return
 
     chosen = flat[parsed.option_idx]
+
+    # Re-answerable grouped messages (AskUserQuestion) take the provisional
+    # path: highlight the selection, keep buttons live, finalize as a group.
+    group_id, group_total = _group_info(row)
+    if group_id is not None:
+        await _handle_grouped_button(
+            conn,
+            backend,
+            waiters,
+            row,
+            parsed.option_idx,
+            chosen,
+            cb_id,
+            group_id,
+            group_total,
+        )
+        return
+
     answer = {
         "option_idx": parsed.option_idx,
         "label": chosen.get("label"),

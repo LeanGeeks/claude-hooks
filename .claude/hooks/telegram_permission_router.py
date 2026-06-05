@@ -268,6 +268,8 @@ def _send_relay(
     kind: str,
     reply_required: bool,
     request_id: str,
+    group_id: Optional[str] = None,
+    group_total: Optional[int] = None,
 ) -> Optional[int]:
     """Common send helper. Returns the relay message_id or None on failure."""
     if not TELEGRAM_ENABLED:
@@ -280,6 +282,8 @@ def _send_relay(
             reply_required=reply_required,
             ttl_sec=RELAY_MESSAGE_TTL,
             idempotency_key=f"req:{request_id}:send",
+            group_id=group_id,
+            group_total=group_total,
         )
     except NotBoundError as e:
         error_log(
@@ -337,12 +341,17 @@ def send_question_message(
     workspace_name: str,
     index: int,
     total: int,
+    group_id: Optional[str] = None,
 ) -> Optional[int]:
     """Send a single AskUserQuestion prompt; buttons map to option indices.
 
     The button ``value`` is ``qa<N>`` (matches the legacy callback_data prefix)
     so the answer-handling code can distinguish question answers from
     permission actions when both routes share a state row.
+
+    When ``group_id`` is set, the relay treats all ``total`` sibling messages as
+    one re-answerable group: taps highlight the choice and stay live until every
+    question is answered, then the whole group's keyboards are stripped at once.
     """
     ti = request.tool_input or {}
     question_text = ti.get("question", "")
@@ -417,6 +426,8 @@ def send_question_message(
         kind="question",
         reply_required=True,
         request_id=request.request_id,
+        group_id=group_id,
+        group_total=total if group_id is not None else None,
     )
     if message_id is not None:
         set_telegram_message_id(request.request_id, message_id)

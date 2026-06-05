@@ -31,6 +31,7 @@ import sys
 import os
 import time
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -43,6 +44,7 @@ from permission_state_store import (
     RequestState,
     create_request,
     get_request,
+    update_request_state,
     cleanup_expired_requests,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
@@ -344,6 +346,13 @@ def handle_ask_user_question(
     # One child request per question. Each gets its own relay message and
     # state-store entry; relay button values ``qa<N>`` (or a free-text reply)
     # are mapped to the originating child via ``relay_answer_to_decision``.
+    #
+    # A shared ``group_id`` ties the sibling relay messages into one
+    # re-answerable group: the relay keeps every question's buttons live (taps
+    # just highlight the choice) until all are answered, then strips them all at
+    # once. The hook still polls children in order — each only goes terminal
+    # when the whole group finalizes, so the sequential loop below stays valid.
+    group_id = uuid.uuid4().hex
     children = []  # list of (PermissionRequest, question_dict, message_id)
     for i, q in enumerate(questions):
         child = create_request(
@@ -359,7 +368,7 @@ def handle_ask_user_question(
             permission_suggestions=[],
             ttl_seconds=REQUEST_TTL,
         )
-        msg_id = send_question_message(child, workspace_name, i, len(questions))
+        msg_id = send_question_message(child, workspace_name, i, len(questions), group_id)
         if not msg_id:
             error_log(f"Failed to send AskUserQuestion message for child {child.request_id}; falling back to terminal")
             return None
@@ -422,6 +431,15 @@ def handle_ask_user_question(
                 debug_log(f"Unexpected decision shape for question: {decision}")
                 return None
             answers[q.get('question', '')] = decision.get('reply_text', '')
+            # Mark this child terminal so the PostToolUse hook's pending-request
+            # sweep won't later try to cancel its (already group-finalized)
+            # relay message.
+            update_request_state(
+                child.request_id,
+                RequestState.REPLY,
+                reply_text=decision.get('reply_text', ''),
+                resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+            )
             resolved = True
 
         if not resolved:

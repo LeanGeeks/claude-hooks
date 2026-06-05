@@ -228,6 +228,8 @@ class RelayClient:
         reply_required: bool = False,
         ttl_sec: int = 300,
         idempotency_key: str | None = None,
+        group_id: str | None = None,
+        group_total: int | None = None,
     ) -> MessageHandle:
         body: dict[str, Any] = {
             "kind": kind,
@@ -237,6 +239,11 @@ class RelayClient:
         }
         if keyboard is not None:
             body["keyboard"] = keyboard
+        # Re-answerable group (AskUserQuestion fan-out): the server keeps these
+        # messages editable until every sibling sharing ``group_id`` is answered.
+        if group_id is not None:
+            body["group_id"] = group_id
+            body["group_total"] = group_total
 
         headers = {"Idempotency-Key": idempotency_key or str(uuid.uuid4())}
         resp = self._request("POST", "/v1/messages", json_body=body, headers=headers)
