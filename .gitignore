@@ -1,5 +1,4 @@
 agents_output/
-tasks/
 temp/
 __pycache__/
 *.pyc
