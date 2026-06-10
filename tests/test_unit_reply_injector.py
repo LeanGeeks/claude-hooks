@@ -33,7 +33,7 @@ class TestSanitize(unittest.TestCase):
 
 
 class TestInjectReply(unittest.TestCase):
-    def test_clears_then_sends_in_order(self):
+    def test_clears_with_line_kills_then_sends(self):
         calls = []
 
         def fake_send(name, *args):
@@ -43,9 +43,16 @@ class TestInjectReply(unittest.TestCase):
         with patch.object(ri, "amux_send", fake_send):
             ri.inject_reply("hyppie-flow", "do the thing")
 
-        # Two Escapes clear the prompt first, then the text (which auto-submits).
-        self.assertEqual(calls[0], ("hyppie-flow", ("--keys", "Escape", "Escape")))
+        # First: clear any half-typed draft in both directions via Ctrl-U (up) +
+        # Ctrl-K (down) — NOT Escape (Rewind shortcut / aborts a turn) and NOT
+        # arrows (recall input history). Then: the reply text, which auto-submits.
+        expected_kills = ("--keys", *(["C-u"] * ri.CLEAR_LINE_KILLS), *(["C-k"] * ri.CLEAR_LINE_KILLS))
+        self.assertEqual(calls[0], ("hyppie-flow", expected_kills))
         self.assertEqual(calls[1], ("hyppie-flow", ("do the thing",)))
+        # Never send an Escape- or arrow-based pre-clear.
+        sent = [a for _, args in calls for a in args]
+        for forbidden in ("Escape", "Up", "Down"):
+            self.assertNotIn(forbidden, sent)
 
 
 class TestMain(unittest.TestCase):

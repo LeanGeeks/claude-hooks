@@ -288,7 +288,11 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                     matcher: "idle_prompt",
                     hooks: [{
                         type: "command",
-                        command: ("python3 " + $notification_path)
+                        # CLAUDE_HOOK_DEBUG=1 mirrors PermissionRequest: it logs the
+                        # idle-notification path AND propagates (via inherited env)
+                        # to the detached reply_injector.py it spawns, so the
+                        # reply-from-Telegram chain is observable end-to-end.
+                        command: ("CLAUDE_HOOK_DEBUG=1 python3 " + $notification_path)
                     }]
                 }]
             }')

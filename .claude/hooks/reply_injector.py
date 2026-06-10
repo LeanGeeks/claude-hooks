@@ -5,8 +5,8 @@ Reply Injector - Inject a Telegram reply into an amux-hosted session.
 Spawned **detached** by ``notification_hook.py`` when an amux-hosted session
 goes idle and its force-reply notification is sent. This process long-polls the
 relay for the answer to that one notification message; on a free-text reply it
-clears the session's prompt (two Escapes) and types the reply via ``amux send``,
-which auto-submits it as the next user turn.
+clears the session's prompt (Ctrl-U/Ctrl-K line-kills) and types the reply via
+``amux send``, which auto-submits it as the next user turn.
 
 Design (see tasks/09_reply_from_telegram.md):
 - One injector per idle notification; injects exactly once, then exits.
@@ -35,6 +35,16 @@ from telegram_permission_router import load_telegram_config, wait_for_relay_answ
 # On answer we inject and exit; on expiry/cancel/timeout we exit without acting.
 INJECT_TTL = 43200
 LONG_POLL_CHUNK = 25
+
+# Line-kills used to clear a half-typed local draft before injecting the reply:
+# Ctrl-U kills from the cursor UP to the input start (climbing across newlines),
+# Ctrl-K kills from the cursor DOWN to the end. Sent together (one send-keys call)
+# they clear a multiline draft in both directions from wherever the cursor sits,
+# with no char limit and — crucially — no arrow keys (Up/Down recall input history
+# and would make the draft vanish). ~2 keystrokes clear one line, so N of each
+# clears roughly N/2 lines per direction; 10 each handles ~5 lines up + ~5 down,
+# far beyond any realistic idle half-typed prompt.
+CLEAR_LINE_KILLS = 10
 
 DEBUG_LOG = Path.home() / ".claude" / "reply_injector_debug.log"
 
@@ -83,11 +93,26 @@ def amux_send(amux_name: str, *args: str) -> bool:
 
 
 def inject_reply(amux_name: str, text: str) -> None:
-    """Clear any stray prompt text, then type + submit the reply."""
-    # Two Escapes clear whatever might be in the input box (a no-op when empty),
-    # so a half-typed local prompt isn't merged with the injected reply. We don't
-    # try to detect emptiness — the idle hook already told us the session is idle.
-    amux_send(amux_name, "--keys", "Escape", "Escape")
+    """Clear any half-typed local draft, then type + submit the reply.
+
+    Clearing uses ``Ctrl-U`` (kill to input start, climbing up across newlines) +
+    ``Ctrl-K`` (kill to input end, climbing down) — deliberately NOT Escape or
+    arrow keys. ``Escape Escape`` is Claude Code's **Rewind** shortcut: on an
+    empty prompt it opens the rewind menu, so the reply types *into that menu* and
+    the trailing Enter acts on Rewind instead of submitting — the reply silently
+    vanishes; a lone ``Esc`` also aborts a running turn. ``End`` + Backspace only
+    deletes backward, so lines *below* the cursor survive, and reaching them would
+    need ``Down``, which recalls input history and makes the draft vanish. The
+    Ctrl-U/Ctrl-K pair clears in *both* directions from wherever the cursor sits,
+    with no char limit and no history risk. On an empty idle box these are
+    harmless no-ops, and neither opens Rewind. (All verified against Claude Code
+    v2.1.169.) Sent as one ``send-keys`` call — a single fast round-trip.
+
+    Known v1 limitation: ~2 keystrokes clear one line, so a draft taller than
+    ~``CLEAR_LINE_KILLS``/2 lines above or below the cursor is only partly cleared.
+    """
+    kill_keys = ["C-u"] * CLEAR_LINE_KILLS + ["C-k"] * CLEAR_LINE_KILLS
+    amux_send(amux_name, "--keys", *kill_keys)
     if amux_send(amux_name, text):
         debug_log(f"Injected into amux:{amux_name}: {text[:80]!r}")
     else:
