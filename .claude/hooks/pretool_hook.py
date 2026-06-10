@@ -503,6 +503,7 @@ class BashPermissionValidator:
             'do curl http://x'        -> 'curl http://x'
             'exec rm -rf /etc'        -> 'rm -rf /etc'
             'timeout 5 curl http://x' -> 'curl http://x'
+            'PORT=3100 pnpm start'    -> 'pnpm start'
             'env FOO=bar node app.js' -> 'node app.js'
             'if grep -q foo file'     -> 'grep -q foo file'
             'command -v chromium'     -> ''            (lookup, runs nothing)
@@ -516,6 +517,14 @@ class BashPermissionValidator:
             head = tokens[0]
 
             if head in CONTROL_KEYWORD_PREFIXES:
+                tokens = tokens[1:]
+                continue
+
+            # Peel leading `KEY=VALUE` environment assignments (e.g.
+            # `PORT=3100 pnpm start`) so we validate the command that actually
+            # runs, not the assignment. Without this, the env prefix glues to the
+            # command and the allow-pattern prefix match (`Bash(pnpm:*)`) fails.
+            if BashCommandParser._is_env_prefix(head):
                 tokens = tokens[1:]
                 continue
 

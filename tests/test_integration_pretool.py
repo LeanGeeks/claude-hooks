@@ -344,6 +344,8 @@ class TestPrefixReduction(unittest.TestCase):
             "exec rm -rf /etc": "rm -rf /etc",
             "timeout 5 curl http://x": "curl http://x",
             "timeout 5s curl http://x": "curl http://x",
+            "PORT=3100 pnpm start -p 3100": "pnpm start -p 3100",  # leading env assignment
+            "FOO=bar BAZ=qux node app.js": "node app.js",          # multiple env assignments
             "env FOO=bar node app.js": "node app.js",
             "time timeout 5 curl http://x": "curl http://x",  # nested
             "/usr/bin/env curl http://x": "curl http://x",    # path-qualified wrapper
@@ -408,6 +410,26 @@ class TestPrefixReduction(unittest.TestCase):
             '(command -v chromium chromium-browser google-chrome 2>/dev/null; '
             'ls node_modules/.bin/playwright 2>/dev/null; echo "---try---"; '
             'node -e "require(\'playwright\')" 2>&1 | tail -3)'
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+    def test_env_prefix_allows_real_allowed_command(self):
+        """`PORT=3100 pnpm start` reduces past the env assignment to an allowed `pnpm`."""
+        result = self.validator.validate_bash_command("PORT=3100 pnpm start -p 3100")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_env_prefix_does_not_bypass(self):
+        """A leading env assignment must not auto-allow a non-whitelisted command:
+        `FOO=bar rm -rf /etc` reduces to `rm` (not whitelisted outside workspace)."""
+        result = self.validator.validate_bash_command("FOO=bar rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_env_prefixed_backgrounded_server_loop_allowed(self):
+        """The original hyppie-flow command with a `PORT=` env prefix is auto-allowed."""
+        command = (
+            'cd /tmp; (PORT=3100 pnpm start -p 3100 >/tmp/next.log 2>&1 &) ; '
+            'sleep 1; echo started'
         )
         result = self.validator.validate_bash_command(command)
         self.assertEqual(result["decision"], "allow")
