@@ -19,6 +19,7 @@ Replay Mode Usage:
 
 import io
 import json
+import re
 import sys
 import os
 from datetime import datetime
@@ -83,6 +84,59 @@ WRAPPER_PREFIXES = {
 # would resolve and runs nothing — so the operand must NOT be validated as if it
 # were executed. Bash spells these `-v` and `-V` (combinable with `-p`, e.g. -pv).
 COMMAND_LOOKUP_FLAGS = {'v', 'V'}
+
+# Shell keywords whose ENTIRE sub-command is loop/conditional scaffolding that
+# runs nothing on its own. These differ from CONTROL_KEYWORD_PREFIXES: those
+# INTRODUCE a command and are peeled so the command after them is validated
+# (`if grep ...` -> validate `grep ...`). These, by contrast, are followed by a
+# word-list rather than a command (`for i in 4 5`, `select opt in a b`) or are
+# bare block terminators (`done`, `fi`, `esac`) — so the whole sub-command is
+# reduced to '' (auto-allow). This is safe because any command substitution in a
+# loop's word-list (e.g. `for f in $(ls)`) is extracted as its own sub-command by
+# the parser and validated independently; dropping the scaffolding cannot
+# authorize it. `for`/`select`/`case` are deliberately NOT in
+# CONTROL_KEYWORD_PREFIXES for exactly this reason (peeling `for` would leave
+# `i in 4 5`, which would then fail validation as a command named `i`).
+SCAFFOLDING_KEYWORDS = {
+    'for', 'select',       # word-list loop headers (the list is data, not a command)
+    'done', 'fi', 'esac',  # block terminators
+}
+
+# A leading function-definition header: `name() {`, `name ()`, `function name {`,
+# or `function name() {`. Defining a function runs nothing, and its body is
+# validated as separate sub-commands, so dropping the header can never authorize
+# the body. At the head of a sub-command, `name()` is unambiguously a function
+# definition in valid bash (a simple command cannot be named `name()`, subshells
+# start with `(` not `name(`, and `$(...)`/`((...))` are tokenized separately),
+# so this match has no realistic false positives. The match is a PREFIX, not the
+# whole string: the inline form `name() { echo hi` is parsed by the tokenizer as
+# one sub-command (the opening brace is not a split point), so we strip the
+# `name() {` prefix and validate the `echo hi` body that follows it. The captured
+# `name` is recorded so later invocations of the function resolve to a no-op too.
+_FUNCTION_DEF_RE = re.compile(
+    r'^\s*(?:function\s+(?P<fname>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\(\))?'  # function name [()]
+    r'|(?P<pname>[A-Za-z_][A-Za-z0-9_]*)\s*\(\))'                       # name()
+    r'\s*\{?\s*'
+)
+
+
+def _strip_function_def_header(cmd: str):
+    """
+    If cmd begins with a function-definition header, return (name, remainder);
+    otherwise return (None, cmd).
+
+    The remainder is the inline body command that followed the opening brace, or
+    '' when the header stands alone:
+        'parse() {'           -> ('parse', '')
+        'greet() { echo hi'   -> ('greet', 'echo hi')
+        'function foo {'      -> ('foo', '')
+        'git status'          -> (None, 'git status')
+    """
+    m = _FUNCTION_DEF_RE.match(cmd)
+    if not m:
+        return None, cmd
+    name = m.group('fname') or m.group('pname')
+    return name, cmd[m.end():].strip()
 
 
 def debug_log(message: str):
@@ -269,14 +323,33 @@ class BashPermissionValidator:
         """
         debug_log(f"Validating command: {command!r}")
 
-        # Parse compound command
-        sub_commands = self.parser.parse_compound_command(command)
+        # Parse compound command, keeping each sub-command's source offset.
+        parsed = self.parser.parse_with_offsets(command)
+        sub_commands = [cmd for cmd, _off in parsed]
         debug_log(f"Parsed into {len(sub_commands)} sub-commands: {sub_commands}")
+
+        # Map each function defined in this compound command to the EARLIEST
+        # source offset at which it is defined. A call to such a function runs
+        # only the function body (validated separately as its own sub-commands),
+        # so the call itself is a no-op — but ONLY once the definition has been
+        # reached. bash defines functions in source order and executes top to
+        # bottom, so a call may treat the name as the function only if the
+        # definition lexically precedes it (def_offset < call_offset). Without
+        # this ordering check, `rm -rf /; rm() { :; }` would auto-allow the real
+        # `rm` that runs before the no-op function is ever defined.
+        function_defs = {}
+        for cmd, off in parsed:
+            name, _ = _strip_function_def_header(cmd)
+            if name is not None:
+                if name not in function_defs or off < function_defs[name]:
+                    function_defs[name] = off
+        if function_defs:
+            debug_log(f"Locally-defined functions (name->offset): {function_defs}")
 
         # Validate each sub-command
         results = []
-        for cmd in sub_commands:
-            result = self._check_single_command(cmd)
+        for cmd, off in parsed:
+            result = self._check_single_command(cmd, function_defs, off)
             results.append(result)
             debug_log(f"  Sub-command {cmd!r}: allowed={result['allowed']}, denied={result['denied']}")
 
@@ -506,15 +579,34 @@ class BashPermissionValidator:
             'PORT=3100 pnpm start'    -> 'pnpm start'
             'env FOO=bar node app.js' -> 'node app.js'
             'if grep -q foo file'     -> 'grep -q foo file'
+            'for i in 4 5'            -> ''            (loop header, runs nothing)
+            'done'                    -> ''            (block terminator)
+            'parse() {'               -> ''            (function-def header)
             'command -v chromium'     -> ''            (lookup, runs nothing)
             'command node app.js'     -> 'node app.js' (exec form)
             'git status'              -> 'git status' (unchanged)
         """
+        # Peel a leading function-definition header (`name() {`, `function name {`).
+        # Defining a function runs nothing; for the inline form `name() { echo hi`
+        # the brace-group body is glued to the header by the tokenizer, so we drop
+        # the header and validate the body command that followed it. A header with
+        # no inline body reduces to a no-op.
+        fname, remainder = _strip_function_def_header(cmd)
+        if fname is not None:
+            if not remainder:
+                return ''
+            cmd = remainder
+
         tokens = cmd.split()
         guard = 0
         while tokens and guard < 20:
             guard += 1
             head = tokens[0]
+
+            # Loop/case headers and block terminators are scaffolding that runs
+            # nothing on its own; the whole sub-command reduces to a no-op.
+            if head in SCAFFOLDING_KEYWORDS:
+                return ''
 
             if head in CONTROL_KEYWORD_PREFIXES:
                 tokens = tokens[1:]
@@ -564,12 +656,23 @@ class BashPermissionValidator:
 
         return ' '.join(tokens)
 
-    def _check_single_command(self, cmd: str) -> Dict[str, Any]:
+    def _check_single_command(self, cmd: str, function_defs: dict = None,
+                              cmd_offset: int = None) -> Dict[str, Any]:
         """
         Check if single command matches any pattern
 
         Args:
             cmd: Normalized command string
+            function_defs: Map of function name -> earliest source offset at which
+                it is defined in this same compound command. A call to one of
+                these executes only its body (validated separately), so it is
+                treated as a no-op — but only when the definition lexically
+                precedes this call (see cmd_offset).
+            cmd_offset: Source offset of this sub-command. A call is treated as a
+                no-op only if its function was defined at a strictly smaller
+                offset; this prevents a command from being auto-allowed because a
+                same-named function is defined *after* it (and so is not yet in
+                effect when the command runs).
 
         Returns:
             Dictionary with:
@@ -588,7 +691,8 @@ class BashPermissionValidator:
             debug_log(f"Reduced {cmd!r} to effective command {effective!r}")
         if not effective:
             # Nothing dangerous runs: a bare control keyword / wrapper with no
-            # command after it (e.g. 'do', 'env'), or a `command -v/-V` lookup.
+            # command after it (e.g. 'do', 'env'), a loop header / block
+            # terminator, a function-def header, or a `command -v/-V` lookup.
             debug_log(f"Command {cmd!r} runs nothing (bare prefix or lookup) - auto-allowing")
             return {
                 'command': cmd,
@@ -598,6 +702,27 @@ class BashPermissionValidator:
                 'matched_deny_patterns': []
             }
         cmd = effective
+
+        # A call to a function defined EARLIER in this same compound command runs
+        # only its (separately validated) body, so it is a no-op here. This also
+        # correctly handles a function that shadows a real binary
+        # (`rm() { ...; }; rm x`): the function runs, not the binary. The offset
+        # guard is what keeps this safe — a same-named function defined *after*
+        # this command (or inside the same substitution) is not yet in effect, so
+        # the real binary would run and the command must be validated for real.
+        if function_defs and cmd_offset is not None:
+            head = effective.split()[0] if effective.split() else ''
+            def_offset = function_defs.get(head)
+            if def_offset is not None and def_offset < cmd_offset:
+                debug_log(f"Command {cmd!r} calls local function {head!r} "
+                          f"(defined at {def_offset} < {cmd_offset}) - auto-allowing")
+                return {
+                    'command': cmd,
+                    'allowed': True,
+                    'denied': False,
+                    'matched_allow_patterns': ['local_function'],
+                    'matched_deny_patterns': []
+                }
 
         # First check: workspace binaries are always allowed
         if self._is_workspace_binary(cmd):

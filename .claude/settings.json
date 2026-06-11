@@ -158,6 +158,7 @@
       "Bash(npx:*)",
       "Bash(nx:*)",
       "Bash(gh:*)",
+      "Bash(playwright:*)",
       "Bash(pnpm:*)",
       "Bash(yarn:*)",
       "Bash(bun:*)",

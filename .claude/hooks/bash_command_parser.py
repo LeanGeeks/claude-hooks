@@ -51,6 +51,27 @@ class BashCommandParser:
             "GIT_PAGER=cat git diff" → ["git diff"]
             "npm install && npm test" → ["npm install", "npm test"]
         """
+        return [cmd for cmd, _offset in self.parse_with_offsets(command)]
+
+    def parse_with_offsets(self, command: str) -> List[Tuple[str, int]]:
+        """
+        Like parse_compound_command, but pairs each sub-command with the source
+        offset at which its execution anchors. Callers that reason about
+        execution order (e.g. "is this function defined before it is called?")
+        need this; the bare string list discards it.
+
+        The anchor offset is:
+        - for a top-level sub-command: the source offset of its first token;
+        - for a command extracted from a $()/`...` substitution: the source
+          offset of the enclosing substitution. All commands inside a
+          substitution share that anchor because they execute together, when
+          the enclosing statement runs.
+
+        Note the returned ORDER is top-level sub-commands first (in source
+        order), then substitution-extracted commands appended — the same shape
+        parse_compound_command has always produced. The offsets are what convey
+        true source order; do not infer it from list position.
+        """
         if not command or not command.strip():
             return []
 
@@ -65,14 +86,17 @@ class BashCommandParser:
         for group in command_groups:
             normalized = self._normalize_command(group)
             if normalized:
-                result.append(normalized)
+                result.append((normalized, group[0][2]))
 
-        # Also extract commands from command substitutions recursively
-        for token_type, token_value in tokens:
+        # Also extract commands from command substitutions recursively. Each
+        # extracted command anchors at the substitution's own source offset, so
+        # a function defined AFTER the substitution cannot appear to precede a
+        # call made INSIDE it.
+        for token_type, token_value, token_offset in tokens:
             if token_type == 'CMD_SUBST' and token_value.strip():
                 # Recursively parse the content of command substitutions
-                subst_commands = self.parse_compound_command(token_value)
-                result.extend(subst_commands)
+                for sub_cmd, _rel_offset in self.parse_with_offsets(token_value):
+                    result.append((sub_cmd, token_offset))
 
         return result
 
@@ -97,6 +121,7 @@ class BashCommandParser:
         """
         tokens = []
         current = []
+        current_start = 0  # Source offset where the current token buffer began
         in_quote = None  # None, "'", or '"'
         escaped = False
         i = 0
@@ -113,10 +138,15 @@ class BashCommandParser:
             """Flush current token buffer"""
             if current:
                 token_str = ''.join(current)
-                tokens.append(self._classify_token(token_str))
+                tokens.append(self._classify_token(token_str, current_start))
                 current.clear()
 
         while i < len(command):
+            # While the buffer is empty, keep the start offset pinned to the
+            # current position; once we append a char it freezes until the next
+            # flush, marking where this token began in the source.
+            if not current:
+                current_start = i
             char = command[i]
 
             # Handle heredoc mode (looking for delimiter)
@@ -215,7 +245,7 @@ class BashCommandParser:
                     i += 1
                 # Extract the command substitution content (excluding $( and ))
                 subst_content = command[subst_start+2:i-1]  # Skip $( and )
-                tokens.append(('CMD_SUBST', subst_content))
+                tokens.append(('CMD_SUBST', subst_content, subst_start))
 
                 if env_prefix:
                     # Part of env var value — keep in current token
@@ -251,7 +281,7 @@ class BashCommandParser:
                     i += 1
                 # Extract content (excluding backticks)
                 subst_content = command[subst_start+1:i-1]
-                tokens.append(('CMD_SUBST', subst_content))
+                tokens.append(('CMD_SUBST', subst_content, subst_start))
 
                 if env_prefix:
                     # Part of env var value — keep in current token
@@ -295,7 +325,7 @@ class BashCommandParser:
                 if delimiter:
                     heredoc_delimiter = delimiter
                     heredoc_seen_first_nl = False  # Will look for delimiter after first newline
-                    tokens.append(('REDIRECT', '<<'))
+                    tokens.append(('REDIRECT', '<<', i))
                     # Skip to after the delimiter (and closing quote if any)
                     i = j
                     continue
@@ -306,7 +336,7 @@ class BashCommandParser:
                 flush_current()
                 # Classify operator as OP or REDIRECT
                 op_type = 'REDIRECT' if self._is_redirect(op) else 'OP'
-                tokens.append((op_type, op))
+                tokens.append((op_type, op, i))
                 i += len(op)
                 continue
 
@@ -336,7 +366,7 @@ class BashCommandParser:
                     # An unquoted newline separates commands, just like ';'.
                     # (Quoted, escaped/continuation, heredoc, and command-subst
                     # newlines are handled before reaching this point.)
-                    tokens.append(('OP', ';'))
+                    tokens.append(('OP', ';', i))
                 i += 1
                 continue
 
@@ -385,15 +415,16 @@ class BashCommandParser:
             return False
         return all(c.isalnum() or c == '_' for c in key)
 
-    def _classify_token(self, token: str) -> Tuple[str, str]:
+    def _classify_token(self, token: str, offset: int = 0) -> Tuple[str, str, int]:
         """
         Classify token as ENV or WORD
 
         Args:
             token: Token string
+            offset: Source offset where the token began
 
         Returns:
-            (type, value) tuple
+            (type, value, offset) tuple
         """
         # Check if it's an environment variable (KEY=VALUE format)
         if '=' in token and not token.startswith('-'):
@@ -402,9 +433,9 @@ class BashCommandParser:
             # Valid env var: starts with letter or underscore, followed by alnum/underscore
             if key and (key[0].isalpha() or key[0] == '_'):
                 if all(c.isalnum() or c == '_' for c in key):
-                    return ('ENV', token)
+                    return ('ENV', token, offset)
 
-        return ('WORD', token)
+        return ('WORD', token, offset)
 
     def _split_on_operators(self, tokens: List[Tuple[str, str]]) -> List[List[Tuple[str, str]]]:
         """
@@ -420,7 +451,7 @@ class BashCommandParser:
         current_group = []
         skip_next = False  # Skip next token (redirect argument)
 
-        for token_type, token_value in tokens:
+        for token_type, token_value, token_offset in tokens:
             if skip_next:
                 # Don't skip operator tokens - they should always split commands
                 # (This handles the case where heredoc delimiter is already consumed)
@@ -444,7 +475,7 @@ class BashCommandParser:
                     skip_next = True
             else:
                 # Regular token or ENV var
-                current_group.append((token_type, token_value))
+                current_group.append((token_type, token_value, token_offset))
 
         # Flush final group
         if current_group:
@@ -471,7 +502,7 @@ class BashCommandParser:
         words = []
         skip_env = True  # Skip env vars at the beginning
 
-        for token_type, token_value in tokens:
+        for token_type, token_value, _token_offset in tokens:
             if skip_env and token_type == 'ENV':
                 # Skip leading environment variables
                 continue
