@@ -268,6 +268,37 @@ class TestTerminalResolutionRace(unittest.TestCase):
         self.assertIsNone(result)
         mock_remove_buttons.assert_called_once_with(777)
 
+    @patch("permission_request_hook.update_request_state")
+    @patch("permission_request_hook.wait_for_relay_answer")
+    @patch("permission_request_hook.get_request")
+    @patch("permission_request_hook.remove_inline_buttons")
+    def test_wait_for_response_relay_answer_strips_keyboard(
+        self,
+        mock_remove_buttons,
+        mock_get_request,
+        mock_wait_relay,
+        mock_update_state,
+    ):
+        """wait_for_response: a Telegram button answer must strip the keyboard
+        immediately (not wait for PostToolUse) and mark the request terminal so
+        the PostToolUse sweep won't re-cancel it."""
+        from permission_request_hook import wait_for_response
+        from permission_state_store import RequestState
+
+        # State store stays pending (the relay, not the terminal, resolves this).
+        mock_get_request.return_value = _make_request(state="pending")
+        # The relay long-poll returns a real button answer.
+        mock_wait_relay.return_value = {"via": "button", "value": "allow"}
+
+        result = wait_for_response("test-id", message_id=888, ttl_seconds=10)
+
+        self.assertEqual(result, {"action": "allow"})
+        mock_remove_buttons.assert_called_once_with(888)
+        # Marked terminal as a Telegram resolution so PostToolUse leaves it alone.
+        args, kwargs = mock_update_state.call_args
+        self.assertEqual(args[0], "test-id")
+        self.assertEqual(args[1], RequestState.ALLOW)
+
     @patch("permission_request_hook.wait_for_relay_answer")
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.get_request")

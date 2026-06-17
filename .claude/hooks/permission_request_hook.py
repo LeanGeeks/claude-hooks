@@ -298,10 +298,52 @@ def wait_for_response(
             debug_log("Failed to translate relay answer to decision")
             return None
         debug_log(f"Request {request_id} resolved via relay: {decision}")
+        # Strip the inline keyboard the instant the user taps a button, mirroring
+        # the terminal-resolution branch above. Without this, a Telegram-approved
+        # permission keeps its live buttons until PostToolUse fires *after the
+        # tool finishes* — for a long-running tool that looks like the buttons
+        # never disappear.
+        remove_inline_buttons(message_id)
+        # Record the Telegram resolution so the PostToolUse sweep skips this
+        # request and won't re-cancel an already-stripped message.
+        _mark_relay_resolved(request_id, decision)
         return decision
 
     debug_log(f"Request {request_id} polling timed out after {ttl_seconds}s")
     return None
+
+
+# Map a relay decision's action onto the state-store terminal state so the
+# PostToolUse hook's pending-request sweep (which only matches PENDING) leaves a
+# Telegram-resolved permission alone.
+_ACTION_TO_STATE = {
+    "allow": RequestState.ALLOW,
+    "deny": RequestState.DENY,
+    "stop": RequestState.STOP,
+    "whitelist": RequestState.WHITELIST,
+    "reply": RequestState.REPLY,
+}
+
+
+def _mark_relay_resolved(request_id: str, decision: Dict[str, Any]) -> None:
+    """Flip a Telegram-resolved permission request to its terminal state.
+
+    Best-effort: a failure here only means PostToolUse may redundantly re-cancel
+    the (already stripped) relay message, which is harmless.
+    """
+    state = _ACTION_TO_STATE.get(decision.get("action"))
+    if state is None:
+        return
+    try:
+        update_request_state(
+            request_id,
+            state,
+            decision=decision,
+            reply_text=decision.get("reply_text"),
+            resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+        )
+    except Exception as e:  # noqa: BLE001 — never disrupt the decision path.
+        debug_log(f"Failed to mark request {request_id} relay-resolved: {e}")
 
 
 def _wait_state_store_only(
