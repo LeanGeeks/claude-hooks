@@ -700,6 +700,46 @@ class BashPermissionValidator:
             if head in NOOP_BUILTINS:
                 return ''
 
+            # `case WORD in` is a header whose WORD is data, not a command (like
+            # `for ... in`). Peel `case ... in` so the arm bodies that follow are
+            # validated on their own merits. This matters for the FIRST arm: the
+            # parser splits a `case` body on `;;`, so the first arm's body comes
+            # through glued to the `case ... in` line (`case "$x" in foo) cmd`).
+            # Without peeling, that whole segment starts with `case` and would be
+            # swallowed by a broad `Bash(case:*)` allow, hiding `cmd`. A command
+            # substitution in WORD is extracted by the parser and validated
+            # independently, so dropping the header cannot hide it. A `case` with
+            # no `in` yet (split across segments) runs nothing -> no-op.
+            if head == 'case':
+                if 'in' in tokens[1:]:
+                    rest = tokens[tokens.index('in', 1) + 1:]
+                    # The token right after `in` is always the first arm's
+                    # pattern label (`foo)`, `*)`), never a command — drop it so
+                    # only the arm body remains. We drop it unconditionally
+                    # rather than via the `)`-based rule below because an
+                    # empty-body first arm (`case $x in *=0) ;;`) loses its
+                    # trailing `)` to _strip_grouping_tokens, leaving a bare
+                    # `*=0` the `)`-rule would not recognize.
+                    tokens = rest[1:] if rest else rest
+                    continue
+                return ''
+
+            # Peel a leading case-arm pattern label (`*)`, `foo)`, `*.txt)`).
+            # Subsequent arms come through as their own `;;`-split segment with
+            # the body glued to the label (`*) echo "$kv"`); the first arm is
+            # exposed by the `case ... in` peel above. A token ending in an
+            # unbalanced `)` can only be a case pattern in valid bash — `)` is a
+            # metacharacter, so no simple command is named that — so stripping
+            # the label and validating the arm body cannot authorize anything the
+            # user did not write. (A leading `(` is excluded so a subshell
+            # fragment like `(cmd` is left for _strip_grouping_tokens;
+            # alternation labels like `a|b)` are split on `|` by the parser and
+            # remain only partially handled.)
+            if (head.endswith(')') and not head.startswith('(')
+                    and head.count(')') > head.count('(')):
+                tokens = tokens[1:]
+                continue
+
             if head in CONTROL_KEYWORD_PREFIXES:
                 tokens = tokens[1:]
                 continue

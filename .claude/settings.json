@@ -237,8 +237,6 @@
       "Bash(for:*)",
       "Bash(break:*)",
       "Bash(seq:*)",
-      "Bash(case:*)",
-      "Bash(esac:*)",
       "Bash(read:*)",
       "Bash(true:*)",
       "Bash(zip:*)",
