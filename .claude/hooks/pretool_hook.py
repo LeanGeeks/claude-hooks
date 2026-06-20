@@ -108,14 +108,17 @@ SCAFFOLDING_KEYWORDS = {
 #   `: > "$LOG"`         truncate a file via the null command
 #   `... || { ...; exit 1; }`  bail out of a chain on failure
 # `:`/`true`/`false` are pure no-ops; `exit`/`return` only terminate the current
-# shell or function. None of them can run an arbitrary command, so peeling them
-# to '' cannot authorize anything (any redirection target is stripped by the
-# parser, and any command substitution in their args is extracted and validated
-# as its own sub-command). Note `exit`/`return` take only a numeric status, never
-# a command, so there is nothing after them to validate.
+# shell or function; `disown` only removes a job from the shell's job table.
+# None of them can run an arbitrary command, so peeling them to '' cannot
+# authorize anything (any redirection target is stripped by the parser, and any
+# command substitution in their args is extracted and validated as its own
+# sub-command). Note `exit`/`return` take only a numeric status, and `disown`
+# only job specs (e.g. `%1`) or flags — never a command, so there is nothing
+# after them to validate.
 NOOP_BUILTINS = {
     ':', 'true', 'false',  # pure no-ops
     'exit', 'return',      # terminate shell/function (numeric status only)
+    'disown',              # detach a job from the job table (job specs only)
 }
 
 # A leading function-definition header: `name() {`, `name ()`, `function name {`,

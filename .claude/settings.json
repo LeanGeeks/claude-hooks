@@ -208,6 +208,7 @@
       "Bash(cargo test:*)",
       "Bash(curl:*)",
       "Bash(sleep:*)",
+      "Bash(sync:*)",
       "Bash(wait:*)",
       "Bash(kill:*)",
       "Bash(killall:*)",
