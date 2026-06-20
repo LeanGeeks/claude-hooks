@@ -691,5 +691,84 @@ class TestAskReasonNamesUnknownCommands(unittest.TestCase):
         self.assertIn("more)", result["reason"])  # overflow tail present
 
 
+class _FakeLoader:
+    """Settings loader stub with an explicit allow/deny list, so constant-
+    substitution behaviour is tested independent of the project's own config."""
+
+    def __init__(self, allow, deny=None):
+        self._allow = allow
+        self._deny = deny or []
+
+    def load_all_settings(self):
+        return {"permissions": {"allow": self._allow, "deny": self._deny}}
+
+
+class TestConstantVariableExpansion(unittest.TestCase):
+    """A constant-like assignment (`GODOT=/usr/local/bin/godot`) used later as
+    `$GODOT ...` is resolved to its literal so the real command is validated."""
+
+    def _validator(self, allow, deny=None):
+        return BashPermissionValidator(
+            _FakeLoader(allow, deny), BashCommandParser(), workspace_dir="/tmp"
+        )
+
+    def test_constant_binary_path_is_resolved_and_allowed(self):
+        v = self._validator(["Bash(godot:*)", "Bash(echo:*)"])
+        cmd = "GODOT=/usr/local/bin/godot\n$GODOT --headless --quit"
+        result = v.validate_bash_command(cmd)
+        self.assertEqual(result["decision"], "allow")
+
+    def test_resolution_inside_command_substitution(self):
+        v = self._validator(["Bash(godot:*)"])
+        cmd = "GODOT=/usr/local/bin/godot\nout=$($GODOT --headless --script t.gd)"
+        result = v.validate_bash_command(cmd)
+        # The inner $GODOT (extracted from $()) resolves and matches godot.
+        godot_cmd = next(r for r in result["validation_results"]
+                         if r["command"].startswith("/usr/local/bin/godot"))
+        self.assertTrue(godot_cmd["allowed"])
+
+    def test_substitution_cannot_bypass_allowlist(self):
+        # X bound to an unrelated command must NOT inherit godot's allowance;
+        # it expands to its real form and is validated on its own merits.
+        v = self._validator(["Bash(godot:*)"])
+        result = v.validate_bash_command("X=rm\n$X -rf /etc/passwd")
+        rm = next(r for r in result["validation_results"]
+                  if r["command"].startswith("rm "))
+        self.assertFalse(rm["allowed"])
+        self.assertEqual(result["decision"], "ask")
+
+    def test_dynamic_value_is_not_substituted(self):
+        # A command-substitution value is not a constant, so $X is left intact
+        # (unknown) rather than guessed.
+        v = self._validator(["Bash(godot:*)"])
+        result = v.validate_bash_command("X=$(which godot)\n$X run")
+        self.assertEqual(result["decision"], "ask")
+        self.assertTrue(any(r["command"].startswith("$X") for r in
+                            result["validation_results"]))
+
+    def test_use_before_assignment_is_not_resolved(self):
+        # bash binds in source order: a use preceding the assignment sees no value.
+        v = self._validator(["Bash(godot:*)"])
+        result = v.validate_bash_command("$GODOT --headless\nGODOT=/usr/local/bin/godot")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_dynamic_reassignment_poisons_earlier_constant(self):
+        # Re-binding to a dynamic value must invalidate the earlier constant,
+        # so $GODOT is not validated against the stale safe path.
+        v = self._validator(["Bash(godot:*)"])
+        cmd = "GODOT=/usr/local/bin/godot\nGODOT=$(echo rm)\n$GODOT -rf /"
+        result = v.validate_bash_command(cmd)
+        self.assertEqual(result["decision"], "ask")
+        self.assertTrue(any(r["command"].startswith("$GODOT") for r in
+                            result["validation_results"]))
+
+    def test_env_prefix_does_not_persist(self):
+        # `KEY=VALUE cmd` applies to that command only; it must not seed a
+        # persistent constant for a later $KEY use.
+        v = self._validator(["Bash(godot:*)", "Bash(echo:*)"])
+        result = v.validate_bash_command("GODOT=/usr/local/bin/godot echo hi\n$GODOT --quit")
+        self.assertEqual(result["decision"], "ask")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

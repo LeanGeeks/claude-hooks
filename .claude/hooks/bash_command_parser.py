@@ -453,6 +453,82 @@ class BashCommandParser:
         """Check if operator is a redirection"""
         return op in self.REDIRECTIONS
 
+    # Characters permitted in a value we treat as a substitutable constant.
+    # Deliberately narrow: a literal path/word with no shell-active characters
+    # (no $ or backtick expansion, no whitespace, no glob *?[]). Expanding only
+    # such values can never introduce a command the user did not literally type.
+    _CONSTANT_VALUE_RE = re.compile(r'^[A-Za-z0-9_./:@%+,=-]+$')
+
+    @staticmethod
+    def is_constant_value(value: str):
+        """
+        If a `KEY=VALUE` assignment's VALUE is a safe literal constant, return
+        the literal (with surrounding quotes stripped); otherwise return None.
+
+        "Safe" means an optionally single/double-quoted literal made only of
+        path/word characters — no parameter or command expansion ($, ``), no
+        glob (*?[]), no whitespace. Substituting such a value for a later
+        `$KEY` merely reveals the command the user already wrote, so it can be
+        re-validated normally; it can never hide a command behind a variable.
+
+        Examples:
+            '/usr/local/bin/godot' -> '/usr/local/bin/godot'
+            '"clang++"'            -> 'clang++'
+            '$(which godot)'       -> None   (command substitution)
+            'a b'                  -> None   (whitespace)
+            '*.txt'               -> None   (glob)
+        """
+        if value is None:
+            return None
+        v = value
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        if not v or not BashCommandParser._CONSTANT_VALUE_RE.match(v):
+            return None
+        return v
+
+    def extract_assignments(self, command: str) -> List[Tuple[str, str, int]]:
+        """
+        Extract standalone variable assignments from a compound command.
+
+        Only `KEY=VALUE` statements that stand alone as a whole sub-command are
+        returned — not a `KEY=VALUE cmd` env prefix. The distinction matters:
+        a standalone assignment persists for the rest of the script (so later
+        `$KEY` uses see it), whereas an env prefix applies to that one command
+        only. A group qualifies when it has no WORD token (see below).
+
+        Returns (name, raw_value, offset) tuples in source order. The value is
+        raw (quotes intact); callers apply is_constant_value() to decide whether
+        it is safe to substitute. The offset is the assignment's source offset,
+        used to enforce that a use is only resolved by an assignment that
+        lexically precedes it.
+
+        A standalone-assignment group is one whose tokens are only ENV (or the
+        CMD_SUBST tokens the tokenizer splits out of a value like
+        `X=$(...)`), with no WORD — i.e. it runs no command of its own. Dynamic
+        values ARE reported (as their raw, non-constant text) on purpose: a
+        later constant-resolution must see that a reassignment like
+        `GODOT=$(echo rm)` poisons an earlier `GODOT=/usr/local/bin/godot`,
+        otherwise `$GODOT` could be validated against the stale safe path.
+        """
+        if not command or not command.strip():
+            return []
+        tokens = self._tokenize_with_quotes(command)
+        groups = self._split_on_operators(tokens)
+        assignments = []
+        for group in groups:
+            if not group:
+                continue
+            # No WORD token => the group assigns variables but runs no command.
+            if all(t[0] in ('ENV', 'CMD_SUBST') for t in group) and \
+                    any(t[0] == 'ENV' for t in group):
+                for t_type, t_val, t_off in group:
+                    if t_type != 'ENV':
+                        continue
+                    name, _sep, value = t_val.partition('=')
+                    assignments.append((name, value, t_off))
+        return assignments
+
     @staticmethod
     def _is_env_prefix(token: str) -> bool:
         """Check if token is an env var assignment prefix (e.g., 'KEY=' or 'KEY=partial')"""
@@ -725,4 +801,42 @@ if __name__ == '__main__':
         print()
 
     print(f"Results: {passed} passed, {failed} failed")
+
+    # --- is_constant_value / extract_assignments ---
+    print("\n=== Constant assignment helpers ===\n")
+    const_cases = [
+        ("/usr/local/bin/godot", "/usr/local/bin/godot"),
+        ('"clang++"', "clang++"),
+        ("'/opt/tool'", "/opt/tool"),
+        ("3.14", "3.14"),
+        ("$(which godot)", None),   # command substitution
+        ("$HOME/bin", None),        # parameter expansion
+        ("a b", None),              # whitespace
+        ("*.txt", None),            # glob
+        ("`pwd`", None),            # backtick
+        ("", None),                 # empty
+    ]
+    for value, expected in const_cases:
+        got = BashCommandParser.is_constant_value(value)
+        ok = got == expected
+        passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
+        print(f"{'✓ PASS' if ok else '✗ FAIL'}: is_constant_value({value!r}) -> {got!r} (want {expected!r})")
+
+    assign_cases = [
+        # (command, expected [(name, value)] for STANDALONE assignments only)
+        ("GODOT=/usr/local/bin/godot\n$GODOT --quit", [("GODOT", "/usr/local/bin/godot")]),
+        ("A=1 B=2 ./script.sh", []),                 # env prefix, not standalone
+        ("A=1\nB=2\n./x", [("A", "1"), ("B", "2")]),  # two standalone assignments
+        # Dynamic value still reported raw, so reassignment can poison a constant.
+        ("X=$(which godot)", [("X", "$(which godot)")]),
+        ("GODOT=/usr/local/bin/godot\nGODOT=$(echo rm)",
+         [("GODOT", "/usr/local/bin/godot"), ("GODOT", "$(echo rm)")]),
+    ]
+    for command, expected in assign_cases:
+        got = [(n, v) for n, v, _off in parser.extract_assignments(command)]
+        ok = got == expected
+        passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
+        print(f"{'✓ PASS' if ok else '✗ FAIL'}: extract_assignments({command!r}) -> {got} (want {expected})")
+
+    print(f"\nResults: {passed} passed, {failed} failed")
     sys.exit(0 if failed == 0 else 1)

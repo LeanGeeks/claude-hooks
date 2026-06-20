@@ -135,6 +135,14 @@ _FUNCTION_DEF_RE = re.compile(
     r'\s*\{?\s*'
 )
 
+# A `$VAR` or `${VAR}` parameter reference. Used to substitute constant-like
+# variable assignments collected from the same compound command (see
+# BashPermissionValidator._expand_constants).
+_VAR_REF_RE = re.compile(
+    r'\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}'  # ${VAR}
+    r'|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)'      # $VAR
+)
+
 
 def _strip_function_def_header(cmd: str):
     """
@@ -385,10 +393,33 @@ class BashPermissionValidator:
         if function_defs:
             debug_log(f"Locally-defined functions (name->offset): {function_defs}")
 
+        # Resolve constant-like variable assignments so a later `$VAR` use is
+        # validated against the command it actually runs. A common pattern is to
+        # bind a tool path once (`GODOT=/usr/local/bin/godot`) and invoke it as
+        # `$GODOT ...` throughout the script; without resolution `$GODOT
+        # --headless` matches no allow pattern and forces an `ask`. We only
+        # collect STANDALONE assignments (a whole-statement `KEY=VALUE`, which
+        # persists for the rest of the script — not a `KEY=VALUE cmd` prefix)
+        # whose value is a literal constant, and we only substitute into uses
+        # that the assignment lexically precedes. Substitution can therefore
+        # only REVEAL the real command for the normal allow/deny check, never
+        # hide one: `X=rm; $X -rf /` expands to `rm -rf /`, still denied.
+        const_assignments = {}  # name -> [(offset, literal_or_None), ...]
+        for name, raw_value, off in self.parser.extract_assignments(command):
+            literal = BashCommandParser.is_constant_value(raw_value)
+            const_assignments.setdefault(name, []).append((off, literal))
+        for name in const_assignments:
+            const_assignments[name].sort(key=lambda pair: pair[0])
+        if const_assignments:
+            debug_log(f"Constant assignments (name->[(off,val)]): {const_assignments}")
+
         # Validate each sub-command
         results = []
         for cmd, off in parsed:
-            result = self._check_single_command(cmd, function_defs, off)
+            expanded = self._expand_constants(cmd, const_assignments, off)
+            if expanded != cmd:
+                debug_log(f"  Expanded constants: {cmd!r} -> {expanded!r}")
+            result = self._check_single_command(expanded, function_defs, off)
             results.append(result)
             debug_log(f"  Sub-command {cmd!r}: allowed={result['allowed']}, denied={result['denied']}")
 
@@ -713,6 +744,44 @@ class BashPermissionValidator:
             break
 
         return ' '.join(tokens)
+
+    def _expand_constants(self, cmd: str, const_assignments: dict,
+                          cmd_offset: int) -> str:
+        """
+        Substitute `$VAR`/`${VAR}` references in cmd with constant literals
+        assigned earlier in the same compound command.
+
+        Args:
+            cmd: Normalized sub-command string.
+            const_assignments: name -> list of (offset, literal_or_None) for
+                every standalone assignment of that name, sorted by offset.
+                A literal of None marks a non-constant (e.g. dynamic) value.
+            cmd_offset: Source offset of this sub-command. Only assignments at a
+                strictly smaller offset are eligible — bash binds variables in
+                source order, so a use cannot see an assignment that follows it.
+
+        Resolution picks the latest eligible assignment for each name (matching
+        bash's last-write-wins). If that assignment is non-constant, the
+        reference is left untouched (the value is unknown, so the command stays
+        on its normal allow/deny path). Unknown names are likewise left as-is.
+        """
+        if not const_assignments or '$' not in cmd:
+            return cmd
+
+        def resolve(name):
+            eligible = [
+                lit for off, lit in const_assignments.get(name, [])
+                if cmd_offset is None or off < cmd_offset
+            ]
+            # Latest write wins; a trailing non-constant poisons the reference.
+            return eligible[-1] if eligible else None
+
+        def repl(match):
+            name = match.group('braced') or match.group('plain')
+            literal = resolve(name)
+            return literal if literal is not None else match.group(0)
+
+        return _VAR_REF_RE.sub(repl, cmd)
 
     def _check_single_command(self, cmd: str, function_defs: dict = None,
                               cmd_offset: int = None) -> Dict[str, Any]:
