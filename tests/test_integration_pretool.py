@@ -328,6 +328,53 @@ class TestPreToolUseEdgeCases(unittest.TestCase):
         # Result depends on settings
         self.assertIn(result["decision"], ["allow", "ask"])
 
+    def test_arithmetic_expansion_is_not_a_command(self):
+        """`$((...))` evaluates a number and runs nothing, so it must not be
+        validated as a command. `echo $((1+2))` should allow on `echo` alone."""
+        result = self.validator.validate_bash_command("echo $((1+2))")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_arithmetic_expansion_nested_parens(self):
+        """Nested parens inside arithmetic must be consumed opaquely."""
+        result = self.validator.validate_bash_command("echo $(( (3+4) * 2 ))")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_counter_increment_loop_allowed(self):
+        """The real-world regression: a test-runner loop with `pass=$((pass+1))`
+        increments must not be split into bogus `pass+1` sub-commands."""
+        command = (
+            'pass=0\n'
+            'for t in a b c; do\n'
+            '  if echo "$t" | grep -q a; then pass=$((pass+1)); fi\n'
+            'done\n'
+            'echo "pass=$pass"'
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+    def test_arithmetic_does_not_mask_real_command_substitution(self):
+        """A real `$(...)` command substitution must still be validated (and here
+        rejected), even though arithmetic `$((...))` is now skipped."""
+        result = self.validator.validate_bash_command("x=$(rm -rf /etc)")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_command_substitution_nested_in_arithmetic_is_not_bypassed(self):
+        """A `$(...)` nested INSIDE arithmetic still executes in bash, so it must
+        be extracted and validated — skipping arithmetic must not become a bypass."""
+        result = self.validator.validate_bash_command("echo $(( $(rm -rf /etc) + 1 ))")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_backtick_nested_in_arithmetic_is_not_bypassed(self):
+        """Same bypass guard for the backtick substitution form."""
+        result = self.validator.validate_bash_command("echo $((`rm -rf /etc` + 1))")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_allowed_command_substitution_in_arithmetic_still_allows(self):
+        """A nested substitution running an *allowed* command keeps the allow."""
+        result = self.validator.validate_bash_command(
+            "echo $(( $(curl http://localhost/x) + 1 ))")
+        self.assertEqual(result["decision"], "allow")
+
 
 class TestPrefixReduction(unittest.TestCase):
     """Control-keyword / wrapper prefixes must not auto-authorize the command

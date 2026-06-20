@@ -216,6 +216,54 @@ class BashCommandParser:
                 i += 1
                 continue
 
+            # Handle arithmetic expansion $((...)). The arithmetic itself runs NO
+            # command — it evaluates to a number — so its operands must NOT be
+            # validated as commands. Without this, `$((pass+1))` is mistaken for a
+            # command substitution and its inner text `pass+1` is checked as a
+            # command, which matches no allow pattern and forces the whole
+            # compound command to `ask`. bash distinguishes `$((` (arithmetic)
+            # from a `$( (subshell) )` command substitution by the absence of a
+            # space, so a glued `$((` is unambiguously arithmetic.
+            #
+            # BUT a command substitution nested inside the arithmetic DOES execute
+            # (`$(( $(rm -rf /) + 1 ))` really runs `rm`), so we cannot swallow
+            # the span blind. We keep the literal text glued to the current token
+            # (so `pass=$((pass+1))` stays one assignment and `echo $((1+2))`
+            # keeps its argument) and then re-tokenize the interior, surfacing any
+            # nested $()/`` `` substitutions as CMD_SUBST tokens so the recursive
+            # extractor still validates the commands they run.
+            if command[i:i+3] == '$((' and cmd_subst_depth == 0 and not in_backtick:
+                arith_start = i
+                paren_depth = 0
+                i += 1  # consume '$'; start counting at the first '('
+                while i < len(command):
+                    c = command[i]
+                    if c == '\\' and i + 1 < len(command):
+                        i += 2  # skip escaped char
+                        continue
+                    if c == '(':
+                        paren_depth += 1
+                    elif c == ')':
+                        paren_depth -= 1
+                        if paren_depth == 0:
+                            i += 1  # consume the final ')'
+                            break
+                    i += 1
+                current.extend(command[arith_start:i])
+                # Interior between `$((` and the closing `))` (when well-formed).
+                # Re-tokenize it and forward only the command substitutions it
+                # contains — the arithmetic operands/operators are intentionally
+                # dropped. Offsets are mapped back to absolute source positions so
+                # the function-definition ordering logic stays correct.
+                interior_start = arith_start + 3
+                interior_end = i - 2 if paren_depth == 0 else i
+                interior = command[interior_start:interior_end]
+                if interior.strip():
+                    for t_type, t_val, t_off in self._tokenize_with_quotes(interior):
+                        if t_type == 'CMD_SUBST':
+                            tokens.append(('CMD_SUBST', t_val, interior_start + t_off))
+                continue
+
             # Handle command substitution $(
             if command[i:i+2] == '$(' and cmd_subst_depth == 0:
                 current_str = ''.join(current)
