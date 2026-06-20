@@ -102,6 +102,22 @@ SCAFFOLDING_KEYWORDS = {
     'done', 'fi', 'esac',  # block terminators
 }
 
+# Shell builtins whose sub-command runs nothing dangerous regardless of its
+# arguments, so the whole sub-command reduces to a no-op (auto-allow). These show
+# up constantly in generated diagnostic scripts:
+#   `: > "$LOG"`         truncate a file via the null command
+#   `... || { ...; exit 1; }`  bail out of a chain on failure
+# `:`/`true`/`false` are pure no-ops; `exit`/`return` only terminate the current
+# shell or function. None of them can run an arbitrary command, so peeling them
+# to '' cannot authorize anything (any redirection target is stripped by the
+# parser, and any command substitution in their args is extracted and validated
+# as its own sub-command). Note `exit`/`return` take only a numeric status, never
+# a command, so there is nothing after them to validate.
+NOOP_BUILTINS = {
+    ':', 'true', 'false',  # pure no-ops
+    'exit', 'return',      # terminate shell/function (numeric status only)
+}
+
 # A leading function-definition header: `name() {`, `name ()`, `function name {`,
 # or `function name() {`. Defining a function runs nothing, and its body is
 # validated as separate sub-commands, so dropping the header can never authorize
@@ -137,6 +153,29 @@ def _strip_function_def_header(cmd: str):
         return None, cmd
     name = m.group('fname') or m.group('pname')
     return name, cmd[m.end():].strip()
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    """Drop duplicates while preserving first-seen order."""
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _format_command_list(commands: List[str], limit: int = 6) -> str:
+    """
+    Render a list of sub-commands for the permission prompt: each quoted, comma-
+    separated, with an overflow tail so a long compound command does not produce
+    an unbounded reason string.
+    """
+    shown = [f"`{c}`" for c in commands[:limit]]
+    if len(commands) > limit:
+        shown.append(f"(+{len(commands) - limit} more)")
+    return ", ".join(shown)
 
 
 def debug_log(message: str):
@@ -359,16 +398,26 @@ class BashPermissionValidator:
 
         if any_denied:
             # ANY denied → ask (let PermissionRequest handle it or user decide)
+            denied_cmds = _dedupe([r['command'] for r in results if r['denied']])
             decision = 'ask'
-            reason = f"Contains denied command: {[r['command'] for r in results if r['denied']]}"
+            reason = "Matches a denied pattern: " + _format_command_list(denied_cmds)
         elif all_allowed and len(sub_commands) > 0:
             # ALL allowed → explicitly allow
             decision = 'allow'
             reason = "All sub-commands are allowed"
         else:
-            # Some unknown or empty → ask (let PermissionRequest handle it)
+            # Some unknown or empty → ask. Name the exact sub-commands that are
+            # not on the allowlist so the user knows what to scrutinize, rather
+            # than re-scanning the whole compound command themselves.
+            unknown = _dedupe(
+                [r['command'] for r in results if not r['allowed'] and not r['denied']]
+            )
             decision = 'ask'
-            reason = "Contains unknown or empty commands"
+            if unknown:
+                reason = ("Not in allowlist — review before approving: "
+                          + _format_command_list(unknown))
+            else:
+                reason = "Contains unknown or empty commands"
 
         debug_log(f"Decision: {decision} - {reason}")
 
@@ -581,6 +630,8 @@ class BashPermissionValidator:
             'if grep -q foo file'     -> 'grep -q foo file'
             'for i in 4 5'            -> ''            (loop header, runs nothing)
             'done'                    -> ''            (block terminator)
+            ': > "$LOG"'              -> ''            (null command, runs nothing)
+            'exit 1'                  -> ''            (terminates, runs nothing)
             'parse() {'               -> ''            (function-def header)
             'command -v chromium'     -> ''            (lookup, runs nothing)
             'command node app.js'     -> 'node app.js' (exec form)
@@ -606,6 +657,13 @@ class BashPermissionValidator:
             # Loop/case headers and block terminators are scaffolding that runs
             # nothing on its own; the whole sub-command reduces to a no-op.
             if head in SCAFFOLDING_KEYWORDS:
+                return ''
+
+            # No-op builtins (`:`, `true`, `false`, `exit`, `return`) run nothing
+            # dangerous regardless of their arguments, so the whole sub-command
+            # reduces to a no-op. Matched on the bare head (these are builtins,
+            # never path-qualified).
+            if head in NOOP_BUILTINS:
                 return ''
 
             if head in CONTROL_KEYWORD_PREFIXES:
@@ -692,7 +750,8 @@ class BashPermissionValidator:
         if not effective:
             # Nothing dangerous runs: a bare control keyword / wrapper with no
             # command after it (e.g. 'do', 'env'), a loop header / block
-            # terminator, a function-def header, or a `command -v/-V` lookup.
+            # terminator, a no-op builtin (':', 'exit', ...), a function-def
+            # header, or a `command -v/-V` lookup.
             debug_log(f"Command {cmd!r} runs nothing (bare prefix or lookup) - auto-allowing")
             return {
                 'command': cmd,

