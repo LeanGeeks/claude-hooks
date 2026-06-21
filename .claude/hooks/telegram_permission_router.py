@@ -354,13 +354,17 @@ def send_permission_message(
     Returns the relay message id (stored as ``telegram_message_id`` on the
     state-store row for legacy reasons).
     """
-    title = f"<b>{workspace_name}</b>"
+    import html as _html
+
+    # Everything interpolated into the HTML body must be escaped: workspace /
+    # session names and the command summary can all contain <, >, & (commands
+    # routinely do — e.g. `2>&1`), which would otherwise corrupt Telegram's HTML
+    # parse and either garble or drop the message.
+    title = f"<b>{_html.escape(workspace_name, quote=False)}</b>"
     if session_name:
-        title += f" <i>{session_name}</i>"
+        title += f" <i>{_html.escape(session_name, quote=False)}</i>"
 
     summary = _format_command_summary(request.tool_name, request.tool_input)
-
-    import html as _html
 
     lines = [
         title,
@@ -368,7 +372,7 @@ def send_permission_message(
         f"<b>Permission Request</b> <code>{request.request_id}</code>",
         "",
         "<pre>",
-        summary,
+        _html.escape(summary, quote=False),
         "</pre>",
     ]
 

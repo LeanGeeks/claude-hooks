@@ -157,6 +157,30 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         # `echo hi` is allowlisted, so it appears in neither bucket.
         self.assertNotIn("echo hi", denied + unknown)
 
+    def test_command_summary_and_names_are_html_escaped(self):
+        """The <pre> command summary and the workspace/session names must be
+        HTML-escaped — commands routinely contain <, >, & (e.g. `2>&1`), which
+        would otherwise corrupt Telegram's HTML parse."""
+        import telegram_permission_router as tpr
+        fake_client = MagicMock()
+        fake_client.send_message.return_value = self.MessageHandle(
+            message_id=42, telegram_message_id=99
+        )
+        req = _make_request(tool_input={"command": "echo hi 2>&1 | grep '<x>'"})
+        with patch.object(tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(tpr, "_relay_client", fake_client), \
+             patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [])), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            tpr.send_permission_message(req, "ws<&>name", "sess&ion")
+        text = fake_client.send_message.call_args.kwargs["text"]
+        self.assertIn("2&gt;&amp;1", text)
+        self.assertIn("&lt;x&gt;", text)
+        self.assertIn("ws&lt;&amp;&gt;name", text)
+        self.assertIn("sess&amp;ion", text)
+        # No raw metacharacters survive in the command body / names.
+        self.assertNotIn("2>&1", text)
+        self.assertNotIn("<x>", text)
+
     def test_unallowlisted_parts_empty_for_non_bash(self):
         import telegram_permission_router as tpr
         req = _make_request(tool_name="Read", tool_input={"file_path": "/x"})
