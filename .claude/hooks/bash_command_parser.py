@@ -134,12 +134,30 @@ class BashCommandParser:
         cmd_subst_depth = 0  # Paren depth inside $(...)
         in_backtick = False  # Inside `...`
 
+        # Conditional-expression handling. `[[` opens a bash conditional and `]]`
+        # closes it; inside, `&&`/`||`/`|` are conditional connectors (not command
+        # separators) and `<`/`>` are string comparisons (not redirections). So
+        # while in_conditional we suppress operator/redirect detection and let
+        # those characters fall through as ordinary word content, keeping the
+        # whole `[[ ... ]]` as one sub-command. Command substitutions inside it
+        # ARE still extracted (handled before the operator checks), so a
+        # `[[ $(rm -rf /) ]]` still validates `rm -rf /` on its own.
+        in_conditional = False
+
         def flush_current():
             """Flush current token buffer"""
+            nonlocal in_conditional
             if current:
                 token_str = ''.join(current)
                 tokens.append(self._classify_token(token_str, current_start))
                 current.clear()
+                # `[[` / `]]` are recognized only as standalone tokens (bash
+                # requires them space-separated), so toggling on the flushed
+                # word is exact — a glued `a[[b` or `${arr[[i]]}` never matches.
+                if token_str == '[[':
+                    in_conditional = True
+                elif token_str == ']]':
+                    in_conditional = False
 
         while i < len(command):
             # While the buffer is empty, keep the start offset pinned to the
@@ -345,8 +363,9 @@ class BashCommandParser:
                 i += 1
                 continue
 
-            # Check for heredoc operator (<<)
-            if command[i:i+2] == '<<':
+            # Check for heredoc operator (<<). Suppressed inside `[[ ]]`, where
+            # `<` is a string comparison, not a redirection.
+            if command[i:i+2] == '<<' and not in_conditional:
                 flush_current()
                 # Check if it's quoted or unquoted heredoc
                 j = i + 2
@@ -378,9 +397,16 @@ class BashCommandParser:
                     i = j
                     continue
 
-            # Check for operators (only when not quoted)
+            # Check for operators (only when not quoted). Inside a `[[ ]]`
+            # conditional, &&/||/|/<>/ are expression operators, not command
+            # separators, so they fall through to ordinary word content. The
+            # exception is a closing `]]` glued to this operator (e.g. `]];`,
+            # `]]|`): it hasn't been flushed yet, so in_conditional is still True
+            # — flush it now to end the conditional and let the operator split.
             op = self._check_operator(command, i)
-            if op:
+            if op and in_conditional and ''.join(current) == ']]':
+                flush_current()  # flips in_conditional False
+            if op and not in_conditional:
                 flush_current()
                 # Classify operator as OP or REDIRECT
                 op_type = 'REDIRECT' if self._is_redirect(op) else 'OP'
@@ -777,6 +803,18 @@ if __name__ == '__main__':
         ('ls foo{1,2}.txt', ["ls foo{1,2}.txt"]),
         # Subshell parens still strip even when glued
         ('(cd app && npm test)', ["cd app", "npm test"]),
+        # Inside [[ ]] conditionals, &&/||/|/<> are expression operators, not
+        # command separators/redirections — the whole test stays one sub-command.
+        ('[[ "$ec" -ne 0 || "${nfail:-0}" -ne 0 ]]',
+         ['[[ "$ec" -ne 0 || "${nfail:-0}" -ne 0 ]]']),
+        ('[[ -f a && -f b ]]', ["[[ -f a && -f b ]]"]),
+        ('[[ "$a" > "$b" ]]', ['[[ "$a" > "$b" ]]']),  # > is comparison, not redirect
+        # A connector AFTER the closing ]] still splits normally.
+        ('[[ -f x ]] || echo missing', ["[[ -f x ]]", "echo missing"]),
+        ('if [[ "$a" == b || "$a" == c ]]; then echo hi; fi',
+         ['if [[ "$a" == b || "$a" == c ]]', "then echo hi", "fi"]),
+        # Command substitution inside [[ ]] is STILL extracted and validated.
+        ('[[ $(rm -rf /) ]] || echo hi', ["[[ ]]", "echo hi", "rm -rf /"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")

