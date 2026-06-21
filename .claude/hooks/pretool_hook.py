@@ -105,23 +105,36 @@ SCAFFOLDING_KEYWORDS = {
 # Shell builtins whose sub-command runs nothing dangerous regardless of its
 # arguments, so the whole sub-command reduces to a no-op (auto-allow). These show
 # up constantly in generated diagnostic scripts:
-#   `: > "$LOG"`         truncate a file via the null command
-#   `... || { ...; exit 1; }`  bail out of a chain on failure
-# `:`/`true`/`false` are pure no-ops; `exit`/`return` only terminate the current
-# shell or function; `disown` only removes a job from the shell's job table;
-# `unset` only removes a variable or function from the current shell.
-# None of them can run an arbitrary command, so peeling them to '' cannot
-# authorize anything (any redirection target is stripped by the parser, and any
-# command substitution in their args is extracted and validated as its own
-# sub-command). Note `exit`/`return` take only a numeric status, `disown`
-# only job specs (e.g. `%1`) or flags, and `unset` only variable/function
-# names (or `-v`/`-f` flags) — never a command, so there is nothing after them
-# to validate.
+#   `: > "$LOG"`             truncate a file via the null command
+#   `... || { ...; exit 1; }`   bail out of a chain on failure
+#   `local mode="$1"`        declare a function-local variable
+#   `set -euo pipefail`      set shell options
+# The unifying safety property: NONE of these can run an arbitrary command. They
+# only inspect or mutate the current shell's own state — variables, attributes,
+# options, the directory stack, positional params, the job table — or terminate
+# it. So peeling them to '' cannot authorize anything: any redirection target is
+# stripped by the parser, and any command substitution in their args (e.g.
+# `local x=$(cmd)`, `set -- $(cmd)`) is extracted and validated as its own
+# sub-command. Whatever follows the builtin is data (a name, assignment, option,
+# numeric status, job spec, or path), never a command to validate.
+#
+# Deliberately EXCLUDED because they CAN execute an arbitrary command (and so
+# must stay on the normal allow/deny path): `eval`, `source`/`.`, `trap` (its
+# handler string is run later, unvalidated), `alias` (can shadow a real command),
+# `mapfile`/`readarray` (their `-C` callback runs per line), and `kill` (signals
+# arbitrary processes). `command`/`exec`/`builtin` are handled as wrappers above.
 NOOP_BUILTINS = {
     ':', 'true', 'false',  # pure no-ops
     'exit', 'return',      # terminate shell/function (numeric status only)
     'disown',              # detach a job from the job table (job specs only)
     'unset',               # remove a variable/function (names or -v/-f only)
+    # Declaration builtins — bind variables / set attributes, never exec.
+    'local', 'declare', 'typeset', 'readonly', 'export',
+    # Shell-state / positional-parameter builtins — mutate the current shell only.
+    'set', 'shopt', 'shift', 'let', 'read', 'getopts', 'umask', 'wait',
+    'hash', 'times',
+    # Directory-stack builtins — change cwd / the dir stack (path operands only).
+    'cd', 'pushd', 'popd', 'dirs',
 }
 
 # A leading function-definition header: `name() {`, `name ()`, `function name {`,

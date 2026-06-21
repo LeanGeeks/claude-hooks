@@ -282,6 +282,40 @@ class BashCommandParser:
                             tokens.append(('CMD_SUBST', t_val, interior_start + t_off))
                 continue
 
+            # Handle process substitution <( ... ) and >( ... ). The inner
+            # command runs in a subshell with its stdout/stdin wired to a
+            # /dev/fd path, so it DOES execute and must be extracted and
+            # validated on its own — exactly like $(...). Without this the
+            # leading `<`/`>` is tokenized as a redirect and the inner command's
+            # text leaks into the surrounding sub-command, hiding it: e.g.
+            # `read x < <(wget evil)` would otherwise collapse to a harmless
+            # `read` and auto-allow. The `<`/`>` is matched glued to `(` (bash
+            # requires no space), which disambiguates it from a plain `< file`
+            # redirect or a `(subshell)`. We emit the interior as a CMD_SUBST
+            # token (the recursive extractor parses it) and drop it from the
+            # surrounding command; the preceding redirect operator, if any, was
+            # already tokenized separately and its now-empty target is harmless.
+            if command[i:i+2] in ('<(', '>(') and cmd_subst_depth == 0 and not in_backtick:
+                flush_current()
+                cmd_subst_depth = 1
+                i += 2  # skip the `<`/`>` and the opening `(`
+                subst_start = i
+                while i < len(command) and cmd_subst_depth > 0:
+                    c = command[i]
+                    if c == '\\' and i + 1 < len(command):
+                        i += 2  # skip escaped char
+                        continue
+                    if c == '(':
+                        cmd_subst_depth += 1
+                    elif c == ')':
+                        cmd_subst_depth -= 1
+                    i += 1
+                # Interior excludes the opening `(` (already skipped) and the
+                # closing `)` (i now points just past it).
+                subst_content = command[subst_start:i-1]
+                tokens.append(('CMD_SUBST', subst_content, subst_start))
+                continue
+
             # Handle command substitution $(
             if command[i:i+2] == '$(' and cmd_subst_depth == 0:
                 current_str = ''.join(current)

