@@ -998,7 +998,28 @@ class BashPermissionValidator:
         # Check for wildcard suffix
         if inner.endswith(':*'):
             prefix = inner[:-2]
-            matches = command.startswith(prefix)
+            # Prefix (wildcard) match, but only at a command-word boundary so a
+            # command-name prefix does not bleed into a longer word: `Bash(tr:*)`
+            # must match `tr -d x` but NOT `trap ...` or `truncate ...`. A bare
+            # `command.startswith(prefix)` would wrongly green-light `trap` (and
+            # likewise let a deny pattern over-match). We accept the match when:
+            #   - the prefix IS the whole command (`tr`),
+            #   - the char right after the prefix is whitespace (a new argument:
+            #     `tr -d x`), or
+            #   - the prefix ends in a non-alphanumeric separator, where
+            #     continuing the same token is the intended behaviour — this
+            #     preserves path/operator prefixes like `./:*`, `[:*`, `git log
+            #     --oneline /tmp/:*`.
+            if not command.startswith(prefix):
+                matches = False
+            elif len(command) == len(prefix):
+                matches = True
+            elif command[len(prefix)].isspace():
+                matches = True
+            elif not prefix[-1:].isalnum():
+                matches = True
+            else:
+                matches = False
             debug_log(f"    Pattern {pattern!r}: prefix match {prefix!r} → {matches}")
             return matches
         else:

