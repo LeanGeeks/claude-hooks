@@ -261,6 +261,54 @@ def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     return "\n".join(result_lines)
 
 
+def _unallowlisted_bash_parts(request: PermissionRequest) -> tuple[list[str], list[str]]:
+    """Return ``(denied, unknown)`` sub-commands for a Bash permission request.
+
+    PreToolUse names the non-allowlisted sub-commands in its
+    ``permissionDecisionReason`` so the terminal prompt can show them, but
+    Claude Code does NOT forward that reason to the PermissionRequest hook, so
+    the Telegram message has no access to it. We re-derive the same breakdown
+    here by running the very same validator against the command (workspace dir =
+    ``request.cwd``, exactly as PreToolUse did), guaranteeing the annotation
+    matches what the terminal shows.
+
+    Best-effort only: returns ``([], [])`` for non-Bash tools, an empty command,
+    or any failure — computing this annotation must never block sending the
+    prompt.
+    """
+    if request.tool_name != "Bash":
+        return [], []
+    command = (request.tool_input or {}).get("command", "")
+    if not command.strip():
+        return [], []
+    try:
+        from pretool_hook import BashPermissionValidator
+        from settings_loader import SettingsLoader
+        from bash_command_parser import BashCommandParser
+
+        validator = BashPermissionValidator(
+            SettingsLoader(request.cwd), BashCommandParser(), workspace_dir=request.cwd
+        )
+        result = validator.validate_bash_command(command)
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"Could not compute non-allowlisted parts: {e}")
+        return [], []
+
+    seen: set[str] = set()
+    denied: list[str] = []
+    unknown: list[str] = []
+    for r in result.get("validation_results", []):
+        cmd = r.get("command", "")
+        if not cmd or cmd in seen:
+            continue
+        seen.add(cmd)
+        if r.get("denied"):
+            denied.append(cmd)
+        elif not r.get("allowed"):
+            unknown.append(cmd)
+    return denied, unknown
+
+
 def _send_relay(
     *,
     text: str,
@@ -312,7 +360,9 @@ def send_permission_message(
 
     summary = _format_command_summary(request.tool_name, request.tool_input)
 
-    text = "\n".join([
+    import html as _html
+
+    lines = [
         title,
         "",
         f"<b>Permission Request</b> <code>{request.request_id}</code>",
@@ -320,9 +370,23 @@ def send_permission_message(
         "<pre>",
         summary,
         "</pre>",
-        "",
-        "Approve this command?",
-    ])
+    ]
+
+    # Re-derive and surface which sub-commands tripped the prompt (PreToolUse's
+    # reason isn't forwarded here — see _unallowlisted_bash_parts). Escaped
+    # because command fragments routinely contain <, >, & (e.g. `2>&1`).
+    denied, unknown = _unallowlisted_bash_parts(request)
+    if denied:
+        lines.append("")
+        lines.append("🚫 <b>Matches a denied pattern:</b>")
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in denied]
+    if unknown:
+        lines.append("")
+        lines.append("⚠️ <b>Not in allowlist:</b>")
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in unknown]
+
+    lines += ["", "Approve this command?"]
+    text = "\n".join(lines)
 
     message_id = _send_relay(
         text=text,
