@@ -20,9 +20,16 @@ from permission_request_hook import (  # noqa: E402
     get_wait_before_telegram,
     get_workspace_name,
     WAIT_BEFORE_TELEGRAM,
+    _auto_deny_output,
+    _record_auto_deny,
 )
 import permission_request_hook  # noqa: E402
-from permission_state_store import PermissionRequest  # noqa: E402
+from permission_state_store import (  # noqa: E402
+    PermissionRequest,
+    RequestState,
+    create_request,
+    get_request,
+)
 
 
 def _make_request(**overrides):
@@ -451,6 +458,53 @@ class TestTerminalResolutionRace(unittest.TestCase):
         self.assertIsNone(result)
         # The current child's relay message (555) must have been cancelled.
         mock_remove_buttons.assert_any_call(555)
+
+
+class TestAutoDenyAtTtl(unittest.TestCase):
+    """Auto-deny-with-note when a permission request goes unanswered for the TTL.
+
+    Permission requests fail safe at the TTL (deny, never allow), carrying a note
+    the agent can act on. The note distinguishes a delivery failure from a
+    delivered-but-ignored request. AskUserQuestion never auto-denies (tested by
+    its absence — handle_ask_user_question returns None to keep the native UI)."""
+
+    def test_delivery_failed_note_says_retry(self):
+        out = _auto_deny_output(_make_request(), delivery_failed=True)
+        dec = out["hookSpecificOutput"]["decision"]
+        self.assertEqual(dec["behavior"], "deny")
+        self.assertNotIn("interrupt", dec)  # agent continues so it can retry
+        reason = dec["reason"].lower()
+        self.assertIn("could not be delivered", reason)
+        self.assertIn("retried", reason)
+
+    def test_delivered_but_unanswered_note(self):
+        out = _auto_deny_output(_make_request(), delivery_failed=False)
+        reason = out["hookSpecificOutput"]["decision"]["reason"].lower()
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertIn("no response", reason)
+        self.assertNotIn("could not be delivered", reason)
+
+    def test_note_includes_non_whitelisted_parts(self):
+        with patch.object(
+            permission_request_hook,
+            "_format_non_whitelisted",
+            return_value="not in allowlist: cowsay",
+        ):
+            out = _auto_deny_output(_make_request(), delivery_failed=True)
+        self.assertIn("cowsay", out["hookSpecificOutput"]["decision"]["reason"])
+
+    def test_record_auto_deny_transitions_pending_to_deny(self):
+        req = create_request(
+            session_id="auto-deny-test",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf /tmp/x"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+        )
+        self.assertEqual(req.state, RequestState.PENDING.value)
+        _record_auto_deny(req.request_id)
+        self.assertEqual(get_request(req.request_id).state, RequestState.DENY.value)
 
 
 if __name__ == "__main__":

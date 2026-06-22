@@ -71,6 +71,10 @@ WAIT_BEFORE_TELEGRAM = 0  # seconds to wait before sending Telegram message
 REQUEST_TTL = 43200  # 12 hour TTL for pending requests
 MAX_WAIT_FOR_RESPONSE = REQUEST_TTL  # Backwards-compatible name for tests/importers
 POLL_INTERVAL = 0.5  # seconds between state store polls
+# Coarser interval for the relay-less wait, which can run for the full TTL.
+# Noticing a terminal resolution a few seconds late is harmless; re-reading the
+# (growing) state file twice a second for 12h is not.
+STATE_STORE_POLL_INTERVAL = 10  # seconds
 
 
 def debug_log(message: str):
@@ -347,44 +351,87 @@ def _mark_relay_resolved(request_id: str, decision: Dict[str, Any]) -> None:
         debug_log(f"Failed to mark request {request_id} relay-resolved: {e}")
 
 
-def _expire_if_pending(request_id: str) -> None:
-    """Finalize a still-``pending`` row when the hook gives up without a decision.
+def _format_non_whitelisted(request: PermissionRequest) -> str:
+    """One-line summary of the command parts that tripped the gate, for the
+    auto-deny note. Best-effort; empty string for non-Bash / none / any failure."""
+    try:
+        from telegram_permission_router import _unallowlisted_bash_parts
+        denied, unknown = _unallowlisted_bash_parts(request)
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"Could not compute non-whitelisted parts for note: {e}")
+        return ""
+    parts = []
+    if denied:
+        parts.append("matches a denied pattern: " + ", ".join(denied))
+    if unknown:
+        parts.append("not in allowlist: " + ", ".join(unknown))
+    return "; ".join(parts)
 
-    The hook falls back to the terminal prompt (exit 0, no output) when the relay
-    message expired/cancelled or the overall TTL elapsed. Without this the row
-    lingers as ``pending`` until the 12h TTL sweep, so ``pending`` can't be
-    trusted as a "someone is actively waiting" signal (stuck-detection, Epic 10).
 
-    ``update_request_state`` is idempotent: if the row already reached a terminal
-    state (e.g. PostToolUse wrote ``resolved_terminal``, or a relay answer wrote
-    allow/deny), this is a harmless no-op.
-    """
+def _auto_deny_output(
+    request: PermissionRequest, delivery_failed: bool
+) -> Dict[str, Any]:
+    """Build the PermissionRequest auto-deny payload used when nobody answered
+    within the TTL. Carries a note the agent can act on (the command may work on
+    retry, plus which parts needed approval). Fail-safe: deny, never allow.
+
+    Two variants depending on what we actually know — a *delivery failure* (we
+    could not even reach the operator) vs. *delivered but unanswered*."""
+    hours = REQUEST_TTL // 3600
+    if delivery_failed:
+        reason = (
+            "Auto-denied: this command required operator approval, but the approval "
+            "request could not be delivered to the operator (Telegram relay "
+            f"unreachable or not bound) and no terminal approval arrived within {hours}h. "
+            "The session was unblocked instead of waiting indefinitely. The same "
+            "command may succeed if retried once the relay is reachable again."
+        )
+    else:
+        reason = (
+            "Auto-denied: this command required operator approval, but no response "
+            f"was received within {hours}h. Re-run the command to request approval again."
+        )
+    parts = _format_non_whitelisted(request)
+    if parts:
+        reason += f" Parts that required approval — {parts}."
+    return {
+        'hookSpecificOutput': {
+            'hookEventName': 'PermissionRequest',
+            'decision': {
+                'behavior': 'deny',
+                'reason': reason,
+            }
+        }
+    }
+
+
+def _record_auto_deny(request_id: str) -> None:
+    """Mark the row terminal (deny/timeout) so it stops reading as ``pending``
+    for stuck-detection. Best-effort, idempotent vs already-terminal rows."""
     try:
         update_request_state(
             request_id,
-            RequestState.EXPIRED,
+            RequestState.DENY,
             resolution_source=RESOLUTION_SOURCE_TIMEOUT,
         )
     except Exception as e:  # noqa: BLE001 — never disrupt the hook's exit path.
-        debug_log(f"Failed to expire pending request {request_id}: {e}")
-
-
-def _fallback_children(children) -> None:
-    """Expire any still-pending AskUserQuestion child rows on terminal fallback.
-
-    Mirrors ``_expire_if_pending`` for the question fan-out: when the group
-    falls back to the native terminal UI, each child relay-message row would
-    otherwise sit ``pending`` until the TTL sweep (the source of the observed
-    multi-hour orphaned-question rows). Idempotent per child.
-    """
-    for child, _q, _msg in children:
-        _expire_if_pending(child.request_id)
+        debug_log(f"Failed to record auto-deny for {request_id}: {e}")
 
 
 def _wait_state_store_only(
     request_id: str, ttl_seconds: int
 ) -> Optional[Dict[str, Any]]:
-    """Legacy state-store-only wait used when no relay message exists."""
+    """State-store-only wait used when there is no relay message (Telegram send
+    failed or is disabled). Races only the terminal: we poll for a terminal
+    resolution written by PostToolUse. Returns the decision if the terminal
+    produced one, else None (terminal-resolved or TTL elapsed — the caller
+    distinguishes by re-reading the row).
+
+    Polls coarsely (``STATE_STORE_POLL_INTERVAL``): this can run for the full
+    12h TTL, and a few seconds of latency in *noticing* a terminal resolution is
+    harmless (Claude Code has already proceeded) — far better than re-reading a
+    growing state file twice a second for hours.
+    """
     start_time = time.time()
     while time.time() - start_time < ttl_seconds:
         request = get_request(request_id)
@@ -399,7 +446,7 @@ def _wait_state_store_only(
                 RequestState.REPLY.value,
             ]:
                 return request.decision
-        time.sleep(POLL_INTERVAL)
+        time.sleep(STATE_STORE_POLL_INTERVAL)
     return None
 
 
@@ -445,13 +492,11 @@ def handle_ask_user_question(
             permission_suggestions=[],
             ttl_seconds=REQUEST_TTL,
         )
-        children.append((child, q, None))
         msg_id = send_question_message(child, workspace_name, i, len(questions), group_id)
         if not msg_id:
             error_log(f"Failed to send AskUserQuestion message for child {child.request_id}; falling back to terminal")
-            _fallback_children(children)
             return None
-        children[-1] = (child, q, msg_id)
+        children.append((child, q, msg_id))
 
     debug_log(f"Sent {len(children)} question messages; polling for answers")
 
@@ -462,7 +507,6 @@ def handle_ask_user_question(
     deadline = time.time() + REQUEST_TTL
     for child, q, child_msg_id in children:
         if time.time() >= deadline:
-            _fallback_children(children)
             return None
         # Tight inner loop: short relay long-poll chunks interleaved with a
         # terminal-resolution check on the local state store.
@@ -505,12 +549,10 @@ def handle_ask_user_question(
                 debug_log(
                     f"Question {child.request_id} relay state={answer['_state']}; falling back"
                 )
-                _fallback_children(children)
                 return None
             decision = relay_answer_to_decision(child, answer)
             if not decision or decision.get('action') != 'reply':
                 debug_log(f"Unexpected decision shape for question: {decision}")
-                _fallback_children(children)
                 return None
             answers[q.get('question', '')] = decision.get('reply_text', '')
             # Mark this child terminal so the PostToolUse hook's pending-request
@@ -525,7 +567,6 @@ def handle_ask_user_question(
             resolved = True
 
         if not resolved:
-            _fallback_children(children)
             return None
 
     # All answered via Telegram — build updatedInput preserving original question structure.
@@ -622,44 +663,59 @@ def main():
         if wait_before > 0:
             time.sleep(wait_before)
 
-        # Send Telegram message using the router
+        # Send Telegram message using the router.
         message_id = send_permission_message(
             request=request,
             workspace_name=workspace_name,
             session_name=session_name,
         )
 
-        if not message_id:
-            debug_log("Failed to send Telegram message, falling back to terminal")
+        # A failed send is NOT a reason to bail: the native terminal prompt is
+        # shown concurrently regardless, so an attended operator can still
+        # approve at the CLI. We keep racing the terminal for the full TTL and,
+        # only if nobody answers, auto-deny with a note (see below). ``None``
+        # message_id routes wait_for_response through the state-store-only race.
+        delivery_failed = message_id is None
+        if delivery_failed:
+            debug_log("Telegram send failed; racing the terminal up to the TTL before auto-deny")
             error_log(
                 f"Failed to send Telegram permission message for request {request.request_id}; "
-                "falling back to terminal prompt"
+                f"racing the terminal for up to {REQUEST_TTL // 3600}h, will auto-deny if unanswered"
             )
-            _expire_if_pending(request.request_id)
-            sys.exit(0)
+        else:
+            debug_log(f"Telegram message sent with ID: {message_id}")
 
-        debug_log(f"Telegram message sent with ID: {message_id}")
-
-        # Race relay long-poll against terminal resolution via state store.
+        # Race relay long-poll (if delivered) against terminal resolution.
         decision = wait_for_response(
             request.request_id,
             message_id=message_id,
             ttl_seconds=REQUEST_TTL,
         )
 
-        # Build output
         output = build_output_decision(decision, request)
-
         if output:
             debug_log(f"Returning decision: {json.dumps(output)}")
             print(json.dumps(output), flush=True)
-        else:
-            debug_log("No decision reached, falling back to terminal prompt")
-            # The relay message died (expired/cancelled) or the TTL elapsed and
-            # we're handing back to the terminal. Don't leave the row dangling
-            # as ``pending`` — finalize it (idempotent if already terminal).
-            _expire_if_pending(request.request_id)
+            sys.exit(0)
 
+        # No answer from Telegram. If the terminal resolved it, we're done —
+        # Claude Code already acted, nothing to emit.
+        current = get_request(request.request_id)
+        if current and current.state == RequestState.RESOLVED_TERMINAL.value:
+            debug_log("Resolved via terminal; exiting without a decision")
+            sys.exit(0)
+
+        # Genuinely unanswered within the TTL — delivered-but-ignored (e.g. an
+        # unattended session over a 12h window) or never delivered. Fail safe:
+        # auto-deny with an explanatory note so the agent isn't blocked forever
+        # and an unattended session can move on. AskUserQuestion never reaches
+        # here (it returns earlier and keeps the native UI indefinitely).
+        debug_log(
+            f"No response within TTL (delivery_failed={delivery_failed}); auto-denying"
+        )
+        _record_auto_deny(request.request_id)
+        output = _auto_deny_output(request, delivery_failed)
+        print(json.dumps(output), flush=True)
         sys.exit(0)
 
     except Exception as e:

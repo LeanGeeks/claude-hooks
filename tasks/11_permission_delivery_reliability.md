@@ -122,6 +122,32 @@ human at the CLI) **plus** a missed Telegram tap → the request parks up to the
 - Debug logs unbounded (no rotation). Now rotated+gzipped on each
   `install-claude-config.sh` run.
 
+### Decision — unattended-parent escalation (2026-06-22)
+
+"Missed tap" is **not** a detectable event (Telegram gives the bot no read
+receipts), so we don't design around it. Spawned/unattended sessions are
+**interactive tmux panes** (not `claude -p`), and the native terminal prompt is
+shown **concurrently** with the Telegram prompt for the hook's whole lifetime —
+either channel can answer. So no attended/unattended detection is needed.
+
+Agreed behavior (implemented):
+
+- **Keep the full ~12h TTL** for both permission requests and AskUserQuestion —
+  overnight prompts answerable in the morning. Unchanged.
+- **Permission requests:** race the terminal for the full TTL **even when the
+  Telegram send fails** (the terminal is still live, so an attended operator can
+  approve at the CLI). If *nobody* answers within the TTL → **auto-deny with an
+  agent-facing note** (fail safe; never auto-allow). The note distinguishes a
+  *delivery failure* ("couldn't reach operator; the same command may work if
+  retried") from *delivered-but-unanswered* ("no response within 12h; re-run"),
+  and includes the non-allowlisted command parts.
+- **AskUserQuestion:** never auto-resolve (no safe synthetic answer). On no
+  Telegram answer the native terminal UI persists indefinitely; a missing
+  Telegram answer is **not** treated as a failure (only an explicit send error
+  is). Its rows intentionally stay `pending`.
+- A delivery failure is surfaced only at the eventual auto-deny (plus the
+  error log), not as an immediate deny — to avoid cutting off an attended CLI.
+
 **Reference:** relay server is remote — `ssh anton@h02.activecdn.net`, docker
 compose at `~/.bin/claude-hooks/relay-server/`, container `relay-server-relay-1`,
 sqlite `/var/lib/relay/relay.db`. In `messages`, `id` = relay id (what the
