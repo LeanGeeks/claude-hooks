@@ -147,7 +147,7 @@ if [[ ! -d "$PROJECT_HOOKS_DIR" ]]; then
     HOOKS_INSTALLED=false
 else
     # Check for required hook files
-    REQUIRED_HOOKS=("pretool_hook.py" "bash_command_parser.py" "settings_loader.py" "notification_hook.py" "permission_request_hook.py" "permission_state_store.py" "telegram_permission_router.py" "posttool_hook.py" "reply_injector.py" "amux_spawn_lib.py")
+    REQUIRED_HOOKS=("pretool_hook.py" "bash_command_parser.py" "settings_loader.py" "notification_hook.py" "permission_request_hook.py" "permission_state_store.py" "telegram_permission_router.py" "posttool_hook.py" "reply_injector.py" "amux_spawn_lib.py" "spawn_producer_hook.py")
     # Optional utility scripts (none at present — get_telegram_chat_id.py was
     # removed in Phase 6: the relay server owns the bot token, so direct
     # getUpdates polling from a device is no longer needed).
@@ -371,6 +371,7 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                        --arg notification_path "$GLOBAL_HOOKS_DIR/notification_hook.py" \
                        --arg permission_path "$GLOBAL_HOOKS_DIR/permission_request_hook.py" \
                        --arg posttool_path "$GLOBAL_HOOKS_DIR/posttool_hook.py" \
+                       --arg producer_path "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
             '{
                 PreToolUse: [{
                     matcher: "Bash",
@@ -397,6 +398,12 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                         command: ("python3 " + $posttool_path)
                     }]
                 }],
+                # Notification has TWO matchers, kept separate and additive:
+                #  - idle_prompt   -> the existing Telegram idle notification (task 09)
+                #  - permission_prompt -> the epic-10 producer sets permission_pending
+                #                         on the tracked sessions handle (no-op for
+                #                         plain/human sessions). These never clobber
+                #                         each other; the producer ignores idle_prompt.
                 Notification: [{
                     matcher: "idle_prompt",
                     hooks: [{
@@ -407,6 +414,37 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                         # reply-from-Telegram chain is observable end-to-end.
                         command: ("CLAUDE_HOOK_DEBUG=1 python3 " + $notification_path)
                     }]
+                }, {
+                    matcher: "permission_prompt",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $producer_path + " --event Notification")
+                    }]
+                }],
+                # Epic-10 producer (Stop-based state machine for tracked amux
+                # sessions). Each handle-gates: a no-op for plain/human sessions and
+                # other repos. Stop is authoritative (sets idle); SubagentStop is
+                # freshness-only; SessionEnd marks terminated.
+                Stop: [{
+                    matcher: "*",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $producer_path + " --event Stop")
+                    }]
+                }],
+                SubagentStop: [{
+                    matcher: "*",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $producer_path + " --event SubagentStop")
+                    }]
+                }],
+                SessionEnd: [{
+                    matcher: "*",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $producer_path + " --event SessionEnd")
+                    }]
                 }]
             }')
 
@@ -416,7 +454,8 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
         log_info "  - PreToolUse: python3 $GLOBAL_HOOKS_DIR/pretool_hook.py"
         log_info "  - PermissionRequest: python3 $GLOBAL_HOOKS_DIR/permission_request_hook.py"
         log_info "  - PostToolUse: python3 $GLOBAL_HOOKS_DIR/posttool_hook.py"
-        log_info "  - Notification: python3 $GLOBAL_HOOKS_DIR/notification_hook.py"
+        log_info "  - Notification (idle_prompt): python3 $GLOBAL_HOOKS_DIR/notification_hook.py"
+        log_info "  - Notification (permission_prompt) + Stop/SubagentStop/SessionEnd: python3 $GLOBAL_HOOKS_DIR/spawn_producer_hook.py"
 fi
 
 # Merge statusLine configuration if statusline was installed
@@ -464,6 +503,7 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
     echo "    - PermissionRequest: Telegram-gated permission approval"
     echo "    - PostToolUse: Telegram message cleanup on terminal response"
     echo "    - Notification: idle_prompt → Telegram (forwards agent's last message)"
+    echo "    - Stop/SubagentStop/Notification(permission_prompt)/SessionEnd → amux-spawn producer (tracked-session state)"
 else
     echo "  - hooks: not installed (missing files)"
 fi

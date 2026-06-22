@@ -40,6 +40,7 @@ TEST_MODULES = {
     "unit_notification": "test_unit_notification_hook",
     "unit_reply_injector": "test_unit_reply_injector",
     "unit_amux_spawn": "test_unit_amux_spawn",
+    "unit_spawn_producer": "test_unit_spawn_producer",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }
