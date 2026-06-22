@@ -14,7 +14,7 @@ This provides coordination between Telegram and terminal prompts:
 import json
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add hooks directory to path for imports
@@ -36,7 +36,7 @@ def log_debug(message: str):
     if DEBUG:
         try:
             with open(DEBUG_LOG, 'a') as f:
-                timestamp = datetime.now().isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 f.write(f"[{timestamp}] {message}\n")
         except Exception:
             pass

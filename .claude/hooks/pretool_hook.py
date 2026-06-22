@@ -22,7 +22,7 @@ import json
 import re
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any
 
 # Import our modules
@@ -210,7 +210,7 @@ def debug_log(message: str):
     if DEBUG:
         try:
             with open(DEBUG_LOG, 'a') as f:
-                timestamp = datetime.now().isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 f.write(f"[{timestamp}] {message}\n")
         except Exception as e:
             print(f"Debug log error: {e}", file=sys.stderr)
@@ -247,7 +247,7 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
     """
     try:
         log_entry = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'session_id': session_id or os.environ.get('CLAUDE_SESSION_ID', ''),
             'workspace': workspace_dir,
             'command': command,

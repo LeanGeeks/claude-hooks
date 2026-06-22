@@ -22,7 +22,7 @@ import argparse
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Make sibling hook modules importable regardless of cwd.
@@ -55,7 +55,7 @@ def debug_log(message: str) -> None:
     if os.environ.get("CLAUDE_HOOK_DEBUG", "0") == "1":
         try:
             with open(DEBUG_LOG, "a") as f:
-                f.write(f"[{datetime.now().isoformat()}] {message}\n")
+                f.write(f"[{datetime.now(timezone.utc).isoformat()}] {message}\n")
         except Exception:
             pass
 

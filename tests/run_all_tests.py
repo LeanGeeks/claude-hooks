@@ -16,9 +16,21 @@ Available modules:
     all              - Run all tests (default)
 """
 
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+# Isolate the permission state store BEFORE any test module imports it (the
+# imports below trigger ``from permission_state_store import ...``, which reads
+# these paths once at import). Keeps test runs from writing ``test-*`` rows into
+# the developer's real ~/.claude/permission_requests.jsonl. Mirrors conftest.py
+# for the pytest path. ``setdefault`` lets an explicit outer override win.
+_tmp_store = Path(tempfile.mkdtemp(prefix="claude-hooks-tests-"))
+os.environ.setdefault("CLAUDE_PERMISSION_STATE_FILE", str(_tmp_store / "permission_requests.jsonl"))
+os.environ.setdefault("CLAUDE_PERMISSION_AUDIT_FILE", str(_tmp_store / "permission_actions.jsonl"))
+os.environ.setdefault("CLAUDE_PERMISSION_DEBUG_LOG", str(_tmp_store / "permission_state_debug.log"))
 
 # Test modules
 TEST_MODULES = {

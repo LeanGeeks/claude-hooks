@@ -179,20 +179,20 @@ class TestLoggingVerification(unittest.TestCase):
 class TestLogFileLocations(unittest.TestCase):
     """Test log file locations."""
 
+    # Paths are env-overridable for test isolation (conftest/run_all_tests point
+    # them at a temp dir), so assert the *filename* rather than the full path —
+    # that still pins the canonical name without depending on the location.
     def test_state_file_location(self):
-        """Test state file is in expected location."""
-        expected = Path.home() / ".claude" / "permission_requests.jsonl"
-        self.assertEqual(STATE_FILE, expected)
+        """Test state file has the expected name."""
+        self.assertEqual(STATE_FILE.name, "permission_requests.jsonl")
 
     def test_audit_log_location(self):
-        """Test audit log is in expected location."""
-        expected = Path.home() / ".claude" / "permission_actions.jsonl"
-        self.assertEqual(AUDIT_LOG_FILE, expected)
+        """Test audit log has the expected name."""
+        self.assertEqual(AUDIT_LOG_FILE.name, "permission_actions.jsonl")
 
     def test_debug_log_location(self):
-        """Test debug log is in expected location."""
-        expected = Path.home() / ".claude" / "permission_state_debug.log"
-        self.assertEqual(DEBUG_LOG, expected)
+        """Test debug log has the expected name."""
+        self.assertEqual(DEBUG_LOG.name, "permission_state_debug.log")
 
 
 class TestLogRetention(unittest.TestCase):

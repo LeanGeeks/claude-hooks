@@ -32,7 +32,7 @@ import os
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -48,6 +48,7 @@ from permission_state_store import (
     cleanup_expired_requests,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
+    RESOLUTION_SOURCE_TIMEOUT,
 )
 from telegram_permission_router import (
     load_telegram_config,
@@ -77,7 +78,7 @@ def debug_log(message: str):
     if DEBUG:
         try:
             with open(DEBUG_LOG, 'a') as f:
-                timestamp = datetime.now().isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 f.write(f"[{timestamp}] {message}\n")
         except Exception as e:
             print(f"Debug log error: {e}", file=sys.stderr)
@@ -88,7 +89,7 @@ def error_log(message: str):
     try:
         Path(ERROR_LOG).parent.mkdir(parents=True, exist_ok=True)
         with open(ERROR_LOG, 'a') as f:
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             f.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
@@ -346,6 +347,40 @@ def _mark_relay_resolved(request_id: str, decision: Dict[str, Any]) -> None:
         debug_log(f"Failed to mark request {request_id} relay-resolved: {e}")
 
 
+def _expire_if_pending(request_id: str) -> None:
+    """Finalize a still-``pending`` row when the hook gives up without a decision.
+
+    The hook falls back to the terminal prompt (exit 0, no output) when the relay
+    message expired/cancelled or the overall TTL elapsed. Without this the row
+    lingers as ``pending`` until the 12h TTL sweep, so ``pending`` can't be
+    trusted as a "someone is actively waiting" signal (stuck-detection, Epic 10).
+
+    ``update_request_state`` is idempotent: if the row already reached a terminal
+    state (e.g. PostToolUse wrote ``resolved_terminal``, or a relay answer wrote
+    allow/deny), this is a harmless no-op.
+    """
+    try:
+        update_request_state(
+            request_id,
+            RequestState.EXPIRED,
+            resolution_source=RESOLUTION_SOURCE_TIMEOUT,
+        )
+    except Exception as e:  # noqa: BLE001 — never disrupt the hook's exit path.
+        debug_log(f"Failed to expire pending request {request_id}: {e}")
+
+
+def _fallback_children(children) -> None:
+    """Expire any still-pending AskUserQuestion child rows on terminal fallback.
+
+    Mirrors ``_expire_if_pending`` for the question fan-out: when the group
+    falls back to the native terminal UI, each child relay-message row would
+    otherwise sit ``pending`` until the TTL sweep (the source of the observed
+    multi-hour orphaned-question rows). Idempotent per child.
+    """
+    for child, _q, _msg in children:
+        _expire_if_pending(child.request_id)
+
+
 def _wait_state_store_only(
     request_id: str, ttl_seconds: int
 ) -> Optional[Dict[str, Any]]:
@@ -410,11 +445,13 @@ def handle_ask_user_question(
             permission_suggestions=[],
             ttl_seconds=REQUEST_TTL,
         )
+        children.append((child, q, None))
         msg_id = send_question_message(child, workspace_name, i, len(questions), group_id)
         if not msg_id:
             error_log(f"Failed to send AskUserQuestion message for child {child.request_id}; falling back to terminal")
+            _fallback_children(children)
             return None
-        children.append((child, q, msg_id))
+        children[-1] = (child, q, msg_id)
 
     debug_log(f"Sent {len(children)} question messages; polling for answers")
 
@@ -425,6 +462,7 @@ def handle_ask_user_question(
     deadline = time.time() + REQUEST_TTL
     for child, q, child_msg_id in children:
         if time.time() >= deadline:
+            _fallback_children(children)
             return None
         # Tight inner loop: short relay long-poll chunks interleaved with a
         # terminal-resolution check on the local state store.
@@ -467,10 +505,12 @@ def handle_ask_user_question(
                 debug_log(
                     f"Question {child.request_id} relay state={answer['_state']}; falling back"
                 )
+                _fallback_children(children)
                 return None
             decision = relay_answer_to_decision(child, answer)
             if not decision or decision.get('action') != 'reply':
                 debug_log(f"Unexpected decision shape for question: {decision}")
+                _fallback_children(children)
                 return None
             answers[q.get('question', '')] = decision.get('reply_text', '')
             # Mark this child terminal so the PostToolUse hook's pending-request
@@ -485,6 +525,7 @@ def handle_ask_user_question(
             resolved = True
 
         if not resolved:
+            _fallback_children(children)
             return None
 
     # All answered via Telegram — build updatedInput preserving original question structure.
@@ -594,6 +635,7 @@ def main():
                 f"Failed to send Telegram permission message for request {request.request_id}; "
                 "falling back to terminal prompt"
             )
+            _expire_if_pending(request.request_id)
             sys.exit(0)
 
         debug_log(f"Telegram message sent with ID: {message_id}")
@@ -613,6 +655,10 @@ def main():
             print(json.dumps(output), flush=True)
         else:
             debug_log("No decision reached, falling back to terminal prompt")
+            # The relay message died (expired/cancelled) or the TTL elapsed and
+            # we're handing back to the terminal. Don't leave the row dangling
+            # as ``pending`` — finalize it (idempotent if already terminal).
+            _expire_if_pending(request.request_id)
 
         sys.exit(0)
 

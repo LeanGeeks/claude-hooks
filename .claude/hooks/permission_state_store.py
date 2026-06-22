@@ -28,11 +28,20 @@ from enum import Enum
 
 
 # Configuration
-STATE_FILE = Path.home() / ".claude" / "permission_requests.jsonl"
-AUDIT_LOG_FILE = Path.home() / ".claude" / "permission_actions.jsonl"
+#
+# Paths honor env-var overrides so tests (and any sandboxed run) can point the
+# state store at a temp dir instead of polluting the real ~/.claude store. The
+# default remains ~/.claude/... for normal hook execution.
+def _store_path(env_var: str, default_name: str) -> Path:
+    override = os.environ.get(env_var)
+    return Path(override) if override else (Path.home() / ".claude" / default_name)
+
+
+STATE_FILE = _store_path("CLAUDE_PERMISSION_STATE_FILE", "permission_requests.jsonl")
+AUDIT_LOG_FILE = _store_path("CLAUDE_PERMISSION_AUDIT_FILE", "permission_actions.jsonl")
 DEFAULT_TTL_SECONDS = 3600  # 1 hour default TTL for pending requests
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
-DEBUG_LOG = Path.home() / ".claude" / "permission_state_debug.log"
+DEBUG_LOG = _store_path("CLAUDE_PERMISSION_DEBUG_LOG", "permission_state_debug.log")
 
 
 class RequestState(Enum):
@@ -117,7 +126,7 @@ def debug_log(message: str):
     if DEBUG:
         try:
             with open(DEBUG_LOG, 'a') as f:
-                timestamp = datetime.now().isoformat()
+                timestamp = datetime.now(timezone.utc).isoformat()
                 f.write(f"[{timestamp}] {message}\n")
         except Exception:
             pass
@@ -193,7 +202,10 @@ def create_request(
     _ensure_state_directory()
 
     now = _utc_now()
-    request_id = str(uuid.uuid4())[:8]  # Short UUID for readability
+    # 12 hex chars (48 bits). Short enough to stay greppable/readable, wide
+    # enough that collisions are negligible across the tens-of-thousands of
+    # rows this append log accumulates (8 hex / 32 bits was collision-prone).
+    request_id = uuid.uuid4().hex[:12]
 
     request = PermissionRequest(
         request_id=request_id,

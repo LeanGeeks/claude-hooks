@@ -31,6 +31,70 @@ log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
 
+# Rotate hook debug/error logs in ~/.claude/. Each install ships a new version,
+# which is a natural rotation point. For every known log that exists and exceeds
+# a small size threshold, gzip it into "<name>.<UTC-timestamp>.gz" (so the live
+# log starts fresh next run), then prune all but the most recent N archives per
+# base name. Tiny logs are left untouched so they aren't churned every run.
+rotate_hook_logs() {
+    local claude_dir="$HOME/.claude"
+    local keep=5                 # archives to retain per base log name
+    local min_bytes=$((1024 * 1024))  # only rotate logs larger than 1 MB
+    local stamp
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+    # Base log names this project writes. reply_injector*.log is expanded via glob.
+    local logs=(
+        bash_hook_debug.log
+        permission_request_debug.log
+        permission_state_debug.log
+        posttool_debug.log
+        notification_hook_debug.log
+        permission_telegram_errors.log
+        telegram_daemon.log
+    )
+    # Include any reply_injector*.log files present.
+    local rij
+    for rij in "$claude_dir"/reply_injector*.log; do
+        [[ -e "$rij" ]] && logs+=("$(basename "$rij")")
+    done
+
+    local name path size archives count old
+    for name in "${logs[@]}"; do
+        path="$claude_dir/$name"
+        [[ -f "$path" ]] || continue
+        # Skip empty or sub-threshold logs.
+        size=$(wc -c < "$path" 2>/dev/null || echo 0)
+        if [[ "$size" -le "$min_bytes" ]]; then
+            continue
+        fi
+
+        # gzip into a timestamped archive; -c keeps stdout so the live log can be
+        # truncated afterward, leaving a fresh empty file for the next run.
+        if gzip -c "$path" > "$path.$stamp.gz" 2>/dev/null; then
+            : > "$path"
+            log_info "Rotated log: $name → $name.$stamp.gz ($(( size / 1024 )) KB)"
+        else
+            log_warn "Could not rotate log: $name"
+            rm -f "$path.$stamp.gz"
+            continue
+        fi
+
+        # Prune older archives, keeping the newest $keep per base name.
+        archives=()
+        while IFS= read -r old; do
+            [[ -n "$old" ]] && archives+=("$old")
+        done < <(ls -1t "$path".*.gz 2>/dev/null)
+        count=${#archives[@]}
+        if [[ "$count" -gt "$keep" ]]; then
+            for old in "${archives[@]:$keep}"; do
+                rm -f "$old"
+                log_info "  Pruned old archive: $(basename "$old")"
+            done
+        fi
+    done
+}
+
 # Check dependencies
 if ! command -v jq &> /dev/null; then
     log_error "jq is required but not installed. Install with: sudo apt install jq"
@@ -48,6 +112,10 @@ fi
 # =============================================================================
 
 log_step "Step 1/4: Installing hooks"
+
+# Rotate (gzip) hook debug/error logs before wiring anything. A fresh install is
+# a natural rotation point and keeps these logs from growing unbounded.
+rotate_hook_logs
 
 # ---------------------------------------------------------------------------
 # Legacy daemon cleanup. Pre-relay installs ran a long-lived telegram_daemon.py

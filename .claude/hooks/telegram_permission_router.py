@@ -28,7 +28,7 @@ import importlib.util
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -111,7 +111,7 @@ def error_log(message: str) -> None:
     try:
         ERROR_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(ERROR_LOG_FILE, "a") as f:
-            timestamp = datetime.now().isoformat()
+            timestamp = datetime.now(timezone.utc).isoformat()
             f.write(f"[{timestamp}] {message}\n")
     except Exception:  # noqa: BLE001
         pass
