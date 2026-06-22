@@ -538,6 +538,41 @@ class BashPermissionValidator:
             debug_log(f"Error checking workspace binary: {e}")
             return False
 
+    def _resolve_target_path(self, path: str):
+        """
+        Resolve a command-line path operand to an absolute realpath the way bash
+        would, or return None when it cannot be resolved with confidence.
+
+        The containment checks below decide whether a path is "inside" an allowed
+        root by string-prefix on its realpath. That reasoning is only sound if we
+        first apply the same expansions the shell does before the path is handed to
+        the binary. Skipping them lets an escaping target masquerade as a local
+        one: `~/x` naively joins onto the workspace as a literal `~` subdirectory
+        (`<ws>/~/x`), which is "inside" the workspace by string prefix even though
+        bash deletes `$HOME/x`, well outside it. So we:
+
+          1. expanduser  — `~`/`~user` -> home dir (matches bash tilde expansion)
+          2. expandvars  — `$VAR`/`${VAR}` -> value from the environment
+
+        After expansion, if the path STILL contains a shell construct that could
+        relocate the target — an unresolved `$` (undefined variable), a backtick
+        or `$(...)` command substitution, or a leading `~` that did not expand
+        (e.g. `~unknownuser`) — we cannot know where it actually points, so we
+        return None and let the caller fall back to a prompt rather than vouch for
+        it. Globs (`*`, `?`, `[`) are deliberately NOT treated as unresolvable:
+        they do not change the path's rooting, so realpath containment stays
+        correct (`~/*.txt` -> `/home/user/*.txt`, rejected; `*.txt` -> inside).
+        """
+        expanded = os.path.expandvars(os.path.expanduser(path))
+        # Any of these mean the post-expansion target location is unknown.
+        if '$' in expanded or '`' in expanded or expanded.startswith('~'):
+            debug_log(f"target {path!r} has unresolved shell expansion "
+                      f"({expanded!r}) - cannot confirm location")
+            return None
+        if expanded.startswith('/'):
+            return os.path.realpath(expanded)
+        return os.path.realpath(os.path.join(self.workspace_dir, expanded))
+
     def _is_path_inside_workspace(self, path: str) -> bool:
         """
         Check if a path (relative or absolute) is inside the workspace.
@@ -549,10 +584,9 @@ class BashPermissionValidator:
             True if path resolves inside workspace
         """
         try:
-            if path.startswith('/'):
-                resolved = os.path.realpath(path)
-            else:
-                resolved = os.path.realpath(os.path.join(self.workspace_dir, path))
+            resolved = self._resolve_target_path(path)
+            if resolved is None:
+                return False
 
             real_workspace = os.path.realpath(self.workspace_dir)
             return resolved.startswith(real_workspace + os.sep) or resolved == real_workspace
@@ -566,10 +600,9 @@ class BashPermissionValidator:
         We allow deletions inside the active workspace and inside /tmp.
         """
         try:
-            if path.startswith('/'):
-                resolved = os.path.realpath(path)
-            else:
-                resolved = os.path.realpath(os.path.join(self.workspace_dir, path))
+            resolved = self._resolve_target_path(path)
+            if resolved is None:
+                return False
 
             allowed_roots = [
                 os.path.realpath(self.workspace_dir),

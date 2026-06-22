@@ -116,6 +116,61 @@ class TestPreToolUseHook(unittest.TestCase):
 
         self.assertEqual(result["decision"], "ask")
 
+    def test_rm_tilde_path_escapes_workspace_returns_ask(self):
+        """`rm ~/x` must not be auto-allowed: ~ expands to $HOME, outside the
+        workspace. The hook previously joined the literal '~' onto the workspace
+        dir and judged it 'inside'."""
+        ws_validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir
+        )
+        command = (
+            'touch ~/claude_test_file.txt && echo "File created" '
+            '&& rm ~/claude_test_file.txt && echo "File removed"'
+        )
+        result = ws_validator.validate_bash_command(command)
+
+        self.assertEqual(result["decision"], "ask")
+
+    def test_rm_env_var_path_escapes_workspace_returns_ask(self):
+        """`rm $HOME/x` / `${HOME}/x` must not be auto-allowed either."""
+        ws_validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir
+        )
+        for command in ("rm $HOME/claude_test_file.txt",
+                        "rm ${HOME}/claude_test_file.txt"):
+            with self.subTest(command=command):
+                result = ws_validator.validate_bash_command(command)
+                self.assertEqual(result["decision"], "ask")
+
+    def test_rm_undefined_var_path_returns_ask(self):
+        """An unresolved variable leaves the target location unknown -> ask."""
+        ws_validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir
+        )
+        result = ws_validator.validate_bash_command(
+            "rm $DEFINITELY_UNSET_VAR_XYZ/file.txt"
+        )
+        self.assertEqual(result["decision"], "ask")
+
+    def test_rm_tilde_glob_escapes_workspace_returns_ask(self):
+        """A glob under ~ still escapes: ~ expands, the glob stays under $HOME."""
+        ws_validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir
+        )
+        result = ws_validator.validate_bash_command("rm -rf ~/*.txt")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_rm_relative_workspace_file_still_allowed(self):
+        """Regression guard: an ordinary in-workspace rm stays auto-allowed,
+        including in-workspace globs (the glob does not escape the root)."""
+        ws_validator = BashPermissionValidator(
+            self.settings_loader, self.parser, workspace_dir=self.workspace_dir
+        )
+        for command in ("rm somefile.txt", "rm -rf build/", "rm -f *.tmp"):
+            with self.subTest(command=command):
+                result = ws_validator.validate_bash_command(command)
+                self.assertEqual(result["decision"], "allow")
+
     def test_complex_pipeline(self):
         """Test complex pipeline with multiple commands."""
         payload = PRETOOL_USE_PAYLOADS["complex_pipeline"]
