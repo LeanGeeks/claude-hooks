@@ -512,31 +512,30 @@ def handle_ask_user_question(
         # terminal-resolution check on the local state store.
         resolved = False
         while time.time() < deadline and not resolved:
-            current = get_request(child.request_id)
-            if current and current.state == RequestState.RESOLVED_TERMINAL.value:
-                debug_log(
-                    f"Child {child.request_id} resolved via terminal; revoking siblings"
-                )
-                # Cancel this child's own relay message first — it was never
-                # answered via Telegram, so its buttons are still live. The
-                # posttool hook only cancels the *parent* permission request's
-                # message, not AskUserQuestion child messages.
-                try:
-                    remove_inline_buttons(child_msg_id)
-                except Exception as e:
-                    debug_log(f"Failed to cancel current child message {child_msg_id}: {e}")
+            # The PostToolUse hook only flips the *most recent* pending child to
+            # resolved_terminal (find_pending_request_by_tool_session returns one
+            # row), but that signals the whole AskUserQuestion was answered in the
+            # terminal. So detect the terminal state on ANY child — not just the
+            # one we happen to be polling — otherwise a loop parked on an earlier
+            # child never fires and that child's keyboard is left live.
+            if any(
+                (st := get_request(c.request_id))
+                and st.state == RequestState.RESOLVED_TERMINAL.value
+                for c, _cq, _cm in children
+            ):
+                debug_log("AskUserQuestion resolved via terminal; revoking all messages")
                 from permission_state_store import resolve_via_terminal
                 for sib, _sq, sib_msg in children:
-                    if sib.request_id == child.request_id:
-                        continue
                     sib_state = get_request(sib.request_id)
                     if sib_state and sib_state.state == RequestState.PENDING.value:
                         resolve_via_terminal(sib.request_id)
-                        try:
-                            remove_inline_buttons(sib_msg)
-                            set_message_reaction(sib_msg, '✅')
-                        except Exception as e:
-                            debug_log(f"Failed to revoke sibling message {sib_msg}: {e}")
+                    # Strip the keyboard on every sibling (idempotent for the one
+                    # the posttool hook already revoked).
+                    try:
+                        remove_inline_buttons(sib_msg)
+                        set_message_reaction(sib_msg, '✅')
+                    except Exception as e:
+                        debug_log(f"Failed to revoke message {sib_msg}: {e}")
                 return None
             chunk = min(25, max(1, int(deadline - time.time())))
             answer = wait_for_relay_answer(

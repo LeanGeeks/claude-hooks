@@ -459,6 +459,68 @@ class TestTerminalResolutionRace(unittest.TestCase):
         # The current child's relay message (555) must have been cancelled.
         mock_remove_buttons.assert_any_call(555)
 
+    @patch("permission_request_hook.wait_for_relay_answer")
+    @patch("permission_request_hook.create_request")
+    @patch("permission_request_hook.get_request")
+    @patch("permission_request_hook.remove_inline_buttons")
+    @patch("permission_request_hook.set_message_reaction")
+    def test_handle_ask_user_question_terminal_revokes_all_group_messages(
+        self,
+        mock_set_reaction,
+        mock_remove_buttons,
+        mock_get_request,
+        mock_create_request,
+        mock_wait_relay,
+    ):
+        """Two questions, answered in the terminal. The PostToolUse hook only
+        flips the *most recent* child (the last one) to resolved_terminal, while
+        the loop is parked on the first child. Every sibling's keyboard must
+        still be revoked — not just the last one."""
+        import telegram_permission_router as tpr
+        from permission_request_hook import handle_ask_user_question
+        from permission_state_store import RequestState
+
+        # Distinct child per question, distinct relay message id per child.
+        mock_create_request.side_effect = [
+            _make_request(request_id="child-1"),
+            _make_request(request_id="child-2"),
+        ]
+        msg_ids = {"child-1": 501, "child-2": 502}
+
+        # Only the *last* child is flipped to resolved_terminal (mirrors
+        # find_pending_request_by_tool_session returning the most recent row).
+        def _get_request_side_effect(request_id):
+            if request_id == "child-2":
+                return _make_request(
+                    request_id=request_id,
+                    state=RequestState.RESOLVED_TERMINAL.value,
+                )
+            return _make_request(request_id=request_id)  # child-1 still pending
+
+        mock_get_request.side_effect = _get_request_side_effect
+        mock_wait_relay.return_value = None  # relay never answers
+
+        def _send(child, *_a, **_k):
+            return msg_ids[child.request_id]
+
+        with patch("permission_request_hook.send_question_message", side_effect=_send):
+            result = handle_ask_user_question(
+                session_id="sess",
+                cwd="/tmp",
+                tool_input={
+                    "questions": [
+                        {"question": "Q1?", "options": []},
+                        {"question": "Q2?", "options": []},
+                    ]
+                },
+                workspace_name="workspace",
+            )
+
+        self.assertIsNone(result)
+        # Both the first child's message (501) and the last (502) get revoked.
+        mock_remove_buttons.assert_any_call(501)
+        mock_remove_buttons.assert_any_call(502)
+
 
 class TestAutoDenyAtTtl(unittest.TestCase):
     """Auto-deny-with-note when a permission request goes unanswered for the TTL.
