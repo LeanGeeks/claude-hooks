@@ -983,6 +983,9 @@ def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None
 
 _SELECTED_PREFIX = "✅ "
 _REPLY_PREFIX = "✍️ "
+# Empty-checkbox prefix on unticked multi-select options (must match
+# ``QUESTION_UNCHECKED_PREFIX`` in the hook's telegram_permission_router.py).
+_UNSELECTED_PREFIX = "⬜ "
 
 # Sentinel button ``value`` for the multi-select Submit button (must match
 # ``QUESTION_SUBMIT_VALUE`` in the hook's telegram_permission_router.py).
@@ -1044,13 +1047,23 @@ def _highlighted_keyboard(
     return out
 
 
+def _strip_checkbox(label: str) -> str:
+    """Drop a leading ✅/⬜ checkbox prefix so re-rendering from a stored keyboard
+    never stacks markers, regardless of which state the label came in as."""
+    for prefix in (_SELECTED_PREFIX, _UNSELECTED_PREFIX):
+        if label.startswith(prefix):
+            return label[len(prefix):]
+    return label
+
+
 def _multi_highlighted_keyboard(
     keyboard: list[list[dict[str, Any]]], selected_idxs: set[int]
 ) -> list[list[dict[str, Any]]]:
-    """Like ``_highlighted_keyboard`` but marks every button whose flat index is
-    in ``selected_idxs`` — for multi-select, where several options can be live at
-    once. The Submit button (identified by its sentinel value) is never marked.
-    Always built from the pristine stored keyboard so toggling is idempotent."""
+    """Like ``_highlighted_keyboard`` but renders every option button with a
+    checkbox — ✅ for selected, ⬜ for unselected — since a multi-select can have
+    several options live at once. The Submit button (identified by its sentinel
+    value) is left untouched. Always built from the pristine stored keyboard
+    (stripping any existing checkbox first) so toggling stays idempotent."""
     out: list[list[dict[str, Any]]] = []
     flat = 0
     for kb_row in keyboard:
@@ -1058,8 +1071,10 @@ def _multi_highlighted_keyboard(
         for btn in kb_row:
             label = btn.get("label", "")
             value = btn.get("value", "")
-            if value != _QUESTION_SUBMIT_VALUE and flat in selected_idxs:
-                label = _SELECTED_PREFIX + label
+            if value != _QUESTION_SUBMIT_VALUE:
+                base = _strip_checkbox(label)
+                prefix = _SELECTED_PREFIX if flat in selected_idxs else _UNSELECTED_PREFIX
+                label = prefix + base
             out_row.append({"label": label, "value": value})
             flat += 1
         out.append(out_row)
@@ -1456,7 +1471,9 @@ async def _handle_multi_select_button(
             await _safe_answer_cb(backend, cb_id, "Tap at least one option first")
             return
         labels = [
-            flat[i].get("label", "") for i in selected if 0 <= i < len(flat)
+            _strip_checkbox(flat[i].get("label", ""))
+            for i in selected
+            if 0 <= i < len(flat)
         ]
         answer = {"via": "button_multi", "option_idxs": selected, "labels": labels}
         wrote = await _record_provisional(conn, int(row["id"]), answer)

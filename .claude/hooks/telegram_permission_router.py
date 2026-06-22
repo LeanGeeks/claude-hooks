@@ -164,6 +164,11 @@ def _client() -> "RelayClient":
 # with ``_QUESTION_SUBMIT_VALUE`` in relay_server/app.py.
 QUESTION_SUBMIT_VALUE = "qa_submit"
 
+# Empty-checkbox prefix on unticked multi-select option buttons (the relay
+# swaps it for ✅ when an option is selected). Must match ``_UNSELECTED_PREFIX``
+# in relay_server/app.py.
+QUESTION_UNCHECKED_PREFIX = "⬜ "
+
 
 # ---- Option labels that signal "let me type a custom answer" ---------------
 
@@ -491,7 +496,13 @@ def send_question_message(
                 lines.append(f"    <i>{esc(description)}</i>")
             # One button per row for maximum width; the button shows the number
             # plus the leading part of the label (Telegram trims the overflow).
-            rows.append([{"label": f"{num}. {label}", "value": f"qa{i}"}])
+            # Multi-select buttons start with an empty checkbox so the initial
+            # (untapped) state reads as "nothing selected yet"; the relay swaps
+            # it for ✅ as options are toggled.
+            btn_label = f"{num}. {label}"
+            if multi_select:
+                btn_label = QUESTION_UNCHECKED_PREFIX + btn_label
+            rows.append([{"label": btn_label, "value": f"qa{i}"}])
         if multi_select:
             # Dedicated Submit button the relay recognises by its sentinel value.
             # Taps on the option buttons above only toggle the selection; this is

@@ -321,6 +321,9 @@ class TestRouting(unittest.TestCase):
         keyboard = captured["keyboard"]
         # Last keyboard row is the Submit button with the sentinel value.
         self.assertEqual(keyboard[-1][0]["value"], tpr.QUESTION_SUBMIT_VALUE)
+        # Option buttons start with an empty checkbox (untapped state).
+        self.assertTrue(keyboard[0][0]["label"].startswith(tpr.QUESTION_UNCHECKED_PREFIX))
+        self.assertTrue(keyboard[1][0]["label"].startswith(tpr.QUESTION_UNCHECKED_PREFIX))
         # The "first answer wins" caveat is gone.
         self.assertNotIn("first answer wins", captured["text"])
 

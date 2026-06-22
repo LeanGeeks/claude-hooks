@@ -359,10 +359,11 @@ async def test_multi_select_toggle_and_submit(
     # Still open before Submit, even though it is a single-member group.
     assert (await _answer(app_client, token, m1)).status_code == 204
 
-    # Both chosen options are marked at once (multi-highlight), Submit is not.
+    # Both chosen options are marked at once (multi-highlight); unchosen show an
+    # empty checkbox; Submit is untouched.
     kb = _edits_for(backend, 1000)[-1].kwargs["keyboard"]
     assert kb[0][0]["label"] == "✅ Logging"
-    assert kb[1][0]["label"] == "Metrics"
+    assert kb[1][0]["label"] == "⬜ Metrics"
     assert kb[2][0]["label"] == "✅ Caching"
     assert kb[3][0]["label"] == "✓ Submit"
 
@@ -404,13 +405,35 @@ async def test_multi_select_toggle_off(
                chat_id=chat_id, user_id=user_id, update_id=12)
 
     kb = _edits_for(backend, 1000)[-1].kwargs["keyboard"]
-    assert kb[0][0]["label"] == "A"  # toggled back off
+    assert kb[0][0]["label"] == "⬜ A"  # toggled back off
     assert kb[1][0]["label"] == "✅ B"
 
     await _tap(app_client, relay_msg_id=m1, option_idx=2,  # Submit
                chat_id=chat_id, user_id=user_id, update_id=13)
     ans = (await _answer(app_client, token, m1)).json()["answer"]
     assert ans["option_idxs"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_multi_select_pristine_checkbox_not_stacked(
+    app_client: httpx.AsyncClient, seeded: dict[str, object], backend
+) -> None:
+    """The hook ships option buttons already prefixed with ⬜. Re-rendering must
+    strip it before applying ✅/⬜ so markers never stack (e.g. no '✅ ⬜ A')."""
+    token = seeded["token"]
+    chat_id = int(seeded["chat_id"])  # type: ignore[arg-type]
+    user_id = int(seeded["bound_user_id"])  # type: ignore[arg-type]
+
+    m1 = await _create_multi(
+        app_client, token, group_id="m", group_total=1,
+        options=[("⬜ A", "qa0"), ("⬜ B", "qa1")],
+    )
+    await _tap(app_client, relay_msg_id=m1, option_idx=0,
+               chat_id=chat_id, user_id=user_id, update_id=10)
+
+    kb = _edits_for(backend, 1000)[-1].kwargs["keyboard"]
+    assert kb[0][0]["label"] == "✅ A"  # not "✅ ⬜ A"
+    assert kb[1][0]["label"] == "⬜ B"
 
 
 @pytest.mark.asyncio
