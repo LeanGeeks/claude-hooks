@@ -1,14 +1,25 @@
 # Task 12 — amux extensions (prerequisite for Epic 10)
 
-**Status:** open · **Type:** upstream/external · **Created:** 2026-06-22 · **Rev:** 3
+**Status:** v1 implemented (E1/E2/E3/E4-floor/E5 done in fork branch
+`feat/epic-10-amux-extensions`; commits `76cc680`, `f86fb62`, `fa6ccc1`) ·
+E4-full + deploy outstanding · **Type:** upstream/external · **Created:**
+2026-06-22 · **Rev:** 5
 <!-- Rev 3 (adversarial review): E1 rewritten around tmux `update-environment` (plain
 inheritance is broken on a running server); E4 split into E4-floor (blocks 10-01) and
 E4-full (post-v1); E5 `--no-attach` added. -->
+<!-- Rev 4 (build kickoff): fork chosen (aDorofeev/amux at ../amux); Decision 4
+(E4-floor ships E4-full's meta schema + create/restart fork now, merge-safe write,
+deferring only the `--resume` branch); Decision 5 (`--no-default-model` persists via a
+backward-compatible `.env` key). -->
 
-**Repo:** amux (`github.com/mixpeek/amux`, installed at `/usr/local/bin/amux`) —
-upstream PRs or an **own fork** if upstream is slow. Prereq for
-[Epic 10](./10_spawn_sessions/). Evidence for each item is in Epic 10's
-[architecture.md](./10_spawn_sessions/architecture.md) §2 (lifecycle spike).
+**Repo:** amux — own fork **`github.com/aDorofeev/amux`**, local clone at
+**`../amux`** (sibling of this repo; remote `origin` = the fork). Forked rather than
+waiting on upstream because Epic 10-01 is blocked on E4-floor + E5. Pin the fork
+commit `amux-spawn` targets; deploy by replacing `/usr/local/bin/amux` with the fork
+build (the installed 0.3.0 binary is **not** the fork HEAD — the fork carries
+`amux-remote` and other features, so the deploy ships the whole fork build, not a
+patch). Prereq for [Epic 10](./10_spawn_sessions/). Evidence for each item is in Epic
+10's [architecture.md](./10_spawn_sessions/architecture.md) §2 (lifecycle spike).
 
 ## Why
 
@@ -73,6 +84,19 @@ the listed vars from the spawner's **live environment** (read via the inherited 
   `--model sonnet` when no `--model` is given. Under alt-model env that default
   wrongly selects `ANTHROPIC_DEFAULT_SONNET_MODEL` instead of `ANTHROPIC_MODEL`.
   Scope to the **claude** provider; leave codex's model defaulting untouched.
+- **Persist, don't pass transiently (Decision 5).** `register`/`exec` write a
+  `CC_NO_DEFAULT_MODEL=1` key to `<name>.env`; `cmd_start` reads it and skips the
+  sonnet injection on **every** start (including `start-all`). Transient (re-passed
+  each spawn, never remembered) would reintroduce the exact E2 bug on any later
+  human `amux start` whose shell still has `ANTHROPIC_MODEL` set — sonnet alias
+  wrongly resolving the alt model — for the session's whole lifetime, not just first
+  launch. **Backward compatible:** the guard is
+  `[[ "${CC_NO_DEFAULT_MODEL:-}" == "1" ]] || cmd="$cmd --model sonnet"`, so an
+  existing `.env` with no such key falls through to today's behavior; the key is
+  written only when `--no-default-model` was explicitly passed. (Cold-restart caveat:
+  if the alt-model env is gone, neither choice reconstructs `ANTHROPIC_MODEL` —
+  persisting just never wrongly injects sonnet; full reconstruction is E4-full /
+  spawn-env-persistence territory, out of scope.)
 - Note: `--no-default-model` only stops amux *injecting* sonnet. The standard
   `--model` tier (opus/sonnet/haiku) is a **flag, not env**, so it isn't inherited
   via env — propagating the parent's `--model` is `amux-spawn`'s job (10-01 reads it
@@ -92,6 +116,21 @@ it blocks 10-01** (Decision 2).
 - Store the minted id in **`<name>.meta.json`** (like `codex_session_id`), never in
   `CC_FLAGS`. The initial `exec`/first start applies `--session-id <id>` (create).
 - This alone makes `start-all` safe — it can't re-pass an id it never stored.
+- **Ship E4-full's meta schema + create/restart fork now (Decision 4).** The "apply
+  on create only" property already forces `cmd_start` to know "is this the first
+  start?", and driving that off a meta flag (not off "which command") correctly
+  handles `register` + plain `start`, where the *first start* — not `exec` — is the
+  create. So write `{"claude_session_id":"<id>","started":false}` and fork in
+  `cmd_start`: id present **and** `started==false` → apply `--session-id`, then flip
+  `started=true`; `started==true` → **(E4-floor)** apply nothing → **(E4-full)** apply
+  `--resume <id>`. Building the `started` flag now costs nothing and makes E4-full a
+  one-line gated branch instead of a meta-schema migration over the same delicate
+  launch fork. Only the literal `--resume` invocation is deferred.
+- **Bash meta-write MUST be merge-safe.** `amux-server.py` (the codex path) is the
+  only writer today; the bash side now becomes a second writer of the same file. Do a
+  read-modify-write of the JSON (preserve `codex_session_id` and anything else
+  present), never a clobbering `cat >`. A meta.json without `claude_session_id` /
+  `started`, or no meta at all, behaves exactly as today (no `--session-id`).
 
 ### E4-full — Resume-aware restart *(post-v1; removes the remaining footgun)*
 - A *subsequent* `start` of a session that has run before uses **`--resume <id>`**
@@ -115,26 +154,41 @@ not the exit code (Decision 3).
 - Build against a local clone/fork; **pin the amux version** `amux-spawn` targets.
 - Deploy by replacing `/usr/local/bin/amux` with the extended build; `amux-spawn`
   calls `amux` on `PATH` (no hard-coded path). Document the install step.
+- **⚠ Outstanding — not yet deployed.** The fork branch is built and tested but
+  the installed `/usr/local/bin/amux` is untouched. Deploy ships the whole fork
+  `amux` (carries `amux-remote` etc., not just E1–E5) — confirm that's intended,
+  pin the commit (`fa6ccc1` or its merge), then replace the binary. `amux-server.py`
+  is unchanged so it need not be redeployed.
 
 ## Acceptance criteria
 
-- [ ] A child session gets the parent's model/auth env (alt-model included) via the
+- [x] A child session gets the parent's model/auth env (alt-model included) via the
       `update-environment` allowlist, **from a second amux session on an
       already-running server**, with no secret in `ps`, `CLAUDE_CODE_SESSION_ID`
-      unset, and no auth conflict.
-- [ ] With `--no-default-model`, an alt-model session runs `ANTHROPIC_MODEL` (not
-      the sonnet alias) when no `--model` is passed; codex defaults unaffected.
-- [ ] `amux attach <name>` from inside tmux switches cleanly.
-- [ ] **(E4-floor)** Create stores `--session-id` in `<name>.meta.json`, never in
+      unset, and no auth conflict. *(Re-spike automated as
+      `test_propagation_end_to_end_on_running_server`: model+token reach the pane,
+      `DISPLAY` preserved, absent key not leaked, union dedups.)*
+- [x] With `--no-default-model`, an alt-model session runs `ANTHROPIC_MODEL` (not
+      the sonnet alias) when no `--model` is passed; codex defaults unaffected. The
+      suppression is **persisted** (`CC_NO_DEFAULT_MODEL=1` in `<name>.env`) and
+      survives a later `start`/`start-all`; an `.env` without the key still injects
+      sonnet as before.
+- [x] `amux attach <name>` from inside tmux switches cleanly. *(tmux_attach uses
+      `switch-client` when `$TMUX` is set, falls back to `attach-session`.)*
+- [x] **(E4-floor)** Create stores `--session-id` in `<name>.meta.json`, never in
       `CC_FLAGS`; `start-all` with a tracked session present does not re-pass it / die.
 - [ ] **(E4-full, post-v1)** A later restart of the same session resumes via
-      `--resume` without collision.
-- [ ] **(E5)** `--no-attach` creates a live session without attaching, at a TTY and
+      `--resume` without collision. *(Deferred. Meta schema + create/restart fork
+      already shipped; only the `--resume` branch — the `started==true` arm — is
+      outstanding.)*
+- [x] **(E5)** `--no-attach` creates a live session without attaching, at a TTY and
       off it; default behavior (no flag) still attaches.
-- [ ] New amux options are parsed by amux, not forwarded to `claude`.
-- [ ] **Backward compatible:** all existing amux behavior is unchanged (additive
+- [x] New amux options are parsed by amux (`parse_amux_opts`), not forwarded to
+      `claude`.
+- [x] **Backward compatible:** all existing amux behavior is unchanged (additive
       only) — existing sessions, `exec`/`start`/`attach`/`ls`/`send`/`start-all`,
       and the codex path behave exactly as before when the new options are absent.
+      *(Full suite 181 passed: 159 upstream + 22 new; no regressions.)*
 
 ## Testing
 
