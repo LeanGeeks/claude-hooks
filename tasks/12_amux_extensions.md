@@ -3,7 +3,7 @@
 **Status:** implemented + chain-verified against real tmux/Claude (fork branch
 `feat/epic-10-amux-extensions`, tip `9b05d10`; installed to `/usr/local/bin/amux`,
 **not merged**) · merge after Epic 10 chain sign-off · **Type:** upstream/external
-· **Created:** 2026-06-22 · **Rev:** 7
+· **Created:** 2026-06-22 · **Rev:** 8
 
 ## Chain verification (real tmux 3.5a + real Claude 2.1.185)
 
@@ -22,11 +22,18 @@ because the stub returns 0 for every tmux call):
 
 A real-tmux integration test (`test_create_flip_resume_on_real_tmux`, routes
 amux's tmux calls to a private server via a PATH shim) now guards all three.
-Suite: 185 passed. **Caveat (not amux):** Claude rejects a custom
-`ANTHROPIC_BASE_URL`/`AUTH_TOKEN` (alt-model relay) while a Claude Max OAuth
-account is present in `~/.claude.json` — alt-model spawns need a profile without
-the conflicting login. amux's env propagation + no-sonnet-injection are proven
-independently (stub harness + re-spike).
+Suite: 185 passed.
+
+**Alt-model (GLM) verified end-to-end through amux.** With `claude_glm_env`
+(`ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic`, `ANTHROPIC_MODEL=glm-4.7`)
++ `--no-default-model` + a valid-UUID `--session-id`: create → `amux send` → GLM
+replied, transcript `model: glm-4.7` (confirms env propagation **and** sonnet not
+injected) → stop → `--resume` restored the conversation. There is **no**
+Claude-vs-Max-OAuth conflict (an earlier note here claimed one — it was wrong):
+the `oauthAccount` in `~/.claude.json` coexists with a custom
+`ANTHROPIC_BASE_URL`/`AUTH_TOKEN`, and the user never exports `ANTHROPIC_API_KEY`.
+The earlier alt-model failures were the three bugs above plus a non-UUID test
+session-id (Claude requires a valid UUID), not an auth conflict.
 <!-- Rev 3 (adversarial review): E1 rewritten around tmux `update-environment` (plain
 inheritance is broken on a running server); E4 split into E4-floor (blocks 10-01) and
 E4-full (post-v1); E5 `--no-attach` added. -->
