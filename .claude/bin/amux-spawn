@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""``amux-spawn`` — unified human + agent launcher for amux sessions (epic 10).
+
+This is the CLI skeleton + the ``spawn`` subcommand (task 10-01). Other
+subcommands are stubs filled by later tasks:
+
+- ``status`` / ``last`` / ``ls``  -> 10-03 (reads + reason-context)
+- ``a`` / ``attach``              -> 10-05 (quick-switch + completion)
+- ``--wait`` / ``--notify``       -> 10-04 (supervise)
+
+Design stance (architecture s0): thin mechanism. ``spawn`` creates + seeds a new
+amux session for both humans (TTY -> attach / switch-client) and agents (non-TTY
+-> fire-and-return), with workspace-anchored naming, tracked-vs-plain handling,
+and model/env inheritance.
+
+The launch structure (architecture s5/s8) is **create-detached-under-lock then
+attach**:
+
+    [ global flock (~/.amux/spawn/.lock), held by ALL spawns ]
+      cap-check (tracked only)
+      pick a free name vs amux's full namespace
+      create the session DETACHED via amux exec --no-attach (E5)
+      tracked: write the handle
+    [ release the lock ]
+    then (TTY, not detached/wait/notify): attach / switch-client
+
+The lock is never held across the blocking attach.
+
+Env/secrets reach the child via tmux ``update-environment`` (amux E1 owns the
+allowlist) — amux-spawn only ensures the model/auth vars are present in its OWN
+environment and NEVER inlines a secret into the launch command (that would leak
+via ``ps``). The minted ``--session-id`` is a valid UUID and is routed by amux
+into ``<name>.meta.json`` (E4-floor), never into ``CC_FLAGS``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+# The shared helpers live alongside the hooks (Phase-0 decision 2). When
+# installed, both this script and amux_spawn_lib.py land in ~/.claude/hooks/ on a
+# parallel path; in the repo, the lib is under .claude/hooks/. Add both candidate
+# locations so the import works either way without depending on repo-local files
+# at runtime.
+_HERE = Path(__file__).resolve().parent
+for _cand in (_HERE, _HERE.parent / "hooks", Path.home() / ".claude" / "hooks"):
+    if (_cand / "amux_spawn_lib.py").exists():
+        sys.path.insert(0, str(_cand))
+        break
+
+import amux_spawn_lib as lib  # noqa: E402
+
+
+def _eprint(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+# ── flock context ─────────────────────────────────────────────────────────────
+
+class SpawnLock:
+    """Exclusive ``flock`` over ``~/.amux/spawn/.lock`` (architecture s8).
+
+    Held by ALL spawns (incl. plain) across [cap-check -> pick name -> create
+    detached -> write handle]. Released before any blocking attach.
+    """
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+
+    def __enter__(self) -> "SpawnLock":
+        lib.ensure_dirs()
+        self._fd = os.open(str(lib.SPAWN_LOCK), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self._fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self._fd)
+            self._fd = None
+
+
+# ── Dir resolution (D-Workspace) ──────────────────────────────────────────────
+
+def resolve_dir(explicit_dir: str | None, is_tty: bool) -> tuple[str, str | None, str | None]:
+    """Resolve the workspace dir and the parent amux name.
+
+    Order (D-Workspace):
+      1. ``--dir`` (resolved absolute);
+      2. agent/non-TTY -> parent ``CC_DIR`` (via the ``amux-<name>`` trick);
+      3. human/TTY -> cwd;
+      4. fallback -> cwd + warning.
+
+    Returns ``(abs_dir, parent_name, warning_or_none)``. ``parent_name`` is the
+    resolved parent amux session (for run_id / --model inheritance), or None.
+    """
+    parent = lib.resolve_amux_session()
+
+    if explicit_dir:
+        abs_dir = os.path.abspath(os.path.expanduser(explicit_dir))
+        return abs_dir, parent, None
+
+    if not is_tty:
+        # Agent / non-TTY: inherit the spawning session's CC_DIR (stable down a
+        # chain; subdir-proof), NOT the agent's cwd.
+        if parent:
+            cc_dir = lib.parent_cc_dir(parent)
+            if cc_dir:
+                return os.path.abspath(cc_dir), parent, None
+        # Non-TTY with no resolvable parent: fall back to cwd + warning.
+        return os.path.abspath(os.getcwd()), parent, (
+            "no parent amux session resolved (bare non-amux caller); "
+            "falling back to cwd for the workspace dir"
+        )
+
+    # Human / TTY: cwd.
+    return os.path.abspath(os.getcwd()), parent, None
+
+
+# ── run_id / model inheritance ────────────────────────────────────────────────
+
+def resolve_run_id(explicit_run_id: str | None, parent_name: str | None) -> str:
+    """run_id: ``--run-id`` overrides; else inherit from the parent handle; else
+    mint a new one (D-RunId)."""
+    if explicit_run_id:
+        return explicit_run_id
+    if parent_name:
+        parent_handle = lib.read_handle(parent_name)
+        if parent_handle and parent_handle.get("run_id"):
+            return str(parent_handle["run_id"])
+    return lib.mint_uuid()
+
+
+def inherited_model_flag(caller_flags: list[str], parent_name: str | None) -> str | None:
+    """Standard ``--model`` tier inheritance (D-Env).
+
+    Alt-model selection rides on inherited env; the standard ``--model`` tier is
+    a flag, not env. When the caller passes no ``--model``, propagate the
+    parent's explicit ``--model`` (read from parent ``CC_FLAGS``) so opus->opus
+    works. Returns the model to propagate, or None.
+    """
+    if lib.extract_model_flag(caller_flags) is not None:
+        return None  # caller already specified one; don't override
+    if parent_name:
+        return lib.extract_model_flag(lib.parent_cc_flags(parent_name))
+    return None
+
+
+# ── spawn ─────────────────────────────────────────────────────────────────────
+
+def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | None) -> int:
+    """Create + seed a new amux session (task 10-01).
+
+    ``claude_flags`` are the pass-through Claude flags (everything amux-spawn did
+    not consume). ``prompt`` is the seeded prompt (from after ``--``), or None.
+    """
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+
+    # --wait/--notify force tracked + detached even at a TTY (you await the
+    # result, you don't interactively attach). --detach forces detach at a TTY.
+    wait_mode = bool(getattr(args, "wait", False) or getattr(args, "notify", False))
+    detach = bool(args.detach) or wait_mode or (not is_tty)
+
+    # Tracked vs plain (D-Tracked): TTY/human launch => plain; agent/non-TTY OR
+    # --wait/--notify => tracked. A seeded prompt at a non-TTY is the agent path.
+    tracked = (not is_tty) or wait_mode
+
+    abs_dir, parent_name, warning = resolve_dir(args.dir, is_tty)
+    if warning:
+        _eprint(f"amux-spawn: warning: {warning}")
+    if not os.path.isdir(abs_dir):
+        _eprint(f"amux-spawn: error: workspace dir does not exist: {abs_dir}")
+        return 1
+
+    prefix = lib.workspace_prefix(abs_dir)
+
+    # Assemble the Claude flags to forward to amux. Start from the caller's
+    # pass-through flags; add inherited --model when the caller gave none.
+    forward_flags = list(claude_flags)
+    if args.yolo and "--yolo" not in forward_flags and \
+            "--dangerously-skip-permissions" not in forward_flags:
+        forward_flags.append("--yolo")
+    inh_model = inherited_model_flag(forward_flags, parent_name)
+    if inh_model:
+        forward_flags += ["--model", inh_model]
+
+    stuck_after_s = parse_stuck_after(args.stuck_after)
+
+    # Build the amux exec base command (E2: --no-default-model so ANTHROPIC_MODEL
+    # governs; E5: --no-attach so every spawn is created detached under the lock).
+    # The minted --session-id (tracked only) is a valid UUID; amux routes it to
+    # meta.json (E4-floor), NOT CC_FLAGS — never re-pass it on restart.
+    session_id = lib.mint_uuid() if tracked else None
+    run_id = resolve_run_id(args.run_id, parent_name) if tracked else None
+
+    # ── Critical section: one global lock held across cap-check -> name pick ->
+    #    create detached -> (tracked) write handle. Released before any attach.
+    chosen_name: str
+    with SpawnLock():
+        if tracked:
+            count = lib.live_tracked_count(abs_dir)
+            cap = lib.max_sessions()
+            if count >= cap:
+                _eprint(
+                    f"amux-spawn: refusing to spawn — fork-bomb cap reached: "
+                    f"{count}/{cap} live tracked sessions in workspace {abs_dir} "
+                    f"(raise AMUX_SPAWN_MAX_SESSIONS to override)."
+                )
+                return 1
+
+        chosen_name = lib.pick_free_name(prefix, args.suffix)
+        # With an explicit suffix the name might already be taken; refuse rather
+        # than overwrite an existing session's .env.
+        if args.suffix and lib.name_in_use(chosen_name):
+            _eprint(
+                f"amux-spawn: error: session name already in use: {chosen_name}"
+            )
+            return 1
+
+        rc, detail = _amux_create_detached(
+            name=chosen_name,
+            abs_dir=abs_dir,
+            forward_flags=forward_flags,
+            session_id=session_id,
+            prompt=prompt,
+        )
+        if rc != 0:
+            _eprint(f"amux-spawn: error: amux failed to create session {chosen_name}")
+            if detail:
+                _eprint(detail)
+            return 1
+
+        # amux runs under `set -e`; don't trust its exit code alone. Confirm the
+        # tmux session is actually live before reporting success.
+        if not lib.tmux_has_session(chosen_name):
+            _eprint(
+                f"amux-spawn: error: session {chosen_name} did not come up "
+                f"(no live tmux session after create)."
+            )
+            return 1
+
+        if tracked:
+            if session_id is None or run_id is None:
+                _eprint("amux-spawn: internal error: missing session_id or run_id for tracked spawn")
+                return 1
+            transcript = lib.transcript_path_for(abs_dir, session_id)
+            handle = lib.new_handle(
+                name=chosen_name,
+                session_id=session_id,
+                run_id=run_id,
+                abs_dir=abs_dir,
+                transcript_path=transcript,
+                stuck_after_s=stuck_after_s,
+            )
+            lib.write_handle(chosen_name, handle)
+    # ── lock released ──
+
+    # Report the resolved name.
+    kind = "tracked" if tracked else "plain"
+    print(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
+    if tracked and session_id:
+        print(f"  session_id: {session_id}")
+        print(f"  run_id:     {run_id}")
+
+    # TTY path: attach / switch-client (separate step, outside the lock). Skipped
+    # for --detach / --wait / --notify / non-TTY.
+    if not detach:
+        _amux_attach(chosen_name)
+
+    return 0
+
+
+def _amux_create_detached(
+    *,
+    name: str,
+    abs_dir: str,
+    forward_flags: list[str],
+    session_id: str | None,
+    prompt: str | None,
+) -> tuple[int, str | None]:
+    """Run ``amux exec <name> --no-attach --no-default-model [flags] [-- prompt]``.
+
+    The prompt is forwarded as a trailing **positional** arg (amux funnels every
+    non-flag token to claude as the prompt, which auto-submits). The minted
+    ``--session-id`` goes through amux's flag parser, which routes it to
+    meta.json (E4-floor). No secret is inlined — env rides update-environment.
+
+    Returns ``(returncode, captured_output_or_none)``.
+    """
+    cmd: list[str] = [
+        "amux", "exec", name,
+        "--no-attach",          # E5: create detached
+        "--no-default-model",   # E2: let ANTHROPIC_MODEL / our --model govern
+        "--dir", abs_dir,
+    ]
+    if session_id is not None:
+        cmd += ["--session-id", session_id]
+    cmd += forward_flags
+    if prompt is not None:
+        # Trailing positional => claude prompt (auto-submits). amux's flag parser
+        # sends unrecognized tokens to CC_EXTRA_ARGS == the prompt. Pass it as a
+        # single argv element so multi-word/multi-line prompts stay intact.
+        cmd.append(prompt)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            # Pass our live environment through so amux's update-environment
+            # allowlist (E1) can copy the model/auth vars into the child pane.
+            env=os.environ.copy(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 1, f"amux invocation failed: {exc}"
+    out = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, out.strip() or None
+
+
+def _amux_attach(name: str) -> None:
+    """Attach / switch-client to the session (TTY path).
+
+    Delegates to ``amux attach``, which already does switch-client inside tmux
+    (E3) and attach-session otherwise. This blocks until the human detaches — it
+    runs only AFTER the spawn lock is released.
+    """
+    try:
+        os.execvp("amux", ["amux", "attach", name])
+    except Exception as exc:  # noqa: BLE001
+        _eprint(f"amux-spawn: warning: could not attach to {name}: {exc}")
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def parse_stuck_after(raw: str | None) -> int:
+    """Parse ``--stuck-after`` (e.g. ``10m``, ``600``, ``2h``) into seconds."""
+    if not raw:
+        return lib.DEFAULT_STUCK_AFTER_S
+    raw = raw.strip().lower()
+    mult = 1
+    if raw.endswith("s"):
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        raw = raw[:-1]
+        mult = 60
+    elif raw.endswith("h"):
+        raw = raw[:-1]
+        mult = 3600
+    try:
+        return max(1, int(float(raw) * mult))
+    except ValueError:
+        return lib.DEFAULT_STUCK_AFTER_S
+
+
+def _stub(name: str) -> int:
+    _eprint(f"amux-spawn: '{name}' is not implemented yet (filled by a later epic-10 task).")
+    return 2
+
+
+# ── CLI dispatch ──────────────────────────────────────────────────────────────
+
+def _split_prompt(argv: list[str]) -> tuple[list[str], str | None]:
+    """Split off amux-spawn's own ``--`` separator and the seeded prompt.
+
+    Everything after the first ``--`` is the prompt (joined with spaces if the
+    caller's shell tokenized it). Returns ``(args_before, prompt_or_none)``.
+    """
+    if "--" not in argv:
+        return argv, None
+    idx = argv.index("--")
+    before = argv[:idx]
+    after = argv[idx + 1:]
+    prompt = " ".join(after) if after else None
+    return before, prompt
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="amux-spawn",
+        description="Unified human + agent launcher for amux sessions.",
+        add_help=True,
+    )
+    sub = parser.add_subparsers(dest="subcommand")
+
+    sp = sub.add_parser("spawn", help="create + seed a new amux session", add_help=True)
+    sp.add_argument("suffix", nargs="?", default=None,
+                    help="optional memorable name suffix (else auto-increment)")
+    sp.add_argument("--detach", action="store_true",
+                    help="force detached launch even at a TTY")
+    sp.add_argument("--wait", action="store_true",
+                    help="(10-04) await first-turn completion; forces tracked+detached")
+    sp.add_argument("--notify", action="store_true",
+                    help="(10-04) background-notify on completion; forces tracked+detached")
+    sp.add_argument("--dir", default=None, help="explicit workspace dir override")
+    sp.add_argument("--yolo", action="store_true",
+                    help="pass --dangerously-skip-permissions to claude (gate still governs)")
+    sp.add_argument("--run-id", default=None, help="override the inherited/minted run_id")
+    sp.add_argument("--stuck-after", default=None,
+                    help="stuck threshold (e.g. 10m, 600, 2h); persisted in the handle")
+
+    # Stubs (later tasks).
+    sub.add_parser("status", help="(10-03) report a tracked session's state")
+    sub.add_parser("last", help="(10-03) print a tracked session's last message")
+    sub.add_parser("ls", help="(10-03) list tracked sessions")
+    sub.add_parser("a", help="(10-05) quick-switch by suffix")
+    sub.add_parser("attach", help="(10-05) quick-switch by suffix")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if not argv:
+        build_parser().print_help()
+        return 0
+
+    subcommand = argv[0]
+
+    if subcommand == "spawn":
+        # Split the prompt first so claude flags (which argparse doesn't know
+        # about) and the prompt are handled outside argparse's strict parsing.
+        rest = argv[1:]
+        before, prompt = _split_prompt(rest)
+        parser = build_parser()
+        # parse_known_args lets pass-through claude flags (e.g. --model,
+        # --append-system-prompt) through to forward_flags untouched.
+        ns, claude_flags = parser.parse_known_args(["spawn"] + before)
+        return cmd_spawn(ns, claude_flags, prompt)
+
+    if subcommand in ("status", "last", "ls"):
+        return _stub(subcommand)
+    if subcommand in ("a", "attach"):
+        return _stub("attach")
+    if subcommand in ("-h", "--help", "help"):
+        build_parser().print_help()
+        return 0
+
+    _eprint(f"amux-spawn: unknown subcommand: {subcommand}")
+    build_parser().print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except OSError as exc:
+        if exc.errno == errno.EPIPE:
+            sys.exit(0)
+        raise

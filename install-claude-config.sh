@@ -11,6 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_HOOKS_DIR=".claude/hooks"
+PROJECT_BIN_DIR=".claude/bin"
 PROJECT_STATUSLINE_DIR=".claude/statusline"
 PROJECT_CONFIG=".claude/settings.json"
 PROJECT_RELAY_DIR="$SCRIPT_DIR/relay-server"
@@ -111,7 +112,7 @@ fi
 # STEP 1: Install Hooks
 # =============================================================================
 
-log_step "Step 1/4: Installing hooks"
+log_step "Step 1/5: Installing hooks"
 
 # Rotate (gzip) hook debug/error logs before wiring anything. A fresh install is
 # a natural rotation point and keeps these logs from growing unbounded.
@@ -146,7 +147,7 @@ if [[ ! -d "$PROJECT_HOOKS_DIR" ]]; then
     HOOKS_INSTALLED=false
 else
     # Check for required hook files
-    REQUIRED_HOOKS=("pretool_hook.py" "bash_command_parser.py" "settings_loader.py" "notification_hook.py" "permission_request_hook.py" "permission_state_store.py" "telegram_permission_router.py" "posttool_hook.py" "reply_injector.py")
+    REQUIRED_HOOKS=("pretool_hook.py" "bash_command_parser.py" "settings_loader.py" "notification_hook.py" "permission_request_hook.py" "permission_state_store.py" "telegram_permission_router.py" "posttool_hook.py" "reply_injector.py" "amux_spawn_lib.py")
     # Optional utility scripts (none at present — get_telegram_chat_id.py was
     # removed in Phase 6: the relay server owns the bot token, so direct
     # getUpdates polling from a device is no longer needed).
@@ -221,7 +222,7 @@ fi
 # STEP 2: Install Statusline
 # =============================================================================
 
-log_step "Step 2/4: Installing statusline"
+log_step "Step 2/5: Installing statusline"
 
 STATUSLINE_INSTALLED=false
 if [[ ! -d "$PROJECT_STATUSLINE_DIR" ]]; then
@@ -254,10 +255,54 @@ else
 fi
 
 # =============================================================================
-# STEP 3: Validate and Backup Configs
+# STEP 3: Install amux-spawn launcher on PATH (epic 10)
+# =============================================================================
+#
+# amux-spawn (and its producer/read hooks in later tasks) must reach PATH
+# system-wide and must NOT depend on repo-local files at runtime. We install the
+# executable into a user-global bin dir and rely on its shared library being
+# copied alongside the hooks (amux_spawn_lib.py is in REQUIRED_HOOKS above, so it
+# lands in ~/.claude/hooks/, which the launcher adds to sys.path).
+#
+# Install target precedence: ~/.local/bin (on PATH for most distros via the XDG
+# user dirs) — created if missing. We warn if it is not on PATH so the operator
+# can fix their shell rc.
+
+log_step "Step 3/5: Installing amux-spawn launcher"
+
+AMUX_SPAWN_INSTALLED=false
+USER_BIN_DIR="$HOME/.local/bin"
+if [[ ! -f "$PROJECT_BIN_DIR/amux-spawn" ]]; then
+    log_warn "amux-spawn not found at $PROJECT_BIN_DIR/amux-spawn — skipping launcher install"
+else
+    mkdir -p "$USER_BIN_DIR"
+    cp "$PROJECT_BIN_DIR/amux-spawn" "$USER_BIN_DIR/amux-spawn"
+    chmod +x "$USER_BIN_DIR/amux-spawn"
+    log_info "Installed: amux-spawn → $USER_BIN_DIR/amux-spawn"
+    AMUX_SPAWN_INSTALLED=true
+
+    # Sanity: it must import its shared lib (copied to ~/.claude/hooks/ in Step 1).
+    if [[ "$HOOKS_INSTALLED" == true ]]; then
+        if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); import amux_spawn_lib" 2>/dev/null; then
+            log_info "  amux_spawn_lib importable from $GLOBAL_HOOKS_DIR"
+        else
+            log_warn "  amux_spawn_lib not importable — amux-spawn will fail until Step 1 succeeds"
+        fi
+    else
+        log_warn "  Hooks not installed, so amux_spawn_lib.py is not in $GLOBAL_HOOKS_DIR — amux-spawn will not run"
+    fi
+
+    case ":$PATH:" in
+        *":$USER_BIN_DIR:"*) ;;
+        *) log_warn "  $USER_BIN_DIR is not on your PATH. Add it, e.g.: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+fi
+
+# =============================================================================
+# STEP 4: Validate and Backup Configs
 # =============================================================================
 
-log_step "Step 3/4: Validating and backing up configs"
+log_step "Step 4/5: Validating and backing up configs"
 
 # Check project config exists
 if [[ ! -f "$PROJECT_CONFIG" ]]; then
@@ -296,10 +341,10 @@ cp "$GLOBAL_CONFIG" "$BACKUP_FILE"
 log_info "Backup created: $BACKUP_FILE"
 
 # =============================================================================
-# STEP 4: Merge Permissions, Hooks, and Statusline Configuration
+# STEP 5: Merge Permissions, Hooks, and Statusline Configuration
 # =============================================================================
 
-log_step "Step 4/4: Merging permissions, hooks, and statusline configuration"
+log_step "Step 5/5: Merging permissions, hooks, and statusline configuration"
 
 # Extract permissions from project config (supports both old and new format)
 ALLOWED_TOOLS=$(jq '.allowedTools // .permissions.allow // []' "$PROJECT_CONFIG")
@@ -428,6 +473,13 @@ if [[ "$STATUSLINE_INSTALLED" == true ]]; then
     echo "  - statusLine: installed and configured ($GLOBAL_STATUSLINE_DIR/statusline.py)"
 else
     echo "  - statusLine: not installed (missing statusline.py)"
+fi
+
+# Show amux-spawn status
+if [[ "$AMUX_SPAWN_INSTALLED" == true ]]; then
+    echo "  - amux-spawn: installed ($USER_BIN_DIR/amux-spawn)"
+else
+    echo "  - amux-spawn: not installed"
 fi
 
 echo ""
