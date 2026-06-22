@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """``amux-spawn`` — unified human + agent launcher for amux sessions (epic 10).
 
-This is the CLI: the ``spawn`` subcommand (task 10-01) and the read subcommands
-``status`` / ``last`` / ``ls`` (task 10-03). Remaining stubs:
+This is the CLI: the ``spawn`` subcommand (task 10-01), the read subcommands
+``status`` / ``last`` / ``ls`` (task 10-03), and the supervise flag
+``--wait`` / ``--notify`` (task 10-04). Remaining stub:
 
 - ``a`` / ``attach``              -> 10-05 (quick-switch + completion)
-- ``--wait`` / ``--notify``       -> 10-04 (supervise)
 
 State is DERIVED at read time (architecture §6); ``stuck`` is never persisted.
 Precedence: terminated -> stuck -> running -> idle. ``status`` bundles
@@ -270,17 +270,48 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
             lib.write_handle(chosen_name, handle)
     # ── lock released ──
 
-    # Report the resolved name.
+    # Report the resolved name (to stderr in wait_mode so stdout stays clean for
+    # orchestrators capturing the result payload).
     kind = "tracked" if tracked else "plain"
-    print(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
-    if tracked and session_id:
-        print(f"  session_id: {session_id}")
-        print(f"  run_id:     {run_id}")
+    if wait_mode:
+        _eprint(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
+        if session_id:
+            _eprint(f"  session_id: {session_id}")
+            _eprint(f"  run_id:     {run_id}")
+    else:
+        print(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
+        if tracked and session_id:
+            print(f"  session_id: {session_id}")
+            print(f"  run_id:     {run_id}")
 
     # TTY path: attach / switch-client (separate step, outside the lock). Skipped
     # for --detach / --wait / --notify / non-TTY.
     if not detach:
         _amux_attach(chosen_name)
+
+    # --wait / --notify: block until the seeded turn reaches true idle.
+    if wait_mode:
+        timeout_s = parse_stuck_after(getattr(args, "timeout", None)) \
+            if getattr(args, "timeout", None) else None
+        _eprint(f"amux-spawn: waiting for session '{chosen_name}' to reach idle"
+                + (f" (timeout {timeout_s}s)" if timeout_s else "") + " …")
+        outcome, payload = _wait_for_idle(chosen_name, timeout_s)
+        if outcome == "idle":
+            # Stdout = the result payload the orchestrator captures.
+            print(payload or "")
+            return 0
+        elif outcome == "timeout":
+            # Machine-readable timeout marker on stdout; distinct exit code 3.
+            print(WAIT_TIMEOUT_MARKER)
+            _eprint(
+                f"amux-spawn: --wait timed out after {timeout_s}s "
+                f"(session '{chosen_name}' did not reach idle)"
+            )
+            return 3
+        else:
+            # Error: detail on stderr, nothing on stdout.
+            _eprint(f"amux-spawn: --wait error: {payload}")
+            return 1
 
     return 0
 
@@ -343,6 +374,111 @@ def _amux_attach(name: str) -> None:
         os.execvp("amux", ["amux", "attach", name])
     except Exception as exc:  # noqa: BLE001
         _eprint(f"amux-spawn: warning: could not attach to {name}: {exc}")
+
+
+# ── Supervise: --wait / --notify (task 10-04) ─────────────────────────────────
+#
+# Exit-code contract (distinct, machine-readable):
+#   0  -> true idle reached; last_message printed to stdout.
+#   1  -> error (session terminated before idle, or poll error).
+#   3  -> timeout expired before idle (caller's patience, NOT a stuck signal).
+#
+# Stdout contract (for orchestrators):
+#   On success (exit 0): the session's last_message (or an empty string if none).
+#   On timeout (exit 3): the single line ``AMUX_WAIT_TIMEOUT`` (machine-readable
+#     marker), so an orchestrator can reliably distinguish timeout from success.
+#   On error (exit 1):  nothing to stdout (error detail on stderr).
+#
+# --notify is an alias of --wait (same blocking semantics). The pattern for
+# asynchronous notification is: run `amux-spawn spawn … --wait` (or --notify)
+# as a background Bash task (`run_in_background`). The harness emits its native
+# completion notification when the background task finishes, and the orchestrator
+# reads the output-file for the result. --wait's stdout IS the payload.
+#
+# False-idle guard (FR5 / architecture §6 step 2):
+#   A freshly-created session has state=spawning / mtime_at_stop=None, which the
+#   _derive_status logic already maps to "running" (not "idle") via the
+#   no_stop_yet clause. We add a belt-and-suspenders flag ``seen_non_idle`` that
+#   requires the poll to have observed at least one "running" or "stuck" state
+#   (i.e. the seeded turn started) before we accept "idle". A session whose
+#   handle is still in spawning state can never satisfy --wait.
+
+# Sentinel printed to stdout on timeout (exit 3). Keep it machine-parseable and
+# distinct from any real last_message content (all-caps, no spaces, not natural
+# language).
+WAIT_TIMEOUT_MARKER = "AMUX_WAIT_TIMEOUT"
+
+# Poll interval while --wait is active (seconds). Low enough to be responsive
+# (~1s after an idle Stop fires), high enough not to busy-spin on fast hardware.
+WAIT_POLL_INTERVAL_S = 0.75
+
+
+def _wait_for_idle(
+    name: str,
+    timeout_s: float | None,
+) -> tuple[str, str | None]:
+    """Block until the session ``name`` reaches true idle, or until timeout.
+
+    Uses the SAME ``_derive_status`` derivation as ``status`` (in-process, no
+    subprocess). Polls at ``WAIT_POLL_INTERVAL_S`` intervals.
+
+    Returns ``(outcome, payload)`` where:
+      outcome == "idle"    -> payload == last_message (str or "")
+      outcome == "timeout" -> payload == None
+      outcome == "error"   -> payload == error description (str)
+
+    False-idle guard: requires seeing at least one non-idle state (running or
+    stuck) before accepting idle. A session still in spawning / with no Stop yet
+    will read "running" (active, no_stop_yet) so the first iteration is never
+    mistakenly "idle" — but we enforce this explicitly as a belt-and-suspenders
+    guard (architecture §6 step 2 / FR5).
+    """
+    deadline: float | None = (time.time() + timeout_s) if timeout_s is not None else None
+
+    # Belt-and-suspenders false-idle guard: require at least one non-idle
+    # observation (running or stuck) before we accept "idle". This ensures the
+    # seeded turn has started.
+    seen_non_idle = False
+
+    while True:
+        # Check timeout BEFORE polling so a zero-timeout returns immediately.
+        if deadline is not None and time.time() >= deadline:
+            return "timeout", None
+
+        # Re-read the handle fresh on every poll (the producer hook overwrites it
+        # on every Stop — this is what carries state/last_message/mtime_at_stop).
+        handle = lib.read_handle(name)
+        if handle is None:
+            return "error", f"handle for session '{name}' disappeared during wait"
+
+        try:
+            result = _derive_status(handle, None)
+        except Exception as exc:  # noqa: BLE001
+            return "error", f"_derive_status raised: {exc}"
+
+        state = result.get("state", "unknown")
+
+        if state == "terminated":
+            return "error", f"session '{name}' terminated before reaching idle"
+
+        if state in ("running", "stuck"):
+            seen_non_idle = True
+
+        if state == "idle" and seen_non_idle:
+            # True idle: a Stop with empty background_tasks, after the seeded
+            # turn ran (seen_non_idle gate).
+            last_message = handle.get("last_message") or ""
+            return "idle", last_message
+
+        # Not yet idle (or idle but haven't seen a non-idle intermediate) — keep
+        # waiting.
+        sleep_s = WAIT_POLL_INTERVAL_S
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return "timeout", None
+            sleep_s = min(sleep_s, remaining)
+        time.sleep(sleep_s)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -758,9 +894,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--detach", action="store_true",
                     help="force detached launch even at a TTY")
     sp.add_argument("--wait", action="store_true",
-                    help="(10-04) await first-turn completion; forces tracked+detached")
+                    help="block until the seeded turn reaches idle; print last_message to stdout")
     sp.add_argument("--notify", action="store_true",
-                    help="(10-04) background-notify on completion; forces tracked+detached")
+                    help="alias for --wait; intended for run_in_background orchestrator pattern")
+    sp.add_argument("--timeout", default=None,
+                    help="--wait patience limit (e.g. 30s, 5m); on expiry print "
+                         f"'{WAIT_TIMEOUT_MARKER}' to stdout and exit 3")
     sp.add_argument("--dir", default=None, help="explicit workspace dir override")
     sp.add_argument("--yolo", action="store_true",
                     help="pass --dangerously-skip-permissions to claude (gate still governs)")

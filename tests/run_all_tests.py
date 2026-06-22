@@ -42,6 +42,7 @@ TEST_MODULES = {
     "unit_amux_spawn": "test_unit_amux_spawn",
     "unit_spawn_producer": "test_unit_spawn_producer",
     "unit_amux_reads": "test_unit_amux_reads",
+    "unit_amux_supervise": "test_unit_amux_supervise",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }
