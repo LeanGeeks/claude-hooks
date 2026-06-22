@@ -32,6 +32,11 @@ class CreateMessageRequest(BaseModel):
     # that aren't inserted yet). Both None for ordinary one-shot messages.
     group_id: str | None = None
     group_total: int | None = Field(default=None, gt=0)
+    # Multi-select question: taps toggle options (accumulating a selection set)
+    # and the message stays live until the user taps the dedicated Submit button,
+    # at which point the joined choice counts as this member's answer. Only
+    # meaningful for grouped ``question`` messages; ignored otherwise.
+    multi_select: bool = False
 
 
 class CreateMessageResponse(BaseModel):

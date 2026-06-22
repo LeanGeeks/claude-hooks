@@ -269,6 +269,61 @@ class TestRouting(unittest.TestCase):
         )
         self.assertEqual(decision, {"action": "reply", "reply_text": "B"})
 
+    def test_relay_answer_to_decision_multi_select(self):
+        """A multi-select answer maps the chosen option indices back to their
+        clean labels, joined with ', ' (the format AskUserQuestion expects)."""
+        import telegram_permission_router as tpr
+
+        req = _make_request(
+            tool_name="AskUserQuestion",
+            tool_input={
+                "question": "pick any",
+                "options": [{"label": "A"}, {"label": "B"}, {"label": "C"}],
+                "multiSelect": True,
+            },
+        )
+        decision = tpr.relay_answer_to_decision(
+            req,
+            {
+                "via": "button_multi",
+                "option_idxs": [0, 2],
+                "labels": ["1. A", "3. C"],
+            },
+        )
+        self.assertEqual(decision, {"action": "reply", "reply_text": "A, C"})
+
+    def test_send_question_message_multi_select_adds_submit_button(self):
+        """A multiSelect question renders a Submit button and flags the relay
+        message as multi_select so taps toggle rather than finalize."""
+        import telegram_permission_router as tpr
+
+        req = _make_request(
+            tool_name="AskUserQuestion",
+            tool_input={
+                "question": "pick any",
+                "options": [{"label": "A"}, {"label": "B"}],
+                "multiSelect": True,
+            },
+        )
+        captured = {}
+
+        def _fake_send_relay(**kwargs):
+            captured.update(kwargs)
+            return 777
+
+        with patch.object(tpr, "_send_relay", side_effect=_fake_send_relay), patch.object(
+            tpr, "set_telegram_message_id"
+        ):
+            msg_id = tpr.send_question_message(req, "ws", 0, 1, group_id="g")
+
+        self.assertEqual(msg_id, 777)
+        self.assertTrue(captured["multi_select"])
+        keyboard = captured["keyboard"]
+        # Last keyboard row is the Submit button with the sentinel value.
+        self.assertEqual(keyboard[-1][0]["value"], tpr.QUESTION_SUBMIT_VALUE)
+        # The "first answer wins" caveat is gone.
+        self.assertNotIn("first answer wins", captured["text"])
+
 
 class TestHookMainPath(unittest.TestCase):
     """Smoke test that ``permission_request_hook.main`` no longer talks to a daemon."""

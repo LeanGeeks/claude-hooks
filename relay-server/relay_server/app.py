@@ -984,6 +984,15 @@ def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None
 _SELECTED_PREFIX = "✅ "
 _REPLY_PREFIX = "✍️ "
 
+# Sentinel button ``value`` for the multi-select Submit button (must match
+# ``QUESTION_SUBMIT_VALUE`` in the hook's telegram_permission_router.py).
+_QUESTION_SUBMIT_VALUE = "qa_submit"
+# ``via`` marker stored on a multi-select message while the user is still
+# toggling options — it holds the running selection but does NOT count as an
+# answer for group finalization until the Submit button flips it to
+# ``button_multi``.
+_MULTI_PENDING_VIA = "multi_pending"
+
 
 def _esc(s: str) -> str:
     """Escape user/option text baked into a message body. All outbound text is
@@ -991,6 +1000,11 @@ def _esc(s: str) -> str:
     ``<``/``>``/``&`` in an option label or a typed reply would otherwise make
     the edit fail as malformed HTML and leave the keyboard un-stripped."""
     return html.escape(s or "", quote=False)
+
+
+def _is_multi_select(row: sqlite3.Row) -> bool:
+    """True if this grouped question accumulates a multi-option selection."""
+    return bool(_payload_for(row).get("multi_select"))
 
 
 def _group_info(row: sqlite3.Row) -> tuple[str | None, int | None]:
@@ -1030,8 +1044,34 @@ def _highlighted_keyboard(
     return out
 
 
+def _multi_highlighted_keyboard(
+    keyboard: list[list[dict[str, Any]]], selected_idxs: set[int]
+) -> list[list[dict[str, Any]]]:
+    """Like ``_highlighted_keyboard`` but marks every button whose flat index is
+    in ``selected_idxs`` — for multi-select, where several options can be live at
+    once. The Submit button (identified by its sentinel value) is never marked.
+    Always built from the pristine stored keyboard so toggling is idempotent."""
+    out: list[list[dict[str, Any]]] = []
+    flat = 0
+    for kb_row in keyboard:
+        out_row: list[dict[str, Any]] = []
+        for btn in kb_row:
+            label = btn.get("label", "")
+            value = btn.get("value", "")
+            if value != _QUESTION_SUBMIT_VALUE and flat in selected_idxs:
+                label = _SELECTED_PREFIX + label
+            out_row.append({"label": label, "value": value})
+            flat += 1
+        out.append(out_row)
+    return out
+
+
 def _answer_line(answer: dict[str, Any]) -> str:
     """The trailing line baked into a message body when its group finalizes."""
+    if answer.get("via") == "button_multi":
+        labels = answer.get("labels") or []
+        joined = ", ".join(_esc(str(label)) for label in labels)
+        return f"\n\n{_SELECTED_PREFIX}{joined}"
     if answer.get("via") == "button":
         return f"\n\n{_SELECTED_PREFIX}{_esc(answer.get('label', ''))}"
     return f"\n\n{_REPLY_PREFIX}{_esc(answer.get('text', ''))}"
@@ -1054,6 +1094,62 @@ async def _record_provisional(
             return cur.rowcount
 
     return bool(await run_in_thread(_w))
+
+
+async def _toggle_multi_selection(
+    conn: sqlite3.Connection, message_id: int, option_idx: int
+) -> list[int] | None:
+    """Flip ``option_idx`` in/out of an *open* multi-select message's running
+    selection (read-modify-write in one transaction so concurrent taps don't
+    clobber each other). Returns the new sorted index list, or None if the
+    message is no longer open."""
+    now_iso = _utcnow_iso()
+
+    def _w() -> list[int] | None:
+        with conn:
+            row = conn.execute(
+                "SELECT answer_json, state FROM messages WHERE id=?", (message_id,)
+            ).fetchone()
+            if row is None or row["state"] != "open":
+                return None
+            current: set[int] = set()
+            if row["answer_json"]:
+                try:
+                    data = json.loads(row["answer_json"])
+                    if data.get("via") == _MULTI_PENDING_VIA:
+                        current = {int(i) for i in data.get("option_idxs", [])}
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    current = set()
+            if option_idx in current:
+                current.discard(option_idx)
+            else:
+                current.add(option_idx)
+            new_idxs = sorted(current)
+            conn.execute(
+                "UPDATE messages SET answer_json=?, answered_at=?"
+                " WHERE id=? AND state='open'",
+                (
+                    json.dumps({"via": _MULTI_PENDING_VIA, "option_idxs": new_idxs}),
+                    now_iso,
+                    message_id,
+                ),
+            )
+            return new_idxs
+
+    return await run_in_thread(_w)
+
+
+def _member_answered(row: sqlite3.Row) -> bool:
+    """True if a group member holds a *final* answer. A multi-select message
+    carrying only a still-being-toggled selection (``via == multi_pending``)
+    does not count — the group must wait for its Submit tap."""
+    raw = row["answer_json"]
+    if raw is None:
+        return False
+    try:
+        return json.loads(raw).get("via") != _MULTI_PENDING_VIA
+    except (json.JSONDecodeError, AttributeError):
+        return True
 
 
 async def _load_group_members(
@@ -1088,7 +1184,7 @@ async def _finalize_group_if_complete(
     # Guard against finalizing before all siblings have even been created.
     if group_total is not None and len(members) < group_total:
         return False
-    if any(m["answer_json"] is None for m in members):
+    if any(not _member_answered(m) for m in members):
         return False
 
     ids = [int(m["id"]) for m in members]
@@ -1332,6 +1428,107 @@ async def _safe_answer_cb(
         logger.exception("answer_callback_query failed")
 
 
+async def _handle_multi_select_button(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    waiters: WaiterRegistry,
+    row: sqlite3.Row,
+    option_idx: int,
+    chosen: dict[str, Any],
+    cb_id: str,
+    group_id: str,
+    group_total: int | None,
+) -> None:
+    """A tap on a multi-select grouped message. Option taps toggle the running
+    selection and re-render with every chosen option marked; the dedicated
+    Submit button bakes the selection into the message's final answer and may
+    finalize the whole group."""
+    chat_id = int(row["telegram_chat_id"])
+    keyboard = _payload_keyboard_for(row) or []
+    flat = [btn for r in keyboard for btn in r]
+
+    if chosen.get("value") == _QUESTION_SUBMIT_VALUE:
+        selected = await _current_multi_selection(conn, int(row["id"]))
+        if selected is None:
+            await _safe_answer_cb(backend, cb_id, "No longer waiting for an answer")
+            return
+        if not selected:
+            await _safe_answer_cb(backend, cb_id, "Tap at least one option first")
+            return
+        labels = [
+            flat[i].get("label", "") for i in selected if 0 <= i < len(flat)
+        ]
+        answer = {"via": "button_multi", "option_idxs": selected, "labels": labels}
+        wrote = await _record_provisional(conn, int(row["id"]), answer)
+        if not wrote:
+            await _safe_answer_cb(backend, cb_id, "Already submitted")
+            return
+        if await _finalize_group_if_complete(
+            conn, backend, waiters, chat_id, group_id, group_total
+        ):
+            await _safe_answer_cb(backend, cb_id, "Submitted ✓")
+        else:
+            await _safe_answer_cb(
+                backend, cb_id, "Saved ✓ — waiting on the other questions"
+            )
+        return
+
+    # An option tap: toggle it in the running selection.
+    new_selected = await _toggle_multi_selection(conn, int(row["id"]), option_idx)
+    if new_selected is None:
+        fresh = await _load_open_message_any(conn, int(row["id"]))
+        state = fresh["state"] if fresh is not None else None
+        ack = {
+            "answered": "Already submitted",
+            "expired": "⏱ Expired — no longer waiting",
+            "cancelled": "Cancelled — handled in the terminal",
+        }.get(state, "No longer waiting for an answer")
+        await _safe_answer_cb(backend, cb_id, ack)
+        return
+
+    highlighted = _multi_highlighted_keyboard(keyboard, set(new_selected))
+    try:
+        await backend.edit_message(
+            chat_id=chat_id,
+            telegram_message_id=int(row["telegram_message_id"]),
+            text=_payload_for(row).get("text") or "",
+            keyboard=highlighted,
+            relay_message_id=int(row["id"]),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("multi-select toggle edit failed for message %s", row["id"])
+    on = option_idx in set(new_selected)
+    await _safe_answer_cb(
+        backend,
+        cb_id,
+        f"{'Selected' if on else 'Unselected'}: {chosen.get('label', '')}",
+    )
+
+
+async def _current_multi_selection(
+    conn: sqlite3.Connection, message_id: int
+) -> list[int] | None:
+    """Read the running multi-select option indices for an *open* message.
+    Returns ``[]`` when nothing is selected yet, or None if no longer open."""
+    def _q() -> list[int] | None:
+        row = conn.execute(
+            "SELECT answer_json, state FROM messages WHERE id=?", (message_id,)
+        ).fetchone()
+        if row is None or row["state"] != "open":
+            return None
+        if not row["answer_json"]:
+            return []
+        try:
+            data = json.loads(row["answer_json"])
+        except json.JSONDecodeError:
+            return []
+        if data.get("via") != _MULTI_PENDING_VIA:
+            return []
+        return [int(i) for i in data.get("option_idxs", [])]
+
+    return await run_in_thread(_q)
+
+
 async def _handle_grouped_button(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
@@ -1345,6 +1542,12 @@ async def _handle_grouped_button(
 ) -> None:
     """A tap on a re-answerable grouped message: record the provisional choice,
     re-render with it highlighted, and finalize the group once all are in."""
+    if _is_multi_select(row):
+        await _handle_multi_select_button(
+            conn, backend, waiters, row, option_idx, chosen, cb_id,
+            group_id, group_total,
+        )
+        return
     chat_id = int(row["telegram_chat_id"])
     answer = {
         "option_idx": option_idx,

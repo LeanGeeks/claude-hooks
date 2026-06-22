@@ -230,6 +230,7 @@ class RelayClient:
         idempotency_key: str | None = None,
         group_id: str | None = None,
         group_total: int | None = None,
+        multi_select: bool = False,
     ) -> MessageHandle:
         body: dict[str, Any] = {
             "kind": kind,
@@ -244,6 +245,10 @@ class RelayClient:
         if group_id is not None:
             body["group_id"] = group_id
             body["group_total"] = group_total
+        # Multi-select fan-out member: taps toggle options and the message stays
+        # live until the Submit button is tapped (see relay _handle_grouped_button).
+        if multi_select:
+            body["multi_select"] = True
 
         headers = {"Idempotency-Key": idempotency_key or str(uuid.uuid4())}
         resp = self._request("POST", "/v1/messages", json_body=body, headers=headers)

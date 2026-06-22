@@ -158,6 +158,13 @@ def _client() -> "RelayClient":
     return _relay_client
 
 
+# Sentinel button ``value`` for the multi-select Submit button. The relay
+# recognises it (vs. the ``qa<N>`` option values) and finalises the message's
+# accumulated selection instead of toggling another option. Must stay in sync
+# with ``_QUESTION_SUBMIT_VALUE`` in relay_server/app.py.
+QUESTION_SUBMIT_VALUE = "qa_submit"
+
+
 # ---- Option labels that signal "let me type a custom answer" ---------------
 
 FREE_TEXT_TRIGGER_LABELS = frozenset({
@@ -318,6 +325,7 @@ def _send_relay(
     request_id: str,
     group_id: Optional[str] = None,
     group_total: Optional[int] = None,
+    multi_select: bool = False,
 ) -> Optional[int]:
     """Common send helper. Returns the relay message_id or None on failure."""
     if not TELEGRAM_ENABLED:
@@ -332,6 +340,7 @@ def _send_relay(
             idempotency_key=f"req:{request_id}:send",
             group_id=group_id,
             group_total=group_total,
+            multi_select=multi_select,
         )
     except NotBoundError as e:
         error_log(
@@ -453,12 +462,15 @@ def send_question_message(
         # message body as a numbered list, where text wraps freely. Each button
         # then only needs to carry its number (and as much of the label as
         # fits) — the body is the source of truth for what each number means.
-        lines += ["", "<i>Tap a number below, or reply with text:</i>", ""]
         if multi_select:
-            lines.append(
-                "<i>(multi-select not supported via Telegram — first answer wins)</i>"
-            )
-            lines.append("")
+            lines += [
+                "",
+                "<i>Tap numbers to toggle (select as many as you like), "
+                "then tap ✓ Submit. Or reply with text:</i>",
+                "",
+            ]
+        else:
+            lines += ["", "<i>Tap a number below, or reply with text:</i>", ""]
 
         rows: list[list[dict[str, str]]] = []
         for i, opt in enumerate(options):
@@ -480,6 +492,11 @@ def send_question_message(
             # One button per row for maximum width; the button shows the number
             # plus the leading part of the label (Telegram trims the overflow).
             rows.append([{"label": f"{num}. {label}", "value": f"qa{i}"}])
+        if multi_select:
+            # Dedicated Submit button the relay recognises by its sentinel value.
+            # Taps on the option buttons above only toggle the selection; this is
+            # what finalises the message's answer.
+            rows.append([{"label": "✓ Submit", "value": QUESTION_SUBMIT_VALUE}])
         keyboard = rows
     else:
         lines += ["", "<i>Reply to this message with your answer.</i>"]
@@ -496,6 +513,7 @@ def send_question_message(
         request_id=request.request_id,
         group_id=group_id,
         group_total=total if group_id is not None else None,
+        multi_select=bool(multi_select),
     )
     if message_id is not None:
         set_telegram_message_id(request.request_id, message_id)
@@ -714,6 +732,19 @@ def relay_answer_to_decision(
     either as a button tap (``value`` = ``qa<N>``) or a free-text reply.
     """
     via = answer.get("via")
+    if via == "button_multi":
+        # Multi-select: ``option_idxs`` are indices into the question's options.
+        # Re-derive the clean labels (the relay only stores button labels) and
+        # join with ", " — the format AskUserQuestion expects for multi-select.
+        options = (request.tool_input or {}).get("options", [])
+        labels: list[str] = []
+        for idx in answer.get("option_idxs", []):
+            if isinstance(idx, int) and 0 <= idx < len(options):
+                opt = options[idx]
+                labels.append(
+                    opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
+                )
+        return {"action": "reply", "reply_text": ", ".join(labels)}
     if via == "button":
         value = answer.get("value")
         if value in ("allow", "deny", "stop"):
