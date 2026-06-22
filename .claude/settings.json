@@ -159,6 +159,7 @@
       "Bash([:*)",
       "Bash(npm:*)",
       "Bash(npx:*)",
+      "Bash(next:*)",
       "Bash(nx:*)",
       "Bash(gh:*)",
       "Bash(playwright:*)",
