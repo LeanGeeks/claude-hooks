@@ -858,9 +858,57 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
-def _stub(name: str) -> int:
-    _eprint(f"amux-spawn: '{name}' is not implemented yet (filled by a later epic-10 task).")
-    return 2
+def cmd_attach(args: argparse.Namespace) -> int:
+    """``a|attach [<suffix>]`` — fuzzy-switch to a session in the current workspace.
+
+    Resolution (architecture §3 / D-Switch):
+      - prefix = basename(cwd) — the SAME algorithm spawn uses (shared via
+        lib.workspace_prefix / lib.resolve_attach_target).
+      - target = <prefix>-<suffix> when suffix given; bare <prefix> when not.
+      - If the cwd-prefix exact match fails, fall back to fuzzy match across the
+        WHOLE session list, ranking current-workspace candidates FIRST.
+      - Ambiguous → list candidates, no switch (never silently attach the wrong one).
+      - Not found → clear error message.
+      - Confirms liveness via amux ls (the session list) before switching.
+      - Inside tmux ($TMUX) → switch-client (task 12 E3, via `amux attach`);
+        else → attach-session (also via `amux attach`, which auto-detects).
+    """
+    suffix = getattr(args, "suffix", None) or None  # "" → None
+
+    kind, payload = lib.resolve_attach_target(suffix)
+
+    if kind == lib.ATTACH_NOT_FOUND:
+        tried = payload
+        _eprint(f"amux-spawn: no session found matching '{tried}'")
+        _eprint("  (run `amux ls` to see available sessions)")
+        return 1
+
+    if kind == lib.ATTACH_AMBIGUOUS:
+        candidates = payload
+        _eprint("amux-spawn: ambiguous — multiple sessions match:")
+        for name in candidates:
+            _eprint(f"  {name}")
+        _eprint("  specify a more precise suffix to pick one")
+        return 1
+
+    # ATTACH_EXACT — one resolved name.
+    target = payload
+    assert isinstance(target, str)
+
+    # Confirm liveness before attempting the switch (architecture §3 / D-Switch).
+    # We check via amux ls names (already fetched inside resolve_attach_target)
+    # AND via tmux has-session so we catch sessions that lost their tmux pane
+    # but are still in amux's registry.
+    if not lib.tmux_has_session(target):
+        _eprint(f"amux-spawn: session '{target}' is not live (tmux has-session false)")
+        _eprint("  the session may have ended; use `amux ls` to check")
+        return 1
+
+    # Delegate to amux attach which already does switch-client inside tmux (E3)
+    # and attach-session otherwise — same helper the spawn TTY path uses.
+    _amux_attach(target)
+    # _amux_attach uses os.execvp, so we only reach here on failure.
+    return 1
 
 
 # ── CLI dispatch ──────────────────────────────────────────────────────────────
@@ -923,9 +971,21 @@ def build_parser() -> argparse.ArgumentParser:
     lsp.add_argument("--dir", default=None, help="filter by an explicit workspace dir")
     lsp.add_argument("--run-id", default=None, help="filter by run_id")
 
-    # Stubs (later tasks).
-    sub.add_parser("a", help="(10-05) quick-switch by suffix")
-    sub.add_parser("attach", help="(10-05) quick-switch by suffix")
+    # Quick-switch (task 10-05): a|attach [<suffix>]
+    for _acmd in ("a", "attach"):
+        _ap = sub.add_parser(
+            _acmd,
+            help="fuzzy-switch to a session in the current workspace",
+        )
+        _ap.add_argument(
+            "suffix",
+            nargs="?",
+            default=None,
+            help=(
+                "optional session suffix; resolves <prefix>-<suffix>. "
+                "Omit to attach the workspace's bare-<prefix> session."
+            ),
+        )
 
     return parser
 
@@ -958,7 +1018,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_last(ns)
         return cmd_ls(ns)
     if subcommand in ("a", "attach"):
-        return _stub("attach")
+        ns = build_parser().parse_args(argv)
+        return cmd_attach(ns)
     if subcommand in ("-h", "--help", "help"):
         build_parser().print_help()
         return 0

@@ -244,6 +244,146 @@ def list_amux_names() -> set[str]:
     return names
 
 
+def list_amux_sessions_with_dirs() -> list[tuple[str, str]]:
+    """Return ``[(name, dir), ...]`` for all amux sessions (from ``amux ls``).
+
+    Parses the ``  N  <name>  <dir>`` columns. The current session (marked with
+    ``*``) is included. Returns an empty list on any error (fail-soft).
+
+    Used by the attach resolver and the completion script helper. The ordering
+    preserves amux's output order (by session index).
+    """
+    sessions: list[tuple[str, str]] = []
+    if not shutil.which("amux"):
+        return sessions
+    try:
+        result = subprocess.run(
+            ["amux", "ls"], capture_output=True, text=True, timeout=10
+        )
+    except Exception:
+        return sessions
+    if result.returncode != 0:
+        return sessions
+    for line in result.stdout.splitlines():
+        # Strip the trailing current-session marker (``*``) before splitting.
+        # A line looks like one of:
+        #   " 1  name  /some/dir"
+        #   " 3* name  /some/dir"
+        # The ``*`` is attached to the index (column 0).
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        idx_part = parts[0].rstrip("*")
+        if not idx_part.isdigit():
+            continue
+        name = parts[1]
+        session_dir = parts[2]
+        sessions.append((name, session_dir))
+    return sessions
+
+
+# Resolution result kinds (returned by resolve_attach_target).
+ATTACH_EXACT = "exact"        # Single unambiguous match → name.
+ATTACH_AMBIGUOUS = "ambiguous"  # Multiple candidates → list of names.
+ATTACH_NOT_FOUND = "not_found"  # No match at all.
+
+
+def resolve_attach_target(
+    suffix: str | None,
+    cwd: str | None = None,
+) -> tuple[str, str | list[str]]:
+    """Resolve a fuzzy attach request to a single amux session name (D-Switch).
+
+    Algorithm (architecture §3 / D-Name / D-Switch):
+
+    1. Compute ``prefix = workspace_prefix(cwd)`` from ``cwd`` (or the current
+       working directory when ``cwd`` is None). This is the SAME ``basename``
+       algorithm 10-01 uses for naming — sharing this helper is the Phase-0
+       invariant that keeps ``a <suffix>`` aligned with ``spawn``.
+
+    2. Target name = ``<prefix>-<suffix>`` when ``suffix`` is given, else the
+       bare ``<prefix>`` (``a`` with no suffix → workspace's root session).
+
+    3. Look up the target name in ``amux ls`` (exact match first — no fuzzy
+       expansion here; ``amux attach`` itself is fuzzy).
+
+    4. If the cwd-prefix yields NO match (e.g. running from a subdir where
+       ``basename(cwd)`` does not appear in any session name):
+       - Fall back to fuzzy match across the WHOLE session list (D-Switch):
+         any session whose name **contains** the suffix substring (case-
+         insensitive). Rank current-workspace sessions FIRST (those whose
+         recorded dir starts with the cwd's parent, or equals cwd).
+       - If the fallback yields exactly one candidate → use it.
+       - If it yields multiple → AMBIGUOUS (list them); never guess.
+
+    5. If no match anywhere → NOT_FOUND.
+
+    Returns ``(kind, payload)`` where:
+      - kind == ATTACH_EXACT      → payload is the resolved session name (str).
+      - kind == ATTACH_AMBIGUOUS  → payload is a list of candidate names.
+      - kind == ATTACH_NOT_FOUND  → payload is the tried target name (str).
+
+    Does NOT call ``tmux has-session``; the caller must confirm liveness and
+    choose ``switch-client`` vs ``attach-session``.
+    """
+    resolved_cwd = os.path.abspath(cwd) if cwd else os.path.abspath(os.getcwd())
+    prefix = workspace_prefix(resolved_cwd)
+
+    # Target = <prefix>-<suffix> or bare <prefix> if no suffix.
+    target_name = f"{prefix}-{suffix}" if suffix else prefix
+
+    sessions = list_amux_sessions_with_dirs()
+    session_names = [name for name, _ in sessions]
+
+    # Step 3: exact match in the full list.
+    if target_name in session_names:
+        return ATTACH_EXACT, target_name
+
+    # Step 4: cwd-prefix yielded no match → fuzzy fallback across the whole list.
+    # Fuzzy = session name CONTAINS the suffix substring (or prefix if no suffix).
+    search_term = suffix if suffix else prefix
+    if not search_term:
+        return ATTACH_NOT_FOUND, target_name
+
+    # Build candidate list, ranking current-workspace sessions first.
+    # Workspace sessions take priority: if there are workspace matches we use ONLY
+    # those for the unambiguous-vs-ambiguous decision (D-Switch: "rank
+    # current-workspace candidates FIRST; if still ambiguous, list rather than
+    # guess — never silently attach the wrong workspace").  Cross-workspace
+    # candidates are shown only when there are NO workspace matches at all.
+    def _is_workspace_session(session_dir: str) -> bool:
+        """True if session_dir is the same workspace as cwd or a parent of it."""
+        abs_sd = os.path.abspath(session_dir) if session_dir else ""
+        return bool(abs_sd and (abs_sd == resolved_cwd or resolved_cwd.startswith(abs_sd + os.sep)))
+
+    ws_candidates: list[str] = []
+    other_candidates: list[str] = []
+    low_term = search_term.lower()
+    for name, sdir in sessions:
+        if low_term not in name.lower():
+            continue
+        if _is_workspace_session(sdir):
+            ws_candidates.append(name)
+        else:
+            other_candidates.append(name)
+
+    # Prefer workspace candidates.  Only fall through to cross-workspace when
+    # there are no workspace matches at all (avoids surprising cross-workspace
+    # attaches when the workspace has an unambiguous match).
+    if ws_candidates:
+        if len(ws_candidates) == 1:
+            return ATTACH_EXACT, ws_candidates[0]
+        # Multiple workspace candidates — genuinely ambiguous within the workspace.
+        # Show all matches (workspace first, then cross-workspace) for context.
+        return ATTACH_AMBIGUOUS, ws_candidates + other_candidates
+
+    if not other_candidates:
+        return ATTACH_NOT_FOUND, target_name
+    if len(other_candidates) == 1:
+        return ATTACH_EXACT, other_candidates[0]
+    return ATTACH_AMBIGUOUS, other_candidates
+
+
 def name_in_use(name: str) -> bool:
     """True if ``name`` is taken in amux's *full* namespace.
 
