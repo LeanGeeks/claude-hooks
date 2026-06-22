@@ -1,7 +1,7 @@
 # 10-05 — Human ergonomics: `a|attach`, completion, shell integration
 
 **Status:** todo · **Depends on:** 10-01 (naming/prefix), [task 12 E3](../12_amux_extensions.md)
-(nested-tmux switch-client)
+(nested-tmux switch-client) — **E3 done & live-verified** (fork `9b05d10`)
 **Read first:** [brd.md](./brd.md) C8–C10 + [architecture.md](./architecture.md)
 §3 and decisions D-Entry, D-Switch, D-Name, D-Env.
 

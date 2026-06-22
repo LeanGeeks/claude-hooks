@@ -1,10 +1,12 @@
 # 10-01 — Launcher core (`amux-spawn spawn`)
 
-**Status:** todo · **Depends on:** [task 12](../12_amux_extensions.md) — **E1**
-(env via `update-environment`), **E2** (`--no-default-model`), **E4-floor**
+**Status:** todo (prereqs ✓) · **Depends on:** [task 12](../12_amux_extensions.md) —
+**E1** (env via `update-environment`), **E2** (`--no-default-model`), **E4-floor**
 (`--session-id` → `meta.json`), **E5** (`--no-attach`) — all four are **hard
 prereqs**: the core launch structure is *create-detached-under-lock (E5) → attach*,
-not just `--detach`.
+not just `--detach`. **These are DONE and chain-verified** (fork
+`feat/epic-10-amux-extensions` @ `9b05d10`, installed at `/usr/local/bin/amux`;
+E3/E4-full also landed). Build against that binary; pin the commit.
 **Read first:** [brd.md](./brd.md) + [architecture.md](./architecture.md) (esp.
 §3 Entry point, §5 Launch & env, **§6.0 handle schema**, and decisions D-Entry,
 D-Workspace, D-Name, D-Tracked, D-Env, D-SessionId, D-RunId).
@@ -29,7 +31,9 @@ are stubs here — filled by 10-03; `--wait`/notify by 10-04; `a|attach` by 10-0
   `suffix`; else `<prefix>`, `<prefix>-2`, … with **atomic allocation** (avoid two
   concurrent spawns picking the same name).
 - **Tracked vs plain** (D-Tracked): TTY/human launch ⇒ plain amux session (no
-  handle, no minted id). Agent/non-TTY ⇒ tracked: mint a `--session-id` UUID, write
+  handle, no minted id). Agent/non-TTY ⇒ tracked: mint a `--session-id` **valid
+  UUID** (e.g. `uuid4` — Claude 2.1.185 rejects a non-UUID with *"Invalid session
+  ID. Must be a valid UUID."* and exits at startup; confirmed in task-12 testing), write
   the handle `~/.amux/spawn/<name>.json` (**schema in architecture §6.0** — use that
   exact field list; persist `stuck_after_s` from `--stuck-after` here so 10-03 can
   read it). The minted id must end up in `<name>.meta.json`, **not `CC_FLAGS`** (task

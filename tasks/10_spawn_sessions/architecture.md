@@ -102,8 +102,9 @@ notification). Continue = `amux send`; terminate = `amux rm`.
 
 - Drive **extended amux** with **`--no-default-model`** so `ANTHROPIC_MODEL`
   governs (and propagate the parent's explicit `--model` when the caller gives none
-  — D-Env); **for tracked sessions, also a minted `--session-id`** (stored by amux in
-  `<name>.meta.json`, not `CC_FLAGS` — task 12 E4-floor). **Env reaches the child via
+  — D-Env); **for tracked sessions, also a minted `--session-id`** — a **valid UUID**
+  (Claude rejects non-UUIDs at startup; confirmed in task-12 testing), stored by amux
+  in `<name>.meta.json`, not `CC_FLAGS` (task 12 E4-floor). **Env reaches the child via
   tmux `update-environment`** — amux (task 12 E1) appends the curated allowlist
   (`ANTHROPIC_*`, curated `CLAUDE_CODE_*`, `API_TIMEOUT_MS`) so those vars are copied
   from the spawner's **live env** (no `ps` leak). **Plain inheritance does NOT work
@@ -249,9 +250,10 @@ presuming the cause, from files (no extra producer state):
 - Background **Bash** in `Stop.background_tasks`? Docs say `type:"shell"` (CC ≥
   2.1.145) — likely yes; confirm in 10-02 and pin the CC version. (§2.2)
 - `--wait` false-idle guard: require a `Stop` *after* the seeded turn.
-- task 12 E1 (Decision 1): confirm the curated vars reach the pane via
-  `update-environment` **from a second amux session on an already-running server**,
-  and survive the `unset` line. (Plain inheritance already disproven for this case.)
+- ~~task 12 E1 (Decision 1): confirm the curated vars reach the pane via
+  `update-environment` from a second amux session on an already-running server.~~
+  **CLOSED** — confirmed by re-spike + a GLM end-to-end run through amux
+  (`model: glm-4.7` in the pane; `DISPLAY`/`SSH_*` preserved; no `ps` leak).
 - Whether `Stop` truly never fires during a permission block (spike claim) — the §6
   re-activation rule and stuck-on-permission both depend on it; re-verify in 10-02.
 - Parent-`CC_DIR` resolution when amux but `CC_DIR` ≠ cwd; bare-`claude` fallback.

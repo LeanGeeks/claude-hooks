@@ -12,12 +12,12 @@ settled.
 
 | id | title | status | depends on |
 |----|-------|--------|-----------|
-| [12](../12_amux_extensions.md) | amux extensions (external/fork) | todo | — |
-| [10-01](./10-01-launcher-core.md) | launcher core (`spawn`) | todo | 12 (E1, E2, E4-floor, E5), Phase 0 |
+| [12](../12_amux_extensions.md) | amux extensions (external/fork) | **done** (E1–E5 + E4-full; fork `feat/epic-10-amux-extensions` @ `9b05d10`, installed to `/usr/local/bin/amux`, chain-verified) | — |
+| [10-01](./10-01-launcher-core.md) | launcher core (`spawn`) | todo (prereqs ✓) | 12 (E1, E2, E4-floor, E5) ✓, Phase 0 |
 | [10-02](./10-02-producer-and-state.md) | producer hook + state | todo | 10-01 |
 | [10-03](./10-03-reads.md) | reads: status/last/ls + reason-context | todo | 10-01, 10-02 |
 | [10-04](./10-04-supervise.md) | supervise (`--wait`/notify) | todo | 10-01, 10-02 |
-| [10-05](./10-05-human-ergonomics.md) | attach/completion/shell | todo | 10-01, 12 (E3) |
+| [10-05](./10-05-human-ergonomics.md) | attach/completion/shell | todo | 10-01, 12 (E3) ✓ |
 | [11](../11_permission_delivery_reliability.md) | permission delivery (bug) | open | independent |
 
 ## Phase 0 — lock these BEFORE parallel work (decide once, all tasks inherit)
@@ -44,8 +44,10 @@ integration. The orchestrator must fix them up front and record the choices here
    that one field list. Do not let any task invent its own fields.
 6. **Env mechanism (Decision 1).** Model/auth env reaches the child via tmux
    **`update-environment`** (curated allowlist, no `ps` leak) — **not** plain
-   inheritance, which is broken on an already-running server (task 12 E1). Re-spike
-   from a second amux session on a live server before trusting it.
+   inheritance, which is broken on an already-running server (task 12 E1).
+   **Confirmed:** the re-spike (and a GLM end-to-end run through amux) verified the
+   curated vars reach the pane from a second amux session on a live server, with
+   `DISPLAY`/`SSH_*` preserved and no `ps` leak. Locked.
 
 ## Dependency graph
 
@@ -61,15 +63,13 @@ integration. The orchestrator must fix them up front and record the choices here
 ## Recommended order (with parallelism)
 
 1. **Phase 0** decisions (above).
-2. **task 12** — amux extensions. Develop against a **local clone/fork** of amux
-   (forking is unavoidable — amux has no plugin surface; pin the exact commit
-   `amux-spawn` targets, open upstream PRs in parallel). **E1 (env via
-   `update-environment`), E2 (`--no-default-model`), E4-floor (`--session-id` →
-   `meta.json`), and E5 (`--no-attach`) all gate 10-01** — E5 is core, not just
-   `--detach`: the launch structure is *create-detached-under-lock → attach*.
-   E3 (switch-client) gates 10-05; E4-full (resume) is post-v1. 10-01 scaffolding can
-   start in parallel, but its env/model + tracked-session + atomic-allocation behavior
-   can't be validated until E1/E2/E4-floor/E5 land.
+2. **task 12** — amux extensions. ✅ **DONE** (fork `feat/epic-10-amux-extensions`
+   @ `9b05d10`, installed to `/usr/local/bin/amux`; pin this commit, not merged).
+   E1–E5 **and** E4-full all landed and were chain-verified against real tmux 3.5a +
+   real Claude (create → `send` → `--resume` → `rm`; GLM alt-model confirmed
+   `model: glm-4.7`). Three bugs surfaced + fixed during that testing (`send-keys`
+   pane target, `rm` meta cleanup, `cmd_start` abort on tmux 3.5a). 10-01 can now be
+   built and validated against the installed binary.
 3. **10-01** launcher core (critical path).
 4. **10-02** producer + state — build right after 10-01. The hook-behavior questions
    are **already settled by experiment** (CC 2.1.185, see *Resolved during review*):
@@ -102,6 +102,10 @@ integration. The orchestrator must fix them up front and record the choices here
   notification does NOT count — else an idle session false-flips to running→stuck),
   gated by `current_mtime > handle.mtime_at_stop` (architecture §6). Compare fs mtime
   to the `mtime_at_stop` snapshot, never to wall-clock `updated_at`.
+- **Minted `--session-id` MUST be a valid UUID** — confirmed during task-12 testing:
+  Claude (2.1.185) rejects a non-UUID with *"Invalid session ID. Must be a valid
+  UUID."* and exits at startup. 10-01 must mint a real UUID (e.g. `uuid4`); amux just
+  passes it through.
 - **Never re-pass `--session-id`** (restart is resume-aware in amux, task 12 E4-full;
   E4-floor keeps the minted id out of `CC_FLAGS` so `start-all` can't re-pass it).
 - **Fail safe, not silent**; never regress task 09 or existing permission gating.
