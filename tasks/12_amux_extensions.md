@@ -1,9 +1,9 @@
 # Task 12 — amux extensions (prerequisite for Epic 10)
 
-**Status:** v1 implemented (E1/E2/E3/E4-floor/E5 done in fork branch
-`feat/epic-10-amux-extensions`; commits `76cc680`, `f86fb62`, `fa6ccc1`) ·
-E4-full + deploy outstanding · **Type:** upstream/external · **Created:**
-2026-06-22 · **Rev:** 5
+**Status:** all extensions implemented (E1/E2/E3/E4-floor/E4-full/E5 in fork
+branch `feat/epic-10-amux-extensions`; commits `76cc680`, `f86fb62`, `fa6ccc1`,
+`cab8ac9`) · **only deploy outstanding** · **Type:** upstream/external ·
+**Created:** 2026-06-22 · **Rev:** 6
 <!-- Rev 3 (adversarial review): E1 rewritten around tmux `update-environment` (plain
 inheritance is broken on a running server); E4 split into E4-floor (blocks 10-01) and
 E4-full (post-v1); E5 `--no-attach` added. -->
@@ -132,7 +132,7 @@ it blocks 10-01** (Decision 2).
   present), never a clobbering `cat >`. A meta.json without `claude_session_id` /
   `started`, or no meta at all, behaves exactly as today (no `--session-id`).
 
-### E4-full — Resume-aware restart *(post-v1; removes the remaining footgun)*
+### E4-full — Resume-aware restart *(done — `cab8ac9`; removed the remaining footgun)*
 - A *subsequent* `start` of a session that has run before uses **`--resume <id>`**
   (mark "has-run" in the meta after first start) instead of `--session-id`. Never
   re-pass `--session-id` on restart.
@@ -157,7 +157,7 @@ not the exit code (Decision 3).
 - **⚠ Outstanding — not yet deployed.** The fork branch is built and tested but
   the installed `/usr/local/bin/amux` is untouched. Deploy ships the whole fork
   `amux` (carries `amux-remote` etc., not just E1–E5) — confirm that's intended,
-  pin the commit (`fa6ccc1` or its merge), then replace the binary. `amux-server.py`
+  pin the commit (`cab8ac9` or its merge), then replace the binary. `amux-server.py`
   is unchanged so it need not be redeployed.
 
 ## Acceptance criteria
@@ -177,10 +177,9 @@ not the exit code (Decision 3).
       `switch-client` when `$TMUX` is set, falls back to `attach-session`.)*
 - [x] **(E4-floor)** Create stores `--session-id` in `<name>.meta.json`, never in
       `CC_FLAGS`; `start-all` with a tracked session present does not re-pass it / die.
-- [ ] **(E4-full, post-v1)** A later restart of the same session resumes via
-      `--resume` without collision. *(Deferred. Meta schema + create/restart fork
-      already shipped; only the `--resume` branch — the `started==true` arm — is
-      outstanding.)*
+- [x] **(E4-full)** A later restart of the same session resumes via `--resume`
+      without collision. *(Done in `cab8ac9`: create mints `--session-id`, restart
+      resumes; neither re-passes `--session-id`.)*
 - [x] **(E5)** `--no-attach` creates a live session without attaching, at a TTY and
       off it; default behavior (no flag) still attaches.
 - [x] New amux options are parsed by amux (`parse_amux_opts`), not forwarded to
