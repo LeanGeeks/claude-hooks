@@ -1,9 +1,32 @@
 # Task 12 — amux extensions (prerequisite for Epic 10)
 
-**Status:** all extensions implemented (E1/E2/E3/E4-floor/E4-full/E5 in fork
-branch `feat/epic-10-amux-extensions`; commits `76cc680`, `f86fb62`, `fa6ccc1`,
-`cab8ac9`) · **only deploy outstanding** · **Type:** upstream/external ·
-**Created:** 2026-06-22 · **Rev:** 6
+**Status:** implemented + chain-verified against real tmux/Claude (fork branch
+`feat/epic-10-amux-extensions`, tip `9b05d10`; installed to `/usr/local/bin/amux`,
+**not merged**) · merge after Epic 10 chain sign-off · **Type:** upstream/external
+· **Created:** 2026-06-22 · **Rev:** 7
+
+## Chain verification (real tmux 3.5a + real Claude 2.1.185)
+
+End-to-end test (create → `amux send` → `peek` → stop → `--resume` → `rm`) passes
+with real Claude: resume restored the prior conversation, meta `started` flips
+correctly. The run surfaced three bugs (all fixed; stub tests couldn't catch them
+because the stub returns 0 for every tmux call):
+- **`9b05d10` send:** `cmd_send` targeted `=<session>`; `send-keys` needs a
+  window target (`=<session>:`) or errors "can't find pane". Broke `amux send`
+  (the chain's "continue").
+- **`9b05d10` rm:** `cmd_rm` left `<name>.meta.json`, so a recreated same-named
+  session resurrected a stale `claude_session_id` as a bogus `--resume <old-id>`.
+- **`b2293cb` start:** `set-option -t "=<session>" allow-rename` errors on
+  tmux 3.5a (window-only option), and under `set -euo pipefail` aborted
+  `cmd_start` before the started-flip + attach. Use `set-window-option` + guard.
+
+A real-tmux integration test (`test_create_flip_resume_on_real_tmux`, routes
+amux's tmux calls to a private server via a PATH shim) now guards all three.
+Suite: 185 passed. **Caveat (not amux):** Claude rejects a custom
+`ANTHROPIC_BASE_URL`/`AUTH_TOKEN` (alt-model relay) while a Claude Max OAuth
+account is present in `~/.claude.json` — alt-model spawns need a profile without
+the conflicting login. amux's env propagation + no-sonnet-injection are proven
+independently (stub harness + re-spike).
 <!-- Rev 3 (adversarial review): E1 rewritten around tmux `update-environment` (plain
 inheritance is broken on a running server); E4 split into E4-floor (blocks 10-01) and
 E4-full (post-v1); E5 `--no-attach` added. -->
@@ -154,11 +177,13 @@ not the exit code (Decision 3).
 - Build against a local clone/fork; **pin the amux version** `amux-spawn` targets.
 - Deploy by replacing `/usr/local/bin/amux` with the extended build; `amux-spawn`
   calls `amux` on `PATH` (no hard-coded path). Document the install step.
-- **⚠ Outstanding — not yet deployed.** The fork branch is built and tested but
-  the installed `/usr/local/bin/amux` is untouched. Deploy ships the whole fork
-  `amux` (carries `amux-remote` etc., not just E1–E5) — confirm that's intended,
-  pin the commit (`cab8ac9` or its merge), then replace the binary. `amux-server.py`
-  is unchanged so it need not be redeployed.
+- **Installed for testing (not merged):** `9b05d10`'s `amux` is live at
+  `/usr/local/bin/amux` (**CLI only**; `amux-server.py`/`amux-remote` left untouched
+  — they carry unrelated fork drift and aren't in the spawn chain). Backup at
+  `/usr/local/bin/amux.pre-epic10.bak` (rollback:
+  `sudo install -m0755 /usr/local/bin/amux.pre-epic10.bak /usr/local/bin/amux`).
+- **For final deploy:** pin the merge commit; decide whether to also ship the
+  fork's server/remote.
 
 ## Acceptance criteria
 
