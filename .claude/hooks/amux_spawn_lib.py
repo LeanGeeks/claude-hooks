@@ -430,3 +430,307 @@ def live_tracked_count(abs_dir: str) -> int:
         if tmux_has_session(str(data.get("name", ""))):
             count += 1
     return count
+
+
+# ── Handle enumeration (10-03 reads) ──────────────────────────────────────────
+
+def list_handles() -> list[dict[str, Any]]:
+    """Return every parseable handle in the registry (no filtering, no cleanup).
+
+    Fail-soft: skips unreadable/malformed files. The registry accumulates dead
+    handles (no auto-cleanup, D-Cleanup) — callers filter by ``dir`` / ``run_id``
+    and mark liveness via ``tmux has-session``.
+    """
+    handles: list[dict[str, Any]] = []
+    if not SPAWN_DIR.is_dir():
+        return handles
+    for entry in sorted(SPAWN_DIR.glob("*.json")):
+        try:
+            with open(entry) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            handles.append(data)
+    return handles
+
+
+# ── Transcript tail parsing (open-turn detection + in-flight tool) ────────────
+#
+# Shared by 10-03 (status reads) and 10-04 (supervise). The transcript is a JSONL
+# file; each line is one event with a ``type`` (``user`` / ``assistant`` / ...)
+# and a ``message`` dict carrying ``role`` + ``content`` (string or list of typed
+# blocks: ``text`` / ``thinking`` / ``tool_use`` / ``tool_result``). All readers
+# here are fail-soft: a missing/unreadable transcript yields the empty / None
+# result, never an exception.
+
+# How many lines from the transcript tail to scan for open-turn / in-flight-tool
+# detection. Bounded so a huge transcript is cheap to read.
+TRANSCRIPT_TAIL_LINES = 400
+
+
+def read_transcript_tail(transcript_path: str | None, max_lines: int = TRANSCRIPT_TAIL_LINES) -> list[dict[str, Any]]:
+    """Return up to ``max_lines`` parsed JSON entries from the transcript tail.
+
+    Fail-soft: returns ``[]`` if the file is missing/unreadable. Malformed lines
+    are skipped individually.
+    """
+    if not transcript_path:
+        return []
+    try:
+        with open(transcript_path) as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for line in lines[-max_lines:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries
+
+
+def _content_blocks(message: Any) -> list[Any]:
+    """Return a message's content as a list of blocks (wrapping a bare string)."""
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        return content
+    return []
+
+
+def _is_real_user_turn(entry: dict[str, Any]) -> bool:
+    """True iff ``entry`` is a genuine *user* turn that opens work.
+
+    A real user turn carries user-authored text or a real prompt — it is NOT a
+    tool_result delivery (that rides on a ``user`` entry too) and NOT a synthetic
+    background-completion notification injected by the harness (``isMeta`` / a
+    ``task-notification`` payload). Those do not constitute an open turn.
+    """
+    if entry.get("type") != "user":
+        return False
+    if entry.get("isMeta") is True:
+        return False
+    if entry.get("isSidechain") is True:
+        return False
+    message = entry.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    blocks = _content_blocks(message)
+    if not blocks:
+        return False
+    # A user entry that carries ONLY tool_result blocks is the harness delivering
+    # results, not a new human/agent turn.
+    saw_text = False
+    for block in blocks:
+        if not isinstance(block, dict):
+            # A bare string already became a {"type":"text"} block above.
+            saw_text = True
+            continue
+        btype = block.get("type")
+        if btype == "tool_result":
+            continue
+        if btype == "text":
+            text = str(block.get("text", "")).strip()
+            if not text:
+                continue
+            # Background-completion notifications arrive as user text containing a
+            # <task-notification> / task-id payload; those are NOT an open turn.
+            low = text.lower()
+            if "task-notification" in low or "<task-id>" in low:
+                continue
+            saw_text = True
+        else:
+            # Any other content block (e.g. image) counts as authored input.
+            saw_text = True
+    return saw_text
+
+
+def _collect_tool_use_ids(blocks: list[Any]) -> list[tuple[str, str]]:
+    """Return ``(tool_use_id, tool_name)`` for every ``tool_use`` block."""
+    out: list[tuple[str, str]] = []
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tid = block.get("id")
+            if isinstance(tid, str) and tid:
+                out.append((tid, str(block.get("name", "")) or "tool"))
+    return out
+
+
+def _collect_tool_result_ids(blocks: list[Any]) -> set[str]:
+    """Return the set of ``tool_use_id``s answered by ``tool_result`` blocks."""
+    ids: set[str] = set()
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            rid = block.get("tool_use_id")
+            if isinstance(rid, str) and rid:
+                ids.add(rid)
+    return ids
+
+
+def _last_assistant_text_index(entries: list[dict[str, Any]]) -> int:
+    """Index of the last main-agent assistant message carrying real *text*.
+
+    That is the point the last ``Stop`` fired (Stop records
+    ``last_assistant_message``). An open turn must be NEWER than this — work that
+    came before it already ended in that ``Stop``. Returns -1 if none found (no
+    Stop boundary in the tail, so the whole tail is "after").
+    """
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if entry.get("type") != "assistant" or entry.get("isSidechain") is True:
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for block in _content_blocks(message):
+            if isinstance(block, dict) and block.get("type") == "text" \
+                    and str(block.get("text", "")).strip():
+                return i
+    return -1
+
+
+def detect_open_turn(transcript_path: str | None, max_lines: int = TRANSCRIPT_TAIL_LINES) -> bool:
+    """True iff the transcript tail shows an OPEN TURN (architecture §6 step 2).
+
+    An open turn = a **user message** (genuine, not a tool_result delivery and not
+    a background-completion notification) **or** a ``tool_use`` with no matching
+    ``tool_result`` — **newer than the last ``Stop``'s assistant message**. Work
+    before that boundary already ended in that ``Stop``; a lone background-completion
+    notification does NOT count (else an idle session would false-flip to
+    running/stuck).
+
+    The caller gates this with ``current_mtime > mtime_at_stop`` (same fs clock) so
+    a stable idle transcript is never even parsed.
+    """
+    entries = read_transcript_tail(transcript_path, max_lines)
+    if not entries:
+        return False
+
+    # Only consider entries AFTER the last Stop boundary (last assistant text). A
+    # dangling tool_use itself has no text block, so the gated/in-flight tool stays
+    # in this window; a finished turn's user-msg+assistant-text sit before it.
+    boundary = _last_assistant_text_index(entries)
+    after = entries[boundary + 1:]
+    if not after:
+        return False
+
+    # 1) A genuine user turn after the boundary = open turn (re-activation via
+    #    `amux send` appends exactly such a user message after the last Stop).
+    for entry in after:
+        if _is_real_user_turn(entry):
+            return True
+
+    # 2) A tool_use with no matching tool_result after the boundary = an in-flight
+    #    foreground tool (incl. a permission-gated tool that never returned).
+    pending_tool_ids: set[str] = set()
+    for entry in after:
+        message = entry.get("message")
+        blocks = _content_blocks(message)
+        if entry.get("type") == "assistant":
+            for tid, _name in _collect_tool_use_ids(blocks):
+                pending_tool_ids.add(tid)
+        for rid in _collect_tool_result_ids(blocks):
+            pending_tool_ids.discard(rid)
+    return bool(pending_tool_ids)
+
+
+def inflight_foreground_tool(transcript_path: str | None, max_lines: int = TRANSCRIPT_TAIL_LINES) -> dict[str, Any] | None:
+    """Return the last in-flight foreground ``tool_use`` (no matching result), or None.
+
+    Shape: ``{tool, command, tool_use_id}``. ``command`` is best-effort from the
+    tool input (Bash ``command``, file ``file_path``, else None). Reason-context
+    pairs this with the frozen transcript mtime (age) at the call site.
+
+    Like :func:`detect_open_turn`, only entries AFTER the last main-agent
+    assistant-text boundary (the last ``Stop``) are scanned.  This avoids a
+    false "foreground tool" when the 400-line tail window cuts a
+    tool_use/result pair at the seam — result scrolled out but the tool_use
+    is still present.  (This function is reason-context only; state derivation
+    uses :func:`detect_open_turn`, which is already boundary-aware.)
+    """
+    entries = read_transcript_tail(transcript_path, max_lines)
+    if not entries:
+        return None
+
+    # Mirror detect_open_turn: only consider entries after the last Stop
+    # boundary (last main-agent assistant text).  boundary == -1 means no
+    # prior Stop in the tail, so after == entries (the whole tail is "after").
+    boundary = _last_assistant_text_index(entries)
+    after = entries[boundary + 1:]
+    if not after:
+        return None
+
+    results: set[str] = set()
+    uses: list[dict[str, Any]] = []
+    for entry in after:
+        message = entry.get("message")
+        blocks = _content_blocks(message)
+        if entry.get("type") == "assistant":
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = block.get("id")
+                    if isinstance(tid, str) and tid:
+                        uses.append(block)
+        results |= _collect_tool_result_ids(blocks)
+
+    for block in reversed(uses):
+        tid = block.get("id")
+        if tid in results:
+            continue
+        tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+        command = None
+        if isinstance(tool_input, dict):
+            command = tool_input.get("command") or tool_input.get("file_path")
+        return {
+            "tool": str(block.get("name", "")) or "tool",
+            "command": str(command) if command is not None else None,
+            "tool_use_id": tid,
+        }
+    return None
+
+
+# ── Harness background-task output files (reason-context) ──────────────────────
+
+def session_tasks_dir(transcript_path: str | None) -> Path | None:
+    """The per-session harness tasks dir (sibling of the transcript): ``.../tasks``.
+
+    Background Bash/Agent output files live there (e.g. ``tasks/<id>.output``).
+    Returns None if there is no transcript path.
+    """
+    if not transcript_path:
+        return None
+    return Path(transcript_path).parent / "tasks"
+
+
+def read_task_output_tail(tasks_dir: Path | None, task_id: str, max_lines: int = 20) -> dict[str, Any] | None:
+    """Best-effort read of a background task's output file.
+
+    Looks for ``<tasks_dir>/<task_id>.output`` (and a ``.log`` fallback). Returns
+    ``{output_file, tail, mtime}`` with a BOUNDED tail, or None if no file is
+    found / readable. Fail-soft.
+    """
+    if tasks_dir is None or not task_id:
+        return None
+    candidates = [tasks_dir / f"{task_id}.output", tasks_dir / f"{task_id}.log"]
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            with open(path, errors="replace") as f:
+                lines = f.readlines()
+            tail = "".join(lines[-max_lines:]).rstrip("\n")
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        return {"output_file": str(path), "tail": tail, "mtime": mtime}
+    return None

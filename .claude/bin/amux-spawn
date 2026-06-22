@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """``amux-spawn`` — unified human + agent launcher for amux sessions (epic 10).
 
-This is the CLI skeleton + the ``spawn`` subcommand (task 10-01). Other
-subcommands are stubs filled by later tasks:
+This is the CLI: the ``spawn`` subcommand (task 10-01) and the read subcommands
+``status`` / ``last`` / ``ls`` (task 10-03). Remaining stubs:
 
-- ``status`` / ``last`` / ``ls``  -> 10-03 (reads + reason-context)
 - ``a`` / ``attach``              -> 10-05 (quick-switch + completion)
 - ``--wait`` / ``--notify``       -> 10-04 (supervise)
+
+State is DERIVED at read time (architecture §6); ``stuck`` is never persisted.
+Precedence: terminated -> stuck -> running -> idle. ``status`` bundles
+cause-agnostic reason-context (background tasks, in-flight foreground tool,
+pending permission) assembled from files (architecture §7).
 
 Design stance (architecture s0): thin mechanism. ``spawn`` creates + seeds a new
 amux session for both humans (TTY -> attach / switch-client) and agents (non-TTY
@@ -38,9 +42,11 @@ from __future__ import annotations
 import argparse
 import errno
 import fcntl
+import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -361,6 +367,361 @@ def parse_stuck_after(raw: str | None) -> int:
         return lib.DEFAULT_STUCK_AFTER_S
 
 
+# ── Reads: status / last / ls (task 10-03) ────────────────────────────────────
+#
+# State is DERIVED at read time (architecture §6 / §6.0 never stores `stuck`).
+# Precedence: terminated -> stuck -> running -> idle. Reason-context is best-effort
+# and ADDITIVE — every signal found is listed; the cause is never inferred into the
+# state. All reads are fail-soft: a missing/partial handle yields a best-effort /
+# "unknown" result, never a traceback.
+
+
+def _import_permission_store() -> Any:
+    """Import ``permission_state_store`` if reachable, else None (fail-soft).
+
+    Lives alongside the hooks; reuse ``get_pending_request_for_session`` for the
+    precise session_id↔permission match (the store keys by session_id).
+    """
+    try:
+        import permission_state_store as store  # type: ignore
+        return store
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _live_background_tasks(handle: dict[str, Any]) -> list[dict[str, Any]]:
+    """Background-task entries from the handle that are not in a terminal status.
+
+    The handle self-drains to ``[]`` on a completion ``Stop`` (architecture §2.2),
+    so this is normally just ``handle["background_tasks"]``. As a defensive guard
+    (architecture §6 step 2) we drop entries whose status looks terminal.
+    """
+    tasks = handle.get("background_tasks")
+    if not isinstance(tasks, list):
+        return []
+    live: list[dict[str, Any]] = []
+    for t in tasks:
+        if not isinstance(t, dict):
+            continue
+        status = str(t.get("status", "")).lower()
+        if status in ("completed", "done", "failed", "cancelled", "canceled", "error", "killed"):
+            continue
+        live.append(t)
+    return live
+
+
+def _reason_context(handle: dict[str, Any]) -> dict[str, Any]:
+    """Assemble cause-agnostic reason-context from files (architecture §7).
+
+    BEST-EFFORT and ADDITIVE — lists EVERY signal found; never collapses to one
+    cause. Returns a dict with keys: ``background_tasks`` (list), ``foreground_tool``
+    (dict|None), ``pending_permission`` (dict|None). Empty/None where not found.
+    """
+    transcript_path = handle.get("transcript_path")
+
+    # 1) Background work: handle entries + harness task output files (bounded tail).
+    background: list[dict[str, Any]] = []
+    tasks_dir = lib.session_tasks_dir(transcript_path)
+    for t in _live_background_tasks(handle):
+        if not isinstance(t, dict):
+            continue
+        task_id = str(t.get("id", "")) if t.get("id") is not None else ""
+        ctx: dict[str, Any] = {
+            "kind": t.get("type"),
+            "id": t.get("id"),
+            "command": t.get("command") or t.get("label") or t.get("description"),
+            "status": t.get("status"),
+            "started_at": t.get("started_at"),
+            "pid": t.get("pid"),
+        }
+        out = lib.read_task_output_tail(tasks_dir, task_id) if task_id else None
+        if out:
+            ctx["output_file"] = out["output_file"]
+            ctx["output_tail"] = out["tail"]
+            ctx["output_mtime"] = out["mtime"]
+        background.append(ctx)
+
+    # 2) In-flight foreground tool: a tool_use with no result + frozen mtime (age).
+    foreground = None
+    fg = lib.inflight_foreground_tool(transcript_path)
+    if fg:
+        mtime = lib.transcript_mtime(transcript_path)
+        foreground = dict(fg)
+        if mtime is not None:
+            foreground["age_s"] = round(max(0.0, time.time() - mtime), 1)
+
+    # 3) Pending permission: matched PRECISELY by session_id via the store.
+    pending_permission = None
+    session_id = handle.get("session_id")
+    store = _import_permission_store()
+    if store is not None and isinstance(session_id, str) and session_id:
+        try:
+            req = store.get_pending_request_for_session(session_id)
+        except Exception:  # noqa: BLE001
+            req = None
+        if req is not None:
+            pending_permission = {
+                "request_id": getattr(req, "request_id", None),
+                "tool_name": getattr(req, "tool_name", None),
+                "tool_input": getattr(req, "tool_input", None),
+                "created_at": getattr(req, "created_at", None),
+            }
+
+    return {
+        "background_tasks": background,
+        "foreground_tool": foreground,
+        "pending_permission": pending_permission,
+    }
+
+
+def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
+    """Derive a tracked session's state (architecture §6 derivation rules).
+
+    Precedence: terminated -> stuck -> running -> idle. Returns a dict suitable for
+    JSON output (see _status_json_schema in the report). ``stuck`` is derived here
+    and NEVER persisted back to the handle.
+    """
+    name = str(handle.get("name", ""))
+    stored_state = handle.get("state")
+
+    # stuck_after: per-query override wins; else handle.stuck_after_s; else default.
+    stuck_after = stuck_after_override
+    if stuck_after is None:
+        try:
+            stuck_after = int(handle.get("stuck_after_s") or lib.DEFAULT_STUCK_AFTER_S)
+        except (TypeError, ValueError):
+            stuck_after = lib.DEFAULT_STUCK_AFTER_S
+
+    transcript_path = handle.get("transcript_path")
+
+    # 1) terminated: tmux gone, OR producer already recorded terminated (SessionEnd).
+    alive = lib.tmux_has_session(name) if name else False
+    if not alive or stored_state == "terminated":
+        last_state = handle.get("last_state")
+        return {
+            "name": name,
+            "state": "terminated",
+            "last_state": last_state,
+            "stuck_after_s": stuck_after,
+        }
+
+    # 2) active = live background_tasks OR open turn OR no Stop yet (spawning /
+    #    mtime_at_stop absent). The spawning clause keeps a just-launched session
+    #    active without short-circuiting stuck.
+    live_bg = bool(_live_background_tasks(handle))
+    mtime_at_stop = handle.get("mtime_at_stop")
+    no_stop_yet = (stored_state == "spawning") or (mtime_at_stop is None)
+
+    # Open-turn detection — cheap gate: only parse the tail when the transcript has
+    # advanced past the last Stop snapshot (SAME fs clock). A bare mtime bump from a
+    # background-completion notification is filtered inside detect_open_turn.
+    open_turn = False
+    current_mtime = lib.transcript_mtime(transcript_path)
+    if current_mtime is not None and isinstance(mtime_at_stop, (int, float)):
+        if current_mtime > mtime_at_stop:
+            open_turn = lib.detect_open_turn(transcript_path)
+
+    active = live_bg or open_turn or no_stop_yet
+
+    # 3) stuck = active AND (now - activity_mtime > stuck_after). Cause-agnostic.
+    #    activity_mtime = transcript mtime if present, else handle.created_at.
+    activity_mtime = current_mtime
+    if activity_mtime is None:
+        activity_mtime = _created_at_epoch(handle)
+    age = None
+    if activity_mtime is not None:
+        age = max(0.0, time.time() - activity_mtime)
+    is_stuck = bool(active and age is not None and age > stuck_after)
+
+    if is_stuck:
+        state = "stuck"
+    elif active:
+        state = "running"
+    else:
+        # 4) idle = not active AND stored state idle.
+        #
+        # This branch is only reached when active==False.  Per spec, idle ⇔
+        # not-active AND stored state == "idle".  Under CC 2.1.185 the
+        # draining Stop always sets state="idle" before the session goes
+        # quiet, so stored_state should always be "idle" here.  However, if
+        # a Stop fires but its state update hasn't been written yet (an
+        # in-flight write race that is normally impossible), stored_state may
+        # still be "running" or "spawning".  In that case we return the stored
+        # intermediate state rather than inventing "idle", because the Stop
+        # that would set idle simply hasn't been processed yet — reporting the
+        # live stored state is less misleading than a premature "idle".
+        state = "idle" if stored_state == "idle" else stored_state or "idle"
+
+    result: dict[str, Any] = {
+        "name": name,
+        "state": state,
+        "stored_state": stored_state,
+        "active": active,
+        "stuck_after_s": stuck_after,
+        "activity_age_s": round(age, 1) if age is not None else None,
+        "signals": {
+            "live_background_tasks": live_bg,
+            "open_turn": open_turn,
+            "no_stop_yet": no_stop_yet,
+        },
+    }
+    # Reason-context: best-effort, attached whenever not plainly idle (esp. stuck).
+    if state != "idle":
+        result["reason_context"] = _reason_context(handle)
+    return result
+
+
+def _created_at_epoch(handle: dict[str, Any]) -> float | None:
+    """Parse ``created_at`` (ISO-8601) into an epoch float, or None."""
+    raw = handle.get("created_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(raw).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _resolve_handle(handle_arg: str) -> tuple[str, dict[str, Any] | None]:
+    """Resolve a queried <handle> (amux session name) to its handle dict.
+
+    The queried token is the amux session name (the handle key). Returns
+    ``(name, handle_or_none)`` — fail-soft (None handle when absent/malformed).
+    """
+    name = handle_arg.strip()
+    return name, lib.read_handle(name)
+
+
+def _human_status_line(result: dict[str, Any]) -> str:
+    """One-line human summary of a status result."""
+    name = result.get("name", "?")
+    state = result.get("state", "unknown")
+    bits = [f"{name}: {state}"]
+    if state == "terminated":
+        ls = result.get("last_state")
+        if ls:
+            bits.append(f"(last_state={ls})")
+    else:
+        age = result.get("activity_age_s")
+        if age is not None:
+            bits.append(f"(idle/active {age}s, stuck_after={result.get('stuck_after_s')}s)")
+        rc = result.get("reason_context") or {}
+        causes = []
+        if rc.get("background_tasks"):
+            causes.append(f"{len(rc['background_tasks'])} bg task(s)")
+        if rc.get("foreground_tool"):
+            ft = rc["foreground_tool"]
+            causes.append(f"foreground {ft.get('tool')}")
+        if rc.get("pending_permission"):
+            pp = rc["pending_permission"]
+            causes.append(f"pending permission {pp.get('tool_name')}")
+        if causes:
+            bits.append("— " + ", ".join(causes))
+    return " ".join(bits)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """``status <handle>`` — report a tracked session's derived state + reason-context."""
+    if not getattr(args, "handle", None):
+        _eprint("amux-spawn status: missing <handle>")
+        return 2
+    stuck_after_override = (
+        parse_stuck_after(args.stuck_after) if getattr(args, "stuck_after", None) else None
+    )
+    name, handle = _resolve_handle(args.handle)
+    if handle is None:
+        result: dict[str, Any] = {"name": name, "state": "unknown", "error": "no handle found"}
+        if args.json:
+            print(json.dumps(result))
+        else:
+            print(f"{name}: unknown (no tracked handle found)")
+        return 1
+    result = _derive_status(handle, stuck_after_override)
+    if args.json:
+        print(json.dumps(result))
+    else:
+        print(_human_status_line(result))
+    return 0
+
+
+def cmd_last(args: argparse.Namespace) -> int:
+    """``last <handle>`` — print the handle's last_message."""
+    if not getattr(args, "handle", None):
+        _eprint("amux-spawn last: missing <handle>")
+        return 2
+    name, handle = _resolve_handle(args.handle)
+    if handle is None:
+        if args.json:
+            print(json.dumps({"name": name, "last_message": None, "error": "no handle found"}))
+        else:
+            _eprint(f"amux-spawn last: no tracked handle found for {name}")
+        return 1
+    last_message = handle.get("last_message")
+    if args.json:
+        print(json.dumps({"name": name, "last_message": last_message}))
+    else:
+        if last_message is None:
+            _eprint(f"amux-spawn last: {name} has no last_message yet")
+            return 1
+        print(last_message)
+    return 0
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    """``ls`` — list tracked sessions for the current workspace and/or run_id.
+
+    Reads the registry (``~/.amux/spawn/*.json``). Marks dead handles
+    (``tmux has-session`` false); no auto-cleanup — the registry accumulates them.
+    Filters: ``--all`` lists every workspace; otherwise the resolved CC_DIR (or
+    ``--dir``); ``--run-id`` further narrows.
+    """
+    if getattr(args, "all", False):
+        target_dir = None
+    elif getattr(args, "dir", None):
+        target_dir = os.path.abspath(os.path.expanduser(args.dir))
+    else:
+        # Resolve the current workspace: parent CC_DIR if in an amux session, else cwd.
+        parent = lib.resolve_amux_session()
+        cc_dir = lib.parent_cc_dir(parent) if parent else None
+        target_dir = os.path.abspath(cc_dir) if cc_dir else os.path.abspath(os.getcwd())
+
+    run_id = getattr(args, "run_id", None)
+
+    rows: list[dict[str, Any]] = []
+    for handle in lib.list_handles():
+        if not isinstance(handle, dict):
+            continue
+        hdir = handle.get("dir")
+        if target_dir is not None:
+            if not isinstance(hdir, str) or os.path.abspath(hdir) != target_dir:
+                continue
+        if run_id is not None and handle.get("run_id") != run_id:
+            continue
+        name = str(handle.get("name", ""))
+        alive = lib.tmux_has_session(name) if name else False
+        rows.append({
+            "name": name,
+            "alive": alive,
+            "state": "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state"),
+            "run_id": handle.get("run_id"),
+            "dir": hdir,
+        })
+
+    rows.sort(key=lambda r: r["name"])
+    if args.json:
+        print(json.dumps({"dir": target_dir, "run_id": run_id, "sessions": rows}))
+    else:
+        if not rows:
+            scope = "all workspaces" if target_dir is None else target_dir
+            print(f"amux-spawn ls: no tracked sessions in {scope}")
+        else:
+            for r in rows:
+                mark = "live " if r["alive"] else "dead "
+                print(f"{mark} {r['name']:<28} {r['state'] or '?':<11} run={r['run_id']}")
+    return 0
+
+
 def _stub(name: str) -> int:
     _eprint(f"amux-spawn: '{name}' is not implemented yet (filled by a later epic-10 task).")
     return 2
@@ -407,10 +768,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--stuck-after", default=None,
                     help="stuck threshold (e.g. 10m, 600, 2h); persisted in the handle")
 
+    st = sub.add_parser("status", help="report a tracked session's derived state")
+    st.add_argument("handle", help="amux session name (handle key)")
+    st.add_argument("--json", action="store_true", help="machine-readable output")
+    st.add_argument("--stuck-after", default=None,
+                    help="override the stuck threshold for this query (e.g. 5s, 10m)")
+
+    la = sub.add_parser("last", help="print a tracked session's last message")
+    la.add_argument("handle", help="amux session name (handle key)")
+    la.add_argument("--json", action="store_true", help="machine-readable output")
+
+    lsp = sub.add_parser("ls", help="list tracked sessions for the workspace")
+    lsp.add_argument("--json", action="store_true", help="machine-readable output")
+    lsp.add_argument("--all", action="store_true", help="list every workspace, not just this one")
+    lsp.add_argument("--dir", default=None, help="filter by an explicit workspace dir")
+    lsp.add_argument("--run-id", default=None, help="filter by run_id")
+
     # Stubs (later tasks).
-    sub.add_parser("status", help="(10-03) report a tracked session's state")
-    sub.add_parser("last", help="(10-03) print a tracked session's last message")
-    sub.add_parser("ls", help="(10-03) list tracked sessions")
     sub.add_parser("a", help="(10-05) quick-switch by suffix")
     sub.add_parser("attach", help="(10-05) quick-switch by suffix")
 
@@ -438,7 +812,12 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_spawn(ns, claude_flags, prompt)
 
     if subcommand in ("status", "last", "ls"):
-        return _stub(subcommand)
+        ns = build_parser().parse_args(argv)
+        if subcommand == "status":
+            return cmd_status(ns)
+        if subcommand == "last":
+            return cmd_last(ns)
+        return cmd_ls(ns)
     if subcommand in ("a", "attach"):
         return _stub("attach")
     if subcommand in ("-h", "--help", "help"):
