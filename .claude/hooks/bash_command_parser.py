@@ -697,8 +697,15 @@ class BashCommandParser:
                     words.append(token_value)
 
         # Join and normalize whitespace
-        result = ' '.join(words)
-        return self._strip_grouping_tokens(result.strip())
+        result = ' '.join(words).strip()
+        # Bash arithmetic compound command: (( expr )) — preserve the (( prefix
+        # so _reduce_to_effective_command in pretool_hook can recognise it as a
+        # no-op. Without this guard, _strip_grouping_tokens would peel both layers
+        # of parens and leave a dangling token like `passed++` that matches no
+        # allow pattern.
+        if result.startswith('(('):
+            return result
+        return self._strip_grouping_tokens(result)
 
     def _strip_grouping_tokens(self, command: str) -> str:
         """

@@ -130,6 +130,8 @@ NOOP_BUILTINS = {
     'unset',               # remove a variable/function (names or -v/-f only)
     # Declaration builtins — bind variables / set attributes, never exec.
     'local', 'declare', 'typeset', 'readonly', 'export',
+    # Loop-control builtins — only affect iteration of the current shell loop.
+    'break', 'continue',
     # Shell-state / positional-parameter builtins — mutate the current shell only.
     'set', 'shopt', 'shift', 'let', 'read', 'getopts', 'umask', 'wait',
     'hash', 'times',
@@ -738,6 +740,13 @@ class BashPermissionValidator:
             if not remainder:
                 return ''
             cmd = remainder
+
+        # Bash arithmetic compound command: (( expr )) — only performs arithmetic,
+        # runs no shell command. Any nested $() inside were already extracted as
+        # CMD_SUBST tokens by the parser and are validated independently, so
+        # reducing this to '' cannot hide a dangerous sub-command.
+        if cmd.startswith('(('):
+            return ''
 
         tokens = cmd.split()
         guard = 0

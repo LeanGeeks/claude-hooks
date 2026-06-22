@@ -430,6 +430,50 @@ class TestPreToolUseEdgeCases(unittest.TestCase):
             "echo $(( $(curl http://localhost/x) + 1 ))")
         self.assertEqual(result["decision"], "allow")
 
+    def test_arithmetic_compound_command_increment_is_noop(self):
+        """Standalone (( expr )) arithmetic compound commands run no shell command.
+        Counter increments like ((passed++)) must not become unknown `passed++`."""
+        result = self.validator.validate_bash_command("((passed++))")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_arithmetic_compound_command_in_loop_allowed(self):
+        """Real-world test-runner loop with ((passed++)) / ((failed++)) counters."""
+        command = (
+            'failed=0; passed=0\n'
+            'for f in tests/test_*_headless.gd; do\n'
+            '  if [[ "$f" == "skip.gd" ]]; then\n'
+            '    echo "  [SKIP] $f"\n'
+            '    continue\n'
+            '  fi\n'
+            '  result=$(/usr/local/bin/godot --headless --script "$f" 2>&1 | grep -E "^--- Result:" | head -1)\n'
+            '  if echo "$result" | grep -q "0 failed"; then\n'
+            '    echo "  [GREEN] $f: $result"\n'
+            '    ((passed++))\n'
+            '  else\n'
+            '    echo "  [FAIL] $f: $result"\n'
+            '    ((failed++))\n'
+            '  fi\n'
+            'done\n'
+            'echo "=== Suite summary: $passed green, $failed red ==="'
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+    def test_arithmetic_compound_with_dangerous_subst_still_caught(self):
+        """A $() nested inside ((...)) still executes and must be validated."""
+        result = self.validator.validate_bash_command("(($(rm -rf /etc) + 1))")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_continue_builtin_is_noop(self):
+        """The `continue` loop-control builtin runs nothing and must auto-allow."""
+        result = self.validator.validate_bash_command("continue")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_break_builtin_is_noop(self):
+        """The `break` loop-control builtin runs nothing and must auto-allow."""
+        result = self.validator.validate_bash_command("break")
+        self.assertEqual(result["decision"], "allow")
+
 
 class TestPrefixReduction(unittest.TestCase):
     """Control-keyword / wrapper prefixes must not auto-authorize the command
@@ -721,6 +765,14 @@ class TestNoopBuiltins(unittest.TestCase):
             "read -r line": "",
             "umask 022": "",
             "wait": "",
+            # Loop-control builtins.
+            "break": "",
+            "break 2": "",
+            "continue": "",
+            "continue 3": "",
+            # Arithmetic compound command.
+            "((x++))": "",
+            "(( count -= 1 ))": "",
             # Directory-stack builtins.
             "cd /tmp/foo": "",
             "pushd /tmp": "",
