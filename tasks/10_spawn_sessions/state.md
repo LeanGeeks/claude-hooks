@@ -13,11 +13,27 @@ settled.
 | id | title | status | depends on |
 |----|-------|--------|-----------|
 | [12](../12_amux_extensions.md) | amux extensions (external/fork) | **done** (E1–E5 + E4-full; fork `feat/epic-10-amux-extensions` @ `9b05d10`, installed to `/usr/local/bin/amux`, chain-verified) | — |
-| [10-01](./10-01-launcher-core.md) | launcher core (`spawn`) | todo (prereqs ✓) | 12 (E1, E2, E4-floor, E5) ✓, Phase 0 |
-| [10-02](./10-02-producer-and-state.md) | producer hook + state | todo | 10-01 |
-| [10-03](./10-03-reads.md) | reads: status/last/ls + reason-context | todo | 10-01, 10-02 |
-| [10-04](./10-04-supervise.md) | supervise (`--wait`/notify) | todo | 10-01, 10-02 |
-| [10-05](./10-05-human-ergonomics.md) | attach/completion/shell | todo | 10-01, 12 (E3) ✓ |
+| [10-01](./10-01-launcher-core.md) | launcher core (`spawn`) | **done + E2E-verified** (code+review+tests @ `765fb36`; 244 green; GLM-on-running-server chain-verified: env via `update-environment`, `model: glm-5.2`, no `ps` leak, handle==§6.0, transcript path matches). Only remaining gate: live `install-claude-config.sh` re-run [user runs separately] | 12 (E1, E2, E4-floor, E5) ✓, Phase 0 |
+| [10-02](./10-02-producer-and-state.md) | producer hook + state | **done** (code+review+tests; 259 green; committing. Live re-confirm gate batched with `install-claude-config.sh` [user runs separately]) | 10-01 |
+| [10-03](./10-03-reads.md) | reads: status/last/ls + reason-context | **done** (code+review+tests @ `db4545a`; 289 green) | 10-01, 10-02 |
+| [10-04](./10-04-supervise.md) | supervise (`--wait`/notify) | **done** (code+review+tests @ `0b899ad`; 310 green; `--wait`/`--notify`/`--timeout` + false-idle guard; live background-Bash verification batched into acceptance) | 10-01, 10-02 |
+| [10-05](./10-05-human-ergonomics.md) | attach/completion/shell | **done** (code+review+tests @ `5fa072b`; 334 green. Opt-in shell snippet — bashrc untouched. Live switch/TAB/integrated-launch batched into acceptance) | 10-01, 12 (E3) ✓ |
+
+**All five 10-0x implementation tasks DONE (each Implementer→Reviewer PASS→Fixer→Committer). Suite 334 passing.**
+
+## BRD §9 acceptance — live run 2026-06-23 (installer re-run by user; hooks now live)
+
+Driven live against installed hooks + real amux + GLM/Claude:
+- **A1 producer Stop hook (10-02 live, was blocked):** ✅ tracked spawn → handle `spawning→idle`, `last_message='PONG'`, `mtime_at_stop` set.
+- **A6 re-activation / open-turn (10-03 load-bearing):** ✅ `amux send` to idle session → `status` reports `running` then `idle` (`PONG2`).
+- **A2 stuck + reason-context:** ✅ background `sleep 180` → `state=stuck` (age>stuck_after), `live_background_tasks=true`, reason_context lists the shell task. Cause-agnostic; stuck derived not persisted.
+- **A5 cross-workspace producer (user-global hooks):** ✅ Stop hook fired for `formdr_replacement-accxw` in a different workspace (`last_message='XWORK-OK'`).
+- **A7 no regression:** ✅ suite 334 OK with installed config; task-09/permission untouched.
+- **C10 GLM env inheritance via update-environment:** ✅ (10-01 prior live verify: `model: glm-5.2`, no `ps` leak).
+- **A3 chain (3+ link autonomous, no human):** ✅ **FULLY VERIFIED** with a real-task chain (run_id `9fa40ce8`): link1 created `calc.py:add()` → spawned link2 → appended `multiply()` → spawned link3 → wrote+ran `test_calc.py` → **TESTS-PASS / CHAIN-DEPTH-3-OK**. All 3 links share `run_id` + workspace-root `CC_DIR` (subdir-independent), no human after seeding link1. NB: a *synthetic* recursive-spawn seed is refused by both GLM and Claude (model safety) — use real task-context chains (see memory).
+- **TTY items (handed to user as checklist):** `claude` launcher, `a <suffix>` switch (root+subdir, switch-client inside tmux), TAB completion, integrated `claude-glm5` — **awaiting user run.**
+
+All acceptance test sessions cleaned up (registry empty; user's 5 plain sessions intact).
 | [11](../11_permission_delivery_reliability.md) | permission delivery (bug) | open | independent |
 
 ## Phase 0 — lock these BEFORE parallel work (decide once, all tasks inherit)
