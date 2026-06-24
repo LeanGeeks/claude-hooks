@@ -5,7 +5,8 @@
 # - Merges hooks configuration (PreToolUse, PermissionRequest, PostToolUse, and idle Notification) from project to global settings
 # - Merges statusLine configuration from project to global settings
 # - Merges allowedTools/disallowedTools from project to global settings
-# - Ensures ~/.tmux.conf enables focus-events (for amux-spawned Claude sessions)
+# - Ensures ~/.tmux.conf tmux options for amux-spawned Claude sessions
+#   (focus-events on; forward Claude's OSC title to the terminal tab)
 # - Preserves all other settings in the global config
 
 set -euo pipefail
@@ -358,36 +359,57 @@ if [[ "$SNIPPET_INSTALLED" == true ]]; then
 fi
 
 # =============================================================================
-# STEP 3c: Ensure tmux 'focus-events on' (epic 10 follow-up)
+# STEP 3c: Ensure tmux options for amux-spawned Claude sessions (epic 10)
 # =============================================================================
 #
 # amux-spawn creates sessions detached (amux exec --no-attach -> tmux
 # new-session -d) and attaches afterward, so Claude's TUI initializes with no
-# client attached and comes up in inline (non-fullscreen) mode. In that mode
-# Claude's own startup nags: "tmux focus-events off · add 'set -g focus-events
-# on' ...". Enabling focus-events silences that and lets Claude track when you
-# switch away from a pane. We apply it here so a fresh machine works out of the
-# box. Idempotent + reversible: a single marked line is appended only when
-# focus-events isn't already enabled; the file is backed up before any edit.
+# client attached and comes up in inline (non-fullscreen) mode. We tune two
+# tmux behaviours that improve that experience:
 #
-# Two parts: (1) the persistent ~/.tmux.conf line (for future tmux servers);
-# (2) a live `tmux set -g` on any already-running server, since a running
-# server reads ~/.tmux.conf only at start — without this, the file edit would
-# not reach sessions on the current server until it restarts.
+#   - focus-events on            Silences Claude's "tmux focus-events off …"
+#                                startup nag and lets Claude track when you
+#                                switch away from a pane.
+#   - set-titles on +            Forward the OSC title Claude sets (captured by
+#     set-titles-string '#{pane_title}'
+#                                tmux into the pane title) up to the outer
+#                                terminal's tab/window title. Default would be
+#                                tmux's verbose "#S:#I:#W - …"; we surface just
+#                                Claude's title.
+#
+# Applied two ways: (1) persistent lines in ~/.tmux.conf (for future tmux
+# servers); (2) a live `tmux set -g` on any already-running server, since a
+# running server reads ~/.tmux.conf only at start — without this the file edit
+# would not reach sessions on the current server until it restarts. Idempotent
+# (exact-line / current-value checks) and reversible (lines are marked; the
+# file is backed up before any edit).
 
-log_step "Step 3c/5: Ensuring tmux 'focus-events on'"
+log_step "Step 3c/5: Ensuring tmux options (focus-events, tab title)"
 
 TMUX_CONF="$HOME/.tmux.conf"
-TMUX_FOCUS_MARKER="# Added by claude-hooks install-claude-config.sh: focus tracking for amux-spawned (detached) Claude sessions"
-# Match an uncommented `set`/`set-option` with any flags that sets focus-events.
-FOCUS_ON_RE='^[[:space:]]*set(-option)?[[:space:]]+(-[A-Za-z]+[[:space:]]+)*focus-events[[:space:]]+on([[:space:]]|$)'
-FOCUS_OFF_RE='^[[:space:]]*set(-option)?[[:space:]]+(-[A-Za-z]+[[:space:]]+)*focus-events[[:space:]]+off([[:space:]]|$)'
-FOCUS_EVENTS_STATUS="unchanged"        # ~/.tmux.conf outcome
-FOCUS_EVENTS_SERVER="no running server" # live running-server outcome
+TMUX_MARKER="# Added by claude-hooks install-claude-config.sh (tmux options for amux-spawned Claude sessions)"
+# Persistent ~/.tmux.conf lines we manage (exact strings → idempotent match).
+TMUX_LINES=(
+    "set -g focus-events on"
+    "set -g set-titles on"
+    "set -g set-titles-string '#{pane_title}'"
+)
+TMUX_FILE_STATUS="unchanged"            # ~/.tmux.conf outcome
+TMUX_LIVE_STATUS="no running server"    # live running-server outcome
 
-if [[ -f "$TMUX_CONF" ]] && grep -Eq "$FOCUS_ON_RE" "$TMUX_CONF"; then
-    log_info "tmux focus-events already enabled in $TMUX_CONF — leaving as is"
-    FOCUS_EVENTS_STATUS="already enabled"
+# 1) Persist any missing lines. Exact whole-line match (grep -Fxq) keeps this
+#    idempotent and avoids re-adding lines a previous run (or the user) wrote.
+TMUX_MISSING=()
+for line in "${TMUX_LINES[@]}"; do
+    if [[ -f "$TMUX_CONF" ]] && grep -Fxq "$line" "$TMUX_CONF"; then
+        continue
+    fi
+    TMUX_MISSING+=("$line")
+done
+
+if [[ ${#TMUX_MISSING[@]} -eq 0 ]]; then
+    log_info "tmux options already present in $TMUX_CONF — leaving as is"
+    TMUX_FILE_STATUS="already present"
 else
     # Back up an existing config before appending (consistent with the settings
     # backup in Step 4). A brand-new file needs no backup.
@@ -396,37 +418,41 @@ else
         TMUX_BACKUP="$BACKUP_DIR/tmux.conf.$(date +%Y%m%d_%H%M%S).bak"
         cp "$TMUX_CONF" "$TMUX_BACKUP"
         log_info "Backup created: $TMUX_BACKUP"
-        if grep -Eq "$FOCUS_OFF_RE" "$TMUX_CONF"; then
-            log_warn "$TMUX_CONF sets 'focus-events off' — appending an 'on' override (later setting wins)"
-        fi
     fi
     {
         # Separate from prior content only when appending to a non-empty file.
         [[ -s "$TMUX_CONF" ]] && echo ""
-        echo "$TMUX_FOCUS_MARKER"
-        echo "set -g focus-events on"
+        echo "$TMUX_MARKER"
+        for line in "${TMUX_MISSING[@]}"; do echo "$line"; done
     } >> "$TMUX_CONF"
-    log_info "Enabled tmux focus-events in $TMUX_CONF"
-    FOCUS_EVENTS_STATUS="enabled (appended)"
+    log_info "Added ${#TMUX_MISSING[@]} tmux option line(s) to $TMUX_CONF"
+    TMUX_FILE_STATUS="updated (${#TMUX_MISSING[@]} line(s) added)"
 fi
 
-# Apply to any already-running tmux server too. A running server only reads
-# ~/.tmux.conf at start, so the file edit above won't reach sessions on the
-# current server until it restarts. Setting the global option live makes
-# newly-spawned sessions pick it up immediately (existing Claude sessions
-# re-check the hint only on relaunch). No-op when tmux isn't installed or no
-# server is running. Mirrors amux's own "server running?" probe (list-sessions).
+# 2) Apply to any already-running tmux server too, so newly-spawned sessions
+#    pick the options up without a restart (existing Claude sessions re-check
+#    only on relaunch). No-op when tmux isn't installed or no server is running.
+#    Mirrors amux's own "server running?" probe (list-sessions).
 if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
-    if [[ "$(tmux show -gv focus-events 2>/dev/null)" == "on" ]]; then
-        log_info "Running tmux server already has focus-events on"
-        FOCUS_EVENTS_SERVER="already on"
-    elif tmux set -g focus-events on 2>/dev/null; then
-        log_info "Applied 'focus-events on' to the running tmux server (new sessions pick it up immediately)"
-        FOCUS_EVENTS_SERVER="enabled live"
-    else
-        log_warn "Could not set focus-events on the running tmux server"
-        FOCUS_EVENTS_SERVER="failed"
-    fi
+    declare -A TMUX_WANT=(
+        [focus-events]="on"
+        [set-titles]="on"
+        [set-titles-string]="#{pane_title}"
+    )
+    tmux_set=0 tmux_already=0 tmux_failed=0
+    for opt in focus-events set-titles set-titles-string; do
+        cur="$(tmux show -gv "$opt" 2>/dev/null || true)"
+        if [[ "$cur" == "${TMUX_WANT[$opt]}" ]]; then
+            tmux_already=$((tmux_already + 1))
+        elif tmux set -g "$opt" "${TMUX_WANT[$opt]}" 2>/dev/null; then
+            tmux_set=$((tmux_set + 1))
+        else
+            log_warn "Could not set tmux option '$opt' on the running server"
+            tmux_failed=$((tmux_failed + 1))
+        fi
+    done
+    log_info "Running tmux server: set $tmux_set, already-correct $tmux_already, failed $tmux_failed"
+    TMUX_LIVE_STATUS="set $tmux_set, already $tmux_already, failed $tmux_failed"
 fi
 
 # =============================================================================
@@ -666,8 +692,8 @@ else
     echo "  - amux-spawn shell snippet: not installed"
 fi
 
-# Show tmux focus-events status (file + running server)
-echo "  - tmux focus-events: $FOCUS_EVENTS_STATUS ($TMUX_CONF); running server: $FOCUS_EVENTS_SERVER"
+# Show tmux options status (file + running server)
+echo "  - tmux options (focus-events, tab title): $TMUX_FILE_STATUS ($TMUX_CONF); running server: $TMUX_LIVE_STATUS"
 
 echo ""
 log_info "Other settings preserved:"
