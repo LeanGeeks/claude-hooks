@@ -300,10 +300,23 @@ class BashCommandParser:
                 cmd_subst_depth = 1
                 i += 2  # skip the `<`/`>` and the opening `(`
                 subst_start = i
+                # Track quote state so a `)` inside a quoted string (e.g. a regex
+                # `[^)]`) does not prematurely close the substitution — same
+                # hazard as the `$(...)` scanner above.
+                subst_quote = None  # None, "'", or '"'
                 while i < len(command) and cmd_subst_depth > 0:
                     c = command[i]
-                    if c == '\\' and i + 1 < len(command):
+                    if c == '\\' and subst_quote != "'" and i + 1 < len(command):
                         i += 2  # skip escaped char
+                        continue
+                    if subst_quote:
+                        if c == subst_quote:
+                            subst_quote = None
+                        i += 1
+                        continue
+                    if c in ('"', "'"):
+                        subst_quote = c
+                        i += 1
                         continue
                     if c == '(':
                         cmd_subst_depth += 1
@@ -328,16 +341,30 @@ class BashCommandParser:
                 cmd_subst_depth = 1
                 subst_start = i
                 i += 2
-                # Scan until matching closing paren
+                # Scan until matching closing paren. We must track quote state:
+                # a `)` inside a quoted string is literal and must NOT close the
+                # substitution. Without this, a regex like `"pos=\([^)]*\)"` ends
+                # the span early at the `)` inside the `[^)]` bracket class,
+                # desyncing the tokenizer for everything that follows.
+                subst_quote = None  # None, "'", or '"'
                 while i < len(command) and cmd_subst_depth > 0:
                     c = command[i]
-                    if c == '\\' and i + 1 < len(command):
-                        # Skip escaped char
+                    # Backslash escapes the next char everywhere except single
+                    # quotes (where it is literal).
+                    if c == '\\' and subst_quote != "'" and i + 1 < len(command):
                         i += 2
                         continue
-                    if c == '"':
-                        # Toggle double quote (simple handling)
-                        pass  # We're not tracking quotes inside subst for simplicity
+                    if subst_quote:
+                        # Inside a quote: only the matching close quote is special;
+                        # parens are literal content.
+                        if c == subst_quote:
+                            subst_quote = None
+                        i += 1
+                        continue
+                    if c in ('"', "'"):
+                        subst_quote = c
+                        i += 1
+                        continue
                     if c == '(':
                         cmd_subst_depth += 1
                     elif c == ')':
@@ -856,6 +883,16 @@ if __name__ == '__main__':
          ['if [[ "$a" == b || "$a" == c ]]', "then echo hi", "fi"]),
         # Command substitution inside [[ ]] is STILL extracted and validated.
         ('[[ $(rm -rf /) ]] || echo hi', ["[[ ]]", "echo hi", "rm -rf /"]),
+        # A literal `)` inside a quoted regex bracket class must NOT close the
+        # enclosing $(...) early. Before the quote-tracking fix, `[^)]` desynced
+        # the tokenizer and stranded later tokens as bogus sub-commands.
+        ('n=$(grep -oE "pos=\\([^)]*\\)" file | wc -l)',
+         ['grep -oE "pos=\\([^)]*\\)" file', "wc -l"]),
+        # The whole double-quoted arg stays one token; crucially `${v:0:14}` is
+        # NOT stranded as a bogus standalone sub-command (the original bug).
+        ('echo "$(basename $f) ${v:0:14}"', ['echo "$(basename $f) ${v:0:14}"']),
+        # Same hazard for process substitution <( ... ).
+        ('diff <(grep -oE "a)b" x) y', ["diff y", 'grep -oE "a)b" x']),
     ]
 
     print("=== Bash Command Parser Tests ===\n")
