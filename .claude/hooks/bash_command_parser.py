@@ -31,6 +31,13 @@ class BashCommandParser:
     # Redirections that don't take an argument
     REDIRECTIONS_NO_ARG = ['2>&1', '1>&2', '<&', '>&']
 
+    # Redirections that WRITE to their path operand (create/truncate/append, or
+    # point stdout/stderr at a file). Reads (`<`, `<<`) are excluded: they
+    # consume an existing file, they neither create nor overwrite one, so their
+    # target needs no write-destination gating. The fd-dup forms in
+    # REDIRECTIONS_NO_ARG carry no path and so are absent here too.
+    WRITE_REDIRECTIONS_WITH_ARG = ['>', '>>', '2>', '&>', '&>>', '2>>', '1>']
+
     def __init__(self):
         """Initialize parser"""
         pass
@@ -615,6 +622,62 @@ class BashCommandParser:
                     name, _sep, value = t_val.partition('=')
                     assignments.append((name, value, t_off))
         return assignments
+
+    @staticmethod
+    def _strip_quotes(value: str) -> str:
+        """Strip one layer of matching surrounding single/double quotes."""
+        v = value
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+            v = v[1:-1]
+        return v
+
+    def extract_write_redirect_targets(self, command: str) -> List[Tuple[str, int]]:
+        """
+        Return (target, offset) for every output redirection that WRITES to a
+        path, across the whole compound command — recursing into command
+        substitutions, whose redirects execute too (`$(evil > /etc/x)`).
+
+        The split/normalize path strips redirects AND their target tokens (see
+        _split_on_operators), so the validator otherwise never sees where output
+        is written. This surfaces those write targets so a caller can gate them
+        by destination.
+
+        One layer of surrounding quotes is stripped from the target; the text is
+        otherwise returned verbatim, so an unexpanded `$VAR`/`$(...)` stays
+        visible and the caller can refuse to vouch for an unresolvable location.
+        Only path-operand writes are returned; fd-dup forms (`2>&1`, `>&`) carry
+        no target and are skipped.
+
+        Examples:
+            'echo x > /etc/passwd'      -> [('/etc/passwd', 7)]
+            'grep x 2>/dev/null'        -> [('/dev/null', 9)]
+            'cmd >> "$LOG"'             -> [('$LOG', 7)]
+            'a 2>&1 | b'                -> []   (fd-dup, no path)
+            'cat < in.txt'             -> []   (read, not a write)
+        """
+        if not command or not command.strip():
+            return []
+        return self._scan_write_targets(command)
+
+    def _scan_write_targets(self, command: str) -> List[Tuple[str, int]]:
+        tokens = self._tokenize_with_quotes(command)
+        targets = []
+        pending = False  # previous token was a write redirect awaiting its path
+        for t_type, t_val, t_off in tokens:
+            if pending:
+                pending = False
+                # The path is the immediately following token. An operator here
+                # means the redirect had no path operand (malformed `> ;`) —
+                # operators never name a file, so record nothing and let this
+                # token be re-examined as a possible new redirect below.
+                if t_type != 'OP':
+                    targets.append((self._strip_quotes(t_val), t_off))
+                    continue
+            if t_type == 'REDIRECT' and t_val in self.WRITE_REDIRECTIONS_WITH_ARG:
+                pending = True
+            elif t_type == 'CMD_SUBST' and t_val.strip():
+                targets.extend(self._scan_write_targets(t_val))
+        return targets
 
     @staticmethod
     def _is_env_prefix(token: str) -> bool:

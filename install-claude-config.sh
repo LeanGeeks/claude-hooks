@@ -548,7 +548,9 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                        --arg producer_path "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
             '{
                 PreToolUse: [{
-                    matcher: "Bash",
+                    # Both Bash and Monitor execute a shell command via
+                    # tool_input.command; the pretool hook validates either.
+                    matcher: "Bash|Monitor",
                     hooks: [{
                         type: "command",
                         command: ("python3 " + $pretool_path)

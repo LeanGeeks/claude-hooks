@@ -785,9 +785,11 @@ class TestNoopBuiltins(unittest.TestCase):
 
     def test_truncate_and_exit_chain_allowed(self):
         """The real-world diagnostic chain: `: > log` to truncate plus `exit 1`
-        bailouts no longer force a prompt."""
+        bailouts no longer force a prompt. The truncate target is anchored in
+        /tmp so the redirect-destination gate (see TestRedirectTargets) is
+        satisfied and only the no-op-builtin reduction is under test here."""
         result = self.validator.validate_bash_command(
-            ': > "$LOG"; echo hi || { echo fail; exit 1; }')
+            ': > /tmp/diag.log; echo hi || { echo fail; exit 1; }')
         self.assertEqual(result["decision"], "allow")
 
     def test_noop_does_not_authorize_following_command(self):
@@ -1157,6 +1159,130 @@ class TestConstantVariableExpansion(unittest.TestCase):
         v = self._validator(["Bash(godot:*)", "Bash(echo:*)"])
         result = v.validate_bash_command("GODOT=/usr/local/bin/godot echo hi\n$GODOT --quit")
         self.assertEqual(result["decision"], "ask")
+
+
+class TestRedirectTargets(unittest.TestCase):
+    """Output redirections are gated by WHERE they write. The parser strips
+    redirect targets before command matching, so an otherwise-allowed command
+    can still carry `> /etc/passwd`; the validator surfaces every write target
+    and forces a prompt on any that escapes the workspace, /tmp, or the
+    write-safe /dev sinks. Unresolvable targets fall back to a lenient
+    literal-prefix anchor (see _literal_prefix_inside_allowed_roots)."""
+
+    WS = "/ws/project"
+
+    def _validator(self, allow=None):
+        return BashPermissionValidator(
+            _FakeLoader(allow or ["Bash(echo:*)", "Bash(grep:*)",
+                                  "Bash(sleep:*)", "Bash(tail:*)", "Bash(cmd:*)"]),
+            BashCommandParser(), workspace_dir=self.WS
+        )
+
+    def _decision(self, command, allow=None):
+        return self._validator(allow).validate_bash_command(command)["decision"]
+
+    # --- targets that should NOT prompt -----------------------------------
+    def test_devnull_redirect_allowed(self):
+        self.assertEqual(self._decision('grep x 2>/dev/null'), "allow")
+
+    def test_dev_sinks_and_fd_allowed(self):
+        for tgt in ('/dev/stdout', '/dev/stderr', '/dev/tty', '/dev/fd/3'):
+            self.assertEqual(self._decision(f'echo hi > {tgt}'), "allow", tgt)
+
+    def test_tmp_redirect_allowed(self):
+        self.assertEqual(self._decision('echo hi > /tmp/out.log'), "allow")
+
+    def test_workspace_absolute_redirect_allowed(self):
+        self.assertEqual(self._decision(f'echo hi > {self.WS}/out.log'), "allow")
+
+    def test_workspace_relative_redirect_allowed(self):
+        self.assertEqual(self._decision('echo hi > out.log'), "allow")
+        self.assertEqual(self._decision('echo hi > sub/dir/out.log'), "allow")
+
+    def test_append_and_stderr_forms_allowed(self):
+        for op in ('>>', '2>', '2>>', '&>', '1>'):
+            self.assertEqual(self._decision(f'echo hi {op} /tmp/x'), "allow", op)
+
+    def test_fd_dup_has_no_target(self):
+        # 2>&1 names no file, so it must not be treated as a write target.
+        self.assertEqual(self._decision('echo hi 2>&1'), "allow")
+
+    def test_input_redirect_is_not_a_write(self):
+        self.assertEqual(self._decision('grep x < /etc/hosts'), "allow")
+
+    def test_lenient_prefix_tmp_with_var_leaf_allowed(self):
+        # The canonical diagnostic loop target: literal /tmp/ root, var leaf.
+        self.assertEqual(self._decision('echo hi > /tmp/jit_$i.txt'), "allow")
+
+    def test_lenient_prefix_workspace_relative_var_allowed(self):
+        self.assertEqual(self._decision('echo hi > run_$i.log'), "allow")
+
+    def test_env_resolvable_var_outside_still_blocked(self):
+        # $HOME expands via the environment, so it resolves — and resolves
+        # outside the workspace/tmp, so it must prompt.
+        self.assertEqual(self._decision('echo hi > $HOME/x'), "ask")
+
+    # --- targets that SHOULD prompt ---------------------------------------
+    def test_outside_root_redirect_prompts(self):
+        d = self._validator().validate_bash_command('echo hi > /etc/passwd')
+        self.assertEqual(d["decision"], "ask")
+        self.assertIn("/etc/passwd", d["reason"])
+
+    def test_anchorless_variable_target_prompts(self):
+        # No literal directory to anchor on -> cannot confirm location.
+        self.assertEqual(self._decision('echo hi > "$LOG"'), "ask")
+        self.assertEqual(self._decision('echo hi > $SP/out.txt'), "ask")
+
+    def test_literal_parent_traversal_prompts(self):
+        self.assertEqual(self._decision('echo hi > /tmp/../etc/$x'), "ask")
+
+    def test_outside_root_with_var_prompts(self):
+        self.assertEqual(self._decision('echo hi > /etc/$x'), "ask")
+
+    def test_redirect_inside_command_substitution_is_caught(self):
+        # A write hidden in $(...) executes too, so its target is gated.
+        d = self._validator().validate_bash_command('echo $(echo hi > /etc/shadow)')
+        self.assertEqual(d["decision"], "ask")
+        self.assertIn("/etc/shadow", d["reason"])
+
+    def test_allowed_command_does_not_excuse_bad_target(self):
+        # `echo` is allowlisted, but the escaping write still forces a prompt.
+        self.assertEqual(self._decision('echo hi > /root/owned'), "ask")
+
+
+class TestMonitorToolHandled(unittest.TestCase):
+    """The pretool hook validates the Monitor tool's command the same way it
+    validates Bash, so a clean Monitor command auto-approves (bypassing Claude
+    Code's coarse built-in cd-redirect heuristic) and an escaping write prompts."""
+
+    def _run(self, payload):
+        """Invoke the hook as a subprocess with a Monitor payload, return the
+        parsed permissionDecision (or None when the hook stays silent)."""
+        hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
+        proc = subprocess.run(
+            [sys.executable, hook], input=json.dumps(payload),
+            capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_WORKSPACE_DIR": "/tmp"},
+        )
+        out = proc.stdout.strip()
+        if not out:
+            return None
+        return json.loads(out)["hookSpecificOutput"].get("permissionDecision")
+
+    def test_monitor_devnull_command_allowed(self):
+        decision = self._run({
+            "tool_name": "Monitor", "cwd": "/tmp",
+            "tool_input": {"description": "wait", "command":
+                           'until grep -q DONE /tmp/x 2>/dev/null; do sleep 3; done'},
+        })
+        self.assertEqual(decision, "allow")
+
+    def test_monitor_escaping_write_asks(self):
+        decision = self._run({
+            "tool_name": "Monitor", "cwd": "/tmp",
+            "tool_input": {"description": "x", "command": 'echo hi > /etc/passwd'},
+        })
+        self.assertEqual(decision, "ask")
 
 
 if __name__ == "__main__":

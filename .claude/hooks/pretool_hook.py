@@ -46,6 +46,12 @@ DEBUG_LOG = os.path.expanduser('~/.claude/bash_hook_debug.log')
 MANUAL_CONFIRM_LOG = os.path.expanduser('~/.claude/bash_manual_confirm.log')
 TMP_ALLOWED_ROOT = '/tmp'
 
+# Output redirections to these pseudo-devices are always safe: they discard or
+# echo output and create no file on disk, so they need no root containment
+# check (and would fail one — none live under the workspace or /tmp). `/dev/fd/N`
+# (handled separately) targets an already-open descriptor, not a new file.
+SAFE_REDIRECT_DEVICES = {'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'}
+
 # Tokens that merely INTRODUCE or WRAP another command and must therefore be
 # transparent to permission checking: the command that follows is the thing that
 # actually runs and must be the thing we validate. Whitelisting any of these as
@@ -444,6 +450,17 @@ class BashPermissionValidator:
             results.append(result)
             debug_log(f"  Sub-command {cmd!r}: allowed={result['allowed']}, denied={result['denied']}")
 
+        # Independently of the per-command allow/deny check, gate where output
+        # redirections WRITE. The parser strips redirect targets before command
+        # matching, so an allowed command can still carry `> /etc/passwd`; this
+        # surfaces every write target and flags any that escapes the workspace,
+        # /tmp, or the write-safe /dev sinks. Recurses into command
+        # substitutions, so a redirect hidden in `$(... > /etc/x)` is caught too.
+        disallowed_targets = _dedupe([
+            target for target, _off in self.parser.extract_write_redirect_targets(command)
+            if not self._is_redirect_target_allowed(target)
+        ])
+
         # Make decision
         any_denied = any(r['denied'] for r in results)
         all_allowed = all(r['allowed'] for r in results)
@@ -453,6 +470,11 @@ class BashPermissionValidator:
             denied_cmds = _dedupe([r['command'] for r in results if r['denied']])
             decision = 'ask'
             reason = "Matches a denied pattern: " + _format_command_list(denied_cmds)
+        elif disallowed_targets:
+            # A redirection writes outside the workspace, /tmp, or /dev/null.
+            decision = 'ask'
+            reason = ("Redirects output outside the workspace, /tmp, or /dev/null — "
+                      "review the write target: " + _format_command_list(disallowed_targets))
         elif all_allowed and len(sub_commands) > 0:
             # ALL allowed → explicitly allow
             decision = 'allow'
@@ -595,6 +617,20 @@ class BashPermissionValidator:
         except Exception:
             return False
 
+    def _allowed_roots(self) -> List[str]:
+        """Realpaths of the roots writes/deletes may touch: workspace and /tmp."""
+        return [
+            os.path.realpath(self.workspace_dir),
+            os.path.realpath(TMP_ALLOWED_ROOT),
+        ]
+
+    def _realpath_inside_allowed_roots(self, resolved: str) -> bool:
+        """True if an already-resolved realpath sits in the workspace or /tmp."""
+        for root in self._allowed_roots():
+            if resolved == root or resolved.startswith(root + os.sep):
+                return True
+        return False
+
     def _is_path_inside_allowed_rm_roots(self, path: str) -> bool:
         """
         Check if a path is allowed for rm operations.
@@ -605,16 +641,66 @@ class BashPermissionValidator:
             resolved = self._resolve_target_path(path)
             if resolved is None:
                 return False
-
-            allowed_roots = [
-                os.path.realpath(self.workspace_dir),
-                os.path.realpath(TMP_ALLOWED_ROOT),
-            ]
-
-            for root in allowed_roots:
-                if resolved == root or resolved.startswith(root + os.sep):
-                    return True
+            return self._realpath_inside_allowed_roots(resolved)
+        except Exception:
             return False
+
+    def _is_redirect_target_allowed(self, target: str) -> bool:
+        """
+        Decide whether an output redirection may write to `target` without a
+        prompt. Allowed: the write-safe /dev sinks (and any `/dev/fd/N`), and
+        anything resolving inside the workspace or /tmp — the same roots that
+        gate `rm` and workspace-binary execution.
+
+        When the target fully resolves (no unexpanded construct), we realpath it
+        and require containment, exactly like `rm`. When it does NOT resolve
+        because of an undefined `$VAR`, a `$(...)`, or a `~user` we cannot expand,
+        we fall back to a lenient literal-prefix check (see _literal_prefix...):
+        the target is still allowed if its literal leading directory roots inside
+        an allowed root and it contains no literal `..`. This keeps frictionless
+        the common diagnostic pattern `> /tmp/jit_$i.txt` (literal `/tmp/` root)
+        while still prompting on a target with no literal anchor (`> "$LOG"`) or
+        one rooted outside (`> /etc/$x`). The residual risk — a variable that
+        itself expands to `../` and escapes — is accepted by design.
+        """
+        if target in SAFE_REDIRECT_DEVICES or target.startswith('/dev/fd/'):
+            return True
+        resolved = self._resolve_target_path(target)
+        if resolved is not None:
+            return self._realpath_inside_allowed_roots(resolved)
+        return self._literal_prefix_inside_allowed_roots(target)
+
+    def _literal_prefix_inside_allowed_roots(self, target: str) -> bool:
+        """
+        Lenient fallback for a redirect target carrying an unexpandable construct
+        (`$VAR`/`$(...)`/backtick/`~user`): allow it only if the LITERAL leading
+        portion — everything before the first such construct — anchors it inside
+        an allowed root.
+
+        Rules, all required:
+          - The literal prefix must be non-empty: a target that begins with the
+            construct (`$LOG`, `$SP/out`) has no anchor and is refused.
+          - No literal `..` path segment anywhere in the target (a literal
+            traversal could climb out of the anchored root).
+          - The literal directory (the prefix's containing dir, or the prefix
+            itself when it ends in `/`) must realpath inside the workspace or
+            /tmp. A relative literal dir is joined onto the workspace first.
+        """
+        # Cut at the first shell construct we could not expand.
+        prefix = re.split(r'[$`]', target, maxsplit=1)[0]
+        if not prefix:
+            return False
+        # A literal parent-dir segment could traverse out of the anchored root.
+        if '..' in prefix.split('/'):
+            return False
+        # The literal directory the write is anchored under.
+        literal_dir = prefix if prefix.endswith('/') else os.path.dirname(prefix)
+        try:
+            if literal_dir.startswith('/'):
+                base = os.path.realpath(literal_dir)
+            else:
+                base = os.path.realpath(os.path.join(self.workspace_dir, literal_dir))
+            return self._realpath_inside_allowed_roots(base)
         except Exception:
             return False
 
@@ -1129,9 +1215,14 @@ def main():
         # Extract session info for correlation
         session_id = input_data.get('session_id', '')
 
-        # Only process Bash tool
-        if tool_name != 'Bash':
-            debug_log(f"Not a Bash tool (got {tool_name!r}), allowing")
+        # Process tools that execute a shell command. Bash is the obvious one;
+        # Monitor is a built-in that runs an until-loop shell command and is
+        # otherwise gated by Claude Code's own coarse heuristic (which, e.g.,
+        # flags any `cd ...; ... > x` as a path-resolution bypass even for
+        # `2>/dev/null`). Both carry the command in tool_input['command'], so the
+        # same validator applies; an `allow` here bypasses that built-in prompt.
+        if tool_name not in ('Bash', 'Monitor'):
+            debug_log(f"Not a command-bearing tool (got {tool_name!r}), allowing")
             sys.exit(0)
 
         # Get command
