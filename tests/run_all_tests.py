@@ -37,6 +37,7 @@ TEST_MODULES = {
     "unit_decision": "test_unit_decision_mapper",
     "unit_state": "test_unit_state_store",
     "unit_whitelist": "test_unit_whitelist",
+    "unit_session_yolo": "test_unit_session_yolo",
     "unit_notification": "test_unit_notification_hook",
     "unit_reply_injector": "test_unit_reply_injector",
     "unit_amux_spawn": "test_unit_amux_spawn",

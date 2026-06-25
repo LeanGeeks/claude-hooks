@@ -161,16 +161,12 @@ def check_decision():
         "stop -> behavior: 'deny' + interrupt: true"
     ))
 
-    # Check 4: Whitelist decision
-    with patch_if_available("permission_request_hook.process_whitelist_update", return_value=True):
-        output = build_output_decision({
-            "action": "whitelist",
-            "updatedPermissions": {"add": ["Bash(test:*)"]}
-        }, make_request())
+    # Check 4: YOLO decision (allow current + flag session for allow-all)
+    with patch_if_available("permission_request_hook.session_yolo_store.enable"):
+        output = build_output_decision({"action": "yolo"}, make_request())
     results.append(pass_fail(
-        output and output["hookSpecificOutput"]["decision"]["behavior"] == "allow" and
-        "updatedPermissions" in output["hookSpecificOutput"]["decision"],
-        "whitelist -> behavior: 'allow' + updatedPermissions"
+        output and output["hookSpecificOutput"]["decision"]["behavior"] == "allow",
+        "yolo -> behavior: 'allow' + enables session allow-all"
     ))
 
     # Check 5: Reply decision

@@ -54,12 +54,12 @@ from telegram_permission_router import (
     load_telegram_config,
     send_permission_message,
     send_question_message,
-    process_whitelist_update,
     wait_for_relay_answer,
     relay_answer_to_decision,
     remove_inline_buttons,
     set_message_reaction,
 )
+import session_yolo_store
 
 # Debug logging
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
@@ -200,22 +200,19 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
             }
         }
 
-    elif action == 'whitelist':
-        # Process whitelist update
-        success = process_whitelist_update(request, decision)
-        if success:
-            debug_log(f"Whitelist update successful for {request.request_id}")
-        else:
-            debug_log(f"Whitelist update failed for {request.request_id}")
-
-        # Build whitelist with updated permissions
-        updated_perms = decision.get('updatedPermissions', {})
+    elif action == 'yolo':
+        # Allow this request AND flag the session so every subsequent request
+        # auto-allows without prompting (consulted at the top of main()). The
+        # flag is keyed by session_id, which lives on the request — the relay
+        # has no session concept, so this can only happen here in the hook.
+        if request is not None:
+            session_yolo_store.enable(request.session_id)
+            debug_log(f"YOLO enabled for session {request.session_id}")
         return {
             'hookSpecificOutput': {
                 'hookEventName': 'PermissionRequest',
                 'decision': {
-                    'behavior': 'allow',
-                    'updatedPermissions': updated_perms
+                    'behavior': 'allow'
                 }
             }
         }
@@ -325,7 +322,7 @@ _ACTION_TO_STATE = {
     "allow": RequestState.ALLOW,
     "deny": RequestState.DENY,
     "stop": RequestState.STOP,
-    "whitelist": RequestState.WHITELIST,
+    "yolo": RequestState.ALLOW,  # YOLO resolves this request as a plain allow
     "reply": RequestState.REPLY,
 }
 
@@ -595,6 +592,7 @@ def main():
 
         # Cleanup expired requests periodically
         cleanup_expired_requests()
+        session_yolo_store.prune()
 
         # Read hook input from stdin
         raw_input = sys.stdin.read()
@@ -650,6 +648,26 @@ def main():
             ttl_seconds=REQUEST_TTL,
         )
         debug_log(f"Created request: {request.request_id}")
+
+        # YOLO mode: the operator previously tapped YOLO for this session, so
+        # auto-allow without sending a Telegram message or prompting. Recorded as
+        # a normal ALLOW (resolution source telegram, since it stems from the
+        # earlier button tap) for the audit trail.
+        if session_yolo_store.is_enabled(session_id):
+            debug_log(f"Session {session_id} in YOLO mode; auto-allowing {request.request_id}")
+            update_request_state(
+                request.request_id,
+                RequestState.ALLOW,
+                decision={"action": "yolo"},
+                resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+            )
+            print(json.dumps({
+                'hookSpecificOutput': {
+                    'hookEventName': 'PermissionRequest',
+                    'decision': {'behavior': 'allow'},
+                }
+            }), flush=True)
+            sys.exit(0)
 
         # Get session/workspace info for message
         workspace_name = get_workspace_name(cwd)

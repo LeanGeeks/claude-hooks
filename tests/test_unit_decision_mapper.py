@@ -6,7 +6,7 @@ Tests the decision mapping logic:
 - allow -> behavior: "allow"
 - deny -> behavior: "deny"
 - stop -> behavior: "deny" + interrupt: true
-- whitelist -> behavior: "allow" + updatedPermissions
+- yolo -> behavior: "allow" + enables session allow-all
 - reply -> behavior: "deny" + message (text reply from user)
 - timeout fallback -> None (falls back to terminal prompt)
 """
@@ -81,40 +81,19 @@ class TestDecisionMapper(unittest.TestCase):
         self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
         self.assertTrue(output["hookSpecificOutput"]["decision"]["interrupt"])
 
-    def test_whitelist_decision_with_suggestions(self):
-        """Test whitelist action with permission suggestions."""
-        request = self.create_mock_request(suggestions=["Bash(test:*)"])
-        decision = {
-            "action": "whitelist",
-            "updatedPermissions": {"add": ["Bash(test:*)"]}
-        }
+    def test_yolo_decision_allows_and_enables_session(self):
+        """Test yolo action allows the current request and flags the session."""
+        request = self.create_mock_request()
+        decision = {"action": "yolo"}
 
-        with patch("permission_request_hook.process_whitelist_update") as mock_whitelist:
-            mock_whitelist.return_value = True
+        with patch("permission_request_hook.session_yolo_store.enable") as mock_enable:
             output = build_output_decision(decision, request)
 
         self.assertIsNotNone(output)
         self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "allow")
-        self.assertIn("updatedPermissions", output["hookSpecificOutput"]["decision"])
-        self.assertEqual(
-            output["hookSpecificOutput"]["decision"]["updatedPermissions"]["add"],
-            ["Bash(test:*)"]
-        )
-
-    def test_whitelist_decision_no_suggestions(self):
-        """Test whitelist action without suggestions."""
-        request = self.create_mock_request(suggestions=[])
-        decision = {
-            "action": "whitelist",
-            "updatedPermissions": {"add": ["Bash(test_cmd:*)"]}
-        }
-
-        with patch("permission_request_hook.process_whitelist_update") as mock_whitelist:
-            mock_whitelist.return_value = True
-            output = build_output_decision(decision, request)
-
-        self.assertIsNotNone(output)
-        self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "allow")
+        self.assertNotIn("interrupt", output["hookSpecificOutput"]["decision"])
+        # The session flag must be set, keyed by the request's session_id.
+        mock_enable.assert_called_once_with("test-session")
 
     def test_reply_decision(self):
         """Test reply action returns deny with reason."""
@@ -202,7 +181,7 @@ class TestDecisionActionValidation(unittest.TestCase):
 
     def test_valid_actions(self):
         """Test all valid action types."""
-        valid_actions = ["allow", "deny", "stop", "whitelist", "reply"]
+        valid_actions = ["allow", "deny", "stop", "yolo", "reply"]
         request = PermissionRequest(
             request_id="validation-test",
             session_id="test-session",
@@ -218,18 +197,13 @@ class TestDecisionActionValidation(unittest.TestCase):
 
         for action in valid_actions:
             decision = {"action": action}
-            if action == "whitelist":
-                decision["updatedPermissions"] = {"add": ["Bash(test:*)"]}
-            elif action == "reply":
+            if action == "reply":
                 decision["reply_text"] = "test"
 
-            with patch("permission_request_hook.process_whitelist_update", return_value=True):
+            with patch("permission_request_hook.session_yolo_store.enable"):
                 output = build_output_decision(decision, request)
 
             # All valid actions should produce output (not None)
-            if action == "whitelist":
-                with patch("permission_request_hook.process_whitelist_update", return_value=True):
-                    output = build_output_decision(decision, request)
             self.assertIsNotNone(output, f"Action '{action}' should produce output")
 
 

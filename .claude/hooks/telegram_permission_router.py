@@ -199,7 +199,7 @@ _PERMISSION_ACTIONS: list[list[dict[str, str]]] = [
     ],
     [
         {"label": "Stop", "value": "stop"},
-        {"label": "Whitelist", "value": "whitelist"},
+        {"label": "YOLO", "value": "yolo"},
     ],
 ]
 
@@ -738,7 +738,7 @@ def relay_answer_to_decision(
 ) -> Optional[Dict[str, Any]]:
     """Translate a relay answer payload into a hook decision dict.
 
-    Permission answers (allow/deny/stop/whitelist) arrive as button taps with
+    Permission answers (allow/deny/stop/yolo) arrive as button taps with
     ``value`` set by ``_PERMISSION_ACTIONS``. AskUserQuestion answers arrive
     either as a button tap (``value`` = ``qa<N>``) or a free-text reply.
     """
@@ -758,18 +758,10 @@ def relay_answer_to_decision(
         return {"action": "reply", "reply_text": ", ".join(labels)}
     if via == "button":
         value = answer.get("value")
-        if value in ("allow", "deny", "stop"):
+        if value in ("allow", "deny", "stop", "yolo"):
+            # ``yolo`` allows the current request *and* flags the session for
+            # allow-all (applied in build_output_decision, which has session_id).
             return {"action": value}
-        if value == "whitelist":
-            perms = list(request.permission_suggestions)
-            # Add session-scoped duplicates so the rule takes effect immediately
-            # without waiting for the settings file to be re-read.
-            session_perms = [
-                dict(p, destination="session")
-                for p in perms
-                if isinstance(p, dict) and p.get("destination") != "session"
-            ]
-            return {"action": "whitelist", "updatedPermissions": perms + session_perms}
         if isinstance(value, str) and value.startswith("qa") and value[2:].isdigit():
             options = (request.tool_input or {}).get("options", [])
             idx = int(value[2:])

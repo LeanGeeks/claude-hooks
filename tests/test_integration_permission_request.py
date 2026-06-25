@@ -66,19 +66,12 @@ class TestBuildOutputDecision(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
         self.assertTrue(out["hookSpecificOutput"]["decision"]["interrupt"])
 
-    def test_whitelist(self):
-        req = _make_request(
-            tool_input={"command": "custom_cmd"},
-            permission_suggestions=["Bash(custom_cmd:*)"],
-        )
-        decision = {
-            "action": "whitelist",
-            "updatedPermissions": ["Bash(custom_cmd:*)"],
-        }
-        with patch("permission_request_hook.process_whitelist_update", return_value=True):
-            out = build_output_decision(decision, req)
+    def test_yolo(self):
+        req = _make_request()
+        with patch("permission_request_hook.session_yolo_store.enable") as mock_enable:
+            out = build_output_decision({"action": "yolo"}, req)
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "allow")
-        self.assertIn("updatedPermissions", out["hookSpecificOutput"]["decision"])
+        mock_enable.assert_called_once_with(req.session_id)
 
     def test_reply(self):
         out = build_output_decision(
@@ -223,9 +216,9 @@ class TestRouting(unittest.TestCase):
         fake_client.send_message.assert_called_once()
         kwargs = fake_client.send_message.call_args.kwargs
         self.assertEqual(kwargs["kind"], "permission")
-        # Keyboard contains allow/deny/stop/whitelist by ``value``.
+        # Keyboard contains allow/deny/stop/yolo by ``value``.
         values = [btn["value"] for row in kwargs["keyboard"] for btn in row]
-        self.assertEqual(set(values), {"allow", "deny", "stop", "whitelist"})
+        self.assertEqual(set(values), {"allow", "deny", "stop", "yolo"})
 
     def test_remove_inline_buttons_cancels_relay_message(self):
         import telegram_permission_router as tpr
@@ -245,6 +238,15 @@ class TestRouting(unittest.TestCase):
             {"via": "button", "value": "allow", "label": "Allow", "option_idx": 0},
         )
         self.assertEqual(decision, {"action": "allow"})
+
+    def test_relay_answer_to_decision_button_yolo(self):
+        import telegram_permission_router as tpr
+
+        decision = tpr.relay_answer_to_decision(
+            _make_request(),
+            {"via": "button", "value": "yolo", "label": "YOLO", "option_idx": 3},
+        )
+        self.assertEqual(decision, {"action": "yolo"})
 
     def test_relay_answer_to_decision_freetext(self):
         import telegram_permission_router as tpr

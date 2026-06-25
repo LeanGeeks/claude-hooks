@@ -10,7 +10,7 @@
 # Test Cases:
 #   all        - Show all test instructions
 #   telegram   - Telegram notification tests
-#   buttons    - Button action tests (allow/deny/stop/whitelist/reply)
+#   buttons    - Button action tests (allow/deny/stop/yolo/reply)
 #   timeout    - Timeout/fallback behavior test
 #   logs       - Log verification commands
 #
@@ -66,7 +66,7 @@ test_telegram() {
     show_command "Claude, please run: some_unknown_command_xyz --test"
     show_expected "1. After 15 seconds, a Telegram message should arrive"
     show_expected "2. Message should contain the command and action buttons"
-    show_expected "3. Buttons: Allow, Deny, Stop, Whitelist"
+    show_expected "3. Buttons: Allow, Deny, Stop, YOLO"
     echo ""
 
     echo "Test 2: Denied Command Triggers Telegram"
@@ -111,13 +111,13 @@ test_buttons() {
     show_expected "3. Audit log should show 'stop' action"
     echo ""
 
-    echo "Test 6: Whitelist Button"
-    echo "------------------------"
-    show_instruction "Click the 'Whitelist' button on a Telegram permission request"
+    echo "Test 6: YOLO Button"
+    echo "-------------------"
+    show_instruction "Click the 'YOLO' button on a Telegram permission request"
     show_expected "1. Claude should execute the command"
-    show_expected "2. A new permission pattern should be added to settings.local.json"
-    show_expected "3. Future similar commands should be auto-allowed"
-    show_command "Check: cat .claude/settings.local.json"
+    show_expected "2. Every subsequent permission request from the SAME session is auto-allowed (no Telegram message)"
+    show_expected "3. A different session still prompts as normal"
+    show_command "Check: cat ~/.claude/session_yolo.json"
     echo ""
 
     echo "Test 7: Text Reply"
