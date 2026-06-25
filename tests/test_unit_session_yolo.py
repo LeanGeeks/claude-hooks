@@ -48,6 +48,32 @@ class TestSessionYoloStore(unittest.TestCase):
         # Distinct session is unaffected (per-session scope).
         self.assertFalse(self.store.is_enabled("sess-b"))
 
+    def test_disable_clears_flag(self):
+        self.store.enable("sess-a")
+        self.store.enable("sess-b")
+        self.store.disable("sess-a")
+        self.assertFalse(self.store.is_enabled("sess-a"))
+        self.assertTrue(self.store.is_enabled("sess-b"))
+        # Disabling an absent session is a harmless no-op.
+        self.store.disable("never-enabled")
+
+    def test_cli_enable_status_disable(self):
+        self.assertEqual(self.store._main(["status", "sess-a"]), 0)
+        self.assertEqual(self.store._main(["enable", "sess-a"]), 0)
+        self.assertTrue(self.store.is_enabled("sess-a"))
+        self.assertEqual(self.store._main(["disable", "sess-a"]), 0)
+        self.assertFalse(self.store.is_enabled("sess-a"))
+
+    def test_cli_rejects_unsubstituted_template(self):
+        # If ${CLAUDE_SESSION_ID} wasn't substituted, fail loudly and write nothing.
+        self.assertEqual(self.store._main(["enable", "${CLAUDE_SESSION_ID}"]), 1)
+        self.assertEqual(self.store._main(["enable", ""]), 1)
+        self.assertFalse(Path(self.tmp.name).exists())
+
+    def test_cli_bad_usage(self):
+        self.assertEqual(self.store._main(["frobnicate", "x"]), 2)
+        self.assertEqual(self.store._main(["enable"]), 2)
+
     def test_empty_session_id_is_noop(self):
         self.store.enable("")
         self.assertFalse(self.store.is_enabled(""))
@@ -81,9 +107,14 @@ class TestSessionYoloStore(unittest.TestCase):
         self.assertTrue(self.store.is_enabled("fresh-sess"))
 
     def test_concurrent_enable_no_clobber(self):
-        ids = [f"sess-{i}" for i in range(20)]
+        # Barrier-synchronized start maximizes contention so a read-modify-write
+        # race (e.g. flushing the write after releasing the lock) is caught
+        # deterministically rather than only under incidental load.
+        ids = [f"sess-{i}" for i in range(40)]
+        barrier = threading.Barrier(len(ids))
 
         def worker(sid):
+            barrier.wait()
             self.store.enable(sid)
 
         threads = [threading.Thread(target=worker, args=(sid,)) for sid in ids]

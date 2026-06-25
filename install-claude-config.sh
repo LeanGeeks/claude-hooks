@@ -15,10 +15,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_HOOKS_DIR=".claude/hooks"
 PROJECT_BIN_DIR=".claude/bin"
 PROJECT_STATUSLINE_DIR=".claude/statusline"
+PROJECT_COMMANDS_DIR=".claude/commands"
 PROJECT_CONFIG=".claude/settings.json"
 PROJECT_RELAY_DIR="$SCRIPT_DIR/relay-server"
 GLOBAL_HOOKS_DIR="$HOME/.claude/hooks"
 GLOBAL_STATUSLINE_DIR="$HOME/.claude/statusline"
+GLOBAL_COMMANDS_DIR="$HOME/.claude/commands"
 GLOBAL_CONFIG="$HOME/.claude/settings.json"
 BACKUP_DIR="$HOME/.claude/backups"
 
@@ -254,6 +256,21 @@ else
 
         STATUSLINE_INSTALLED=true
     fi
+fi
+
+# Install global slash commands (e.g. /yolo, /yolo-off). These are user-global
+# markdown commands; they call the installed session_yolo_store.py CLI with the
+# current ${CLAUDE_SESSION_ID} to toggle per-session YOLO mode.
+COMMANDS_INSTALLED=false
+if [[ -d "$PROJECT_COMMANDS_DIR" ]]; then
+    mkdir -p "$GLOBAL_COMMANDS_DIR"
+    shopt -s nullglob
+    for cmd in "$PROJECT_COMMANDS_DIR"/*.md; do
+        cp "$cmd" "$GLOBAL_COMMANDS_DIR/"
+        log_info "Installed: $(basename "$cmd") → $GLOBAL_COMMANDS_DIR/$(basename "$cmd")"
+        COMMANDS_INSTALLED=true
+    done
+    shopt -u nullglob
 fi
 
 # =============================================================================
@@ -670,6 +687,11 @@ if [[ "$STATUSLINE_INSTALLED" == true ]]; then
     echo "  - statusLine: installed and configured ($GLOBAL_STATUSLINE_DIR/statusline.py)"
 else
     echo "  - statusLine: not installed (missing statusline.py)"
+fi
+
+# Show slash-command status
+if [[ "$COMMANDS_INSTALLED" == true ]]; then
+    echo "  - slash commands: installed ($GLOBAL_COMMANDS_DIR/) — /yolo, /yolo-off"
 fi
 
 # Show amux-spawn status
