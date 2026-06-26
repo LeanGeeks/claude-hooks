@@ -506,6 +506,9 @@ class TestPrefixReduction(unittest.TestCase):
             "env -S node app.js": "node app.js",              # -S operand is a command, NOT dropped
             "timeout -s TERM 5 curl http://x": "curl http://x",  # -s eats SIG, then duration
             "timeout -k 1 5 curl http://x": "curl http://x",     # -k eats DUR, then duration
+            "timeout 0.5m curl http://x": "curl http://x",       # fractional duration w/ unit
+            "timeout rm -rf /etc": "rm -rf /etc",   # `rm` is not a duration -> stays the command
+            "timeout reboot": "reboot",             # not a duration -> validated, not peeled away
             "time timeout 5 curl http://x": "curl http://x",  # nested
             "/usr/bin/env curl http://x": "curl http://x",    # path-qualified wrapper
             "command node app.js": "node app.js",             # `command` exec form
@@ -545,6 +548,15 @@ class TestPrefixReduction(unittest.TestCase):
     def test_timeout_wrapper_allows_real_allowed_command(self):
         result = self.validator.validate_bash_command("timeout 5 curl http://localhost/x")
         self.assertEqual(result["decision"], "allow")
+
+    def test_timeout_without_duration_does_not_bypass(self):
+        """`timeout reboot` has no duration operand — `reboot` must NOT be peeled
+        away as the duration (which would reduce to nothing and auto-allow). It
+        stays the command head and is validated (not whitelisted -> ask)."""
+        self.assertEqual(
+            self.validator.validate_bash_command("timeout reboot")["decision"], "ask")
+        self.assertEqual(
+            self.validator.validate_bash_command("timeout rm -rf /etc")["decision"], "ask")
 
     def test_command_lookup_is_auto_allowed(self):
         """`command -v X` is a lookup (like which/type), not an execution of X,

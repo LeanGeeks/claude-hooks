@@ -116,6 +116,20 @@ WRAPPER_ARG_FLAGS = {
     'timeout': {'-s', '--signal', '-k', '--kill-after'},
 }
 
+# A pattern the wrapper's leading POSITIONAL operand must match before we skip it
+# (see WRAPPER_PREFIXES counts). Without this, the skip is blind: `timeout
+# reboot` treats `reboot` as the duration, peels it, and reduces to nothing —
+# auto-allowing `reboot`. A real `timeout` duration is unambiguous: an
+# optionally-fractional number with an optional unit suffix (`5`, `5s`, `0.5m`,
+# `10h`, `2d`). When the operand does NOT match, it is the command itself, so we
+# stop peeling and validate it (`timeout rm -rf /` keeps `rm` as the head).
+# `flock` has no entry: its positional is a lockfile/fd that is not reliably
+# distinguishable from a command name, and its residual mis-peel is not
+# exploitable (a bare `flock reboot` has no command operand, so nothing runs).
+WRAPPER_POSITIONAL_PATTERNS = {
+    'timeout': re.compile(r'^[0-9]+(\.[0-9]+)?[smhd]?$'),
+}
+
 # Flags that switch the `command` builtin from exec mode to lookup mode. With any
 # of these present, `command` behaves like `which`/`type` — it prints where NAME
 # would resolve and runs nothing — so the operand must NOT be validated as if it
@@ -982,10 +996,18 @@ class BashPermissionValidator:
                     if (flag in arg_flags and tokens
                             and not tokens[0].startswith('-')):
                         tokens = tokens[1:]
-                # Skip the wrapper's fixed leading positional args (e.g. duration).
+                # Skip the wrapper's fixed leading positional args (e.g. the
+                # duration for `timeout`). When a pattern is defined for this
+                # wrapper, only skip an operand that matches it — otherwise the
+                # operand is the command itself and must be validated, not peeled
+                # (`timeout rm ...` / `timeout reboot`, not a duration).
+                pos_pattern = WRAPPER_POSITIONAL_PATTERNS.get(name)
                 for _ in range(positional):
-                    if tokens and not tokens[0].startswith('-'):
-                        tokens = tokens[1:]
+                    if not tokens or tokens[0].startswith('-'):
+                        break
+                    if pos_pattern is not None and not pos_pattern.match(tokens[0]):
+                        break
+                    tokens = tokens[1:]
                 continue
 
             break
