@@ -497,6 +497,15 @@ class TestPrefixReduction(unittest.TestCase):
             "PORT=3100 pnpm start -p 3100": "pnpm start -p 3100",  # leading env assignment
             "FOO=bar BAZ=qux node app.js": "node app.js",          # multiple env assignments
             "env FOO=bar node app.js": "node app.js",
+            "env -u DATABASE_URL pnpm exec next build": "pnpm exec next build",  # -u eats its operand
+            "env -u FOO -u BAR node app.js": "node app.js",   # repeated arg-flag
+            "env -i -u FOO node app.js": "node app.js",       # -i takes no arg, -u does
+            "env -uFOO node app.js": "node app.js",           # glued short form (self-contained)
+            "env --unset=FOO node app.js": "node app.js",     # glued long form
+            "env -u FOO -C /tmp node app.js": "node app.js",  # -C also eats its operand
+            "env -S node app.js": "node app.js",              # -S operand is a command, NOT dropped
+            "timeout -s TERM 5 curl http://x": "curl http://x",  # -s eats SIG, then duration
+            "timeout -k 1 5 curl http://x": "curl http://x",     # -k eats DUR, then duration
             "time timeout 5 curl http://x": "curl http://x",  # nested
             "/usr/bin/env curl http://x": "curl http://x",    # path-qualified wrapper
             "command node app.js": "node app.js",             # `command` exec form
@@ -573,6 +582,27 @@ class TestPrefixReduction(unittest.TestCase):
         """A leading env assignment must not auto-allow a non-whitelisted command:
         `FOO=bar rm -rf /etc` reduces to `rm` (not whitelisted outside workspace)."""
         result = self.validator.validate_bash_command("FOO=bar rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_env_unset_flag_does_not_strand_operand(self):
+        """`env -u DATABASE_URL pnpm ...` must reduce to the real `pnpm` command,
+        not validate a phantom command named `DATABASE_URL`. The `-u` flag eats
+        its operand."""
+        result = self.validator.validate_bash_command(
+            "env -u DATABASE_URL pnpm exec next build")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_env_unset_flag_still_validates_real_command(self):
+        """The arg-flag peel must not become a bypass: `env -u FOO rm -rf /etc`
+        still reduces to `rm` (not whitelisted outside the workspace)."""
+        result = self.validator.validate_bash_command("env -u FOO rm -rf /etc")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_env_split_string_operand_is_not_dropped(self):
+        """`env -S`'s operand is a command string, NOT droppable data. It must
+        stay on the validation path so a bare `env -S "reboot"` prompts instead
+        of being reduced to nothing and auto-allowed."""
+        result = self.validator.validate_bash_command('env -S "reboot"')
         self.assertEqual(result["decision"], "ask")
 
     def test_env_prefixed_backgrounded_server_loop_allowed(self):
@@ -1225,6 +1255,22 @@ class TestRedirectTargets(unittest.TestCase):
 
     def test_lenient_prefix_workspace_relative_var_allowed(self):
         self.assertEqual(self._decision('echo hi > run_$i.log'), "allow")
+
+    def test_constant_assignment_resolves_redirect_target(self):
+        # A constant assigned earlier in the same compound command resolves the
+        # `$VAR` write target the same way command matching resolves it, so the
+        # common scratch-log pattern auto-allows instead of prompting.
+        self.assertEqual(
+            self._decision('SP=/tmp/scratch\necho hi > "$SP/out.txt"'), "allow")
+        self.assertEqual(
+            self._decision(f'D={self.WS}/logs\necho hi > "$D/run.log"'), "allow")
+
+    def test_constant_assignment_outside_root_still_prompts(self):
+        # Expansion only reveals the literal; the containment check still applies,
+        # and the prompt now shows the resolved path.
+        d = self._validator().validate_bash_command('OUT=/etc\necho hi > "$OUT/x"')
+        self.assertEqual(d["decision"], "ask")
+        self.assertIn("/etc/x", d["reason"])
 
     def test_env_resolvable_var_outside_still_blocked(self):
         # $HOME expands via the environment, so it resolves — and resolves

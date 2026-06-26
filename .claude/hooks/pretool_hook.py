@@ -95,6 +95,27 @@ WRAPPER_PREFIXES = {
     'flock': 1,    # leading <lockfile|fd>
 }
 
+# Per-wrapper short/long flags that consume a SEPARATE following argument whose
+# value is DATA (a var name, directory, signal, duration) — never a command.
+# When peeling a wrapper's own flags we must drop that operand too, otherwise it
+# is mistaken for the command name: `env -u DATABASE_URL pnpm ...` would
+# otherwise reduce to `DATABASE_URL pnpm ...` and be validated as a command
+# named `DATABASE_URL`, which matches nothing and forces a needless prompt. Only
+# the SEPARATED form (`-u NAME`) needs this entry — the glued forms (`-uNAME`,
+# `--unset=NAME`) are already self-contained single tokens stripped by the plain
+# flag skip. `env -i`/`timeout --foreground` and friends take no argument and so
+# are deliberately absent.
+#
+# DELIBERATELY EXCLUDED: `env -S`/`--split-string`, whose operand is itself a
+# command string to run. Dropping it as opaque data would hide that command from
+# validation — `env -S "reboot"` would reduce to nothing and auto-allow. Left
+# out of this map, `-S` is treated as a plain flag and the operand stays as the
+# command head, so it is validated (and prompts) instead of being bypassed.
+WRAPPER_ARG_FLAGS = {
+    'env': {'-u', '--unset', '-C', '--chdir'},
+    'timeout': {'-s', '--signal', '-k', '--kill-after'},
+}
+
 # Flags that switch the `command` builtin from exec mode to lookup mode. With any
 # of these present, `command` behaves like `which`/`type` — it prints where NAME
 # would resolve and runs nothing — so the operand must NOT be validated as if it
@@ -466,10 +487,20 @@ class BashPermissionValidator:
         # surfaces every write target and flags any that escapes the workspace,
         # /tmp, or the write-safe /dev sinks. Recurses into command
         # substitutions, so a redirect hidden in `$(... > /etc/x)` is caught too.
-        disallowed_targets = _dedupe([
-            target for target, _off in self.parser.extract_write_redirect_targets(command)
-            if not self._is_redirect_target_allowed(target)
-        ])
+        #
+        # First resolve constant-like `$VAR` references the same way command
+        # matching does, so the common `SP=/tmp/x; cmd > "$SP/out"` pattern is
+        # vouched for by its literal value instead of prompting on an
+        # unexpandable `$SP/out`. Expansion only ever REVEALS a literal the user
+        # already wrote, and the containment check still applies to the result,
+        # so a constant pointing outside the allowed roots (`OUT=/etc`) stays
+        # refused — and is now shown resolved in the prompt.
+        disallowed_targets = []
+        for target, off in self.parser.extract_write_redirect_targets(command):
+            expanded = self._expand_constants(target, const_assignments, off)
+            if not self._is_redirect_target_allowed(expanded):
+                disallowed_targets.append(expanded)
+        disallowed_targets = _dedupe(disallowed_targets)
 
         # Make decision
         any_denied = any(r['denied'] for r in results)
@@ -939,11 +970,18 @@ class BashPermissionValidator:
 
             if name in WRAPPER_PREFIXES:
                 positional = WRAPPER_PREFIXES[name]
+                arg_flags = WRAPPER_ARG_FLAGS.get(name, frozenset())
                 tokens = tokens[1:]
-                # Skip the wrapper's own flags and KEY=VALUE assignments.
+                # Skip the wrapper's own flags and KEY=VALUE assignments. A flag
+                # that takes a SEPARATE argument (e.g. `env -u NAME`) also eats
+                # the next token, so it is not mistaken for the command name.
                 while tokens and (tokens[0].startswith('-')
                                   or BashCommandParser._is_env_prefix(tokens[0])):
+                    flag = tokens[0]
                     tokens = tokens[1:]
+                    if (flag in arg_flags and tokens
+                            and not tokens[0].startswith('-')):
+                        tokens = tokens[1:]
                 # Skip the wrapper's fixed leading positional args (e.g. duration).
                 for _ in range(positional):
                     if tokens and not tokens[0].startswith('-'):
