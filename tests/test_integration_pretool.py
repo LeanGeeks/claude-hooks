@@ -1210,6 +1210,15 @@ class TestRedirectTargets(unittest.TestCase):
     def test_input_redirect_is_not_a_write(self):
         self.assertEqual(self._decision('grep x < /etc/hosts'), "allow")
 
+    def test_net_pseudo_path_redirect_allowed(self):
+        # Bash /dev/tcp|udp pseudo-paths open a socket, not a file, and are
+        # allowed by explicit opt-in (any host) — including the port-probe form
+        # whose target carries a clinging subshell `)`.
+        self.assertEqual(self._decision('echo probe > /dev/tcp/localhost/5432'), "allow")
+        self.assertEqual(self._decision('echo probe > /dev/udp/8.8.8.8/53'), "allow")
+        self.assertEqual(
+            self._decision('(exec 3<>/dev/tcp/localhost/5432) 2>/dev/null'), "allow")
+
     def test_lenient_prefix_tmp_with_var_leaf_allowed(self):
         # The canonical diagnostic loop target: literal /tmp/ root, var leaf.
         self.assertEqual(self._decision('echo hi > /tmp/jit_$i.txt'), "allow")
