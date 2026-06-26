@@ -23,20 +23,21 @@ class BashCommandParser:
     OPERATORS = ['&&', '||', '|', ';']
 
     # Redirection operators (NOT command separators)
-    REDIRECTIONS = ['>', '>>', '<', '<<', '2>&1', '2>', '&>', '&>>', '1>&2', '2>>', '1>', '<&', '>&']
+    REDIRECTIONS = ['>', '>>', '<', '<>', '<<', '2>&1', '2>', '&>', '&>>', '1>&2', '2>>', '1>', '<&', '>&']
 
     # Redirections that take an argument (file/fd)
-    REDIRECTIONS_WITH_ARG = ['>', '>>', '<', '<<', '2>', '&>', '&>>', '2>>', '1>']
+    REDIRECTIONS_WITH_ARG = ['>', '>>', '<', '<>', '<<', '2>', '&>', '&>>', '2>>', '1>']
 
     # Redirections that don't take an argument
     REDIRECTIONS_NO_ARG = ['2>&1', '1>&2', '<&', '>&']
 
     # Redirections that WRITE to their path operand (create/truncate/append, or
-    # point stdout/stderr at a file). Reads (`<`, `<<`) are excluded: they
+    # point stdout/stderr at a file). Pure reads (`<`, `<<`) are excluded: they
     # consume an existing file, they neither create nor overwrite one, so their
-    # target needs no write-destination gating. The fd-dup forms in
+    # target needs no write-destination gating. `<>` opens for read AND write
+    # and CREATES the file when absent, so it IS a write. The fd-dup forms in
     # REDIRECTIONS_NO_ARG carry no path and so are absent here too.
-    WRITE_REDIRECTIONS_WITH_ARG = ['>', '>>', '2>', '&>', '&>>', '2>>', '1>']
+    WRITE_REDIRECTIONS_WITH_ARG = ['>', '>>', '<>', '2>', '&>', '&>>', '2>>', '1>']
 
     def __init__(self):
         """Initialize parser"""
@@ -465,6 +466,32 @@ class BashCommandParser:
                     i = j
                     continue
 
+            # File-descriptor prefix on a redirection: a digit run glued with
+            # no space to a redirect operator (`2>`, `3<>`, `4>>`) names the fd
+            # bash should redirect. Only fires at a token boundary (nothing
+            # buffered) so `foo3>bar` keeps `foo3` as a word, matching bash. The
+            # fd number is irrelevant for allowlisting, so we drop it and emit
+            # the bare operator — which also stops the digit from leaking out as
+            # a phantom command word (the bug that mis-parsed `exec 3<>/dev/...`
+            # into a `3 /dev/... 2` non-command).
+            #
+            # Skipped when the digit already begins a recognized fused operator
+            # (`2>&1`, `2>>`, `1>`): the normal operator check below handles
+            # those whole. Skipped for the heredoc (`n<<`) and fd-dup (`n>&m`,
+            # `n<&m`) forms, whose trailing fd/delimiter is not a path operand —
+            # they keep their existing handling.
+            if (char.isdigit() and not current and not in_conditional
+                    and not self._check_operator(command, i)):
+                j = i
+                while j < len(command) and command[j].isdigit():
+                    j += 1
+                fd_op = self._check_operator(command, j) if j < len(command) else ''
+                if (fd_op and fd_op != '<<' and self._is_redirect(fd_op)
+                        and fd_op not in self.REDIRECTIONS_NO_ARG):
+                    tokens.append(('REDIRECT', fd_op, i))
+                    i = j + len(fd_op)
+                    continue
+
             # Check for operators (only when not quoted). Inside a `[[ ]]`
             # conditional, &&/||/|/<>/ are expression operators, not command
             # separators, so they fall through to ordinary word content. The
@@ -533,7 +560,7 @@ class BashCommandParser:
             Operator string if found, empty string otherwise
         """
         # Check multi-character operators first (longest match)
-        for op in ['&&', '||', '2>&1', '>>', '&>>', '2>>', '<<', '1>&2', '>&', '<&', '1>']:
+        for op in ['&&', '||', '2>&1', '>>', '&>>', '2>>', '<<', '<>', '1>&2', '>&', '<&', '1>']:
             if command[pos:pos+len(op)] == op:
                 return op
 
@@ -956,6 +983,18 @@ if __name__ == '__main__':
         ('echo "$(basename $f) ${v:0:14}"', ['echo "$(basename $f) ${v:0:14}"']),
         # Same hazard for process substitution <( ... ).
         ('diff <(grep -oE "a)b" x) y', ["diff y", 'grep -oE "a)b" x']),
+        # fd-prefixed redirections: the fd digit must not leak as a phantom
+        # command word, and `<>` must stay one operator (not split into < >).
+        # The real-world failing case: a /dev/tcp port probe in a subshell.
+        ('(exec 3<>/dev/tcp/localhost/5432) 2>/dev/null && echo OPEN',
+         ["exec", "echo OPEN"]),
+        ('grep -i DATABASE_URL .env 2>/dev/null', ["grep -i DATABASE_URL .env"]),
+        ('cat file 3>out.txt', ["cat file"]),
+        ('cmd 2>>log.txt', ["cmd"]),
+        # A digit with a space before the redirect is a plain argument, and a
+        # digit glued to a word stays part of that word (bash semantics).
+        ('echo 3 > out.txt', ["echo 3"]),
+        ('echo foo3>out.txt', ["echo foo3"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")
