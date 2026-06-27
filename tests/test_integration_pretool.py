@@ -637,6 +637,58 @@ class TestPrefixReduction(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
 
 
+class TestBuiltinAliasNormalization(unittest.TestCase):
+    """The `.` builtin is bash's shorthand for `source`. Both spellings are the
+    same command, so one `Bash(source:*)` allow rule must govern both — the
+    spelling equivalence is normalized in code, not duplicated in settings."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    def test_alias_unit(self):
+        """_alias_variant canonicalizes the `.` builtin to `source`, leaves
+        everything else (including path executions) untouched."""
+        cases = {
+            ". ./.env": "source ./.env",
+            ". /etc/profile": "source /etc/profile",
+            ".": "source",                  # bare builtin
+            "source ./.env": "source ./.env",  # already canonical, unchanged
+            "./tool": "./tool",             # path execution, not the builtin
+            "../tool": "../tool",           # parent-path execution, not the builtin
+            "git status": "git status",     # unrelated, unchanged
+        }
+        for cmd, expected in cases.items():
+            self.assertEqual(
+                self.validator._alias_variant(cmd), expected, f"alias({cmd!r})")
+
+    def test_dot_source_is_allowed_via_source_rule(self):
+        """`. ./.env` auto-allows through the single `Bash(source:*)` rule."""
+        result = self.validator.validate_bash_command(". ./.env")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_source_longhand_still_allowed(self):
+        """The canonical `source` spelling keeps working unchanged."""
+        result = self.validator.validate_bash_command("source ./.env")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_env_loading_pipeline_allowed(self):
+        """The original real-world command (set -a; . ./.env; ...) auto-allows."""
+        command = (
+            "set -a; . ./.env; set +a; pnpm test:db 2>&1 | tail -25"
+        )
+        result = self.validator.validate_bash_command(command)
+        self.assertEqual(result["decision"], "allow")
+
+    def test_dot_alias_does_not_over_match_relative_path(self):
+        """The `.`->`source` alias must not green-light a `../` path execution:
+        `../evil.sh` is not the source builtin and stays on the ask path."""
+        result = self.validator.validate_bash_command("../evil.sh")
+        self.assertEqual(result["decision"], "ask")
+
+
 class TestScaffoldingAndFunctions(unittest.TestCase):
     """`for`/`select` loop headers, block terminators, and function definitions
     are scaffolding that runs nothing on its own. They reduce to no-ops, while

@@ -833,6 +833,37 @@ class BashPermissionValidator:
         rest = parts[1] if len(parts) > 1 else ''
         return f"{base} {rest}" if rest else base
 
+    def _alias_variant(self, cmd: str) -> str:
+        """
+        Rewrite a builtin invoked under one spelling to its canonical spelling,
+        so a single allow/deny pattern covers every spelling of the same builtin.
+
+        Currently the only such pair is the `.` builtin and its longhand
+        `source`: bash treats `. FILE` and `source FILE` as the identical
+        command. Canonicalizing `.` -> `source` means one `Bash(source:*)` rule
+        governs both, rather than the policy having to enumerate each spelling
+        (and risk the two drifting apart). The argument tail is preserved
+        verbatim. This is the same idea as _basename_variant, applied to a
+        name alias instead of a path qualification.
+
+        Returns the original command unchanged when the head is not an aliased
+        builtin. The head is matched exactly: a bare `.` (the source builtin),
+        never `./tool` or `..` (those contain no whitespace boundary and stay a
+        path execution handled elsewhere).
+
+        Examples:
+            '. ./.env'        -> 'source ./.env'
+            '. /etc/profile'  -> 'source /etc/profile'
+            'source ./.env'   -> 'source ./.env' (unchanged)
+            './tool'          -> './tool'         (unchanged, path execution)
+            'git status'      -> 'git status'     (unchanged)
+        """
+        parts = cmd.split(None, 1)  # first token + untouched remainder
+        if not parts or parts[0] != '.':
+            return cmd
+        rest = parts[1] if len(parts) > 1 else ''
+        return f"source {rest}" if rest else 'source'
+
     def _reduce_to_effective_command(self, cmd: str) -> str:
         """
         Peel leading control-keyword and wrapper prefixes off a sub-command so we
@@ -1152,6 +1183,16 @@ class BashPermissionValidator:
         if normalized != cmd:
             candidates.append(normalized)
             debug_log(f"Basename-normalized variant: {normalized!r}")
+
+        # Canonicalize builtin-spelling aliases (currently `.` -> `source`) so a
+        # single allow/deny pattern covers every spelling of the same builtin.
+        # Applied to each existing candidate so it composes with the basename
+        # variant above.
+        for c in list(candidates):
+            aliased = self._alias_variant(c)
+            if aliased != c and aliased not in candidates:
+                candidates.append(aliased)
+                debug_log(f"Builtin-alias variant: {aliased!r}")
 
         # Check deny patterns first (deny takes precedence)
         for pattern in self.denied_patterns:
