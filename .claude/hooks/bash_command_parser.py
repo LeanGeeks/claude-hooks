@@ -10,7 +10,7 @@ Parses compound bash commands, splitting on operators while respecting:
 """
 
 import re
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 class BashCommandParser:
@@ -108,6 +108,39 @@ class BashCommandParser:
 
         return result
 
+    @staticmethod
+    def _parse_heredoc_delim(command: str, i: int) -> Tuple[Optional[str], int]:
+        """
+        Parse a heredoc operator at `command[i:]` (caller guarantees
+        `command[i:i+2] == '<<'`).
+
+        Returns `(delimiter, j)` where `j` is the index just past the delimiter
+        token, or `(None, i)` if this is not a heredoc that introduces a body
+        (a bare `<<` with no delimiter word, or a `<<<` here-string). Mirrors
+        the delimiter parsing in `_tokenize_with_quotes` so the two stay in
+        sync — the quote around the delimiter (`<<'EOF'`) is consumed but does
+        not affect how the body is matched.
+        """
+        # `<<<` is a here-string, not a heredoc: it has no multi-line body.
+        if command[i:i+3] == '<<<':
+            return None, i
+        j = i + 2
+        while j < len(command) and command[j] in (' ', '\t'):
+            j += 1
+        quote_char = None
+        if j < len(command) and command[j] in ('"', "'"):
+            quote_char = command[j]
+            j += 1
+        delim_start = j
+        while j < len(command) and (command[j].isalnum() or command[j] == '_'):
+            j += 1
+        delimiter = command[delim_start:j]
+        if not delimiter:
+            return None, i
+        if quote_char is not None and j < len(command) and command[j] == quote_char:
+            j += 1
+        return delimiter, j
+
     def _scan_paren_subst(self, command: str, start: int) -> Tuple[str, int]:
         """
         Scan a `$(...)` command substitution beginning at `start` (the `$`).
@@ -116,13 +149,33 @@ class BashCommandParser:
         matching `)`, and `end` is the index just past that `)`. Quote state is
         tracked so a `)` inside a quoted string (e.g. a regex `[^)]`) does not
         close the substitution prematurely, and nested `$(...)` raise the depth.
+
+        A heredoc body inside the substitution (`$(cat <<'EOF' ... EOF)`) is
+        skipped wholesale: its text is data, not shell, so an apostrophe
+        (`node's`), a stray quote, or an unbalanced paren in the body must not
+        flip quote state or move the depth count, which would mislocate the
+        closing `)` and leak the tail back out as bogus sub-commands.
         """
         depth = 1
         i = start + 2
         quote = None  # None, "'", or '"'
-        while i < len(command) and depth > 0:
+        heredoc_delim = None  # active heredoc delimiter, once `<<DELIM` is seen
+        heredoc_seen_nl = False  # body begins after the first newline past `<<`
+        n = len(command)
+        while i < n and depth > 0:
             c = command[i]
-            if c == '\\' and quote != "'" and i + 1 < len(command):
+            # Inside a heredoc body: skip every char until a line equal to the
+            # delimiter, mirroring the top-level tokenizer's body handling.
+            if heredoc_delim is not None and heredoc_seen_nl:
+                if c == '\n':
+                    i += 1
+                    if command[i:i+len(heredoc_delim)] == heredoc_delim:
+                        i += len(heredoc_delim)
+                        heredoc_delim = None
+                    continue
+                i += 1
+                continue
+            if c == '\\' and quote != "'" and i + 1 < n:
                 i += 2
                 continue
             if quote:
@@ -132,6 +185,17 @@ class BashCommandParser:
                 continue
             if c in ('"', "'"):
                 quote = c
+                i += 1
+                continue
+            if heredoc_delim is None and command[i:i+2] == '<<':
+                delim, j = self._parse_heredoc_delim(command, i)
+                if delim is not None:
+                    heredoc_delim = delim
+                    heredoc_seen_nl = False
+                    i = j
+                    continue
+            if c == '\n' and heredoc_delim is not None and not heredoc_seen_nl:
+                heredoc_seen_nl = True
                 i += 1
                 continue
             if c == '(':
@@ -149,12 +213,40 @@ class BashCommandParser:
         Returns (content, end) where `content` is the text between the
         backticks and `end` is the index just past the closing backtick. A
         backslash escapes the next character (including an embedded backtick).
+
+        A heredoc body inside the substitution (`` `cat <<EOF ... EOF` ``) is
+        skipped wholesale so a literal backtick in the body cannot prematurely
+        close the substitution — the symmetric hazard to the apostrophe/quote
+        leak handled in `_scan_paren_subst`.
         """
         i = start + 1
-        while i < len(command):
+        n = len(command)
+        heredoc_delim = None
+        heredoc_seen_nl = False
+        while i < n:
             c = command[i]
-            if c == '\\' and i + 1 < len(command):
+            if heredoc_delim is not None and heredoc_seen_nl:
+                if c == '\n':
+                    i += 1
+                    if command[i:i+len(heredoc_delim)] == heredoc_delim:
+                        i += len(heredoc_delim)
+                        heredoc_delim = None
+                    continue
+                i += 1
+                continue
+            if c == '\\' and i + 1 < n:
                 i += 2
+                continue
+            if heredoc_delim is None and command[i:i+2] == '<<':
+                delim, j = self._parse_heredoc_delim(command, i)
+                if delim is not None:
+                    heredoc_delim = delim
+                    heredoc_seen_nl = False
+                    i = j
+                    continue
+            if c == '\n' and heredoc_delim is not None and not heredoc_seen_nl:
+                heredoc_seen_nl = True
+                i += 1
                 continue
             if c == '`':
                 i += 1
@@ -1058,6 +1150,26 @@ if __name__ == '__main__':
         ('git commit -m "$(cat <<\'EOF\'\nfix: thing\n\nthrew "Cannot read\nundefined" here\nEOF\n)"',
          ['git commit -m "$(cat <<\'EOF\' fix: thing threw "Cannot read undefined" here EOF )"',
           'cat']),
+        # An UNBALANCED quote in the heredoc body — an apostrophe in `node's` —
+        # must not flip quote state inside the `$(...)` scan and mislocate the
+        # closing `)`. The real-world failing case leaked the trailing
+        # `)" ... git push origin master` back out as a bogus, non-allowlisted
+        # sub-command; the body is data, so only `cat` and the following real
+        # commands survive.
+        ('git commit -m "$(cat <<\'EOF\'\nSmoke test the node\'s own bind IP (best-effort).\nEOF\n)"\ngit push origin master',
+         ['git commit -m "$(cat <<\'EOF\' Smoke test the node\'s own bind IP (best-effort). EOF )"',
+          'git push origin master',
+          'cat']),
+        # An unbalanced paren in the heredoc body must not move the depth count
+        # and swallow the real closing `)`.
+        ('echo "$(cat <<\'EOF\'\na lone ) paren and a ( too\nEOF\n)"\nls',
+         ['echo "$(cat <<\'EOF\' a lone ) paren and a ( too EOF )"',
+          'ls',
+          'cat']),
+        # A literal backtick in a heredoc body inside a `` `...` `` substitution
+        # must not prematurely close it.
+        ('echo "`cat <<\'EOF\'\nuse `code` spans\nEOF\n`"\nls',
+         ['echo "`cat <<\'EOF\' use `code` spans EOF `"', 'ls', 'cat']),
         # Backtick substitution inside double quotes is likewise extracted.
         ('echo "result=`id -u`"', ['echo "result=`id -u`"', 'id -u']),
         # Arithmetic `$((...))` inside double quotes runs NO command, so its
