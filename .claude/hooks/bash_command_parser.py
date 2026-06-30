@@ -108,6 +108,97 @@ class BashCommandParser:
 
         return result
 
+    def _scan_paren_subst(self, command: str, start: int) -> Tuple[str, int]:
+        """
+        Scan a `$(...)` command substitution beginning at `start` (the `$`).
+
+        Returns (content, end) where `content` is the text between `$(` and the
+        matching `)`, and `end` is the index just past that `)`. Quote state is
+        tracked so a `)` inside a quoted string (e.g. a regex `[^)]`) does not
+        close the substitution prematurely, and nested `$(...)` raise the depth.
+        """
+        depth = 1
+        i = start + 2
+        quote = None  # None, "'", or '"'
+        while i < len(command) and depth > 0:
+            c = command[i]
+            if c == '\\' and quote != "'" and i + 1 < len(command):
+                i += 2
+                continue
+            if quote:
+                if c == quote:
+                    quote = None
+                i += 1
+                continue
+            if c in ('"', "'"):
+                quote = c
+                i += 1
+                continue
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+            i += 1
+        return command[start + 2:i - 1], i
+
+    def _scan_backtick(self, command: str, start: int) -> Tuple[str, int]:
+        """
+        Scan a `` `...` `` command substitution beginning at `start` (the
+        opening backtick).
+
+        Returns (content, end) where `content` is the text between the
+        backticks and `end` is the index just past the closing backtick. A
+        backslash escapes the next character (including an embedded backtick).
+        """
+        i = start + 1
+        while i < len(command):
+            c = command[i]
+            if c == '\\' and i + 1 < len(command):
+                i += 2
+                continue
+            if c == '`':
+                i += 1
+                break
+            i += 1
+        return command[start + 1:i - 1], i
+
+    def _scan_arith(self, command: str, start: int) -> Tuple[int, List[Tuple[str, int]]]:
+        """
+        Scan an arithmetic expansion `$((...))` beginning at `start` (the `$`).
+
+        Arithmetic runs no command, so its operands must NOT be validated as
+        commands. Returns (end, nested) where `end` is the index just past the
+        closing `))` (or end-of-string if unterminated) and `nested` is a list
+        of (content, abs_offset) for command substitutions found INSIDE the
+        arithmetic — those DO execute (`$(( $(cmd) + 1 ))`) and must still be
+        surfaced. The literal span `command[start:end]` is left for the caller
+        to keep glued to its token.
+        """
+        paren_depth = 0
+        i = start + 1  # consume '$'; start counting at the first '('
+        while i < len(command):
+            c = command[i]
+            if c == '\\' and i + 1 < len(command):
+                i += 2  # skip escaped char
+                continue
+            if c == '(':
+                paren_depth += 1
+            elif c == ')':
+                paren_depth -= 1
+                if paren_depth == 0:
+                    i += 1  # consume the final ')'
+                    break
+            i += 1
+        interior_start = start + 3
+        interior_end = i - 2 if paren_depth == 0 else i
+        interior = command[interior_start:interior_end]
+        nested = []
+        if interior.strip():
+            for t_type, t_val, t_off in self._tokenize_with_quotes(interior):
+                if t_type == 'CMD_SUBST':
+                    nested.append((t_val, interior_start + t_off))
+        return i, nested
+
     def _tokenize_with_quotes(self, command: str) -> List[Tuple[str, str]]:
         """
         Tokenize command into (type, value) pairs
@@ -236,6 +327,46 @@ class BashCommandParser:
                     i += 1
                     continue
 
+            # If in quote, add everything literally — with one exception:
+            # inside DOUBLE quotes bash still performs command substitution. A
+            # `$(...)` or `` `...` `` within "..." runs a command, and its own
+            # quotes are balanced independently of the surrounding double quote
+            # (so an inner `"` does NOT close the outer one). Without this, the
+            # inner `"` flips our quote state and desyncs everything after it —
+            # e.g. `git commit -m "$(cat <<'EOF' ... "quoted" ... EOF)"` splits
+            # the commit body into bogus sub-commands. We extract the
+            # substitution as a CMD_SUBST token (so the command it runs is
+            # validated by the recursive pass) while keeping its literal text
+            # glued to the current token, so the surrounding quoted word stays
+            # intact. Single quotes suppress all expansion, so they fall through
+            # to the literal append below.
+            #
+            # `$((...))` is arithmetic (runs no command) and must be checked
+            # FIRST, since `$(` is a prefix of `$((`: without this an in-quote
+            # `"sum=$((1+2))"` would mis-extract `1+2` as a bogus command.
+            # Process substitution `<(...)`/`>(...)` is NOT performed inside
+            # double quotes, so it is intentionally absent here.
+            if in_quote == '"' and command[i:i+3] == '$((':
+                arith_start = i
+                end, nested = self._scan_arith(command, i)
+                current.extend(command[arith_start:end])
+                for content, off in nested:
+                    tokens.append(('CMD_SUBST', content, off))
+                i = end
+                continue
+            if in_quote == '"' and command[i:i+2] == '$(':
+                subst_content, end = self._scan_paren_subst(command, i)
+                tokens.append(('CMD_SUBST', subst_content, i))
+                current.extend(command[i:end])
+                i = end
+                continue
+            if in_quote == '"' and char == '`':
+                subst_content, end = self._scan_backtick(command, i)
+                tokens.append(('CMD_SUBST', subst_content, i))
+                current.extend(command[i:end])
+                i = end
+                continue
+
             # If in quote, add everything literally
             if in_quote:
                 current.append(char)
@@ -260,34 +391,16 @@ class BashCommandParser:
             # extractor still validates the commands they run.
             if command[i:i+3] == '$((' and cmd_subst_depth == 0 and not in_backtick:
                 arith_start = i
-                paren_depth = 0
-                i += 1  # consume '$'; start counting at the first '('
-                while i < len(command):
-                    c = command[i]
-                    if c == '\\' and i + 1 < len(command):
-                        i += 2  # skip escaped char
-                        continue
-                    if c == '(':
-                        paren_depth += 1
-                    elif c == ')':
-                        paren_depth -= 1
-                        if paren_depth == 0:
-                            i += 1  # consume the final ')'
-                            break
-                    i += 1
-                current.extend(command[arith_start:i])
-                # Interior between `$((` and the closing `))` (when well-formed).
-                # Re-tokenize it and forward only the command substitutions it
-                # contains — the arithmetic operands/operators are intentionally
-                # dropped. Offsets are mapped back to absolute source positions so
-                # the function-definition ordering logic stays correct.
-                interior_start = arith_start + 3
-                interior_end = i - 2 if paren_depth == 0 else i
-                interior = command[interior_start:interior_end]
-                if interior.strip():
-                    for t_type, t_val, t_off in self._tokenize_with_quotes(interior):
-                        if t_type == 'CMD_SUBST':
-                            tokens.append(('CMD_SUBST', t_val, interior_start + t_off))
+                # Keep the literal text glued to the current token (so
+                # `pass=$((pass+1))` stays one assignment and `echo $((1+2))`
+                # keeps its argument); forward only the command substitutions
+                # nested inside, with offsets mapped to absolute source
+                # positions so the function-definition ordering logic holds.
+                end, nested = self._scan_arith(command, i)
+                current.extend(command[arith_start:end])
+                for content, off in nested:
+                    tokens.append(('CMD_SUBST', content, off))
+                i = end
                 continue
 
             # Handle process substitution <( ... ) and >( ... ). The inner
@@ -345,50 +458,16 @@ class BashCommandParser:
                 if not env_prefix:
                     flush_current()
 
-                # Start capturing command substitution
-                cmd_subst_depth = 1
                 subst_start = i
-                i += 2
-                # Scan until matching closing paren. We must track quote state:
-                # a `)` inside a quoted string is literal and must NOT close the
-                # substitution. Without this, a regex like `"pos=\([^)]*\)"` ends
-                # the span early at the `)` inside the `[^)]` bracket class,
-                # desyncing the tokenizer for everything that follows.
-                subst_quote = None  # None, "'", or '"'
-                while i < len(command) and cmd_subst_depth > 0:
-                    c = command[i]
-                    # Backslash escapes the next char everywhere except single
-                    # quotes (where it is literal).
-                    if c == '\\' and subst_quote != "'" and i + 1 < len(command):
-                        i += 2
-                        continue
-                    if subst_quote:
-                        # Inside a quote: only the matching close quote is special;
-                        # parens are literal content.
-                        if c == subst_quote:
-                            subst_quote = None
-                        i += 1
-                        continue
-                    if c in ('"', "'"):
-                        subst_quote = c
-                        i += 1
-                        continue
-                    if c == '(':
-                        cmd_subst_depth += 1
-                    elif c == ')':
-                        cmd_subst_depth -= 1
-                    i += 1
-                # Extract the command substitution content (excluding $( and ))
-                subst_content = command[subst_start+2:i-1]  # Skip $( and )
+                subst_content, end = self._scan_paren_subst(command, i)
                 tokens.append(('CMD_SUBST', subst_content, subst_start))
 
                 if env_prefix:
-                    # Part of env var value — keep in current token
-                    current.append('$')
-                    current.append('(')
-                    current.extend(subst_content)
-                    current.append(')')
+                    # Part of env var value — keep the literal `$(...)` in the
+                    # current token.
+                    current.extend(command[subst_start:end])
 
+                i = end
                 continue
 
             # Handle backtick command substitution
@@ -399,31 +478,16 @@ class BashCommandParser:
                 if not env_prefix:
                     flush_current()
 
-                in_backtick = True
                 subst_start = i
-                i += 1
-                # Scan until closing backtick
-                while i < len(command):
-                    c = command[i]
-                    if c == '\\' and i + 1 < len(command):
-                        # Skip escaped char
-                        i += 2
-                        continue
-                    if c == '`':
-                        in_backtick = False
-                        i += 1
-                        break
-                    i += 1
-                # Extract content (excluding backticks)
-                subst_content = command[subst_start+1:i-1]
+                subst_content, end = self._scan_backtick(command, i)
                 tokens.append(('CMD_SUBST', subst_content, subst_start))
 
                 if env_prefix:
-                    # Part of env var value — keep in current token
-                    current.append('`')
-                    current.extend(subst_content)
-                    current.append('`')
+                    # Part of env var value — keep the literal `` `...` `` in
+                    # the current token.
+                    current.extend(command[subst_start:end])
 
+                i = end
                 continue
 
             # If inside command substitution, treat most chars literally
@@ -978,9 +1042,31 @@ if __name__ == '__main__':
         # the tokenizer and stranded later tokens as bogus sub-commands.
         ('n=$(grep -oE "pos=\\([^)]*\\)" file | wc -l)',
          ['grep -oE "pos=\\([^)]*\\)" file', "wc -l"]),
-        # The whole double-quoted arg stays one token; crucially `${v:0:14}` is
-        # NOT stranded as a bogus standalone sub-command (the original bug).
-        ('echo "$(basename $f) ${v:0:14}"', ['echo "$(basename $f) ${v:0:14}"']),
+        # The whole double-quoted arg stays one token, and `${v:0:14}` is NOT
+        # stranded as a bogus standalone sub-command. The `$(basename $f)` is a
+        # real command substitution that bash runs even inside double quotes, so
+        # it is correctly extracted for validation.
+        ('echo "$(basename $f) ${v:0:14}"',
+         ['echo "$(basename $f) ${v:0:14}"', 'basename $f']),
+        # Command substitution inside DOUBLE quotes is recognized: an inner `"`
+        # must not flip the surrounding quote state. The real-world failing case
+        # was a `git commit -m "$(cat <<'EOF' ... )"` whose heredoc body held
+        # double quotes and blank lines; the body must not leak out as bogus
+        # sub-commands, and the substitution runs only `cat`.
+        ('echo "$(grep \"needle\" file)"',
+         ['echo "$(grep \"needle\" file)"', 'grep "needle" file']),
+        ('git commit -m "$(cat <<\'EOF\'\nfix: thing\n\nthrew "Cannot read\nundefined" here\nEOF\n)"',
+         ['git commit -m "$(cat <<\'EOF\' fix: thing threw "Cannot read undefined" here EOF )"',
+          'cat']),
+        # Backtick substitution inside double quotes is likewise extracted.
+        ('echo "result=`id -u`"', ['echo "result=`id -u`"', 'id -u']),
+        # Arithmetic `$((...))` inside double quotes runs NO command, so its
+        # operands must NOT be stranded as a bogus sub-command (`$(` is a prefix
+        # of `$((`). A real command substitution nested in the arithmetic is
+        # still extracted.
+        ('echo "sum=$((1+2))"', ['echo "sum=$((1+2))"']),
+        ('echo "x=$(( $(date +%s) + 1 ))"',
+         ['echo "x=$(( $(date +%s) + 1 ))"', 'date +%s']),
         # Same hazard for process substitution <( ... ).
         ('diff <(grep -oE "a)b" x) y', ["diff y", 'grep -oE "a)b" x']),
         # fd-prefixed redirections: the fd digit must not leak as a phantom
