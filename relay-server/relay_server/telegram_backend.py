@@ -69,8 +69,17 @@ class TelegramBackend(Protocol):
         keyboard: list[list[dict[str, Any]]] | None,
         reply_required: bool,
         message_id: int,
+        force_reply: bool = True,
     ) -> int:
-        """Send a relay-tracked message; return the Telegram-side message id."""
+        """Send a relay-tracked message; return the Telegram-side message id.
+
+        ``reply_required`` marks the message as answerable by free text.
+        ``force_reply`` controls whether Telegram shows its auto-reply prompt:
+        we suppress it for idle notifications because a chat-wide ``force_reply``
+        auto-targets the *newest* such message, so with several idle sessions a
+        reply meant for one session threads to another. Without it the user must
+        long-press→Reply, yielding an unambiguous ``reply_to``.
+        """
 
     async def send_text(self, *, chat_id: int, text: str) -> None:
         """Send a plain text message that requires no relay tracking (e.g. /bind replies)."""
@@ -135,6 +144,7 @@ class FakeTelegramBackend:
         keyboard: list[list[dict[str, Any]]] | None,
         reply_required: bool,
         message_id: int,
+        force_reply: bool = True,
     ) -> int:
         tg_id = next(self._ids)
         self.calls.append(
@@ -146,6 +156,7 @@ class FakeTelegramBackend:
                     "keyboard": keyboard,
                     "reply_required": reply_required,
                     "message_id": message_id,
+                    "force_reply": force_reply,
                 },
             )
         )
@@ -339,6 +350,7 @@ class HttpTelegramBackend:
         keyboard: list[list[dict[str, Any]]] | None,
         reply_required: bool,
         message_id: int,
+        force_reply: bool = True,
     ) -> int:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -354,8 +366,11 @@ class HttpTelegramBackend:
             # an open question is attributed to that question even without
             # the force_reply prompt.
             payload["reply_markup"] = markup
-        elif reply_required:
+        elif reply_required and force_reply:
             # No buttons + need free-text answer → force_reply prompt.
+            # Suppressed for idle notifications (force_reply=False): a chat-wide
+            # force_reply auto-targets the newest such message, mis-threading
+            # replies across concurrently idle sessions.
             payload["reply_markup"] = {"force_reply": True, "selective": False}
         result = await self._call("sendMessage", payload)
         return int(result["message_id"])

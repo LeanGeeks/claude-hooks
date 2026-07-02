@@ -604,6 +604,11 @@ def create_app(
                     keyboard=keyboard_dump,
                     reply_required=body.reply_required,
                     message_id=message_id,
+                    # Idle notifications stay answerable but WITHOUT a force_reply
+                    # prompt: a chat-wide force_reply auto-targets the newest such
+                    # message, so with several idle sessions a reply meant for one
+                    # threads to another. Require an explicit Reply instead.
+                    force_reply=body.kind != "notification",
                 )
             except TelegramForbidden:
                 # Bot was blocked or removed from the chat. Clear the binding
@@ -929,23 +934,37 @@ async def _load_message_by_tg_id(
     return await run_in_thread(_q)
 
 
-async def _load_last_open_in_chat(
+async def _load_open_in_chat(
     conn: sqlite3.Connection, chat_id: int
-) -> sqlite3.Row | None:
-    """Fallback heuristic: most recently created open message in this chat.
+) -> list[sqlite3.Row]:
+    """All open messages in a chat, most-recently-created first.
 
-    Mirrors the per-chat "last awaiting" tracking the legacy daemon used so a
-    bound user can type a plain reply without quoting the prompt.
+    Used to decide whether a loose (non-threaded) reply is unambiguous: we
+    attribute it only when there is a single open target.
     """
 
-    def _q() -> sqlite3.Row | None:
+    def _q() -> list[sqlite3.Row]:
         return conn.execute(
             "SELECT * FROM messages WHERE telegram_chat_id = ? AND state = 'open'"
-            " ORDER BY created_at DESC, id DESC LIMIT 1",
+            " ORDER BY created_at DESC, id DESC",
             (chat_id,),
-        ).fetchone()
+        ).fetchall()
 
     return await run_in_thread(_q)
+
+
+def _distinct_open_targets(rows: list[sqlite3.Row]) -> int:
+    """Count distinct answer targets among open messages.
+
+    A question group (shared ``group_id``) is one logical target — its sibling
+    child messages must not read as "multiple sessions". Every ungrouped message
+    is its own target.
+    """
+    targets: set[object] = set()
+    for row in rows:
+        group_id, _ = _group_info(row)
+        targets.add(group_id if group_id is not None else ("msg", row["id"]))
+    return len(targets)
 
 
 async def _load_installation_for_chat(
@@ -1276,6 +1295,11 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
         return
 
     # Free-text reply path: prefer explicit reply_to_message_id when present.
+    # A threaded reply is the *only* unambiguous signal when several messages
+    # are open in one chat (e.g. multiple idle sessions), so we honor it and
+    # stop — even if it matches no open row. Falling through to the recency
+    # heuristic here would silently mis-thread a reply the user aimed at a
+    # since-resolved message onto whatever most recently went idle.
     reply_to = msg.get("reply_to_message_id") or (
         (msg.get("reply_to_message") or {}).get("message_id")
     )
@@ -1285,18 +1309,19 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
             await _apply_text_answer(
                 conn, backend, waiters, row, msg.get("text", ""), "reply"
             )
-            return
+        return
 
     # Ignore other slash-commands so /start, /help, etc. don't accidentally
     # become answers.
     if text.startswith("/"):
         return
 
-    # Fallback: attribute to the most recently created open message in this
-    # chat *iff* the sender is the user that bound the chat.
-    # This path also compensates for the send-time trade-off where a message
-    # with both `keyboard` and `reply_required` ends up without a force_reply
-    # prompt — bound users can still answer by typing.
+    # Loose (non-threaded) reply from the bound user. We only auto-attribute
+    # when there is exactly ONE open target in the chat — otherwise the guess is
+    # ambiguous (this is what mis-routed replies across concurrently idle
+    # sessions). A question group counts as a single target so grouped
+    # AskUserQuestion plain replies still work. When ambiguous we nudge the user
+    # to use Telegram's Reply, which routes unambiguously.
     sender_id = (msg.get("from") or {}).get("id")
     install = await _load_installation_for_chat(conn, int(chat_id))
     if install is None or install["bound_user_id"] is None:
@@ -1304,11 +1329,30 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     if sender_id is None or int(sender_id) != int(install["bound_user_id"]):
         return
 
-    row = await _load_last_open_in_chat(conn, int(chat_id))
-    if row is None:
+    open_rows = await _load_open_in_chat(conn, int(chat_id))
+    if not open_rows:
         return
+    if _distinct_open_targets(open_rows) > 1:
+        logger.info(
+            "loose reply in chat %s ignored: %d open messages (ambiguous)",
+            chat_id,
+            len(open_rows),
+        )
+        try:
+            await backend.send_text(
+                chat_id=int(chat_id),
+                text=(
+                    "Multiple sessions are waiting — I can't tell which this is"
+                    " for. Long-press the session's message and tap Reply."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("ambiguous-reply hint send failed")
+        return
+
+    # Exactly one open target: the most-recent open row is unambiguous.
     await _apply_text_answer(
-        conn, backend, waiters, row, msg.get("text", ""), "fallback"
+        conn, backend, waiters, open_rows[0], msg.get("text", ""), "fallback"
     )
 
 

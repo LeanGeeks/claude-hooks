@@ -88,10 +88,26 @@ text. Two escapes is cheap and idempotent; on an already-empty prompt it is a
 no-op.
 
 ### D4 — Threaded replies only (multi-machine correctness)
-The idle notification is sent with **force-reply** so the natural action in
-Telegram is a threaded reply. Document that loose (non-threaded) messages are
-ambiguous across machines and may be mis-routed by the relay fallback. No code
-change to the relay's attribution is required.
+A reply is routed by Telegram's **threaded Reply** (`reply_to_message` → exact
+message → installation). Loose (non-threaded) messages are ambiguous across
+machines.
+
+**Revised (post-incident fix).** The original design sent idle notifications
+with **force-reply** and left the relay's loose-message fallback untouched. In
+practice this mis-routed replies across concurrently idle sessions two ways:
+(1) a chat-wide `force_reply` (`selective:false`) makes the Telegram client
+auto-target the *newest* such notification, so a reply the user aimed at session
+A threaded onto whichever session most recently went idle; (2) the relay
+silently fell through to "most recently created open message" whenever a threaded
+reply's target was no longer open. Both are fixed:
+- Idle notifications are now sent **without** force-reply (still answerable via
+  `reply_required`); the user must explicitly long-press→Reply, which yields an
+  unambiguous `reply_to`. (`telegram_backend`/`app` gate force-reply on
+  `kind != "notification"`.)
+- `_handle_update` no longer falls through when a `reply_to` matches no open
+  message, and the loose-reply fallback attributes **only when a single target
+  is open** in the chat (a question group counts as one target); otherwise it
+  nudges the user to use Reply.
 
 ### D5 — Non-blocking, detached injector (no daemon)
 There is no client daemon (the old one was deleted; hooks long-poll directly).
@@ -154,8 +170,10 @@ No relay-server changes required.
   into the session env; cwd may differ from `CC_DIR`. Hence D1 uses tmux, not env
   or cwd.
 - Relay free-text reply attribution: `reply_to_message_id` →
-  `_load_message_by_tg_id(chat_id, tg_id)` → exact message → installation.
-  Fallback otherwise is `_load_last_open_in_chat` (ambiguous across machines).
+  `_load_message_by_tg_id(chat_id, tg_id)` → exact message → installation. An
+  unmatched `reply_to` is dropped (no fallback). A loose message falls back only
+  when a single target is open (`_load_open_in_chat` + `_distinct_open_targets`);
+  multiple open → ignored with a nudge to use Reply.
 - Answers are only acted upon while a process long-polls
   `GET /v1/messages/{id}/answer`; there is no background drain (hence D5's
   detached injector must be the long-poller).

@@ -158,10 +158,16 @@ Two answer paths (`app.py`):
   relay looks up the **exact** message by `(chat_id, telegram_message_id)` and
   attributes the answer to it (and thus to its installation). This is what makes
   **threaded replies route to the correct machine** even when several
-  installations share one chat.
-- **Fallback** (no reply-to): attribute to the most recently created open message
-  in the chat, *only* for the bound user. This is ambiguous when multiple
-  machines are idle at once, so the threaded-reply path is strongly preferred.
+  installations share one chat. If the `reply_to` matches no *open* message the
+  update is dropped — it is **not** downgraded to the fallback (doing so
+  mis-threaded replies aimed at since-resolved messages).
+- **Fallback** (no reply-to, bound user only): attribute to the single open
+  message in the chat — but **only when exactly one target is open** (a question
+  group counts as one target). With multiple open messages (e.g. several idle
+  sessions) the reply is ambiguous, so the relay ignores it and nudges the user
+  to use Telegram's Reply. Idle notifications are therefore sent **without**
+  force-reply: a chat-wide force-reply auto-targets the newest notification and
+  would mis-thread a reply onto the wrong session.
 
 ---
 

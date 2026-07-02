@@ -89,6 +89,34 @@ async def test_send_message_force_reply_when_no_keyboard() -> None:
 
 
 @pytest.mark.asyncio
+async def test_no_force_reply_prompt_when_suppressed() -> None:
+    """force_reply=False (idle notifications) sends no reply_markup even though
+    the message is reply_required — the chat-wide prompt would mis-thread across
+    concurrently idle sessions."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"ok": True, "result": {"message_id": 1}}
+        )
+
+    backend = _make_backend(handler)
+    try:
+        await backend.send_message(
+            chat_id=1,
+            text="idle",
+            keyboard=None,
+            reply_required=True,
+            message_id=2,
+            force_reply=False,
+        )
+    finally:
+        await backend.aclose()
+    assert "reply_markup" not in captured["body"]
+
+
+@pytest.mark.asyncio
 async def test_forbidden_response_raises() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

@@ -4,7 +4,10 @@ Covers:
 - Wrong-secret returns 404 (does not advertise the endpoint).
 - callback_query happy path and chat-mismatch trust check.
 - reply_to_message_id matches an open message.
-- Fallback heuristic: plain message from bound user attributes to last open.
+- reply_to that matches no open message does NOT fall through to the fallback.
+- Loose reply: attributed only when a single target is open; ambiguous (multiple
+  idle sessions) is ignored with a nudge; a question group counts as one target.
+- Idle notifications are answerable but sent without a force_reply prompt.
 - /bind command is accepted and a no-op (Phase 3 territory).
 - update_id deduplication.
 - Unhandled handler exceptions still return 2xx (no infinite Telegram retry).
@@ -72,6 +75,25 @@ async def _create_message(client: httpx.AsyncClient, token: str) -> int:
         "kind": "question",
         "text": "?",
         "keyboard": [[{"label": "A", "value": "a"}]],
+        "ttl_sec": 60,
+    }
+    r = await client.post(
+        "/v1/messages",
+        headers={"Authorization": f"Bearer {token}"},
+        json=body,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["message_id"]
+
+
+async def _create_notification(
+    client: httpx.AsyncClient, token: str, text: str = "idle"
+) -> int:
+    """Create an answerable idle notification (no keyboard, reply_required)."""
+    body = {
+        "kind": "notification",
+        "text": text,
+        "reply_required": True,
         "ttl_sec": 60,
     }
     r = await client.post(
@@ -206,6 +228,134 @@ async def test_fallback_attribution_for_bound_user(
     )
     assert ans.status_code == 200
     assert ans.json()["answer"]["via"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_loose_reply_ambiguous_with_multiple_open_is_ignored(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """Two sessions idle at once → a loose (non-threaded) reply is ambiguous and
+    must NOT be attributed to either; the user is nudged to use Reply."""
+    token = seeded["token"]
+    msg_a = await _create_notification(app_client, token, "session A idle")
+    msg_b = await _create_notification(app_client, token, "session B idle")
+    update = {
+        "update_id": 31,
+        "message": {
+            "message_id": 6100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "do the thing",
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+    # Neither message got the answer.
+    for mid in (msg_a, msg_b):
+        ans = await app_client.get(
+            f"/v1/messages/{mid}/answer",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ans.status_code == 204
+    # The user was nudged to use Reply.
+    assert any(c.method == "send_text" for c in backend.calls)
+
+
+@pytest.mark.asyncio
+async def test_grouped_questions_count_as_single_target(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """Sibling messages of one AskUserQuestion group are one logical target, so
+    a loose reply is NOT rejected as ambiguous — it's routed to the group
+    handler (recorded provisionally, no "use Reply" nudge)."""
+    token = seeded["token"]
+    body = {
+        "kind": "question",
+        "text": "?",
+        "keyboard": [[{"label": "A", "value": "a"}]],
+        "reply_required": True,
+        "ttl_sec": 60,
+        "group_id": "grp-1",
+        "group_total": 2,
+    }
+    ids = []
+    for _ in range(2):
+        r = await app_client.post(
+            "/v1/messages",
+            headers={"Authorization": f"Bearer {token}"},
+            json=body,
+        )
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["message_id"])
+    update = {
+        "update_id": 32,
+        "message": {
+            "message_id": 6200,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "grouped free text",
+        },
+    }
+    hint_calls_before = sum(1 for c in backend.calls if c.method == "send_text")
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+    # Not treated as ambiguous: no "use Reply" nudge was sent...
+    hint_calls_after = sum(1 for c in backend.calls if c.method == "send_text")
+    assert hint_calls_after == hint_calls_before
+    # ...and the loose reply was routed into the group (provisional render edits
+    # the message), rather than being dropped.
+    assert any(c.method == "edit_message" for c in backend.calls)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_unmatched_does_not_fall_through(
+    app_client: httpx.AsyncClient, seeded: dict[str, object]
+) -> None:
+    """A threaded reply whose target is not an open message must NOT drop into
+    the loose-reply fallback — otherwise it would mis-thread onto whatever is
+    open. The lone open message stays unanswered."""
+    token = seeded["token"]
+    msg_id = await _create_notification(app_client, token, "the only open msg")
+    update = {
+        "update_id": 33,
+        "message": {
+            "message_id": 6300,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "meant for a since-resolved message",
+            "reply_to_message_id": 999999,  # no such open message
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_notification_sent_without_force_reply(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """Idle notifications must be answerable but WITHOUT a force_reply prompt
+    (which would auto-target the newest and mis-thread across sessions).
+    Questions keep force_reply."""
+    token = seeded["token"]
+    await _create_notification(app_client, token, "idle")
+    await _create_message(app_client, token)  # a question
+    sends = [c for c in backend.calls if c.method == "send_message"]
+    by_reqd = {c.kwargs["text"]: c.kwargs for c in sends}
+    assert by_reqd["idle"]["force_reply"] is False
+    assert by_reqd["idle"]["reply_required"] is True
+    assert by_reqd["?"]["force_reply"] is True
 
 
 @pytest.mark.asyncio
