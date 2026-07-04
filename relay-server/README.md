@@ -227,12 +227,53 @@ systemctl start relay
 
 ## Device Setup
 
-Each device needs the `relay-server` package installed (client-only use; no
-server dependencies are pulled unless you run the server on the same machine):
+Device setup has two independent halves that use **different** Python
+environments — get this right or notifications silently stay disabled:
+
+1. **The client CLI** (`relay-client` — `config init` / `bind` / `whoami`),
+   which you run by hand. Install it in isolation with **pipx** (recommended).
+2. **The Claude Code hook** (`telegram_permission_router.py`, imported by the
+   permission/notification hooks), which Claude Code runs under **system
+   `python3`**. It needs `relay_server` + `httpx` importable *there* — pipx's
+   isolated venv is invisible to it. See "Hook runtime dependencies" below.
+
+### Install the CLI with pipx (recommended)
 
 ```bash
-pip install -e /path/to/relay-server/
+# Isolated install; exposes the `relay-client` (and `relay-admin`) entry points.
+pipx install /path/to/relay-server/
+
+# `config init` writes TOML, which needs tomli_w — not a declared dependency,
+# so inject it into the same pipx venv.
+pipx inject relay-server tomli_w
 ```
+
+Why pipx over `pip install`: the package pulls server deps
+(`fastapi`, `uvicorn`, …) even for client-only use, and modern distros are
+PEP 668 "externally-managed" — a bare `pip install` into system Python is
+blocked and, if forced, pollutes it. pipx keeps the CLI in its own venv.
+
+> Prefer a plain venv? `python3 -m venv ~/.venvs/relay-client &&
+> ~/.venvs/relay-client/bin/pip install /path/to/relay-server/ tomli_w`, then
+> call `~/.venvs/relay-client/bin/relay-client …`. Either way, the hook still
+> needs the system-Python deps below.
+
+### Hook runtime dependencies (system `python3`)
+
+The Claude Code hooks are invoked as `python3 …/hook.py` (see the `command`
+entries in `settings.json`), so the hook's `import relay_server.client` runs in
+system Python, **not** the pipx/venv environment. `install-claude-config.sh`
+already drops a user-site `.pth` so `import relay_server` resolves to this
+repo, but the client module also imports `httpx`. Install it (plus `tomli_w`
+if you'll also run the CLI under system Python) into the same user site:
+
+```bash
+# --user keeps it in ~/.local; --break-system-packages satisfies PEP 668.
+python3 -m pip install --user --break-system-packages httpx tomli_w
+```
+
+Skip this and the hook's import fails silently — the relay disables itself and
+you get no Telegram prompts even though the CLI's `whoami` works fine.
 
 ### 1. Write the config
 
@@ -240,17 +281,19 @@ The admin sends the installation token out-of-band (Signal, password manager,
 etc.). On the device:
 
 ```bash
-python -m relay_server.client_cli config init \
+relay-client config init \
     --server-url https://relay.example.com \
     --token rly_8f3a2b...
 ```
 
-This writes `~/.config/claude-tg-relay/config.toml`.
+This writes `~/.config/claude-tg-relay/config.toml`. (Equivalent, if you
+installed under system Python instead of pipx:
+`python3 -m relay_server.client_cli config init …`.)
 
 ### 2. Bind a Telegram chat
 
 ```bash
-python -m relay_server.client_cli bind
+relay-client bind
 # Prints: Send "/bind BIND-7H2K-9XQ4" to the bot in the chat you want notifications in.
 # (waiting up to 10 min...)
 ```
@@ -266,7 +309,7 @@ Bound to chat "Anton (private)" (user @anton).
 ### 3. Verify
 
 ```bash
-python -m relay_server.client_cli whoami
+relay-client whoami
 ```
 
 The Claude Code hooks (`telegram_permission_router.py`) read the config on
