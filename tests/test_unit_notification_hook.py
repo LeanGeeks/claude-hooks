@@ -294,6 +294,24 @@ class TestMainRouting(unittest.TestCase):
             self._run_main(payload)
         self.assertEqual(called, [])
 
+    def test_suppressed_while_background_shell_task_active(self):
+        t = _write_transcript([
+            _assistant("parent waiting on watcher"),
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "bmgbzg3bk"}},
+        ])
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": "s",
+            "cwd": "/tmp/x",
+            "transcript_path": t,
+        }
+        called = []
+        with patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
+            self._run_main(payload)
+        self.assertEqual(called, [])
+
     def test_suppressed_while_background_agent_active(self):
         t = _write_transcript([
             _assistant("parent waiting"),
@@ -311,6 +329,73 @@ class TestMainRouting(unittest.TestCase):
              patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
             self._run_main(payload)
         self.assertEqual(called, [])
+
+
+def _notification(task_id, status):
+    body = (
+        "<task-notification>\n"
+        f"<task-id>{task_id}</task-id>\n"
+        f"<status>{status}</status>\n"
+        "</task-notification>"
+    )
+    return {"type": "user", "message": {"role": "user", "content": body}}
+
+
+class TestHasActiveBackgroundWork(unittest.TestCase):
+    def test_background_shell_launch_is_active(self):
+        t = _write_transcript([
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_background_shell_cleared_by_completed_notification(self):
+        t = _write_transcript([
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+            _notification("b123", "completed"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_background_shell_cleared_by_killed_notification(self):
+        t = _write_transcript([
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+            _notification("b123", "killed"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_background_shell_cleared_by_taskstop_result(self):
+        t = _write_transcript([
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+            {"toolUseResult": {
+                "message": "Successfully stopped task: b123 (sleep 999)",
+                "task_id": "b123",
+                "task_type": "local_bash",
+                "command": "sleep 999",
+            }},
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_agent_cleared_by_notification_inside_tool_result(self):
+        body = (
+            "<task-notification>\n"
+            "<task-id>a1</task-id>\n"
+            "<status>completed</status>\n"
+            "</task-notification>"
+        )
+        t = _write_transcript([
+            {"toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": "a1"}},
+            {"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_x",
+                 "content": [{"type": "text", "text": body}]},
+            ]}},
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_non_terminal_event_keeps_task_active(self):
+        t = _write_transcript([
+            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+            _notification("b123", "running"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
 
 
 if __name__ == "__main__":

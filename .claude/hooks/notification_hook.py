@@ -57,7 +57,7 @@ from telegram_permission_router import (
 
 # Configuration
 CLAUDE_DIR = Path.home() / ".claude"
-TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "canceled", "error"}
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "canceled", "error", "killed"}
 
 # Telegram caps a message at 4096 chars. We forward the *tail* of the agent's
 # last message (the end is where the question / conclusion lives), HTML-escaped,
@@ -157,13 +157,41 @@ def _extract_task_notification(content: str) -> tuple[str, str] | None:
     return task_id_match.group(1), status_match.group(1).strip().lower()
 
 
+def _iter_content_texts(content):
+    """Yield every text string reachable in a message ``content``.
+
+    Content may be a plain string, or a list of typed blocks. Task
+    notifications normally arrive as string content, but they can also be
+    embedded in ``text`` blocks or inside a ``tool_result`` block's nested
+    content (observed when the event lands while a tool call is in flight).
+    """
+    if isinstance(content, str):
+        yield content
+        return
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                yield text
+        elif block.get("type") == "tool_result":
+            yield from _iter_content_texts(block.get("content"))
+
+
 def has_active_background_agents(transcript_path: str) -> bool:
     """
-    Detect if the current session has async background agents still running.
+    Detect if the current session has background work still running: async
+    subagents (Task tool) or background shell commands (Bash with
+    run_in_background).
 
     We infer this by scanning the session transcript:
-    - async launches: toolUseResult.isAsync=true with status=async_launched + agentId
+    - agent launches: toolUseResult.isAsync=true with status=async_launched + agentId
+    - shell launches: toolUseResult.backgroundTaskId
     - terminal notifications: task-notification with status in TERMINAL_TASK_STATUSES
+    - explicit stops: a TaskStop result names the task_id it stopped
     """
     if not transcript_path:
         debug_log("No transcript_path provided; cannot detect background agents")
@@ -174,7 +202,7 @@ def has_active_background_agents(transcript_path: str) -> bool:
         debug_log(f"Transcript file not found: {transcript_file}")
         return False
 
-    active_agent_ids: set[str] = set()
+    active_task_ids: set[str] = set()
 
     try:
         with open(transcript_file, "r") as f:
@@ -188,44 +216,56 @@ def has_active_background_agents(transcript_path: str) -> bool:
                 except json.JSONDecodeError:
                     continue
 
-                # Async launch event
                 tool_use_result = entry.get("toolUseResult")
-                if (
-                    isinstance(tool_use_result, dict)
-                    and tool_use_result.get("isAsync") is True
-                    and tool_use_result.get("status") == "async_launched"
-                ):
-                    agent_id = tool_use_result.get("agentId")
-                    if agent_id:
-                        active_agent_ids.add(str(agent_id))
-                    continue
+                if isinstance(tool_use_result, dict):
+                    # Async agent launch event
+                    if (
+                        tool_use_result.get("isAsync") is True
+                        and tool_use_result.get("status") == "async_launched"
+                    ):
+                        agent_id = tool_use_result.get("agentId")
+                        if agent_id:
+                            active_task_ids.add(str(agent_id))
 
-                # Completion/failure/cancel notification event
+                    # Background shell command launch event
+                    background_task_id = tool_use_result.get("backgroundTaskId")
+                    if background_task_id:
+                        active_task_ids.add(str(background_task_id))
+
+                    # TaskStop result — the task is dead but no terminal
+                    # task-notification is emitted for it.
+                    stopped_task_id = tool_use_result.get("task_id")
+                    if (
+                        stopped_task_id
+                        and "stopped" in str(tool_use_result.get("message", "")).lower()
+                    ):
+                        active_task_ids.discard(str(stopped_task_id))
+
+                # Completion/failure/kill/cancel notification event
                 message = entry.get("message")
                 if not isinstance(message, dict):
                     continue
 
-                content = message.get("content")
-                if isinstance(content, str):
-                    task_notification = _extract_task_notification(content)
+                for text in _iter_content_texts(message.get("content")):
+                    task_notification = _extract_task_notification(text)
                     if task_notification:
                         task_id, status = task_notification
                         if status in TERMINAL_TASK_STATUSES:
-                            active_agent_ids.discard(task_id)
+                            active_task_ids.discard(task_id)
 
     except Exception as e:
         debug_log(f"Error scanning transcript for background agents: {e}")
         # Fail open: if detection errors, do not suppress notification
         return False
 
-    if active_agent_ids:
+    if active_task_ids:
         debug_log(
-            "Background agents still active: "
-            + ", ".join(sorted(active_agent_ids))
+            "Background tasks still active: "
+            + ", ".join(sorted(active_task_ids))
         )
         return True
 
-    debug_log("No active background agents detected")
+    debug_log("No active background tasks detected")
     return False
 
 
