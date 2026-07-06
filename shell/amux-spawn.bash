@@ -49,7 +49,11 @@ _AMUX_SPAWN_SHELL_LOADED=1
 # All flags and arguments are forwarded to `amux-spawn spawn` unchanged.
 # ---------------------------------------------------------------------------
 claude() {
-    amux-spawn spawn "$@"
+    if declare -f claude_env &>/dev/null; then
+        ( claude_env && amux-spawn spawn "$@" )
+    else
+        amux-spawn spawn "$@"
+    fi
 }
 
 # ---------------------------------------------------------------------------
