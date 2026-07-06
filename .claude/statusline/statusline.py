@@ -154,18 +154,17 @@ def detect_environment(env: dict, status_input: dict) -> StatusEnvironment:
     profile  = profile_ov if profile_ov else _PROFILE_DEFAULTS.get(provider, "unknown")
 
     # Model name: explicit override → ANTHROPIC_MODEL → JSON display_name
-    raw_model = (
-        model_ov
-        or env.get("ANTHROPIC_MODEL", "")
-        or env.get("ANTHROPIC_DEFAULT_SONNET_MODEL", "")
-    )
+    raw_model = model_ov or env.get("ANTHROPIC_MODEL", "")
+    json_name = (status_input.get("model") or {}).get("display_name", "")
     if raw_model:
         model = _normalize_model_name(raw_model, provider)
         pricing_key = _pricing_key(raw_model)
+    elif json_name:
+        model = _normalize_model_name(json_name, provider)
+        pricing_key = _pricing_key(json_name)
     else:
-        json_name = (status_input.get("model") or {}).get("display_name", "")
-        model = _normalize_model_name(json_name, provider) if json_name else "Claude"
-        pricing_key = _pricing_key(json_name) if json_name else ""
+        model = "Claude"
+        pricing_key = ""
 
     return StatusEnvironment(
         provider=provider, billing=billing, profile=profile, model=model, pricing_key=pricing_key
