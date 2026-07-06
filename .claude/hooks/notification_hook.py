@@ -43,6 +43,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -157,16 +158,65 @@ def _is_background_tool_use(block: dict) -> bool:
     return False
 
 
+# task-notification payloads are XML-ish text inside a plain-string user (or
+# queue-operation) entry, e.g.:
+#   <task-notification><task-id>a1b2</task-id><tool-use-id>toolu_x</tool-use-id>
+#   <status>completed</status>...</task-notification>
+_NOTIF_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
+_NOTIF_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([^<\s]+)\s*</tool-use-id>")
+
+# Fallbacks for pulling the task id out of a launch ack's *text* when the
+# entry-level toolUseResult metadata is missing.
+_ACK_TASK_ID_RES = (
+    re.compile(r"agentId:\s*([A-Za-z0-9_-]+)"),
+    re.compile(r"running in background with ID:\s*([A-Za-z0-9_-]+)"),
+    re.compile(r"Monitor started \(task ([A-Za-z0-9_-]+)"),
+)
+
+# SendMessage resume ack: 'Agent "a47c..." was stopped (completed); resumed it
+# in the background with your message.'
+_RESUMED_AGENT_RE = re.compile(r'Agent "([^"]+)"')
+
+
+def _tool_result_text(block: dict) -> str:
+    """Flatten a tool_result block's content to plain text."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "")
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 def has_active_background_agents(transcript_path: str) -> bool:
     """
     Detect if the current session has background work still running: async
     subagents (Agent tool), background shell commands (Bash with
-    run_in_background), or Monitor commands.
+    run_in_background), Monitor watchers, or Workflow runs.
 
-    We infer this by scanning the session transcript for tool_use blocks
-    (the assistant requesting to launch background work) and matching them
-    against tool_result blocks (the completion).  A tool_use with no
-    matching tool_result means the task is still in-flight.
+    Background launches resolve their tool_result *immediately* with a launch
+    ack ("Async agent launched successfully… agentId: X" / "Command running in
+    background with ID: X"), so a matched tool_result does NOT mean the work
+    finished. Actual completion is a later plain-string user entry carrying a
+    ``<task-notification>`` whose ``<task-id>``/``<tool-use-id>`` point back at
+    the launch. We replay the transcript in order:
+
+    - background tool_use            → running (keyed by tool_use_id)
+    - launch ack                     → extract task id (toolUseResult.agentId /
+                                       backgroundTaskId / taskId / runId) so
+                                       notifications can be matched; an ack with
+                                       no async marker means the tool actually
+                                       ran synchronously → not running
+    - <task-notification>            → task stopped → not running; except a
+                                       persistent Monitor's <event> (no
+                                       <status>), which fires per event while
+                                       the monitor keeps watching
+    - TaskStop tool_use              → task killed → not running
+    - SendMessage ack "resumed it in the background" → agent running again
     """
     if not transcript_path:
         debug_log("No transcript_path provided; cannot detect background agents")
@@ -177,8 +227,73 @@ def has_active_background_agents(transcript_path: str) -> bool:
         debug_log(f"Transcript file not found: {transcript_file}")
         return False
 
-    pending_tool_use_ids: set[str] = set()
-    completed_tool_use_ids: set[str] = set()
+    # running: launch tool_use_id → kind ("launching:<Tool>", "agent", "bash",
+    # "monitor", "monitor-persistent", "workflow").
+    running: dict[str, str] = {}
+    task_to_key: dict[str, str] = {}
+    pending_sends: dict[str, str | None] = {}  # SendMessage tool_use_id → input "to"
+
+    def resolve_launch_ack(tool_use_id: str, block: dict, tool_use_result) -> None:
+        launch_kind = running[tool_use_id]  # "launching:<ToolName>"
+        tool_name = launch_kind.split(":", 1)[1]
+        if block.get("is_error"):
+            running.pop(tool_use_id, None)
+            return
+        task_id = None
+        persistent = False
+        if isinstance(tool_use_result, dict):
+            task_id = (
+                tool_use_result.get("agentId")
+                or tool_use_result.get("backgroundTaskId")
+                or tool_use_result.get("taskId")
+                or tool_use_result.get("runId")
+            )
+            persistent = bool(tool_use_result.get("persistent"))
+        text = _tool_result_text(block)
+        if not task_id:
+            for pattern in _ACK_TASK_ID_RES:
+                m = pattern.search(text)
+                if m:
+                    task_id = m.group(1)
+                    break
+            if tool_name == "Monitor" and "persistent" in text:
+                persistent = True
+        if task_id:
+            if tool_name == "Monitor" and persistent:
+                kind = "monitor-persistent"
+            else:
+                kind = tool_name.lower()
+            running[tool_use_id] = kind
+            task_to_key[task_id] = tool_use_id
+        else:
+            # No async-launch marker: the tool ran synchronously (its result IS
+            # the completion) or the ack format changed. Fail open — a spurious
+            # idle ping beats silently suppressing them for the whole session.
+            debug_log(
+                f"Launch ack for {tool_name} ({tool_use_id}) has no task id; "
+                "treating as completed"
+            )
+            running.pop(tool_use_id, None)
+
+    def resolve_send_ack(tool_use_id: str, tool_use_result) -> None:
+        to = pending_sends.pop(tool_use_id, None)
+        if not isinstance(tool_use_result, dict) or tool_use_result.get("success") is not True:
+            return
+        message = str(tool_use_result.get("message", ""))
+        if "resumed" not in message:
+            return
+        m = _RESUMED_AGENT_RE.search(message)
+        agent_id = m.group(1) if m else None
+        # Only re-arm agents we can tie back to a launch in this transcript —
+        # an unmatchable key (e.g. a name where notifications carry the id)
+        # could never be cleared and would suppress idle pings forever.
+        key = task_to_key.get(agent_id) or (task_to_key.get(to) if to else None)
+        if not key:
+            debug_log(
+                f"SendMessage resumed unknown agent (to={to!r}); not tracking"
+            )
+            return
+        running[key] = "agent"
 
     try:
         with open(transcript_file, "r") as f:
@@ -192,43 +307,103 @@ def has_active_background_agents(transcript_path: str) -> bool:
                 except json.JSONDecodeError:
                     continue
 
-                # --- Assistant tool_use blocks: detect launches ---
-                if entry.get("type") == "assistant":
-                    msg = entry.get("message") or {}
+                # Subagent sidechain entries track their own tools, not ours.
+                if entry.get("isSidechain"):
+                    continue
+
+                msg = entry.get("message")
+
+                # --- task-notification: a background task stopped ---
+                # Delivered as a plain-string user message or a queued_command
+                # attachment; the enqueue is also journaled as a queue-operation
+                # entry (any one of them counts). Only these entry types count:
+                # an assistant message *quoting* a notification must not.
+                content_str = None
+                if entry.get("type") == "queue-operation":
+                    content_str = entry.get("content")
+                elif entry.get("type") == "attachment":
+                    prompt = (entry.get("attachment") or {}).get("prompt")
+                    if isinstance(prompt, str):
+                        content_str = prompt
+                elif (
+                    entry.get("type") == "user"
+                    and isinstance(msg, dict)
+                    and isinstance(msg.get("content"), str)
+                ):
+                    content_str = msg["content"]
+                if isinstance(content_str, str) and "<task-notification>" in content_str:
+                    has_status = "<status>" in content_str
+                    is_event = "<event>" in content_str
+                    keys = set()
+                    for task_id in _NOTIF_TASK_ID_RE.findall(content_str):
+                        key = task_to_key.get(task_id)
+                        if key:
+                            keys.add(key)
+                    for tool_use_id in _NOTIF_TOOL_USE_ID_RE.findall(content_str):
+                        if tool_use_id in running:
+                            keys.add(tool_use_id)
+                    for key in keys:
+                        if (
+                            running.get(key) == "monitor-persistent"
+                            and is_event
+                            and not has_status
+                        ):
+                            continue  # persistent monitor: fired, still watching
+                        running.pop(key, None)
+                    continue
+
+                # --- assistant tool_use blocks: launches / stops / resumes ---
+                if entry.get("type") == "assistant" and isinstance(msg, dict):
                     content = msg.get("content")
                     if isinstance(content, list):
                         for block in content:
-                            if (
+                            if not (
                                 isinstance(block, dict)
                                 and block.get("type") == "tool_use"
-                                and _is_background_tool_use(block)
                             ):
-                                tool_id = block.get("id")
-                                if tool_id:
-                                    pending_tool_use_ids.add(tool_id)
+                                continue
+                            name = block.get("name", "")
+                            inp = block.get("input") or {}
+                            tool_id = block.get("id")
+                            if _is_background_tool_use(block) and tool_id:
+                                running[tool_id] = f"launching:{name}"
+                            elif name == "TaskStop":
+                                task_id = inp.get("task_id") or inp.get("shell_id")
+                                key = task_to_key.pop(task_id, None) if task_id else None
+                                if key:
+                                    running.pop(key, None)
+                            elif name == "SendMessage" and tool_id:
+                                pending_sends[tool_id] = inp.get("to")
+                    continue
 
-                # --- tool_result blocks: detect completions ---
-                message = entry.get("message")
-                if isinstance(message, dict):
-                    content = message.get("content")
+                # --- tool_result blocks: launch / SendMessage acks ---
+                if isinstance(msg, dict):
+                    content = msg.get("content")
                     if isinstance(content, list):
                         for block in content:
-                            if not isinstance(block, dict):
+                            if not (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_result"
+                            ):
                                 continue
-                            if block.get("type") == "tool_result":
-                                tool_use_id = block.get("tool_use_id")
-                                if tool_use_id:
-                                    completed_tool_use_ids.add(tool_use_id)
+                            tool_use_id = block.get("tool_use_id")
+                            if not tool_use_id:
+                                continue
+                            if running.get(tool_use_id, "").startswith("launching:"):
+                                resolve_launch_ack(
+                                    tool_use_id, block, entry.get("toolUseResult")
+                                )
+                            elif tool_use_id in pending_sends:
+                                resolve_send_ack(tool_use_id, entry.get("toolUseResult"))
 
     except Exception as e:
         debug_log(f"Error scanning transcript for background agents: {e}")
         return False
 
-    active = pending_tool_use_ids - completed_tool_use_ids
-    if active:
+    if running:
         debug_log(
-            "Background tasks still active (tool_use_ids): "
-            + ", ".join(sorted(active))
+            "Background tasks still active: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(running.items()))
         )
         return True
 

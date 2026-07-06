@@ -335,11 +335,96 @@ class TestMainRouting(unittest.TestCase):
         self.assertEqual(called, [])
 
 
-def _tool_result(tool_use_id, text="done"):
-    return {"type": "user", "message": {"role": "user", "content": [
-        {"type": "tool_result", "tool_use_id": tool_use_id,
-         "content": [{"type": "text", "text": text}]},
-    ]}}
+def _tool_result(tool_use_id, text="done", tool_use_result=None, is_error=False):
+    """User entry carrying a tool_result block, shaped like real transcripts:
+    launch acks put structured metadata in the entry-level toolUseResult."""
+    block = {"type": "tool_result", "tool_use_id": tool_use_id,
+             "content": [{"type": "text", "text": text}]}
+    if is_error:
+        block["is_error"] = True
+    entry = {"type": "user", "message": {"role": "user", "content": [block]}}
+    if tool_use_result is not None:
+        entry["toolUseResult"] = tool_use_result
+    return entry
+
+
+def _agent_launch_ack(tool_use_id, agent_id):
+    return _tool_result(
+        tool_use_id,
+        text=f"Async agent launched successfully.\nagentId: {agent_id} (internal ID)",
+        tool_use_result={"isAsync": True, "status": "async_launched", "agentId": agent_id},
+    )
+
+
+def _bash_launch_ack(tool_use_id, task_id):
+    return _tool_result(
+        tool_use_id,
+        text=f"Command running in background with ID: {task_id}. Output is being "
+             f"written to: /tmp/tasks/{task_id}.output.",
+        tool_use_result={"stdout": "", "stderr": "", "interrupted": False,
+                         "backgroundTaskId": task_id},
+    )
+
+
+def _monitor_launch_ack(tool_use_id, task_id, persistent=False):
+    text = (f"Monitor started (task {task_id}, persistent — runs until TaskStop)"
+            if persistent else f"Monitor started (task {task_id})")
+    return _tool_result(
+        tool_use_id,
+        text=text,
+        tool_use_result={"taskId": task_id, "timeoutMs": 0, "persistent": persistent},
+    )
+
+
+def _task_notification(task_id, tool_use_id=None, status="completed", event=None):
+    """Delivered completion/event notification: user entry with string content."""
+    parts = ["<task-notification>", f"<task-id>{task_id}</task-id>"]
+    if tool_use_id:
+        parts.append(f"<tool-use-id>{tool_use_id}</tool-use-id>")
+    if status:
+        parts.append(f"<status>{status}</status>")
+        parts.append(f"<summary>Task {task_id} finished</summary>")
+    if event:
+        parts.append(f"<event>{event}</event>")
+    parts.append("</task-notification>")
+    return {"type": "user", "message": {"role": "user", "content": "\n".join(parts)}}
+
+
+def _queue_op_notification(task_id, tool_use_id):
+    """Journal entry for the notification enqueue (precedes delivery)."""
+    content = _task_notification(task_id, tool_use_id)["message"]["content"]
+    return {"type": "queue-operation", "operation": "enqueue", "content": content}
+
+
+def _attachment_notification(task_id, tool_use_id):
+    """Notification delivered as a queued_command attachment."""
+    content = _task_notification(task_id, tool_use_id)["message"]["content"]
+    return {"type": "attachment",
+            "attachment": {"type": "queued_command", "prompt": content}}
+
+
+def _taskstop_tool_use(tool_id, task_id):
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "TaskStop",
+         "input": {"task_id": task_id}},
+    ])
+
+
+def _sendmessage_tool_use(tool_id, to):
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "SendMessage",
+         "input": {"to": to, "summary": "resume", "message": "continue"}},
+    ])
+
+
+def _sendmessage_resume_ack(tool_use_id, agent_id):
+    msg = (f'Agent "{agent_id}" was stopped (completed); resumed it in the '
+           f"background with your message. You'll be notified when it finishes.")
+    return _tool_result(
+        tool_use_id,
+        text=json.dumps({"success": True, "message": msg}),
+        tool_use_result={"success": True, "message": msg},
+    )
 
 
 def _agent_tool_use(tool_id="toolu_a1", run_in_background=None):
@@ -373,31 +458,161 @@ def _workflow_tool_use(tool_id="toolu_w1"):
 
 
 class TestHasActiveBackgroundWork(unittest.TestCase):
-    def test_agent_launch_is_active(self):
+    # --- Agent ---
+
+    def test_agent_launch_without_ack_is_active(self):
         t = _write_transcript([_agent_tool_use()])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_agent_cleared_by_tool_result(self):
+    def test_agent_still_active_after_launch_ack(self):
+        # THE regression: the launch ack tool_result arrives immediately, the
+        # agent is still running until its task-notification lands.
         t = _write_transcript([
             _agent_tool_use("toolu_a1"),
-            _tool_result("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_agent_completed_by_task_notification(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _task_notification("aaa111", "toolu_a1"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
-    def test_agent_foreground_not_tracked(self):
+    def test_agent_foreground_flag_not_tracked(self):
         t = _write_transcript([
             _agent_tool_use("toolu_a1", run_in_background=False),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
+    def test_agent_synchronous_result_not_tracked(self):
+        # Older Claude Code ran Agent in the foreground: the tool_result IS the
+        # final report, with no async-launch marker → treat as completed.
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _tool_result("toolu_a1", text="Here is my full report: ..."),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_agent_launch_error_not_tracked(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _tool_result("toolu_a1", text="InputValidationError: prompt required",
+                         is_error=True),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_multiple_agents_one_completed(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_tool_use("toolu_a2"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _agent_launch_ack("toolu_a2", "aaa222"),
+            _task_notification("aaa111", "toolu_a1"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_multiple_agents_all_completed(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_tool_use("toolu_a2"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _agent_launch_ack("toolu_a2", "aaa222"),
+            _task_notification("aaa111", "toolu_a1"),
+            _task_notification("aaa222", "toolu_a2"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    # --- SendMessage resume / TaskStop ---
+
+    def test_sendmessage_resume_rearms_agent(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _task_notification("aaa111", "toolu_a1"),
+            _sendmessage_tool_use("toolu_s1", "aaa111"),
+            _sendmessage_resume_ack("toolu_s1", "aaa111"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_resumed_agent_completed_by_second_notification(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _task_notification("aaa111", "toolu_a1"),
+            _sendmessage_tool_use("toolu_s1", "aaa111"),
+            _sendmessage_resume_ack("toolu_s1", "aaa111"),
+            _task_notification("aaa111", "toolu_a1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_sendmessage_resume_of_unknown_agent_not_tracked(self):
+        # Resume ack quoting a *name* (no launch in this transcript maps it to
+        # a task id): tracking it would suppress idle pings forever, since the
+        # completion notification carries the id, not the name. Fail open.
+        t = _write_transcript([
+            _sendmessage_tool_use("toolu_s1", "researcher"),
+            _sendmessage_resume_ack("toolu_s1", "researcher"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_sendmessage_failure_does_not_rearm(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _task_notification("aaa111", "toolu_a1"),
+            _sendmessage_tool_use("toolu_s1", "aaa111"),
+            _tool_result("toolu_s1", text="No such agent",
+                         tool_use_result={"success": False, "message": "No such agent"}),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_taskstop_clears_running_task(self):
+        t = _write_transcript([
+            _bash_bg_tool_use("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _taskstop_tool_use("toolu_ts1", "bqq111"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    # --- Bash ---
+
     def test_background_shell_launch_is_active(self):
         t = _write_transcript([_bash_bg_tool_use()])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_background_shell_cleared_by_tool_result(self):
+    def test_background_shell_still_active_after_launch_ack(self):
         t = _write_transcript([
             _bash_bg_tool_use("toolu_b1"),
-            _tool_result("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_background_shell_completed_by_notification(self):
+        t = _write_transcript([
+            _bash_bg_tool_use("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _task_notification("bqq111", "toolu_b1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_completion_via_queue_operation_entry(self):
+        # The enqueue journal entry alone (delivery not yet written) counts.
+        t = _write_transcript([
+            _bash_bg_tool_use("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _queue_op_notification("bqq111", "toolu_b1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_completion_via_attachment_entry(self):
+        # Notifications can be delivered as a queued_command attachment.
+        t = _write_transcript([
+            _bash_bg_tool_use("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _attachment_notification("bqq111", "toolu_b1"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
@@ -410,53 +625,103 @@ class TestHasActiveBackgroundWork(unittest.TestCase):
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
+    # --- Monitor ---
+
     def test_monitor_launch_is_active(self):
         t = _write_transcript([_monitor_tool_use()])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_monitor_cleared_by_tool_result(self):
+    def test_monitor_event_completes_nonpersistent(self):
+        # One-shot monitor: event notification carries no tool-use-id and no
+        # status; matched via the task id recorded from the launch ack.
         t = _write_transcript([
             _monitor_tool_use("toolu_m1"),
-            _tool_result("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification("boil111", status=None, event="condition met"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
-    def test_multiple_agents_one_completed(self):
+    def test_persistent_monitor_event_keeps_running(self):
         t = _write_transcript([
-            _agent_tool_use("toolu_a1"),
-            _agent_tool_use("toolu_a2"),
-            _tool_result("toolu_a1"),
+            _monitor_tool_use("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111", persistent=True),
+            _task_notification("boil111", status=None, event="tick"),
         ])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_multiple_agents_all_completed(self):
+    def test_persistent_monitor_taskstop_clears(self):
         t = _write_transcript([
-            _agent_tool_use("toolu_a1"),
-            _agent_tool_use("toolu_a2"),
-            _tool_result("toolu_a1"),
-            _tool_result("toolu_a2"),
+            _monitor_tool_use("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111", persistent=True),
+            _task_notification("boil111", status=None, event="tick"),
+            _taskstop_tool_use("toolu_ts1", "boil111"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
+
+    # --- Workflow ---
 
     def test_workflow_launch_is_active(self):
         t = _write_transcript([_workflow_tool_use()])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_workflow_cleared_by_tool_result(self):
+    def test_workflow_completed_by_notification(self):
         t = _write_transcript([
             _workflow_tool_use("toolu_w1"),
-            _tool_result("toolu_w1"),
+            _tool_result("toolu_w1", text="Workflow started",
+                         tool_use_result={"runId": "wf_abc123"}),
+            _task_notification("wf_abc123", "toolu_w1"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
+
+    # --- Robustness ---
+
+    def test_sidechain_entries_ignored(self):
+        launch = _agent_tool_use("toolu_side")
+        launch["isSidechain"] = True
+        t = _write_transcript([launch])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_notification_text_inside_tool_result_not_a_completion(self):
+        # A tool_result whose *text* quotes a task-notification (grep over a
+        # transcript, say) must not clear the running task.
+        quoted = ("$ grep transcript\n<task-notification>\n"
+                  "<task-id>aaa111</task-id>\n<status>completed</status>\n"
+                  "</task-notification>")
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _assistant(blocks=[{"type": "tool_use", "id": "toolu_g1",
+                                "name": "Bash", "input": {"command": "grep ..."}}]),
+            _tool_result("toolu_g1", text=quoted),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_notification_quoted_by_assistant_not_a_completion(self):
+        # Older transcripts carry assistant content as a plain string; an
+        # assistant *quoting* a task-notification must not clear the task.
+        quoted = ("The agent will finish with:\n<task-notification>\n"
+                  "<task-id>aaa111</task-id>\n<tool-use-id>toolu_a1</tool-use-id>\n"
+                  "<status>completed</status>\n</task-notification>")
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            {"type": "assistant",
+             "message": {"role": "assistant", "content": quoted}},
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
 
     def test_mixed_agent_bash_monitor(self):
         t = _write_transcript([
             _agent_tool_use("toolu_a1"),
             _bash_bg_tool_use("toolu_b1"),
             _monitor_tool_use("toolu_m1"),
-            _tool_result("toolu_a1"),
-            _tool_result("toolu_b1"),
+            _agent_launch_ack("toolu_a1", "aaa111"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification("aaa111", "toolu_a1"),
+            _task_notification("bqq111", "toolu_b1"),
         ])
+        # Monitor still watching → active.
         self.assertTrue(nh.has_active_background_agents(t))
 
 
