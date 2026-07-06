@@ -296,8 +296,10 @@ class TestMainRouting(unittest.TestCase):
 
     def test_suppressed_while_background_shell_task_active(self):
         t = _write_transcript([
-            _assistant("parent waiting on watcher"),
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "bmgbzg3bk"}},
+            _assistant(blocks=[
+                {"type": "tool_use", "id": "toolu_bg1", "name": "Bash",
+                 "input": {"command": "sleep 999", "run_in_background": True}},
+            ]),
         ])
         payload = {
             "notification_type": "idle_prompt",
@@ -314,8 +316,10 @@ class TestMainRouting(unittest.TestCase):
 
     def test_suppressed_while_background_agent_active(self):
         t = _write_transcript([
-            _assistant("parent waiting"),
-            {"toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": "a1"}},
+            _assistant(blocks=[
+                {"type": "tool_use", "id": "toolu_agent1", "name": "Agent",
+                 "input": {"prompt": "do work", "description": "work"}},
+            ]),
         ])
         payload = {
             "notification_type": "idle_prompt",
@@ -331,69 +335,127 @@ class TestMainRouting(unittest.TestCase):
         self.assertEqual(called, [])
 
 
-def _notification(task_id, status):
-    body = (
-        "<task-notification>\n"
-        f"<task-id>{task_id}</task-id>\n"
-        f"<status>{status}</status>\n"
-        "</task-notification>"
-    )
-    return {"type": "user", "message": {"role": "user", "content": body}}
+def _tool_result(tool_use_id, text="done"):
+    return {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": tool_use_id,
+         "content": [{"type": "text", "text": text}]},
+    ]}}
+
+
+def _agent_tool_use(tool_id="toolu_a1", run_in_background=None):
+    inp = {"prompt": "do work", "description": "work"}
+    if run_in_background is not None:
+        inp["run_in_background"] = run_in_background
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "Agent", "input": inp},
+    ])
+
+
+def _bash_bg_tool_use(tool_id="toolu_b1"):
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "Bash",
+         "input": {"command": "sleep 999", "run_in_background": True}},
+    ])
+
+
+def _monitor_tool_use(tool_id="toolu_m1"):
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "Monitor",
+         "input": {"command": "until false; do sleep 1; done"}},
+    ])
+
+
+def _workflow_tool_use(tool_id="toolu_w1"):
+    return _assistant(blocks=[
+        {"type": "tool_use", "id": tool_id, "name": "Workflow",
+         "input": {"script": "export const meta = {name:'t',description:'t'}"}},
+    ])
 
 
 class TestHasActiveBackgroundWork(unittest.TestCase):
-    def test_background_shell_launch_is_active(self):
+    def test_agent_launch_is_active(self):
+        t = _write_transcript([_agent_tool_use()])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_agent_cleared_by_tool_result(self):
         t = _write_transcript([
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
+            _agent_tool_use("toolu_a1"),
+            _tool_result("toolu_a1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_agent_foreground_not_tracked(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1", run_in_background=False),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_background_shell_launch_is_active(self):
+        t = _write_transcript([_bash_bg_tool_use()])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_background_shell_cleared_by_tool_result(self):
+        t = _write_transcript([
+            _bash_bg_tool_use("toolu_b1"),
+            _tool_result("toolu_b1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_foreground_bash_not_tracked(self):
+        t = _write_transcript([
+            _assistant(blocks=[
+                {"type": "tool_use", "id": "toolu_fg", "name": "Bash",
+                 "input": {"command": "echo hi"}},
+            ]),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_monitor_launch_is_active(self):
+        t = _write_transcript([_monitor_tool_use()])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_monitor_cleared_by_tool_result(self):
+        t = _write_transcript([
+            _monitor_tool_use("toolu_m1"),
+            _tool_result("toolu_m1"),
+        ])
+        self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_multiple_agents_one_completed(self):
+        t = _write_transcript([
+            _agent_tool_use("toolu_a1"),
+            _agent_tool_use("toolu_a2"),
+            _tool_result("toolu_a1"),
         ])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_background_shell_cleared_by_completed_notification(self):
+    def test_multiple_agents_all_completed(self):
         t = _write_transcript([
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
-            _notification("b123", "completed"),
+            _agent_tool_use("toolu_a1"),
+            _agent_tool_use("toolu_a2"),
+            _tool_result("toolu_a1"),
+            _tool_result("toolu_a2"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
-    def test_background_shell_cleared_by_killed_notification(self):
+    def test_workflow_launch_is_active(self):
+        t = _write_transcript([_workflow_tool_use()])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_workflow_cleared_by_tool_result(self):
         t = _write_transcript([
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
-            _notification("b123", "killed"),
+            _workflow_tool_use("toolu_w1"),
+            _tool_result("toolu_w1"),
         ])
         self.assertFalse(nh.has_active_background_agents(t))
 
-    def test_background_shell_cleared_by_taskstop_result(self):
+    def test_mixed_agent_bash_monitor(self):
         t = _write_transcript([
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
-            {"toolUseResult": {
-                "message": "Successfully stopped task: b123 (sleep 999)",
-                "task_id": "b123",
-                "task_type": "local_bash",
-                "command": "sleep 999",
-            }},
-        ])
-        self.assertFalse(nh.has_active_background_agents(t))
-
-    def test_agent_cleared_by_notification_inside_tool_result(self):
-        body = (
-            "<task-notification>\n"
-            "<task-id>a1</task-id>\n"
-            "<status>completed</status>\n"
-            "</task-notification>"
-        )
-        t = _write_transcript([
-            {"toolUseResult": {"isAsync": True, "status": "async_launched", "agentId": "a1"}},
-            {"type": "user", "message": {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_x",
-                 "content": [{"type": "text", "text": body}]},
-            ]}},
-        ])
-        self.assertFalse(nh.has_active_background_agents(t))
-
-    def test_non_terminal_event_keeps_task_active(self):
-        t = _write_transcript([
-            {"toolUseResult": {"stdout": "", "backgroundTaskId": "b123"}},
-            _notification("b123", "running"),
+            _agent_tool_use("toolu_a1"),
+            _bash_bg_tool_use("toolu_b1"),
+            _monitor_tool_use("toolu_m1"),
+            _tool_result("toolu_a1"),
+            _tool_result("toolu_b1"),
         ])
         self.assertTrue(nh.has_active_background_agents(t))
 

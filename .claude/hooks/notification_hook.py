@@ -46,7 +46,6 @@ import os
 import shutil
 import subprocess
 import sys
-import re
 from pathlib import Path
 
 import telegram_permission_router as telegram_router
@@ -57,7 +56,6 @@ from telegram_permission_router import (
 
 # Configuration
 CLAUDE_DIR = Path.home() / ".claude"
-TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "canceled", "error", "killed"}
 
 # Telegram caps a message at 4096 chars. We forward the *tail* of the agent's
 # last message (the end is where the question / conclusion lives), HTML-escaped,
@@ -138,60 +136,37 @@ def get_workspace_name(cwd: str) -> str:
     return Path(cwd).name
 
 
-def _extract_task_notification(content: str) -> tuple[str, str] | None:
+
+def _is_background_tool_use(block: dict) -> bool:
+    """Return True if a tool_use block represents a background task.
+
+    Background tasks are:
+    - Agent tool (background by default unless run_in_background is explicitly false)
+    - Bash tool with run_in_background=true
+    - Monitor tool (always background)
+    - Workflow tool (always background)
     """
-    Extract task ID and status from task-notification XML-like payload.
-
-    Returns:
-        (task_id, status) if found, None otherwise.
-    """
-    if not content or "<task-notification>" not in content:
-        return None
-
-    task_id_match = re.search(r"<task-id>\s*([^<\s]+)\s*</task-id>", content)
-    status_match = re.search(r"<status>\s*([^<\s]+)\s*</status>", content)
-
-    if not task_id_match or not status_match:
-        return None
-
-    return task_id_match.group(1), status_match.group(1).strip().lower()
-
-
-def _iter_content_texts(content):
-    """Yield every text string reachable in a message ``content``.
-
-    Content may be a plain string, or a list of typed blocks. Task
-    notifications normally arrive as string content, but they can also be
-    embedded in ``text`` blocks or inside a ``tool_result`` block's nested
-    content (observed when the event lands while a tool call is in flight).
-    """
-    if isinstance(content, str):
-        yield content
-        return
-    if not isinstance(content, list):
-        return
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text":
-            text = block.get("text")
-            if isinstance(text, str):
-                yield text
-        elif block.get("type") == "tool_result":
-            yield from _iter_content_texts(block.get("content"))
+    name = block.get("name", "")
+    inp = block.get("input") or {}
+    if name == "Agent":
+        return inp.get("run_in_background") is not False
+    if name == "Bash":
+        return inp.get("run_in_background") is True
+    if name in ("Monitor", "Workflow"):
+        return True
+    return False
 
 
 def has_active_background_agents(transcript_path: str) -> bool:
     """
     Detect if the current session has background work still running: async
-    subagents (Task tool) or background shell commands (Bash with
-    run_in_background).
+    subagents (Agent tool), background shell commands (Bash with
+    run_in_background), or Monitor commands.
 
-    We infer this by scanning the session transcript:
-    - agent launches: toolUseResult.isAsync=true with status=async_launched + agentId
-    - shell launches: toolUseResult.backgroundTaskId
-    - terminal notifications: task-notification with status in TERMINAL_TASK_STATUSES
-    - explicit stops: a TaskStop result names the task_id it stopped
+    We infer this by scanning the session transcript for tool_use blocks
+    (the assistant requesting to launch background work) and matching them
+    against tool_result blocks (the completion).  A tool_use with no
+    matching tool_result means the task is still in-flight.
     """
     if not transcript_path:
         debug_log("No transcript_path provided; cannot detect background agents")
@@ -202,7 +177,8 @@ def has_active_background_agents(transcript_path: str) -> bool:
         debug_log(f"Transcript file not found: {transcript_file}")
         return False
 
-    active_task_ids: set[str] = set()
+    pending_tool_use_ids: set[str] = set()
+    completed_tool_use_ids: set[str] = set()
 
     try:
         with open(transcript_file, "r") as f:
@@ -216,52 +192,43 @@ def has_active_background_agents(transcript_path: str) -> bool:
                 except json.JSONDecodeError:
                     continue
 
-                tool_use_result = entry.get("toolUseResult")
-                if isinstance(tool_use_result, dict):
-                    # Async agent launch event
-                    if (
-                        tool_use_result.get("isAsync") is True
-                        and tool_use_result.get("status") == "async_launched"
-                    ):
-                        agent_id = tool_use_result.get("agentId")
-                        if agent_id:
-                            active_task_ids.add(str(agent_id))
+                # --- Assistant tool_use blocks: detect launches ---
+                if entry.get("type") == "assistant":
+                    msg = entry.get("message") or {}
+                    content = msg.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if (
+                                isinstance(block, dict)
+                                and block.get("type") == "tool_use"
+                                and _is_background_tool_use(block)
+                            ):
+                                tool_id = block.get("id")
+                                if tool_id:
+                                    pending_tool_use_ids.add(tool_id)
 
-                    # Background shell command launch event
-                    background_task_id = tool_use_result.get("backgroundTaskId")
-                    if background_task_id:
-                        active_task_ids.add(str(background_task_id))
-
-                    # TaskStop result — the task is dead but no terminal
-                    # task-notification is emitted for it.
-                    stopped_task_id = tool_use_result.get("task_id")
-                    if (
-                        stopped_task_id
-                        and "stopped" in str(tool_use_result.get("message", "")).lower()
-                    ):
-                        active_task_ids.discard(str(stopped_task_id))
-
-                # Completion/failure/kill/cancel notification event
+                # --- tool_result blocks: detect completions ---
                 message = entry.get("message")
-                if not isinstance(message, dict):
-                    continue
-
-                for text in _iter_content_texts(message.get("content")):
-                    task_notification = _extract_task_notification(text)
-                    if task_notification:
-                        task_id, status = task_notification
-                        if status in TERMINAL_TASK_STATUSES:
-                            active_task_ids.discard(task_id)
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            if block.get("type") == "tool_result":
+                                tool_use_id = block.get("tool_use_id")
+                                if tool_use_id:
+                                    completed_tool_use_ids.add(tool_use_id)
 
     except Exception as e:
         debug_log(f"Error scanning transcript for background agents: {e}")
-        # Fail open: if detection errors, do not suppress notification
         return False
 
-    if active_task_ids:
+    active = pending_tool_use_ids - completed_tool_use_ids
+    if active:
         debug_log(
-            "Background tasks still active: "
-            + ", ".join(sorted(active_task_ids))
+            "Background tasks still active (tool_use_ids): "
+            + ", ".join(sorted(active))
         )
         return True
 
