@@ -372,6 +372,54 @@ SOME_VAR = "price$100"
         self.assertIn("        )", output)
 
 
+class TestEmitProfileFunctions(unittest.TestCase):
+    """Tests for emit_profile_functions() — profiles only, no amux-spawn."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.tmp = Path(self._tmp)
+
+    def _canonical_path(self) -> Path:
+        return _write_toml(self.tmp, _CANONICAL_TOML)
+
+    def test_contains_function_per_profile(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        self.assertIn("claude()", output)
+        self.assertIn("claude-latest()", output)
+        self.assertIn("claude-glm5()", output)
+
+    def test_no_amux_spawn_branch(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        self.assertNotIn("amux-spawn", output)
+        self.assertNotIn("command -v", output)
+
+    def test_exports_resolved_values(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        self.assertNotIn("${", output)
+        self.assertIn('ANTHROPIC_AUTH_TOKEN="e468a9fd..."', output)
+        self.assertIn('ANTHROPIC_MODEL="glm-5.2[1m]"', output)
+
+    def test_exec_claude_present(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        self.assertIn('exec claude "$@"', output)
+
+    def test_subshell_wrapper_present(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        self.assertIn("(\n", output)
+
+    def test_missing_file_returns_empty_string(self):
+        output = lib.emit_profile_functions("/no/such/file.toml")
+        self.assertEqual(output, "")
+
+    def test_empty_profile_gets_all_profiles_vars(self):
+        output = lib.emit_profile_functions(self._canonical_path())
+        idx = output.find("claude-latest()")
+        self.assertGreater(idx, -1)
+        block = output[idx:]
+        self.assertIn("API_TIMEOUT_MS", block)
+        self.assertIn("GITHUB_MCP_PAT", block)
+
+
 class TestMergeOverride(unittest.TestCase):
     """Focused tests for the merge order: [all-profiles] → [profile.X] wins."""
 

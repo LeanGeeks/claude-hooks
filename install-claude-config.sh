@@ -363,7 +363,8 @@ fi
 log_step "Step 3b/5: Installing amux-spawn completion + shell integration snippet"
 
 COMPLETION_SRC="$SCRIPT_DIR/shell/amux-spawn-completion.bash"
-SNIPPET_SRC="$SCRIPT_DIR/shell/amux-spawn.bash"
+PROFILES_SNIPPET_SRC="$SCRIPT_DIR/shell/claude-profiles.bash"
+AMUX_SNIPPET_SRC="$SCRIPT_DIR/shell/amux-spawn.bash"
 COMPLETION_INSTALLED=false
 SNIPPET_INSTALLED=false
 
@@ -372,7 +373,6 @@ USER_COMPLETIONS_DIR="$HOME/.local/share/bash-completion/completions"
 if [[ -f "$COMPLETION_SRC" ]]; then
     mkdir -p "$USER_COMPLETIONS_DIR"
     cp "$COMPLETION_SRC" "$USER_COMPLETIONS_DIR/amux-spawn"
-    # The completion file does not need +x; bash sources it.
     chmod 644 "$USER_COMPLETIONS_DIR/amux-spawn"
     log_info "Installed completion: amux-spawn → $USER_COMPLETIONS_DIR/amux-spawn"
     COMPLETION_INSTALLED=true
@@ -380,31 +380,41 @@ else
     log_warn "Completion script not found at $COMPLETION_SRC — skipping"
 fi
 
-# ── Shell integration snippet ──────────────────────────────────────────────────
+# ── Shell integration snippets ─────────────────────────────────────────────────
 CLAUDE_SHELL_DIR="$HOME/.claude/shell"
-if [[ -f "$SNIPPET_SRC" ]]; then
-    mkdir -p "$CLAUDE_SHELL_DIR"
-    cp "$SNIPPET_SRC" "$CLAUDE_SHELL_DIR/amux-spawn.bash"
+mkdir -p "$CLAUDE_SHELL_DIR"
+
+if [[ -f "$PROFILES_SNIPPET_SRC" ]]; then
+    cp "$PROFILES_SNIPPET_SRC" "$CLAUDE_SHELL_DIR/claude-profiles.bash"
+    chmod 644 "$CLAUDE_SHELL_DIR/claude-profiles.bash"
+    log_info "Installed shell snippet: claude-profiles.bash → $CLAUDE_SHELL_DIR/claude-profiles.bash"
+    SNIPPET_INSTALLED=true
+else
+    log_warn "Shell snippet not found at $PROFILES_SNIPPET_SRC — skipping"
+fi
+
+if [[ -f "$AMUX_SNIPPET_SRC" ]]; then
+    cp "$AMUX_SNIPPET_SRC" "$CLAUDE_SHELL_DIR/amux-spawn.bash"
     chmod 644 "$CLAUDE_SHELL_DIR/amux-spawn.bash"
     log_info "Installed shell snippet: amux-spawn.bash → $CLAUDE_SHELL_DIR/amux-spawn.bash"
     SNIPPET_INSTALLED=true
 else
-    log_warn "Shell snippet not found at $SNIPPET_SRC — skipping"
+    log_warn "Shell snippet not found at $AMUX_SNIPPET_SRC — skipping"
 fi
 
 # Print the opt-in instructions once (NOT applied automatically).
 if [[ "$SNIPPET_INSTALLED" == true ]]; then
     echo ""
     echo "  ┌─────────────────────────────────────────────────────────────────────┐"
-    echo "  │  Shell integration opt-in (amux-spawn wrappers for claude launcher) │"
+    echo "  │  Shell integration opt-in — choose ONE:                            │"
     echo "  │                                                                     │"
-    echo "  │  Add this ONE line to your bashrc / claude.bashrc to route the      │"
-    echo "  │  everyday launchers through amux-spawn (reversible: remove to undo):│"
+    echo "  │  Profiles only (model aliases, no amux/Telegram):                  │"
+    echo "  │    source $CLAUDE_SHELL_DIR/claude-profiles.bash"
     echo "  │                                                                     │"
+    echo "  │  Profiles + amux-spawn (session tracking, Telegram notifications): │"
     echo "  │    source $CLAUDE_SHELL_DIR/amux-spawn.bash"
     echo "  │                                                                     │"
-    echo "  │  This defines: claude(), claude-glm5(), claude-glm5-f()             │"
-    echo "  │  Do NOT add this line automatically — it redefines your launchers.  │"
+    echo "  │  Do NOT source both — amux-spawn.bash sources profiles internally. │"
     echo "  └─────────────────────────────────────────────────────────────────────┘"
     echo ""
     echo "  ┌─────────────────────────────────────────────────────────────────────┐"
@@ -755,16 +765,18 @@ else
     echo "  - amux-spawn completion: not installed"
 fi
 if [[ "$SNIPPET_INSTALLED" == true ]]; then
-    echo "  - amux-spawn shell snippet: installed ($CLAUDE_SHELL_DIR/amux-spawn.bash)"
-    echo "    OPT-IN: source $CLAUDE_SHELL_DIR/amux-spawn.bash"
+    echo "  - shell snippets: installed ($CLAUDE_SHELL_DIR/)"
+    echo "    OPT-IN (choose one):"
+    echo "      source $CLAUDE_SHELL_DIR/claude-profiles.bash  # profiles only"
+    echo "      source $CLAUDE_SHELL_DIR/amux-spawn.bash       # profiles + amux"
 else
-    echo "  - amux-spawn shell snippet: not installed"
+    echo "  - shell snippets: not installed"
 fi
 
 # Show model profiles status
 if [[ "$PROFILES_INSTALLED" == true ]]; then
     echo "  - profiles.toml: installed ($PROFILES_DEST)"
-    echo "    Edit with your model tokens, then re-source amux-spawn.bash"
+    echo "    Edit with your model tokens, then re-source your chosen shell snippet"
 elif [[ -f "$PROFILES_DEST" ]]; then
     echo "  - profiles.toml: already present ($PROFILES_DEST)"
 else

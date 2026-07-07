@@ -9,8 +9,8 @@
 #   [all-profiles]  — env vars applied to every profile. Overridden per-profile.
 #   [profile.X]     — per-profile env vars. Profile name = shell alias.
 #
-# After editing, open a new shell (or re-source amux-spawn.bash) to pick
-# up changes. No install script rerun needed.
+# After editing, open a new shell (or re-source claude-profiles.bash /
+# amux-spawn.bash) to pick up changes. No install script rerun needed.
 
 # ── Shared values ────────────────────────────────────────────────────
 # Put tokens, model names, or any repeated values here.

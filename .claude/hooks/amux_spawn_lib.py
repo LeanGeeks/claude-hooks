@@ -994,6 +994,40 @@ def _bash_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def emit_profile_functions(path: str | Path | None = None) -> str:
+    """Return bash source text defining one shell function per profile.
+
+    Each function exports the profile's fully-resolved env vars in a subshell
+    and exec's ``claude``.  No amux-spawn integration — use
+    :func:`emit_shell_functions` for that.
+
+    Returns an empty string if the profiles file does not exist or has no
+    profiles.
+    """
+    profiles = load_profiles(path)
+    if not profiles:
+        return ""
+
+    functions: list[str] = []
+    for name in sorted(profiles.keys()):
+        env = profiles[name]
+        export_lines = "\n".join(
+            f"        export {key}={_bash_quote(val)}"
+            for key, val in sorted(env.items())
+        )
+        func = (
+            f"{name}() {{\n"
+            f"    (\n"
+            f"{export_lines}\n"
+            f'        exec claude "$@"\n'
+            f"    )\n"
+            f"}}"
+        )
+        functions.append(func)
+
+    return "\n\n".join(functions) + "\n"
+
+
 def emit_shell_functions(path: str | Path | None = None) -> str:
     """Return bash source text defining one shell function per profile.
 
