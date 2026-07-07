@@ -43,6 +43,10 @@ relay HTTP API itself.
     notification_hook.py         Notification(idle_prompt): forward last msg to Telegram
   settings.json                  permissions allow/deny (+ statusline); hooks merged in by installer
 install-claude-config.sh         merges permissions + wires hooks into global settings.json
+shell/
+  profiles.example.toml          shipped template for ~/.claude/profiles.toml
+  amux-spawn.bash                shell integration: auto-generates aliases from profiles
+  amux-spawn-completion.bash     bash completion for amux-spawn + profile names
 relay-server/
   relay_server/
     app.py                       FastAPI app: HTTP API + Telegram webhook + update dispatch
@@ -234,6 +238,39 @@ each session in **tmux**. Relevant facts:
 This is the substrate the **reply-from-Telegram** feature (task 09) builds on:
 amux's `send` is the only available way to inject a remote reply as a new user
 turn into a running interactive session.
+
+---
+
+## Model profiles (epic 13)
+
+Model/provider configurations are stored as structured TOML at
+`~/.claude/profiles.toml`. Each profile defines env vars for a specific
+model backend (Anthropic native, GLM, DeepSeek, Kimi, local, etc.).
+
+**File structure — three sections:**
+
+```toml
+[vars]              # interpolation-only; ${name} refs, never exported
+[all-profiles]      # env vars applied to EVERY profile (overridden per-profile)
+[profile.<name>]    # per-profile env vars; <name> becomes the shell alias
+```
+
+Merge order: `[all-profiles]` → `[profile.X]` (profile wins on collision).
+Both layers support `${var}` interpolation from `[vars]`.
+
+**Shell aliases** are auto-generated at source-time by `shell/amux-spawn.bash`
+(calls `emit_shell_functions()` in `amux_spawn_lib.py`). Each alias checks for
+`amux-spawn` on PATH: if present, routes through `amux-spawn spawn --profile
+<name>` (tracked session, Telegram); if absent, exports env in a subshell and
+exec's `claude` directly (same model, no tracking).
+
+**Profile loader** lives in `amux_spawn_lib.py` — pure functions, no side
+effects. `resolve_profile(name)` returns the merged env dict; `amux-spawn`
+exports those vars into its own process before the create-detached-under-lock
+flow (env reaches child via tmux `update-environment`, no `ps` leak).
+
+**Install:** `install-claude-config.sh` copies `shell/profiles.example.toml`
+to `~/.claude/profiles.toml` if the file does not exist (never overwrites).
 
 ---
 
