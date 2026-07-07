@@ -318,6 +318,40 @@ else
 fi
 
 # =============================================================================
+# STEP 3a: Install model profiles config (epic 13)
+# =============================================================================
+#
+# profiles.toml stores model backends as structured data (TOML). On a fresh
+# install, copy the shipped example so the user has a ready-to-edit template.
+# Never overwrite an existing file — it may contain user secrets (API tokens).
+
+log_step "Step 3a/5: Installing model profiles config"
+
+PROFILES_SRC="$SCRIPT_DIR/shell/profiles.example.toml"
+PROFILES_DEST="$HOME/.claude/profiles.toml"
+PROFILES_INSTALLED=false
+
+if [[ -f "$PROFILES_DEST" ]]; then
+    log_info "profiles.toml already present — skipping (never overwrite user config)"
+    log_info "  $PROFILES_DEST"
+elif [[ -f "$PROFILES_SRC" ]]; then
+    mkdir -p "$(dirname "$PROFILES_DEST")"
+    cp "$PROFILES_SRC" "$PROFILES_DEST"
+    chmod 600 "$PROFILES_DEST"
+    log_info "Installed: profiles.example.toml → $PROFILES_DEST"
+    PROFILES_INSTALLED=true
+else
+    log_warn "profiles.example.toml not found at $PROFILES_SRC — skipping"
+fi
+
+# Always remind the user to fill in their tokens, whether the file was just
+# created or was already present. Skip only if the file doesn't exist at all
+# (source not found and dest not present).
+if [[ -f "$PROFILES_DEST" ]]; then
+    log_info "Edit ~/.claude/profiles.toml with your model tokens."
+fi
+
+# =============================================================================
 # STEP 3b: Install bash completion + shell integration snippet (epic 10 / 10-05)
 # =============================================================================
 #
@@ -371,6 +405,17 @@ if [[ "$SNIPPET_INSTALLED" == true ]]; then
     echo "  │                                                                     │"
     echo "  │  This defines: claude(), claude-glm5(), claude-glm5-f()             │"
     echo "  │  Do NOT add this line automatically — it redefines your launchers.  │"
+    echo "  └─────────────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────────────┐"
+    echo "  │  Migrating from claude.bashrc env functions to profiles.toml:       │"
+    echo "  │                                                                     │"
+    echo "  │  1. Copy tokens from claude_*_env() into [vars] in profiles.toml.  │"
+    echo "  │  2. Translate each claude_*_env() into a [profile.*] section.       │"
+    echo "  │  3. Move shared env vars (timeouts, PATs) into [all-profiles].      │"
+    echo "  │  4. Remove the old wrapper functions from claude.bashrc.             │"
+    echo "  │  5. Keep non-Claude env vars (TaskMaster, Milvus, etc.) in          │"
+    echo "  │     claude.bashrc.                                                   │"
     echo "  └─────────────────────────────────────────────────────────────────────┘"
     echo ""
 fi
@@ -714,6 +759,16 @@ if [[ "$SNIPPET_INSTALLED" == true ]]; then
     echo "    OPT-IN: source $CLAUDE_SHELL_DIR/amux-spawn.bash"
 else
     echo "  - amux-spawn shell snippet: not installed"
+fi
+
+# Show model profiles status
+if [[ "$PROFILES_INSTALLED" == true ]]; then
+    echo "  - profiles.toml: installed ($PROFILES_DEST)"
+    echo "    Edit with your model tokens, then re-source amux-spawn.bash"
+elif [[ -f "$PROFILES_DEST" ]]; then
+    echo "  - profiles.toml: already present ($PROFILES_DEST)"
+else
+    echo "  - profiles.toml: not installed (profiles.example.toml not found)"
 fi
 
 # Show tmux options status (file + running server)
