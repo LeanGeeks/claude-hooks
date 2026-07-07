@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib  # Python 3.11+ stdlib
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -874,3 +875,162 @@ def read_task_output_tail(tasks_dir: Path | None, task_id: str, max_lines: int =
             continue
         return {"output_file": str(path), "tail": tail, "mtime": mtime}
     return None
+
+
+# ── Profile loader (epic 13, task 13-01) ─────────────────────────────────────
+#
+# Reads ``~/.claude/profiles.toml``, resolves ``${var}`` interpolation from
+# ``[vars]``, merges ``[all-profiles]`` with per-profile env vars, and returns
+# clean dicts.  All functions are pure (no side effects, no os.environ mutation).
+
+PROFILES_TOML = CLAUDE_DIR / "profiles.toml"
+
+# Matches either the escape sequence ``$${`` (-> literal ``${``) or a var ref
+# ``${name}`` (-> value from [vars]).  Single compiled pattern for one-pass
+# substitution without recursion.
+_VAR_PATTERN = re.compile(r"\$\$\{|\$\{(\w+)\}")
+
+
+def _interpolate_value(value: str, vars_: dict[str, str], context: str = "") -> str:
+    """Substitute ``${name}`` refs from *vars_* in *value*.
+
+    - ``$${`` -> literal ``${`` (escape).
+    - ``${name}`` -> ``vars_[name]``; raises ``ValueError`` on undefined names.
+    - One-pass, non-recursive: a var's own value is never re-expanded.
+    """
+    def _replace(m: re.Match) -> str:
+        if m.group(0) == "$${":
+            return "${"
+        name = m.group(1)
+        if name not in vars_:
+            suffix = f" in {context}" if context else ""
+            raise ValueError(f"Undefined variable ${{{name}}}{suffix}")
+        return vars_[name]
+
+    return _VAR_PATTERN.sub(_replace, value)
+
+
+def _interpolate_section(
+    section: dict[str, str],
+    vars_: dict[str, str],
+    context: str = "",
+) -> dict[str, str]:
+    """Return a new dict with all values interpolated from *vars_*."""
+    return {
+        k: _interpolate_value(v, vars_, context=f"{context}.{k}" if context else k)
+        for k, v in section.items()
+    }
+
+
+def load_profiles(path: str | Path | None = None) -> dict[str, dict[str, str]]:
+    """Parse the profiles TOML and return resolved env dicts for all profiles.
+
+    Returns ``{profile_name: {ENV_VAR: resolved_value}}``.  Each profile's dict
+    is the merged result: ``[all-profiles]`` globals with ``[profile.X]``
+    overrides applied, all ``${var}`` refs resolved from ``[vars]``.
+
+    Returns an empty dict if the file does not exist (profiles are opt-in).
+    Raises ``ValueError`` on undefined ``${var}`` references.
+    """
+    toml_path = Path(path) if path is not None else PROFILES_TOML
+    if not toml_path.exists():
+        return {}
+
+    with open(toml_path, "rb") as f:
+        raw = tomllib.load(f)
+
+    vars_: dict[str, str] = {k: str(v) for k, v in raw.get("vars", {}).items()}
+    all_profiles_raw: dict[str, str] = {
+        k: str(v) for k, v in raw.get("all-profiles", {}).items()
+    }
+    profiles_raw: dict[str, dict[str, str]] = {
+        name: {k: str(v) for k, v in section.items()}
+        for name, section in raw.get("profile", {}).items()
+        if isinstance(section, dict)
+    }
+
+    # Interpolate [all-profiles] values using [vars].
+    all_profiles = _interpolate_section(all_profiles_raw, vars_, context="all-profiles")
+
+    # Build each profile: [all-profiles] merged with per-profile overrides.
+    result: dict[str, dict[str, str]] = {}
+    for name, per_profile_raw in profiles_raw.items():
+        per_profile = _interpolate_section(
+            per_profile_raw, vars_, context=f"profile.{name}"
+        )
+        result[name] = {**all_profiles, **per_profile}
+
+    return result
+
+
+def resolve_profile(name: str, path: str | Path | None = None) -> dict[str, str]:
+    """Return merged env vars for a single profile *name*.
+
+    Raises ``ValueError`` if *name* is not present in the profiles file.
+    """
+    profiles = load_profiles(path)
+    if name not in profiles:
+        raise ValueError(f"Unknown profile: {name!r}")
+    return profiles[name]
+
+
+def profile_names(path: str | Path | None = None) -> list[str]:
+    """Sorted list of profile names (for shell completion).
+
+    Returns an empty list if the profiles file does not exist.
+    """
+    return sorted(load_profiles(path).keys())
+
+
+def _bash_quote(value: str) -> str:
+    """Wrap *value* in double quotes with embedded special chars escaped."""
+    escaped = (
+        value
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
+    )
+    return f'"{escaped}"'
+
+
+def emit_shell_functions(path: str | Path | None = None) -> str:
+    """Return bash source text defining one shell function per profile.
+
+    Each function name equals the profile name.  It checks for ``amux-spawn``
+    on PATH: if present, routes through ``amux-spawn spawn --profile <name>``;
+    if absent, exports the profile's fully-resolved env vars in a subshell and
+    exec's ``claude``.
+
+    Values in the fallback branch are fully resolved (no ``${var}`` references
+    -- those are resolved at Python load time, not at bash invocation time).
+
+    Returns an empty string if the profiles file does not exist or has no
+    profiles.
+    """
+    profiles = load_profiles(path)
+    if not profiles:
+        return ""
+
+    functions: list[str] = []
+    for name in sorted(profiles.keys()):
+        env = profiles[name]
+        export_lines = "\n".join(
+            f"            export {key}={_bash_quote(val)}"
+            for key, val in sorted(env.items())
+        )
+        func = (
+            f"{name}() {{\n"
+            f"    if command -v amux-spawn &>/dev/null; then\n"
+            f'        amux-spawn spawn --profile {name} "$@"\n'
+            f"    else\n"
+            f"        (\n"
+            f"{export_lines}\n"
+            f'            exec claude "$@"\n'
+            f"        )\n"
+            f"    fi\n"
+            f"}}"
+        )
+        functions.append(func)
+
+    return "\n\n".join(functions) + "\n"
