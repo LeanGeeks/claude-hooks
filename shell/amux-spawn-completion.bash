@@ -30,7 +30,7 @@ _amux_spawn_completions() {
 
     # ── Top-level subcommand completion ──────────────────────────────────────
     if [[ $cword -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "spawn a attach status last ls" -- "$cur"))
+        COMPREPLY=($(compgen -W "spawn a attach status last ls profiles" -- "$cur"))
         return
     fi
 
@@ -53,6 +53,23 @@ _amux_spawn_completions() {
             done
             COMPREPLY=($(compgen -W "${names[*]}" -- "$cur"))
         fi
+        return
+    fi
+
+    # ── spawn: complete --profile <name> ─────────────────────────────────────
+    if [[ "$subcommand" == "spawn" ]]; then
+        if [[ "$prev" == "--profile" ]]; then
+            local profile_names
+            profile_names=$(grep -oP '^\[profile\.\K[^\]]+' \
+                "${HOME}/.claude/profiles.toml" 2>/dev/null)
+            COMPREPLY=($(compgen -W "$profile_names" -- "$cur"))
+        fi
+        return
+    fi
+
+    # ── profiles: complete flags ──────────────────────────────────────────────
+    if [[ "$subcommand" == "profiles" ]]; then
+        COMPREPLY=($(compgen -W "--json" -- "$cur"))
         return
     fi
 

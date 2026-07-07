@@ -1,42 +1,29 @@
 #!/usr/bin/env bash
-# amux-spawn shell integration — opt-in wrapper functions (task 10-05 / epic 10)
+# amux-spawn shell integration (task 13-02 / epic 13)
 #
 # PURPOSE
-#   Redefine the everyday Claude launchers so they route through `amux-spawn spawn`,
-#   which creates an amux session and (inside tmux) switch-clients to it — giving
-#   every launch Telegram follow-up, a trackable handle, and proper nested-tmux
-#   behaviour.  The model environment is preserved: env vars ride tmux
-#   update-environment (task 12 E1 / D-Env), so `claude_glm5_env && amux-spawn spawn`
-#   delivers the GLM model/auth vars into the child pane without a `ps` leak.
+#   Auto-generates one wrapper function per profile in ~/.claude/profiles.toml
+#   at source-time. Each function routes through `amux-spawn spawn --profile
+#   <name>` when amux-spawn is on PATH (full tracking, Telegram, session handle),
+#   or falls back to a subshell with profile env vars exported and exec's claude
+#   directly (same model, no tracking).
+#
+#   Adding a profile = edit ~/.claude/profiles.toml, open a new shell (or
+#   re-source this file). No install script rerun needed.
 #
 # OPT-IN (REVERSIBLE)
-#   Add ONE line to your personal bashrc (e.g. ~/.bashrc or claude.bashrc):
+#   Add ONE line to your personal bashrc (e.g. ~/.bashrc):
 #
-#     source /path/to/this/file          # absolute path to this file in the repo
-#                                        # or the installed copy (~/.claude/shell/amux-spawn.bash)
+#     source /path/to/this/file
 #
-#   To UNDO: remove that `source` line.  The functions vanish and the original
-#   `claude` / `claude-glm5` aliases or functions (if any) are NOT restored —
-#   either ensure the original definitions appear BEFORE this source line so they
-#   survive, or simply restart the shell without this file sourced.
+#   To UNDO: remove that `source` line and restart the shell.
 #
 # SAFETY
-#   - This file is NOT sourced or modified automatically by install-claude-config.sh.
-#     The install script only copies it to ~/.claude/shell/ and prints the opt-in
-#     source line; you choose whether to add it.
-#   - Nothing in this file touches ~/.claude/settings.json, amux config, or any
-#     system file.  It ONLY defines shell functions in the current shell session.
-#   - The bash completion (installed separately) works regardless of whether this
-#     snippet is sourced.
-#
-# FUNCTIONS DEFINED
-#   claude          — amux-spawn spawn "$@"  (plain Claude session with amux)
-#   claude-glm5     — claude_glm5_env + amux-spawn spawn "$@" (GLM env via subshell)
-#   claude-glm5-f   — alias for claude-glm5 (the "-f" family shares the same env)
-#
-# CUSTOMISATION
-#   If your repo defines additional env-setter functions (e.g. `claude_opus_env`),
-#   add wrappers following the same pattern below.
+#   This file is NOT sourced automatically by install-claude-config.sh. The
+#   install script only copies it to ~/.claude/shell/ and prints the opt-in
+#   source line; you choose whether to add it.
+#   Nothing here touches ~/.claude/settings.json, amux config, or any system
+#   file. It ONLY defines shell functions in the current shell session.
 
 # Guard: don't re-source if already loaded.
 if [[ "${_AMUX_SPAWN_SHELL_LOADED:-}" == "1" ]]; then
@@ -44,52 +31,31 @@ if [[ "${_AMUX_SPAWN_SHELL_LOADED:-}" == "1" ]]; then
 fi
 _AMUX_SPAWN_SHELL_LOADED=1
 
-# ---------------------------------------------------------------------------
-# claude — drop-in replacement that creates an amux session and attaches to it.
-# All flags and arguments are forwarded to `amux-spawn spawn` unchanged.
-# ---------------------------------------------------------------------------
-claude() {
-    if declare -f claude_env &>/dev/null; then
-        ( claude_env && amux-spawn spawn "$@" )
-    else
-        amux-spawn spawn "$@"
+# Locate amux_spawn_lib.py.
+# Priority: installed copy (~/.claude/hooks/) → repo copy (sibling of shell/).
+_amux_spawn_hooks_dir=""
+if [[ -f "${HOME}/.claude/hooks/amux_spawn_lib.py" ]]; then
+    _amux_spawn_hooks_dir="${HOME}/.claude/hooks"
+else
+    _amux_spawn_this_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+    if [[ -n "$_amux_spawn_this_dir" && \
+          -f "${_amux_spawn_this_dir}/../.claude/hooks/amux_spawn_lib.py" ]]; then
+        _amux_spawn_hooks_dir="${_amux_spawn_this_dir}/../.claude/hooks"
     fi
-}
+    unset _amux_spawn_this_dir
+fi
 
-# ---------------------------------------------------------------------------
-# claude-glm5 / claude-glm5-f — GLM model wrappers.
-#
-# Runs `claude_glm5_env` in a subshell first to export the GLM model/auth vars
-# into the spawning shell's environment, then calls `amux-spawn spawn`.  The
-# vars reach the amux session's pane via tmux update-environment (task 12 E1),
-# which copies them from the spawner's LIVE env when the session is created —
-# so the GLM credentials are present in the child without being inlined into the
-# launch command (no `ps` leak).
-#
-# `claude_glm5_env` must be defined in your claude.bashrc (or wherever your
-# personal model functions live).  If it is absent this function falls back to a
-# plain `amux-spawn spawn` with a warning so you don't silently get the wrong
-# model.
-# ---------------------------------------------------------------------------
-claude-glm5() {
-    if declare -f claude_glm5_env &>/dev/null; then
-        # Subshell: set env vars, then exec amux-spawn in the same subshell so
-        # those vars are in its LIVE environment when amux E1 snapshots them.
-        ( claude_glm5_env && amux-spawn spawn "$@" )
-    else
-        echo "amux-spawn: warning: claude_glm5_env is not defined; falling back to plain spawn" >&2
-        amux-spawn spawn "$@"
-    fi
-}
+# Eval the auto-generated shell functions.
+# If python3 fails or profiles.toml doesn't exist, eval receives empty output —
+# no functions defined, no error.
+if [[ -n "$_amux_spawn_hooks_dir" ]]; then
+    eval "$(AMUX_SPAWN_HOOKS_DIR="$_amux_spawn_hooks_dir" \
+        python3 -c "
+import sys, os
+sys.path.insert(0, os.environ['AMUX_SPAWN_HOOKS_DIR'])
+import amux_spawn_lib
+print(amux_spawn_lib.emit_shell_functions())
+" 2>/dev/null)" 2>/dev/null || true
+fi
 
-# `-f` family (same GLM model, if your rc defines a separate env function for it)
-claude-glm5-f() {
-    if declare -f claude_glm5_f_env &>/dev/null; then
-        ( claude_glm5_f_env && amux-spawn spawn "$@" )
-    elif declare -f claude_glm5_env &>/dev/null; then
-        ( claude_glm5_env && amux-spawn spawn "$@" )
-    else
-        echo "amux-spawn: warning: claude_glm5_f_env / claude_glm5_env not defined; plain spawn" >&2
-        amux-spawn spawn "$@"
-    fi
-}
+unset _amux_spawn_hooks_dir

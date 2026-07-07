@@ -169,6 +169,17 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
     ``claude_flags`` are the pass-through Claude flags (everything amux-spawn did
     not consume). ``prompt`` is the seeded prompt (from after ``--``), or None.
     """
+    # Resolve model profile and export its env vars BEFORE the lock so the
+    # spawner's live environment (which amux E1 snapshots via update-environment)
+    # already carries the profile vars when the session is created.
+    if getattr(args, "profile", None):
+        try:
+            profile_env = lib.resolve_profile(args.profile)
+            os.environ.update(profile_env)
+        except ValueError as exc:
+            _eprint(f"amux-spawn: error: {exc}")
+            return 1
+
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
 
     # --wait/--notify force tracked + detached even at a TTY (you await the
@@ -911,6 +922,58 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return 1
 
 
+# ── profiles (task 13-02) ─────────────────────────────────────────────────────
+
+def cmd_profiles(args: argparse.Namespace) -> int:
+    """``profiles [--json]`` — list available model profiles.
+
+    Human-readable: name / model / provider table.
+    ``--json``: array of ``{name, env}`` objects.
+    """
+    from urllib.parse import urlparse
+
+    profiles = lib.load_profiles()
+
+    if args.json:
+        output = [{"name": name, "env": env} for name, env in sorted(profiles.items())]
+        print(json.dumps(output))
+        return 0
+
+    if not profiles:
+        print("amux-spawn: no profiles found (missing ~/.claude/profiles.toml or no [profile.*] sections)")
+        return 0
+
+    rows: list[tuple[str, str, str]] = []
+    for name, env in sorted(profiles.items()):
+        # Model: ANTHROPIC_MODEL if set, else first of the default model vars.
+        model = (
+            env.get("ANTHROPIC_MODEL")
+            or env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+            or env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+            or ""
+        )
+        # Provider: hostname from ANTHROPIC_BASE_URL if set, else "anthropic".
+        base_url = env.get("ANTHROPIC_BASE_URL", "")
+        if base_url:
+            try:
+                provider = urlparse(base_url).hostname or "anthropic"
+            except Exception:  # noqa: BLE001
+                provider = "anthropic"
+        else:
+            provider = "anthropic"
+        rows.append((name, model, provider))
+
+    # Format as an aligned table.
+    col_name_w = max(len("NAME"), *(len(r[0]) for r in rows))
+    col_model_w = max(len("MODEL"), *(len(r[1]) for r in rows))
+    fmt = f"{{:<{col_name_w}}}  {{:<{col_model_w}}}  {{}}"
+    print(fmt.format("NAME", "MODEL", "PROVIDER"))
+    print(fmt.format("-" * col_name_w, "-" * col_model_w, "-" * 8))
+    for name, model, provider in rows:
+        print(fmt.format(name, model, provider))
+    return 0
+
+
 # ── CLI dispatch ──────────────────────────────────────────────────────────────
 
 def _split_prompt(argv: list[str]) -> tuple[list[str], str | None]:
@@ -954,6 +1017,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--run-id", default=None, help="override the inherited/minted run_id")
     sp.add_argument("--stuck-after", default=None,
                     help="stuck threshold (e.g. 10m, 600, 2h); persisted in the handle")
+    sp.add_argument("--profile", default=None,
+                    help="model profile name from ~/.claude/profiles.toml; "
+                         "resolved env vars are exported before spawning")
+
+    prof = sub.add_parser("profiles", help="list available model profiles from profiles.toml")
+    prof.add_argument("--json", action="store_true", help="machine-readable JSON output")
 
     st = sub.add_parser("status", help="report a tracked session's derived state")
     st.add_argument("handle", help="amux session name (handle key)")
@@ -1009,6 +1078,10 @@ def main(argv: list[str] | None = None) -> int:
         # --append-system-prompt) through to forward_flags untouched.
         ns, claude_flags = parser.parse_known_args(["spawn"] + before)
         return cmd_spawn(ns, claude_flags, prompt)
+
+    if subcommand == "profiles":
+        ns = build_parser().parse_args(argv)
+        return cmd_profiles(ns)
 
     if subcommand in ("status", "last", "ls"):
         ns = build_parser().parse_args(argv)
