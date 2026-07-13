@@ -629,5 +629,110 @@ class TestAutoDenyAtTtl(unittest.TestCase):
         self.assertEqual(get_request(req.request_id).state, RequestState.DENY.value)
 
 
+class TestCrossAgentIsolation(unittest.TestCase):
+    """Verify that PostToolUse from one agent doesn't cancel another agent's
+    pending permission request (the cross-agent race condition)."""
+
+    def test_different_agent_id_not_matched(self):
+        """A pending request from subagent A is NOT found when searching with
+        subagent B's agent_id."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="shared-session",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf dist"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id="subagent-A",
+        )
+
+        # PostToolUse from a DIFFERENT agent should NOT find this request
+        found = find_pending_request_by_tool_session(
+            session_id="shared-session",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id="subagent-B",
+        )
+        self.assertIsNone(found)
+
+        # PostToolUse from the parent session (agent_id=None) should NOT find it
+        found = find_pending_request_by_tool_session(
+            session_id="shared-session",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+        )
+        self.assertIsNone(found)
+
+        # PostToolUse from the SAME agent SHOULD find it
+        found = find_pending_request_by_tool_session(
+            session_id="shared-session",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id="subagent-A",
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_parent_session_request_matched_by_parent_only(self):
+        """A pending request from the parent (agent_id=None) is only found
+        when searching with agent_id=None."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="parent-session",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf dist"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # Subagent's PostToolUse should NOT find parent's request
+        found = find_pending_request_by_tool_session(
+            session_id="parent-session",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id="some-subagent",
+        )
+        self.assertIsNone(found)
+
+        # Parent's PostToolUse SHOULD find it
+        found = find_pending_request_by_tool_session(
+            session_id="parent-session",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_agent_id_stored_in_request(self):
+        """create_request persists agent_id so it can be filtered on."""
+        from permission_state_store import create_request, get_request
+
+        req = create_request(
+            session_id="sess",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id="agent-xyz",
+        )
+
+        loaded = get_request(req.request_id)
+        self.assertEqual(loaded.agent_id, "agent-xyz")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

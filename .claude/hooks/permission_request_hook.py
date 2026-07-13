@@ -608,10 +608,12 @@ def main():
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
         permission_suggestions = input_data.get('permission_suggestions', [])
+        agent_id = input_data.get('agent_id') or None
 
         debug_log(f"Session: {session_id}")
         debug_log(f"CWD: {cwd}")
         debug_log(f"Tool: {tool_name}")
+        debug_log(f"Agent ID: {agent_id}")
         debug_log(f"Tool input: {json.dumps(tool_input)[:200]}")
         debug_log(f"Permission suggestions: {permission_suggestions}")
 
@@ -646,6 +648,7 @@ def main():
             tool_input=tool_input,
             permission_suggestions=permission_suggestions,
             ttl_seconds=REQUEST_TTL,
+            agent_id=agent_id,
         )
         debug_log(f"Created request: {request.request_id}")
 

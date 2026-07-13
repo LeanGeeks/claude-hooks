@@ -93,6 +93,7 @@ class PermissionRequest:
     resolution_source: Optional[str] = None  # "telegram" | "terminal" | "timeout"
     resolved_at: Optional[str] = None  # ISO timestamp when resolved
     expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
+    agent_id: Optional[str] = None  # subagent id (None for parent session)
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -184,6 +185,7 @@ def create_request(
     tool_input: Dict[str, Any],
     permission_suggestions: List[str],
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    agent_id: Optional[str] = None,
 ) -> PermissionRequest:
     """
     Create a new pending permission request.
@@ -195,6 +197,7 @@ def create_request(
         tool_input: Input parameters for the tool
         permission_suggestions: Suggested permission patterns from hook input
         ttl_seconds: Time-to-live in seconds
+        agent_id: Subagent id (None for parent session)
 
     Returns:
         PermissionRequest object with request_id
@@ -218,6 +221,7 @@ def create_request(
         created_at=now,
         updated_at=now,
         expires_at=_expires_at(ttl_seconds),
+        agent_id=agent_id,
     )
 
     # Append to state file with lock
@@ -717,6 +721,7 @@ def find_pending_request_by_tool_session(
     session_id: str,
     tool_name: str,
     cwd: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> Optional[PermissionRequest]:
     """
     Find a pending request matching tool name and session.
@@ -728,6 +733,7 @@ def find_pending_request_by_tool_session(
         session_id: Claude session UUID
         tool_name: Name of the tool that was executed
         cwd: Optional working directory to match
+        agent_id: Optional subagent id to match (prevents cross-agent cancellation)
 
     Returns:
         Most recent matching pending PermissionRequest if found, None otherwise
@@ -751,6 +757,11 @@ def find_pending_request_by_tool_session(
                         data.get('state') == RequestState.PENDING.value):
                         # Optionally filter by cwd
                         if cwd and data.get('cwd') != cwd:
+                            continue
+                        # Filter by agent_id: a PostToolUse from agent X must
+                        # only match requests created by agent X (or both None
+                        # for the parent session).
+                        if data.get('agent_id') != agent_id:
                             continue
                         request = PermissionRequest.from_dict(data)
                         # Skip if expired

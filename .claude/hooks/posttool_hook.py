@@ -77,21 +77,24 @@ def main():
         cwd = input_data.get('cwd', os.getcwd())
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
+        agent_id = input_data.get('agent_id') or None
 
         log_debug(f"Session: {session_id}")
         log_debug(f"CWD: {cwd}")
         log_debug(f"Tool: {tool_name}")
+        log_debug(f"Agent ID: {agent_id}")
 
         # Skip if Telegram is not enabled
         if not telegram_permission_router.TELEGRAM_ENABLED:
             log_debug("Telegram not enabled, skipping")
             sys.exit(0)
 
-        # Find pending request for this tool/session
+        # Find pending request for this tool/session/agent
         pending_request = find_pending_request_by_tool_session(
             session_id=session_id,
             tool_name=tool_name,
             cwd=cwd,
+            agent_id=agent_id,
         )
 
         if not pending_request:
