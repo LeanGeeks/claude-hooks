@@ -114,6 +114,8 @@ WRAPPER_PREFIXES = {
 WRAPPER_ARG_FLAGS = {
     'env': {'-u', '--unset', '-C', '--chdir'},
     'timeout': {'-s', '--signal', '-k', '--kill-after'},
+    'xargs': {'-I', '-P', '--max-procs', '-n', '--max-args', '-L', '--max-lines',
+              '-s', '--max-chars', '-E', '-d', '--delimiter'},
 }
 
 # A pattern the wrapper's leading POSITIONAL operand must match before we skip it

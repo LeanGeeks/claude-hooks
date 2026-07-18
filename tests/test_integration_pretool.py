@@ -540,6 +540,21 @@ class TestPrefixReduction(unittest.TestCase):
         result = self.validator.validate_bash_command("find / | xargs rm -rf")
         self.assertEqual(result["decision"], "ask")
 
+    def test_xargs_with_P_and_I_flags(self):
+        """`xargs -P 10 -I {} gh api ...` must reduce to `gh` not `10`."""
+        result = self.validator.validate_bash_command(
+            "gh api repos/o/r/actions/artifacts --paginate --jq '.artifacts[].id'"
+            " | xargs -P 10 -I {} gh api -X DELETE repos/o/r/actions/artifacts/{}"
+            " 2>&1 | tail -5"
+        )
+        self.assertEqual(result["decision"], "allow")
+
+    def test_xargs_with_n_flag(self):
+        result = self.validator.validate_bash_command(
+            "echo a b c | xargs -n 1 echo"
+        )
+        self.assertEqual(result["decision"], "allow")
+
     def test_keyword_prefix_allows_real_allowed_command(self):
         """`do curl ...` reduces to an allowed `curl`."""
         result = self.validator.validate_bash_command("do curl http://localhost/x")
