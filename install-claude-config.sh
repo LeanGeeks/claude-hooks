@@ -223,7 +223,7 @@ else
             # for the system python3 (the relay stays disabled without it).
             if ! python3 -c "import httpx" 2>/dev/null; then
                 log_warn "  Python 'httpx' not available for system python3 — Telegram relay will stay disabled."
-                log_warn "  Install it with: sudo apt install python3-httpx   (or: pip install --user httpx)"
+                log_warn "  Install it with: sudo apt install python3-httpx"
             fi
         fi
 
