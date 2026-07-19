@@ -112,6 +112,15 @@ if ! command -v python3 &> /dev/null; then
     exit 1
 fi
 
+# Check uv is available (needed for context-usage MCP server)
+if command -v uv &> /dev/null; then
+    UV_AVAILABLE=true
+else
+    UV_AVAILABLE=false
+    log_warn "uv not found — context-usage MCP server will not be installed."
+    log_warn "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+fi
+
 # =============================================================================
 # STEP 1: Install Hooks
 # =============================================================================
@@ -698,6 +707,32 @@ if [[ "$STATUSLINE_INSTALLED" == true ]]; then
     log_info "  - refreshInterval: 30"
 fi
 
+# Register context-usage MCP server in ~/.claude.json (not settings.json)
+# Claude Code reads MCP servers from ~/.claude.json (user-scoped) or .mcp.json (project-scoped).
+CONTEXT_MCP_INSTALLED=false
+CONTEXT_MCP_SCRIPT="$SCRIPT_DIR/context-mcp/server.py"
+CLAUDE_JSON="$HOME/.claude.json"
+if [[ "$UV_AVAILABLE" == true && -f "$CONTEXT_MCP_SCRIPT" ]]; then
+    if [[ ! -f "$CLAUDE_JSON" ]]; then
+        echo '{}' > "$CLAUDE_JSON"
+    fi
+    if jq empty "$CLAUDE_JSON" 2>/dev/null; then
+        jq --arg script "$CONTEXT_MCP_SCRIPT" \
+            '.mcpServers = (.mcpServers // {}) + {"context-usage": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {}}}' \
+            "$CLAUDE_JSON" > "$CLAUDE_JSON.tmp"
+        if jq empty "$CLAUDE_JSON.tmp" 2>/dev/null; then
+            mv "$CLAUDE_JSON.tmp" "$CLAUDE_JSON"
+            log_info "MCP server registered in ~/.claude.json: context-usage (uv run --script $CONTEXT_MCP_SCRIPT)"
+            CONTEXT_MCP_INSTALLED=true
+        else
+            log_warn "Failed to produce valid JSON for ~/.claude.json — MCP server not registered"
+            rm -f "$CLAUDE_JSON.tmp"
+        fi
+    else
+        log_warn "~/.claude.json is not valid JSON — skipping MCP server registration"
+    fi
+fi
+
 # Validate merged JSON
 if ! echo "$MERGED" | jq empty 2>/dev/null; then
     log_error "Merged config is not valid JSON!"
@@ -781,6 +816,13 @@ elif [[ -f "$PROFILES_DEST" ]]; then
     echo "  - profiles.toml: already present ($PROFILES_DEST)"
 else
     echo "  - profiles.toml: not installed (profiles.example.toml not found)"
+fi
+
+# Show context-usage MCP status
+if [[ "$CONTEXT_MCP_INSTALLED" == true ]]; then
+    echo "  - MCP server (context-usage): installed"
+else
+    echo "  - MCP server (context-usage): not installed (uv missing or server.py not found)"
 fi
 
 # Show tmux options status (file + running server)
