@@ -208,6 +208,7 @@
       "Bash(jest:*)",
       "Bash(vitest:*)",
       "Bash(cargo test:*)",
+      "Bash(nc:*)",
       "Bash(curl:*)",
       "Bash(sleep:*)",
       "Bash(sync:*)",
