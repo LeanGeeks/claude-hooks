@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Search full Claude Code prompt history (history.jsonl has everything; ctrl+r only shows 100).
+
+Usage:
+    claude-history                     # fzf over all prompts (newest first)
+    claude-history -q "migration"      # fzf pre-filtered
+    claude-history -p claude-hooks     # only prompts from projects matching substring
+    claude-history --after 2026-07-01  # date range
+    claude-history --list              # dump to stdout (no fzf)
+    claude-history --list | grep ...   # pipe-friendly
+
+Selected prompt is printed to stdout (for paste / piping).
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+HISTORY_FILE = Path.home() / ".claude" / "history.jsonl"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+# Cache session titles so we only parse each conversation file once.
+_title_cache: dict[str, str | None] = {}
+
+
+def load_history(path: Path) -> list[dict]:
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
+
+
+def project_short(project_path: str) -> str:
+    """'/data/sync/work/leangeeks-ai/claude-hooks' -> 'claude-hooks'"""
+    return project_path.rstrip("/").rsplit("/", 1)[-1] if project_path else "?"
+
+
+def project_slug(project_path: str) -> str:
+    """'/data/sync/work/foo/bar' -> '-data-sync-work-foo-bar'"""
+    return project_path.replace("/", "-")
+
+
+def session_title(session_id: str | None, project_path: str | None) -> str | None:
+    if not session_id:
+        return None
+    if session_id in _title_cache:
+        return _title_cache[session_id]
+
+    title = None
+    candidates = []
+    if project_path:
+        slug = project_slug(project_path)
+        candidates.append(PROJECTS_DIR / slug / f"{session_id}.jsonl")
+    # Fallback: search all project dirs (slow, only if needed).
+    if not candidates or not candidates[0].exists():
+        for d in PROJECTS_DIR.iterdir():
+            p = d / f"{session_id}.jsonl"
+            if p.exists():
+                candidates = [p]
+                break
+
+    for cpath in candidates:
+        if not cpath.exists():
+            continue
+        try:
+            with open(cpath) as f:
+                for line in f:
+                    if '"ai-title"' in line:
+                        r = json.loads(line)
+                        if r.get("type") == "ai-title":
+                            title = r.get("aiTitle")
+                            break
+        except (json.JSONDecodeError, OSError):
+            pass
+        break
+
+    _title_cache[session_id] = title
+    return title
+
+
+def ts_to_str(ts_ms: int) -> str:
+    dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone()
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def parse_date(s: str) -> float:
+    """Parse YYYY-MM-DD (or YYYY-MM-DD HH:MM) to epoch ms."""
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).timestamp() * 1000
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(f"bad date: {s!r} (use YYYY-MM-DD)")
+
+
+def format_line(rec: dict, show_title: bool = False) -> str:
+    ts = ts_to_str(rec["timestamp"])
+    proj = project_short(rec.get("project", ""))
+    prompt = rec["display"].replace("\n", "  ↵  ")
+    # Collapse long pasted-text placeholders.
+    prompt = re.sub(r"\[Pasted text #\d+ \+\d+ lines\]", "[paste]", prompt)
+    parts = [ts, proj, prompt]
+    if show_title:
+        title = session_title(rec.get("sessionId"), rec.get("project"))
+        if title:
+            parts.insert(2, f"({title})")
+    return " │ ".join(parts)
+
+
+def original_prompt(rec: dict) -> str:
+    """Reconstruct the full prompt including pasted content."""
+    text = rec["display"]
+    pasted = rec.get("pastedContents") or {}
+    for pid, blob in pasted.items():
+        placeholder_re = re.compile(re.escape(f"[Pasted text #{pid}") + r"[^\]]*\]")
+        content = blob.get("content", "")
+        text = placeholder_re.sub(content, text)
+    return text
+
+
+def run_fzf(lines: list[str], query: str | None = None) -> str | None:
+    cmd = [
+        "fzf",
+        "--ansi",
+        "--no-sort",
+        "--exact",
+        "--reverse",
+        "--wrap",
+        "--height=80%",
+        "--border",
+        "--header=Claude Code prompt history (full)",
+    ]
+    if query:
+        cmd += ["--query", query]
+    try:
+        result = subprocess.run(
+            cmd,
+            input="\n".join(lines),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("fzf not found — install it or use --list", file=sys.stderr)
+        sys.exit(1)
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Search full Claude Code prompt history"
+    )
+    parser.add_argument("-q", "--query", help="initial fzf query / grep pattern")
+    parser.add_argument(
+        "-p", "--project", help="filter by project path substring"
+    )
+    parser.add_argument(
+        "--after", type=parse_date, help="only prompts after YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--before", type=parse_date, help="only prompts before YYYY-MM-DD"
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="dump to stdout instead of fzf"
+    )
+    parser.add_argument(
+        "--titles", action="store_true",
+        help="include session titles (slower — reads conversation files)"
+    )
+    parser.add_argument(
+        "-n", "--limit", type=int, default=0,
+        help="max prompts to show (0=all)"
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="output the full prompt with pasted content (on selection)"
+    )
+    parser.add_argument(
+        "--stats", action="store_true",
+        help="show history statistics and exit"
+    )
+    args = parser.parse_args()
+
+    if not HISTORY_FILE.exists():
+        print(f"history file not found: {HISTORY_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    records = load_history(HISTORY_FILE)
+
+    if args.stats:
+        projects: dict[str, int] = {}
+        for r in records:
+            p = project_short(r.get("project", "?"))
+            projects[p] = projects.get(p, 0) + 1
+        oldest = ts_to_str(records[0]["timestamp"]) if records else "?"
+        newest = ts_to_str(records[-1]["timestamp"]) if records else "?"
+        print(f"Total prompts: {len(records)}")
+        print(f"Date range:    {oldest}  →  {newest}")
+        print(f"Projects:      {len(projects)}")
+        print()
+        for p, c in sorted(projects.items(), key=lambda x: -x[1]):
+            print(f"  {c:5d}  {p}")
+        return
+
+    if args.project:
+        pat = args.project.lower()
+        records = [r for r in records if pat in r.get("project", "").lower()]
+
+    if args.after:
+        records = [r for r in records if r["timestamp"] >= args.after]
+
+    if args.before:
+        records = [r for r in records if r["timestamp"] <= args.before]
+
+    if args.query and args.list:
+        pat = re.compile(re.escape(args.query), re.IGNORECASE)
+        records = [r for r in records if pat.search(r["display"])]
+
+    # Newest first.
+    records.reverse()
+
+    if args.limit:
+        records = records[: args.limit]
+
+    if not records:
+        print("no matching prompts", file=sys.stderr)
+        sys.exit(0)
+
+    lines = [format_line(r, show_title=args.titles) for r in records]
+
+    if args.list:
+        print("\n".join(lines))
+        return
+
+    selected = run_fzf(lines, query=args.query)
+    if not selected:
+        sys.exit(0)
+
+    # Find the record that matches the selected line.
+    idx = None
+    for i, line in enumerate(lines):
+        if line == selected:
+            idx = i
+            break
+
+    if idx is not None:
+        rec = records[idx]
+        if args.full:
+            print(original_prompt(rec))
+        else:
+            print(rec["display"])
+    else:
+        # Fallback: extract prompt from formatted line.
+        parts = selected.split(" │ ", 2)
+        print(parts[-1] if parts else selected)
+
+
+if __name__ == "__main__":
+    main()
