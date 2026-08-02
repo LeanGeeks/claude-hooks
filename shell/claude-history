@@ -128,6 +128,22 @@ def original_prompt(rec: dict) -> str:
     return text
 
 
+def fzf_supports(option: str) -> bool:
+    """Check whether the installed fzf knows an option (--wrap needs fzf >= 0.52).
+
+    fzf prints its usage to stdout; if the binary is missing or misbehaves we
+    report False and let run_fzf surface the real error.
+    """
+    try:
+        help_text = subprocess.run(
+            ["fzf", "--help"], capture_output=True, text=True
+        ).stdout
+    except FileNotFoundError:
+        return False
+    # \b would match inside '--wrap-sign', so require a non-flag char after it.
+    return re.search(rf"{re.escape(option)}(?![\w-])", help_text) is not None
+
+
 def run_fzf(lines: list[str], query: str | None = None) -> str | None:
     cmd = [
         "fzf",
@@ -135,25 +151,30 @@ def run_fzf(lines: list[str], query: str | None = None) -> str | None:
         "--no-sort",
         "--exact",
         "--reverse",
-        "--wrap",
         "--height=80%",
         "--border",
         "--header=Claude Code prompt history (full)",
     ]
+    if fzf_supports("--wrap"):
+        cmd.append("--wrap")
     if query:
         cmd += ["--query", query]
     try:
+        # stderr is left attached to the terminal so fzf's own errors are visible.
         result = subprocess.run(
             cmd,
             input="\n".join(lines),
-            capture_output=True,
+            stdout=subprocess.PIPE,
             text=True,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
     except FileNotFoundError:
         print("fzf not found — install it or use --list", file=sys.stderr)
         sys.exit(1)
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    if result.returncode not in (0, 1, 130):  # 1=no match, 130=ctrl-c
+        print(f"fzf exited with status {result.returncode}", file=sys.stderr)
+        sys.exit(result.returncode)
     return None
 
 
