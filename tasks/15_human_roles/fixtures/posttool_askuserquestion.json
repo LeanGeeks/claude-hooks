@@ -1,0 +1,213 @@
+{
+  "_source": "Real PostToolUse `tool_response` payloads for AskUserQuestion. Epic 15 / task 15-04.",
+  "_captured": "2026-08-02",
+  "_note": "Cases 1-2 are verbatim from a live PostToolUse hook payload, verified byte-identical to the transcript's toolUseResult for the same tool_use_id. Case 3 is the same object read from a transcript (equivalence established by cases 1-2); its long option descriptions are trimmed, but `answers` and `annotations` are verbatim.",
+  "_payload_keys": [
+    "cwd",
+    "duration_ms",
+    "effort",
+    "hook_event_name",
+    "permission_mode",
+    "prompt_id",
+    "session_id",
+    "tool_input",
+    "tool_name",
+    "tool_response",
+    "tool_use_id",
+    "transcript_path"
+  ],
+  "cases": {
+    "1_options_selected": {
+      "tool_response": {
+        "questions": [
+          {
+            "question": "Pick a color",
+            "header": "Color",
+            "options": [
+              {
+                "label": "Red",
+                "description": "The color red."
+              },
+              {
+                "label": "Blue",
+                "description": "The color blue."
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "Pick a size",
+            "header": "Size",
+            "options": [
+              {
+                "label": "Small",
+                "description": "The small size."
+              },
+              {
+                "label": "Large",
+                "description": "The large size."
+              }
+            ],
+            "multiSelect": false
+          }
+        ],
+        "answers": {
+          "Pick a color": "Red",
+          "Pick a size": "Large"
+        },
+        "annotations": {}
+      }
+    },
+    "2_free_text_answer": {
+      "tool_response": {
+        "questions": [
+          {
+            "question": "Pick a color",
+            "header": "Color",
+            "options": [
+              {
+                "label": "Red",
+                "description": "The color red."
+              },
+              {
+                "label": "Blue",
+                "description": "The color blue."
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "Pick a size",
+            "header": "Size",
+            "options": [
+              {
+                "label": "Small",
+                "description": "The small size."
+              },
+              {
+                "label": "Large",
+                "description": "The large size."
+              }
+            ],
+            "multiSelect": false
+          }
+        ],
+        "answers": {
+          "Pick a color": "Red",
+          "Pick a size": "I'd prefer medium"
+        },
+        "annotations": {}
+      }
+    },
+    "3_notes_only_mixed_with_selected": {
+      "tool_response": {
+        "questions": [
+          {
+            "question": "AskUserQuestion's schema is closed — no `role` field is possible. How should an agent name the target role?",
+            "header": "Role tag",
+            "options": [
+              {
+                "label": "@alias in header (Recommended)",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Marker in question text",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "New MCP tool ask_role",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Infer from agent only",
+                "description": "<trimmed>"
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "How should a role resolve to a Telegram destination?",
+            "header": "Transport",
+            "options": [
+              {
+                "label": "Server-side role bindings (Recommended)",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "One token per role",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Token per role now, server later",
+                "description": "<trimmed>"
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "How does an agent find out which roles exist? Without this, roles will simply never get used.",
+            "header": "Discovery",
+            "options": [
+              {
+                "label": "SessionStart hook injects roster (Recommended)",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "CLAUDE.md section",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Both",
+                "description": "<trimmed>"
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "A question is routed to the designer and they don't answer. What happens?",
+            "header": "Escalation",
+            "options": [
+              {
+                "label": "cc operator, then escalate (Recommended)",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Wait indefinitely",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "cc operator, no escalation",
+                "description": "<trimmed>"
+              },
+              {
+                "label": "Fall back to default role",
+                "description": "<trimmed>"
+              }
+            ],
+            "multiSelect": false
+          }
+        ],
+        "answers": {
+          "AskUserQuestion's schema is closed — no `role` field is possible. How should an agent name the target role?": "@alias in header (Recommended)",
+          "How should a role resolve to a Telegram destination?": "One token per role",
+          "How does an agent find out which roles exist? Without this, roles will simply never get used.": "(notes only)",
+          "A question is routed to the designer and they don't answer. What happens?": "(notes only)"
+        },
+        "annotations": {
+          "AskUserQuestion's schema is closed — no `role` field is possible. How should an agent name the target role?": {
+            "preview": "AskUserQuestion({\n  questions: [{\n    header: \"@ux Layout\",\n    question: \"Sidebar or top nav for the settings area?\",\n    options: [...]\n  }]\n})\n\nTerminal chip:  [@ux Layout]\nTelegram (designer's chat):\n  Question — leangeeks  ·  for UX/UI designer\n  Layout\n  Sidebar or top nav for the settings area?"
+          },
+          "How should a role resolve to a Telegram destination?": {
+            "preview": "# machine config carries the fan-out\n~/.config/claude-tg-relay/config.toml\n\n[workspace.leangeeks.roles]\noperator  = \"rly_aaa...\"\nux        = \"rly_bbb...\"\narchitect = \"rly_ccc...\"\n\n# each token bound the normal way:\n$ relay-client bind --config-path ...ux.toml"
+          },
+          "How does an agent find out which roles exist? Without this, roles will simply never get used.": {
+            "notes": "It doesn't have to be specifically CLAUDE.md; it may be somewhere else, e.g., in the prompts, but will likely be CLAUDE.md in most cases. The reason to choose this option: agents would need to have role descriptions, not just aliases.\n\nIt's also possible that some of the roles will be non-configured on a specific machine, or unreachable for any other reason. That's why we should mark one of the roles as \"Default\"."
+          },
+          "A question is routed to the designer and they don't answer. What happens?": {
+            "notes": "1. Whait indefinitely, but keep in mind that designer may be fully unreachable (e.g., token not configured, or invalid); in that case reroute to default.\n2. Note that operator can still be first ro respond via CLI, and in that case designer chat should be updated with the answers.\n3. Let's add optional timeout configuration (e.g., 30 min), that will trigger a message (CC) to the default destination if not responded by designer; both parties will be able to respond, the first one wins."
+          }
+        }
+      }
+    }
+  }
+}
