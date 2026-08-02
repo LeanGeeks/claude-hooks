@@ -167,6 +167,7 @@
       "Bash(pnpm:*)",
       "Bash(yarn:*)",
       "Bash(bun:*)",
+      "Bash(nvm:*)",
       "Bash(node:*)",
       "Bash(tsx:*)",
       "Bash(deno:*)",
