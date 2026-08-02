@@ -3,3 +3,5 @@ temp/
 __pycache__/
 *.pyc
 .claude/scheduled_tasks.lock
+.venv/
+

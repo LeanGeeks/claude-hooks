@@ -141,7 +141,12 @@ def test_init_schema_rejects_unknown_future_version(tmp_path: Path) -> None:
 def test_admin_rotate_warns_when_un_revoking(tmp_path: Path) -> None:
     """Rotating a revoked installation should print a stderr warning."""
     db = str(tmp_path / "warn.db")
-    runner = CliRunner(mix_stderr=False)
+    # click < 8.2 mixes stderr into stdout unless asked not to; 8.2 removed the
+    # parameter and captures stderr separately by default.
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except TypeError:
+        runner = CliRunner()
 
     r = runner.invoke(cli, ["--db", db, "issue", "--label", "x"])
     assert r.exit_code == 0

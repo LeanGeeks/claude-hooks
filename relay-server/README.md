@@ -27,6 +27,24 @@ python3 -m venv /opt/relay-server/venv
 /opt/relay-server/venv/bin/pip install -e /path/to/relay-server/
 ```
 
+### Running the tests
+
+The server's own suite needs `fastapi`, `pydantic>=2.5`, `uvicorn` and
+`pytest-asyncio`. Debian/Ubuntu ship versions too old to satisfy
+`requirements.txt` (pydantic 1.10, fastapi 0.101), and system Python is
+PEP 668 "externally-managed", so use a local venv:
+
+```bash
+cd relay-server
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt -e .
+./.venv/bin/python -m pytest tests -q
+```
+
+`.venv/` is gitignored. This is only for the relay server — the hooks suite at
+the repository root runs on system Python with `python3 tests/run_all_tests.py`
+and deliberately has no third-party dependencies beyond `httpx`.
+
 ### Configuration
 
 Settings are read from `/etc/relay/config.toml` (override path with
