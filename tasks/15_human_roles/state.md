@@ -19,8 +19,8 @@ Each task file is written for a fresh-context agent and carries its own
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 15-01 | [Role config loader](./15-01-role-config-loader.md) | todo | — | Pure `roles_config.py`: both TOML files, alias table, token/reference chase, escalation precedence. Also adds the one `REQUIRED_HOOKS` installer line — see Ordering |
-| 15-02 | [Multi-destination transport](./15-02-multi-destination-transport_opus.md) | todo | 15-01 | Token-keyed client registry, `role` on the state-store row, role-aware PostToolUse revoke |
+| 15-01 | [Role config loader](./15-01-role-config-loader.md) | done | — | Pure `roles_config.py`: both TOML files, alias table, token/reference chase, escalation precedence. Also adds the one `REQUIRED_HOOKS` installer line — see Ordering |
+| 15-02 | [Multi-destination transport](./15-02-multi-destination-transport_opus.md) | in_progress | 15-01 | Token-keyed client registry, `role` on the state-store row, role-aware PostToolUse revoke |
 | 15-03 | [Alias routing](./15-03-alias-routing.md) | todo | 15-02 | Header parse/strip, destination resolution, mixed-role deny, send-failure retry, rendering |
 | 15-04 | [Wait phase](./15-04-wait-phase_opus.md) | todo | 15-03 | Sequential loop → thread-per-message; terminal answers patched into the role's chat |
 | 15-05 | [Escalation](./15-05-escalation_opus.md) | todo | 15-04 | Deadline, duplicate group to the default, first-group-wins |
