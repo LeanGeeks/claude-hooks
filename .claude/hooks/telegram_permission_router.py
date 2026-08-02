@@ -28,15 +28,26 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from permission_state_store import (
     PermissionRequest,
     set_telegram_message_id,
     debug_log,
 )
+
+# ``roles_config`` (epic 15) supplies the machine's relay credentials *and* its
+# per-role bindings. The import is guarded because the installer only learned
+# about this module in 15-01: a stale or partially-updated ``~/.claude/hooks/``
+# must degrade to the pre-roles behaviour (default destination via
+# ``RelayClient.from_config``) rather than lose Telegram altogether.
+try:
+    import roles_config  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    roles_config = None  # type: ignore[assignment]
 
 # Make the ``relay_server`` package importable regardless of how this hook is
 # launched. Resolution order:
@@ -96,9 +107,27 @@ ERROR_LOG_FILE = Path.home() / ".claude" / "permission_telegram_errors.log"
 TELEGRAM_ENABLED = False
 RELAY_CONFIG_SOURCE = "unknown"
 
-# Module-level singleton RelayClient. Created lazily on first send so unit
-# tests can patch ``RelayClient`` before any HTTP call goes out.
-_relay_client: Optional["RelayClient"] = None  # type: ignore[type-arg]
+# Sentinel token key used when the ``RelayClient.from_config()`` fallback path
+# runs and the actual installation token is unknown. Chosen to be outside the
+# printable-token namespace so it cannot collide with a real relay token.
+_DEFAULT_TOKEN_SENTINEL: str = "\x00from_config"
+
+# Registry of clients keyed by *installation token*, so one process can talk to
+# several destinations (epic 15 roles). Keyed by token rather than by role so
+# two roles bound to the same human share one client and one connection pool.
+# ``httpx.Client`` is safe for concurrent use, so only lazy creation is locked —
+# per-request locking would serialise the long-polls the wait phase depends on.
+_clients: Dict[str, "RelayClient"] = {}  # type: ignore[type-arg]
+_clients_lock = threading.Lock()
+
+# Key into ``_clients`` for the default destination. Set by
+# ``load_telegram_config``; ``_client(None)`` resolves via this.
+_default_token: Optional[str] = None
+
+# Relay base URL shared by every client. ``None`` when it could not be
+# determined (the ``RelayClient.from_config`` fallback path), in which case only
+# the default destination is reachable.
+_server_url: Optional[str] = None
 
 # Default TTL for relay messages (seconds). The hook still tracks its own
 # longer-running TTL in the state store; this is just how long the relay row
@@ -117,12 +146,36 @@ def error_log(message: str) -> None:
         pass
 
 
+def _default_credentials() -> tuple[Optional[str], Optional[str]]:
+    """Read ``(server_url, installation_token)`` for the default destination.
+
+    Uses ``roles_config.load_bindings`` — the same parser that reads the role
+    bindings out of the very same file. Returns ``(None, None)`` when
+    ``roles_config`` is unavailable or the file yields no usable credentials, so
+    the caller can fall back to ``RelayClient.from_config``.
+    """
+    if roles_config is None:
+        return None, None
+    try:
+        bindings = roles_config.load_bindings(RELAY_CONFIG_FILE)
+    except Exception as e:  # noqa: BLE001
+        error_log(f"roles_config.load_bindings failed: {e}")
+        return None, None
+    for err in bindings.errors:
+        error_log(f"Relay config: {err}")
+    if not bindings.server_url or not bindings.default_token:
+        return None, None
+    return bindings.server_url, bindings.default_token
+
+
 def load_telegram_config() -> None:
     """Discover relay credentials and set ``TELEGRAM_ENABLED`` accordingly.
 
     Name kept for call-site compatibility with the legacy router.
+    ``TELEGRAM_ENABLED`` means *the default destination is usable*; role
+    destinations are created lazily by ``_client(token)``.
     """
-    global TELEGRAM_ENABLED, RELAY_CONFIG_SOURCE, _relay_client
+    global TELEGRAM_ENABLED, RELAY_CONFIG_SOURCE, _default_token, _server_url
 
     if RelayClient is None:
         TELEGRAM_ENABLED = False
@@ -140,7 +193,24 @@ def load_telegram_config() -> None:
         return
 
     try:
-        _relay_client = RelayClient.from_config(RELAY_CONFIG_FILE)
+        server_url, token = _default_credentials()
+        if server_url and token:
+            client = RelayClient(server_url, token)
+            with _clients_lock:
+                _clients.clear()
+                _clients[token] = client
+                _default_token = token
+                _server_url = server_url
+        else:
+            # Degraded path: no roles_config (stale ~/.claude/hooks/) or a
+            # config it could not read credentials from. Exactly today's
+            # behaviour — default destination only, no role clients.
+            fallback_client = RelayClient.from_config(RELAY_CONFIG_FILE)
+            with _clients_lock:
+                _clients.clear()
+                _clients[_DEFAULT_TOKEN_SENTINEL] = fallback_client
+                _default_token = _DEFAULT_TOKEN_SENTINEL
+                _server_url = None
         TELEGRAM_ENABLED = True
         RELAY_CONFIG_SOURCE = str(RELAY_CONFIG_FILE)
     except Exception as e:  # noqa: BLE001
@@ -151,11 +221,37 @@ def load_telegram_config() -> None:
     debug_log(f"Relay enabled: {TELEGRAM_ENABLED} (source={RELAY_CONFIG_SOURCE})")
 
 
-def _client() -> "RelayClient":
-    """Return the active relay client; raises if disabled."""
-    if not TELEGRAM_ENABLED or _relay_client is None:
+def _client(token: Optional[str] = None) -> "RelayClient":
+    """Return the relay client for *token*; raises ``RelayError`` if unusable.
+
+    ``_clients`` is the single source of truth. ``token=None`` is resolved to
+    ``_default_token`` and looked up in the registry (the default client is
+    always pre-populated by ``load_telegram_config``). A non-default token is
+    also looked up first, then created lazily under ``_clients_lock`` when the
+    shared ``_server_url`` is known.
+    """
+    if not TELEGRAM_ENABLED:
         raise RelayError("relay client not initialised")
-    return _relay_client
+
+    resolved = _default_token if token is None else token
+    if resolved is None:
+        raise RelayError("relay client not initialised")
+
+    with _clients_lock:
+        existing = _clients.get(resolved)
+        if existing is not None:
+            return existing
+        # The default client is always pre-populated; reaching here for token=None
+        # means load_telegram_config() has not run or failed.
+        if token is None:
+            raise RelayError("relay client not initialised")
+        if RelayClient is None:
+            raise RelayError("relay_server package not importable")
+        if not _server_url:
+            raise RelayError("relay server_url unknown; cannot reach role destinations")
+        client = RelayClient(_server_url, resolved)
+        _clients[resolved] = client
+        return client
 
 
 # Sentinel button ``value`` for the multi-select Submit button. The relay
@@ -331,12 +427,16 @@ def _send_relay(
     group_id: Optional[str] = None,
     group_total: Optional[int] = None,
     multi_select: bool = False,
+    token: Optional[str] = None,
 ) -> Optional[int]:
-    """Common send helper. Returns the relay message_id or None on failure."""
+    """Common send helper. Returns the relay message_id or None on failure.
+
+    ``token`` selects the destination; ``None`` is the default one.
+    """
     if not TELEGRAM_ENABLED:
         return None
     try:
-        handle = _client().send_message(
+        handle = _client(token).send_message(
             text=text,
             keyboard=keyboard,
             kind=kind,
@@ -418,22 +518,27 @@ def send_permission_message(
     return message_id
 
 
-def send_question_message(
+def render_question_body(
     request: PermissionRequest,
     workspace_name: str,
     index: int,
     total: int,
-    group_id: Optional[str] = None,
-) -> Optional[int]:
-    """Send a single AskUserQuestion prompt; buttons map to option indices.
+    *,
+    role_title: Optional[str] = None,
+    notes: Iterable[str] = (),
+    banner: Optional[str] = None,
+) -> str:
+    """Build the HTML body of a single AskUserQuestion message.
 
-    The button ``value`` is ``qa<N>`` (matches the legacy callback_data prefix)
-    so the answer-handling code can distinguish question answers from
-    permission actions when both routes share a state row.
+    Pure function — no network, no state-store writes. ``send_question_message``
+    calls it to compose the text it sends, and callers that later need to PATCH
+    that message (terminal win, escalation loser) call it again to reconstruct
+    the exact body they sent.
 
-    When ``group_id`` is set, the relay treats all ``total`` sibling messages as
-    one re-answerable group: taps highlight the choice and stay live until every
-    question is answered, then the whole group's keyboards are stripped at once.
+    ``role_title``, ``notes`` and ``banner`` carry the epic-15 role context and
+    render directly under the title line: the escalation ``banner`` first (with
+    a ⏳), then ``for: <role title>``, then one ⚠️ line per reroute note. With
+    all three omitted the output is byte-identical to the pre-roles message.
     """
     ti = request.tool_input or {}
     question_text = ti.get("question", "")
@@ -455,12 +560,18 @@ def send_question_message(
         )
     else:
         lines.append(f"<b>Question</b> — {esc(workspace_name)}")
+    if banner:
+        lines.append(f"⏳ {esc(banner)}")
+    if role_title:
+        lines.append(f"<i>for: {esc(role_title)}</i>")
+    for note in notes:
+        if note:
+            lines.append(f"⚠️ {esc(note)}")
     lines.append("")
     if header:
         lines += [f"<b><i>{esc(header)}</i></b>", ""]
     lines.append(esc(question_text))
 
-    keyboard: list[list[dict[str, str]]] | None
     if options:
         # Telegram inline buttons are narrow and truncate (never wrap) their
         # text, so we render the *full* option label + description in the
@@ -477,7 +588,6 @@ def send_question_message(
         else:
             lines += ["", "<i>Tap a number below, or reply with text:</i>", ""]
 
-        rows: list[list[dict[str, str]]] = []
         for i, opt in enumerate(options):
             if isinstance(opt, dict):
                 label = opt.get("label", str(opt))
@@ -494,37 +604,94 @@ def send_question_message(
             lines.append(f"<b>{num}. {esc(label)}</b>")
             if description:
                 lines.append(f"    <i>{esc(description)}</i>")
-            # One button per row for maximum width; the button shows the number
-            # plus the leading part of the label (Telegram trims the overflow).
-            # Multi-select buttons start with an empty checkbox so the initial
-            # (untapped) state reads as "nothing selected yet"; the relay swaps
-            # it for ✅ as options are toggled.
-            btn_label = f"{num}. {label}"
-            if multi_select:
-                btn_label = QUESTION_UNCHECKED_PREFIX + btn_label
-            rows.append([{"label": btn_label, "value": f"qa{i}"}])
-        if multi_select:
-            # Dedicated Submit button the relay recognises by its sentinel value.
-            # Taps on the option buttons above only toggle the selection; this is
-            # what finalises the message's answer.
-            rows.append([{"label": "✓ Submit", "value": QUESTION_SUBMIT_VALUE}])
-        keyboard = rows
     else:
         lines += ["", "<i>Reply to this message with your answer.</i>"]
-        keyboard = None
 
     if total > 1 and index == total - 1:
         lines += ["", "━" * 23]
 
+    return "\n".join(lines)
+
+
+def _build_question_keyboard(
+    options: List[Any], multi_select: bool
+) -> Optional[list[list[dict[str, str]]]]:
+    """Build the inline keyboard for a question, mirroring the numbered list
+    ``render_question_body`` writes into the body."""
+    if not options:
+        return None
+
+    rows: list[list[dict[str, str]]] = []
+    for i, opt in enumerate(options):
+        label = opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
+        # One button per row for maximum width; the button shows the number plus
+        # the leading part of the label (Telegram trims the overflow).
+        # Multi-select buttons start with an empty checkbox so the initial
+        # (untapped) state reads as "nothing selected yet"; the relay swaps it
+        # for ✅ as options are toggled.
+        btn_label = f"{i + 1}. {label}"
+        if multi_select:
+            btn_label = QUESTION_UNCHECKED_PREFIX + btn_label
+        rows.append([{"label": btn_label, "value": f"qa{i}"}])
+    if multi_select:
+        # Dedicated Submit button the relay recognises by its sentinel value.
+        # Taps on the option buttons above only toggle the selection; this is
+        # what finalises the message's answer.
+        rows.append([{"label": "✓ Submit", "value": QUESTION_SUBMIT_VALUE}])
+    return rows
+
+
+def send_question_message(
+    request: PermissionRequest,
+    workspace_name: str,
+    index: int,
+    total: int,
+    group_id: Optional[str] = None,
+    *,
+    token: Optional[str] = None,
+    role_title: Optional[str] = None,
+    notes: Iterable[str] = (),
+    banner: Optional[str] = None,
+) -> Optional[int]:
+    """Send a single AskUserQuestion prompt; buttons map to option indices.
+
+    The button ``value`` is ``qa<N>`` (matches the legacy callback_data prefix)
+    so the answer-handling code can distinguish question answers from
+    permission actions when both routes share a state row.
+
+    When ``group_id`` is set, the relay treats all ``total`` sibling messages as
+    one re-answerable group: taps highlight the choice and stay live until every
+    question is answered, then the whole group's keyboards are stripped at once.
+
+    ``token`` picks the destination (``None`` = the default one);
+    ``role_title``, ``notes`` and ``banner`` are forwarded verbatim to
+    ``render_question_body``.
+    """
+    ti = request.tool_input or {}
+    options = ti.get("options", [])
+    multi_select = bool(ti.get("multiSelect", False))
+
+    text = render_question_body(
+        request,
+        workspace_name,
+        index,
+        total,
+        role_title=role_title,
+        notes=notes,
+        banner=banner,
+    )
+    keyboard = _build_question_keyboard(options, multi_select)
+
     message_id = _send_relay(
-        text="\n".join(lines),
+        text=text,
         keyboard=keyboard,
         kind="question",
         reply_required=True,
         request_id=request.request_id,
         group_id=group_id,
         group_total=total if group_id is not None else None,
-        multi_select=bool(multi_select),
+        multi_select=multi_select,
+        token=token,
     )
     if message_id is not None:
         set_telegram_message_id(request.request_id, message_id)
@@ -579,16 +746,18 @@ def send_freetext_followup(request_id: str, workspace_name: str) -> Optional[int
 # ---- Message lifecycle helpers --------------------------------------------
 
 
-def remove_inline_buttons(message_id: int) -> bool:
+def remove_inline_buttons(message_id: int, *, token: Optional[str] = None) -> bool:
     """Cancel the relay message (server strips keyboard + marks cancelled).
 
     Returns True on success. Kept under the legacy name so ``posttool_hook``
     and the AskUserQuestion fan-out don't need to know about the swap.
+    ``token`` selects the destination the message was sent to — cancelling a
+    role message against the default client would 404.
     """
     if not TELEGRAM_ENABLED or message_id is None:
         return False
     try:
-        _client().cancel_message(int(message_id))
+        _client(token).cancel_message(int(message_id))
         return True
     except RelayError as e:
         error_log(f"Relay cancel_message failed: {e}")
@@ -609,28 +778,58 @@ def edit_message_text(
     message_id: int,
     text: str,
     inline_buttons: Optional[List] = None,
+    *,
+    token: Optional[str] = None,
 ) -> bool:
     """Update a relay message's text. Keyboard edits are not supported."""
     if not TELEGRAM_ENABLED or message_id is None:
         return False
     try:
-        _client().edit_message(int(message_id), text=text)
+        _client(token).edit_message(int(message_id), text=text)
         return True
     except RelayError as e:
         error_log(f"Relay edit_message failed: {e}")
         return False
 
 
-def delete_message(message_id: int) -> bool:
+def delete_message(message_id: int, *, token: Optional[str] = None) -> bool:
     """Delete a relay message via the server."""
     if not TELEGRAM_ENABLED or message_id is None:
         return False
     try:
-        _client().delete_message(int(message_id))
+        _client(token).delete_message(int(message_id))
         return True
     except RelayError as e:
         error_log(f"Relay delete_message failed: {e}")
         return False
+
+
+def finalize_message(
+    message_id: int,
+    body_text: str,
+    answer_text: str,
+    *,
+    prefix: str = "✍️ ",
+    token: Optional[str] = None,
+) -> bool:
+    """Bake an answer into a live message and strip its keyboard.
+
+    PATCHes the message to ``body_text`` plus a blank line plus
+    ``prefix + <html-escaped answer_text>``, then cancels it. ``prefix`` mirrors
+    the relay's own finalization markers: ``✍️ `` for a typed answer, ``✅ `` for
+    a chosen one.
+
+    Patch **then** cancel, in that order: a cancelled message can still be
+    edited, whereas cancelling last would leave a live keyboard visible for the
+    duration of the round trip. Either step failing is logged and non-fatal;
+    returns ``True`` only when both succeeded.
+    """
+    import html as _html
+
+    text = f"{body_text}\n\n{prefix}{_html.escape(answer_text or '', quote=False)}"
+    edited = edit_message_text(message_id, text, token=token)
+    cancelled = remove_inline_buttons(message_id, token=token)
+    return edited and cancelled
 
 
 # ---- Whitelist / settings helpers (unchanged from legacy router) -----------
@@ -786,17 +985,21 @@ def wait_for_relay_answer(
     message_id: int,
     timeout: float = 300.0,
     long_poll_chunk: int = 5,
+    *,
+    token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Long-poll the relay for an answer to ``message_id``.
 
     Returns the raw answer dict on success, ``None`` on overall timeout, or a
     sentinel ``{"_state": state}`` dict when the message terminated without a
     user answer (expired or cancelled — the caller decides what to do).
+
+    ``token`` selects the destination the message was sent to.
     """
     if not TELEGRAM_ENABLED:
         return None
     try:
-        result = _client().wait_for_answer(
+        result = _client(token).wait_for_answer(
             int(message_id), timeout=timeout, long_poll_chunk=long_poll_chunk
         )
     except RelayError as e:

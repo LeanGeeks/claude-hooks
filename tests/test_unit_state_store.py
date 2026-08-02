@@ -469,5 +469,95 @@ class TestSessionQueries(unittest.TestCase):
         self.assertIsNone(pending)
 
 
+class TestRoleField(unittest.TestCase):
+    """``PermissionRequest.role`` — the resolved role id a request was routed
+    to. Only the id is persisted; the installation token never is."""
+
+    def test_create_request_defaults_role_to_none(self):
+        request = create_request(
+            session_id="test-role-default",
+            cwd="/test",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "q"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        self.assertIsNone(request.role)
+        self.assertIsNone(get_request(request.request_id).role)
+
+    def test_role_round_trips_through_the_jsonl_store(self):
+        request = create_request(
+            session_id="test-role-roundtrip",
+            cwd="/test",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "q"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+            role="ux",
+        )
+        self.assertEqual(request.role, "ux")
+        self.assertEqual(request.to_dict()["role"], "ux")
+
+        loaded = get_request(request.request_id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.role, "ux")
+
+    def test_row_written_before_this_change_loads_with_role_none(self):
+        """Rows persisted before ``role`` existed must deserialize unchanged."""
+        legacy = {
+            "request_id": "legacy-row-no-role",
+            "session_id": "legacy-session",
+            "cwd": "/test",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "permission_suggestions": [],
+            "state": "pending",
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "expires_at": _expires_at(600),
+            "telegram_message_id": None,
+            "decision": None,
+            "reply_text": None,
+            "actor_user_id": None,
+            "resolution_source": None,
+            "resolved_at": None,
+            "expired_notified_at": None,
+            "agent_id": None,
+        }
+        self.assertNotIn("role", legacy)
+
+        # Straight from_dict, and through the JSONL store.
+        self.assertIsNone(PermissionRequest.from_dict(legacy).role)
+
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, "a") as f:
+            f.write(json.dumps(legacy) + "\n")
+
+        loaded = get_request("legacy-row-no-role")
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.role)
+        self.assertEqual(loaded.tool_name, "Bash")
+
+    def test_from_dict_filters_unknown_keys(self):
+        """Forward compatibility: a row carrying a field this version does not
+        know about still loads."""
+        loaded = PermissionRequest.from_dict({
+            "request_id": "unknown-key-row",
+            "session_id": "s",
+            "cwd": "/test",
+            "tool_name": "Bash",
+            "tool_input": {},
+            "permission_suggestions": [],
+            "state": "pending",
+            "created_at": "t",
+            "updated_at": "t",
+            "expires_at": "t",
+            "role": "ux",
+            "a_field_from_the_future": 42,
+        })
+        self.assertEqual(loaded.role, "ux")
+        self.assertFalse(hasattr(loaded, "a_field_from_the_future"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

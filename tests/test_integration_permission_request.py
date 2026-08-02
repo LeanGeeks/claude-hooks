@@ -6,9 +6,12 @@ Tests the PermissionRequest hook output mapping and verifies that the
 Telegram helpers route through RelayClient (Phase 4 of task 08).
 """
 
+import inspect
 import io
 import json
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -103,7 +106,8 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
             message_id=42, telegram_message_id=99
         )
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
-             patch.object(tpr, "_relay_client", fake_client), \
+             patch.object(tpr, "_default_token", "__td__"), \
+             patch.object(tpr, "_clients", {"__td__": fake_client}), \
              patch("telegram_permission_router.set_telegram_message_id"):
             tpr.send_permission_message(_make_request(), "workspace", "session")
         return fake_client.send_message.call_args.kwargs["text"]
@@ -168,7 +172,8 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         )
         req = _make_request(tool_input={"command": "echo hi 2>&1 | grep '<x>'"})
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
-             patch.object(tpr, "_relay_client", fake_client), \
+             patch.object(tpr, "_default_token", "__td__"), \
+             patch.object(tpr, "_clients", {"__td__": fake_client}), \
              patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [])), \
              patch("telegram_permission_router.set_telegram_message_id"):
             tpr.send_permission_message(req, "ws<&>name", "sess&ion")
@@ -208,7 +213,8 @@ class TestRouting(unittest.TestCase):
             message_id=42, telegram_message_id=99
         )
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
-             patch.object(tpr, "_relay_client", fake_client), \
+             patch.object(tpr, "_default_token", "__td__"), \
+             patch.object(tpr, "_clients", {"__td__": fake_client}), \
              patch("telegram_permission_router.set_telegram_message_id"):
             mid = tpr.send_permission_message(_make_request(), "workspace", "session")
 
@@ -225,7 +231,8 @@ class TestRouting(unittest.TestCase):
 
         fake_client = MagicMock()
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
-             patch.object(tpr, "_relay_client", fake_client):
+             patch.object(tpr, "_default_token", "__td__"), \
+             patch.object(tpr, "_clients", {"__td__": fake_client}):
             ok = tpr.remove_inline_buttons(123)
         self.assertTrue(ok)
         fake_client.cancel_message.assert_called_once_with(123)
@@ -732,6 +739,658 @@ class TestCrossAgentIsolation(unittest.TestCase):
 
         loaded = get_request(req.request_id)
         self.assertEqual(loaded.agent_id, "agent-xyz")
+
+
+class _FakeRelayClient:
+    """Stand-in for ``RelayClient``: records the (server_url, token) it was
+    built with and swallows every relay call."""
+
+    def __init__(self, server_url, installation_token):
+        self.server_url = server_url
+        self.token = installation_token
+
+    def __getattr__(self, name):  # any relay method is a no-op MagicMock
+        mock = MagicMock(name=name)
+        setattr(self, name, mock)
+        return mock
+
+
+def _router_state(tpr, **overrides):
+    """Context managers pinning the router's client-registry globals.
+
+    Every test that touches the registry must patch all of them so nothing
+    leaks into the next test (or the developer's real relay config).
+
+    ``_clients`` is now the single source of truth; ``_default_token`` points at
+    the default entry inside it (Issue 3 unification). Pass both together:
+        _router_state(tpr,
+                      _default_token="__td__",
+                      _clients={"__td__": default_mock, "rly_ux": role_mock},
+                      _server_url="https://relay.example")
+    """
+    state = {
+        "TELEGRAM_ENABLED": True,
+        "_default_token": None,
+        "_clients": {},
+        "_server_url": None,
+    }
+    state.update(overrides)
+    return [patch.object(tpr, key, value) for key, value in state.items()]
+
+
+class TestClientRegistry(unittest.TestCase):
+    """``_client`` is a token-keyed registry over one shared server_url."""
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+
+    def test_client_none_returns_default_client(self):
+        default = object()
+        with patch.object(self.tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(self.tpr, "_default_token", "__td__"), \
+             patch.object(self.tpr, "_clients", {"__td__": default}), \
+             patch.object(self.tpr, "_server_url", "https://relay.example"):
+            self.assertIs(self.tpr._client(), default)
+            self.assertIs(self.tpr._client(None), default)
+
+    def test_client_token_is_distinct_and_memoized(self):
+        default = object()
+        with patch.object(self.tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(self.tpr, "RelayClient", _FakeRelayClient), \
+             patch.object(self.tpr, "_default_token", "__td__"), \
+             patch.object(self.tpr, "_clients", {"__td__": default}), \
+             patch.object(self.tpr, "_server_url", "https://relay.example"):
+            first = self.tpr._client("rly_x")
+            second = self.tpr._client("rly_x")
+            other = self.tpr._client("rly_y")
+
+            self.assertIsNot(first, default)
+            self.assertIs(first, second)  # same token -> same object
+            self.assertIsNot(first, other)
+            # Built on the shared server_url with its own token.
+            self.assertEqual(first.server_url, "https://relay.example")
+            self.assertEqual(first.token, "rly_x")
+            self.assertEqual(other.token, "rly_y")
+
+    def test_client_raises_when_relay_disabled(self):
+        with patch.object(self.tpr, "TELEGRAM_ENABLED", False), \
+             patch.object(self.tpr, "_default_token", "__td__"), \
+             patch.object(self.tpr, "_clients", {"__td__": object()}), \
+             patch.object(self.tpr, "_server_url", "https://relay.example"):
+            with self.assertRaises(self.tpr.RelayError):
+                self.tpr._client()
+            with self.assertRaises(self.tpr.RelayError):
+                self.tpr._client("rly_x")
+
+    def test_client_raises_when_server_url_unknown(self):
+        """The ``RelayClient.from_config`` fallback leaves ``_server_url``
+        unknown; role destinations are then unreachable but the default one
+        still works."""
+        default = object()
+        with patch.object(self.tpr, "TELEGRAM_ENABLED", True), \
+             patch.object(self.tpr, "RelayClient", _FakeRelayClient), \
+             patch.object(self.tpr, "_default_token", "__td__"), \
+             patch.object(self.tpr, "_clients", {"__td__": default}), \
+             patch.object(self.tpr, "_server_url", None):
+            self.assertIs(self.tpr._client(), default)
+            with self.assertRaises(self.tpr.RelayError):
+                self.tpr._client("rly_x")
+
+
+class TestLoadTelegramConfig(unittest.TestCase):
+    """``load_telegram_config`` reads credentials through ``roles_config`` and
+    degrades to ``RelayClient.from_config`` when that module is missing."""
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+        self.tmp = tempfile.mkdtemp(prefix="claude-hooks-relaycfg-")
+        self.cfg = Path(self.tmp) / "config.toml"
+        self.cfg.write_text(
+            'server_url = "https://relay.example"\n'
+            'installation_token = "rly_default"\n'
+            "\n[roles]\nux = \"rly_ux\"\n"
+        )
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_builds_default_client_from_bindings(self):
+        tpr = self.tpr
+        with patch.object(tpr, "RelayClient", _FakeRelayClient), \
+             patch.object(tpr, "RELAY_CONFIG_FILE", self.cfg), \
+             patch.object(tpr, "TELEGRAM_ENABLED", False), \
+             patch.object(tpr, "RELAY_CONFIG_SOURCE", "unknown"), \
+             patch.object(tpr, "_default_token", None), \
+             patch.object(tpr, "_clients", {}), \
+             patch.object(tpr, "_server_url", None):
+            tpr.load_telegram_config()
+
+            self.assertTrue(tpr.TELEGRAM_ENABLED)
+            self.assertEqual(tpr._server_url, "https://relay.example")
+            self.assertEqual(tpr._default_token, "rly_default")
+            self.assertEqual(tpr._clients["rly_default"].token, "rly_default")
+            # _client(None) and _client("rly_default") return the same object —
+            # the registry is the single source of truth.
+            self.assertIs(tpr._client(None), tpr._clients["rly_default"])
+            self.assertIs(tpr._client("rly_default"), tpr._clients["rly_default"])
+
+    def test_falls_back_to_from_config_when_roles_config_missing(self):
+        """A stale ~/.claude/hooks/ without roles_config must still produce a
+        working default client — today's behaviour, not a lost Telegram."""
+        tpr = self.tpr
+        fake_cls = MagicMock()
+        sentinel = object()
+        fake_cls.from_config.return_value = sentinel
+        with patch.object(tpr, "roles_config", None), \
+             patch.object(tpr, "RelayClient", fake_cls), \
+             patch.object(tpr, "RELAY_CONFIG_FILE", self.cfg), \
+             patch.object(tpr, "TELEGRAM_ENABLED", False), \
+             patch.object(tpr, "RELAY_CONFIG_SOURCE", "unknown"), \
+             patch.object(tpr, "_default_token", None), \
+             patch.object(tpr, "_clients", {}), \
+             patch.object(tpr, "_server_url", "stale"):
+            tpr.load_telegram_config()
+
+            self.assertTrue(tpr.TELEGRAM_ENABLED)
+            fake_cls.from_config.assert_called_once_with(self.cfg)
+            # Unknown server_url -> role destinations unreachable, default fine.
+            self.assertIsNone(tpr._server_url)
+            # Default client is stored in the registry under a sentinel key;
+            # _client(None) reaches it via _default_token.
+            self.assertIn(tpr._default_token, tpr._clients)
+            self.assertIs(tpr._clients[tpr._default_token], sentinel)
+            self.assertIs(tpr._client(), sentinel)
+
+    def test_import_guard_survives_non_importerror_in_roles_config(self):
+        """The module-level guard is ``except Exception``, not ``except ImportError``.
+
+        A stale/partially-broken roles_config.py that raises SyntaxError at
+        import time must still degrade to the RelayClient.from_config() path
+        rather than losing Telegram — the guard must survive any import failure,
+        not only a missing file. Simulate by poisoning sys.modules so the import
+        raises AttributeError (a non-ImportError) when the router tries to access
+        the module.
+        """
+        import builtins as _builtins
+        tpr = self.tpr
+        fake_cls = MagicMock()
+        sentinel = object()
+        fake_cls.from_config.return_value = sentinel
+
+        original_import = _builtins.__import__
+
+        def _raise_syntax_error(name, *args, **kwargs):
+            if name == "roles_config":
+                raise SyntaxError("simulated broken roles_config.py")
+            return original_import(name, *args, **kwargs)
+
+        # Snapshot all module globals that the reload will re-initialise.
+        # The reload is necessary to trigger the module-level import guard, but
+        # it leaves every global at its "freshly imported" initial value — which
+        # may differ from whatever the suite had set up before this test ran.
+        # Restoring via addCleanup (not a bare finally statement) guarantees the
+        # snapshot is applied even when the test raises an exception mid-way.
+        _pre_test_globals = {
+            "roles_config": tpr.roles_config,
+            "TELEGRAM_ENABLED": tpr.TELEGRAM_ENABLED,
+            "RELAY_CONFIG_SOURCE": tpr.RELAY_CONFIG_SOURCE,
+            "_clients": tpr._clients,
+            "_clients_lock": tpr._clients_lock,
+            "_default_token": tpr._default_token,
+            "_server_url": tpr._server_url,
+            "RelayClient": tpr.RelayClient,
+            "Answer": tpr.Answer,
+            "MessageHandle": tpr.MessageHandle,
+            "NotBoundError": tpr.NotBoundError,
+            "RelayError": tpr.RelayError,
+        }
+        _saved_sys_mod = sys.modules.get("roles_config")
+
+        def _restore_module():
+            # Restore sys.modules entry (idempotent with the finally block below).
+            if _saved_sys_mod is not None:
+                sys.modules["roles_config"] = _saved_sys_mod
+            else:
+                sys.modules.pop("roles_config", None)
+            # Restore every snapshotted global directly — no second reload, so
+            # this cleanup cannot introduce a new ordering dependency of its own.
+            for _attr, _val in _pre_test_globals.items():
+                setattr(tpr, _attr, _val)
+
+        self.addCleanup(_restore_module)
+
+        # Remove any cached copy so the guard's import actually fires.
+        saved = sys.modules.pop("roles_config", None)
+        try:
+            with patch.object(_builtins, "__import__", side_effect=_raise_syntax_error), \
+                 patch.object(tpr, "RelayClient", fake_cls), \
+                 patch.object(tpr, "RELAY_CONFIG_FILE", self.cfg), \
+                 patch.object(tpr, "TELEGRAM_ENABLED", False), \
+                 patch.object(tpr, "RELAY_CONFIG_SOURCE", "unknown"), \
+                 patch.object(tpr, "_default_token", None), \
+                 patch.object(tpr, "_clients", {}), \
+                 patch.object(tpr, "_server_url", "stale"):
+                # Reload the module so its top-level guard fires under the patched
+                # import; capture the resulting roles_config binding.
+                import importlib
+                import telegram_permission_router as _tpr_mod
+                importlib.reload(_tpr_mod)
+                # The guard must have caught the SyntaxError and set roles_config=None.
+                self.assertIsNone(_tpr_mod.roles_config)
+        finally:
+            if saved is not None:
+                sys.modules["roles_config"] = saved
+            else:
+                sys.modules.pop("roles_config", None)
+            # Module globals are restored by _restore_module() via addCleanup,
+            # which runs after tearDown and is robust to mid-test failure.
+            # A second importlib.reload() here would re-initialise all globals
+            # and defeat the snapshot/restore above.
+
+
+class TestQuestionBodyRendering(unittest.TestCase):
+    """``render_question_body`` is the pure body builder; with no role context
+    its output is byte-identical to the pre-roles message."""
+
+    SINGLE_INPUT = {
+        "question": "Sidebar or top nav?",
+        "header": "Layout",
+        "options": [
+            {"label": "Sidebar", "description": "Left rail"},
+            {"label": "Top nav"},
+        ],
+    }
+    # Captured from the implementation as it stood before task 15-02.
+    SINGLE_BODY = "\n".join([
+        "<b>Question</b> — leangeeks",
+        "",
+        "<b><i>Layout</i></b>",
+        "",
+        "Sidebar or top nav?",
+        "",
+        "<i>Tap a number below, or reply with text:</i>",
+        "",
+        "<b>1. Sidebar</b>",
+        "    <i>Left rail</i>",
+        "",
+        "<b>2. Top nav</b>",
+    ])
+
+    MULTI_INPUT = {
+        "question": "Which shades?",
+        "header": "Palette",
+        "multiSelect": True,
+        "options": [
+            {"label": "Blue"},
+            {"label": "Green", "description": "Forest"},
+        ],
+    }
+    MULTI_BODY = "\n".join([
+        "<b>Question</b> — leangeeks",
+        "",
+        "<b><i>Palette</i></b>",
+        "",
+        "Which shades?",
+        "",
+        "<i>Tap numbers to toggle (select as many as you like), "
+        "then tap ✓ Submit. Or reply with text:</i>",
+        "",
+        "<b>1. Blue</b>",
+        "",
+        "<b>2. Green</b>",
+        "    <i>Forest</i>",
+    ])
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+
+    def _sent_text(self, request, **kwargs):
+        captured = {}
+
+        def _fake_send_relay(**kw):
+            captured.update(kw)
+            return 1
+
+        with patch.object(self.tpr, "_send_relay", side_effect=_fake_send_relay), \
+             patch.object(self.tpr, "set_telegram_message_id"):
+            self.tpr.send_question_message(request, "leangeeks", 0, 1, **kwargs)
+        return captured
+
+    def test_single_select_body_unchanged(self):
+        req = _make_request(tool_name="AskUserQuestion", tool_input=self.SINGLE_INPUT)
+        self.assertEqual(
+            self.tpr.render_question_body(req, "leangeeks", 0, 1), self.SINGLE_BODY
+        )
+        self.assertEqual(self._sent_text(req)["text"], self.SINGLE_BODY)
+
+    def test_multi_select_body_unchanged(self):
+        req = _make_request(tool_name="AskUserQuestion", tool_input=self.MULTI_INPUT)
+        self.assertEqual(
+            self.tpr.render_question_body(req, "leangeeks", 0, 1), self.MULTI_BODY
+        )
+        self.assertEqual(self._sent_text(req)["text"], self.MULTI_BODY)
+
+    def test_role_title_notes_and_banner_render_under_the_title(self):
+        req = _make_request(tool_name="AskUserQuestion", tool_input=self.SINGLE_INPUT)
+        body = self.tpr.render_question_body(
+            req,
+            "leangeeks",
+            0,
+            1,
+            role_title="UX/UI designer",
+            notes=("Unknown role @uxx — routed to Operator.",),
+            banner="@ux hasn't answered in 15m — you can decide instead.",
+        )
+        lines = body.split("\n")
+        self.assertEqual(lines[0], "<b>Question</b> — leangeeks")
+        # Banner sits above the ``for:`` line; notes below it.
+        self.assertEqual(
+            lines[1], "⏳ @ux hasn't answered in 15m — you can decide instead."
+        )
+        self.assertEqual(lines[2], "<i>for: UX/UI designer</i>")
+        self.assertEqual(lines[3], "⚠️ Unknown role @uxx — routed to Operator.")
+        self.assertEqual(lines[4], "")
+        # Everything after the inserted block is unchanged.
+        self.assertEqual("\n".join(lines[4:]), "\n".join(self.SINGLE_BODY.split("\n")[1:]))
+
+    def test_role_context_is_html_escaped(self):
+        req = _make_request(tool_name="AskUserQuestion", tool_input=self.SINGLE_INPUT)
+        body = self.tpr.render_question_body(
+            req, "leangeeks", 0, 1, role_title="A<&>B", notes=("n<&>",), banner="b<&>"
+        )
+        self.assertIn("<i>for: A&lt;&amp;&gt;B</i>", body)
+        self.assertIn("⚠️ n&lt;&amp;&gt;", body)
+        self.assertIn("⏳ b&lt;&amp;&gt;", body)
+
+    def test_send_question_message_forwards_all_role_arguments(self):
+        """The four keyword-only parameters must reach the renderer verbatim —
+        a send that routes correctly but renders no role context is the easy
+        mistake here."""
+        req = _make_request(tool_name="AskUserQuestion", tool_input=self.SINGLE_INPUT)
+        seen = {}
+
+        def _fake_render(*args, **kwargs):
+            seen.update(kwargs)
+            return "BODY"
+
+        captured = {}
+        with patch.object(self.tpr, "render_question_body", side_effect=_fake_render), \
+             patch.object(self.tpr, "_send_relay",
+                          side_effect=lambda **kw: (captured.update(kw), 5)[1]), \
+             patch.object(self.tpr, "set_telegram_message_id"):
+            msg_id = self.tpr.send_question_message(
+                req,
+                "leangeeks",
+                0,
+                1,
+                group_id="g",
+                token="rly_ux",
+                role_title="UX/UI designer",
+                notes=("note",),
+                banner="banner",
+            )
+
+        self.assertEqual(msg_id, 5)
+        self.assertIsInstance(msg_id, int)  # return type must stay an int
+        self.assertEqual(seen["role_title"], "UX/UI designer")
+        self.assertEqual(seen["notes"], ("note",))
+        self.assertEqual(seen["banner"], "banner")
+        self.assertEqual(captured["token"], "rly_ux")
+        self.assertEqual(captured["text"], "BODY")
+
+
+class TestTokenRouting(unittest.TestCase):
+    """Every send/wait/cancel/edit helper honours an explicit ``token`` and
+    keeps using the default client when none is given."""
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+        self.default = MagicMock(name="default")
+        self.role = MagicMock(name="role")
+        self._patches = _router_state(
+            tpr,
+            _default_token="__td__",
+            _clients={"__td__": self.default, "rly_ux": self.role},
+            _server_url="https://relay.example",
+        )
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def test_send_relay_routes_by_token(self):
+        self.role.send_message.return_value = MagicMock(message_id=11)
+        mid = self.tpr._send_relay(
+            text="t", keyboard=None, kind="question", reply_required=True,
+            request_id="r", token="rly_ux",
+        )
+        self.assertEqual(mid, 11)
+        self.role.send_message.assert_called_once()
+        self.default.send_message.assert_not_called()
+
+    def test_send_relay_defaults_to_default_client(self):
+        self.default.send_message.return_value = MagicMock(message_id=12)
+        mid = self.tpr._send_relay(
+            text="t", keyboard=None, kind="question", reply_required=True,
+            request_id="r",
+        )
+        self.assertEqual(mid, 12)
+        self.default.send_message.assert_called_once()
+        self.role.send_message.assert_not_called()
+
+    def test_remove_inline_buttons_routes_by_token(self):
+        self.assertTrue(self.tpr.remove_inline_buttons(7, token="rly_ux"))
+        self.role.cancel_message.assert_called_once_with(7)
+        self.default.cancel_message.assert_not_called()
+
+        self.assertTrue(self.tpr.remove_inline_buttons(8))
+        self.default.cancel_message.assert_called_once_with(8)
+
+    def test_edit_message_text_routes_by_token(self):
+        self.assertTrue(self.tpr.edit_message_text(7, "hi", token="rly_ux"))
+        self.role.edit_message.assert_called_once_with(7, text="hi")
+        self.default.edit_message.assert_not_called()
+
+        self.assertTrue(self.tpr.edit_message_text(8, "yo"))
+        self.default.edit_message.assert_called_once_with(8, text="yo")
+
+    def test_delete_message_routes_by_token(self):
+        self.assertTrue(self.tpr.delete_message(7, token="rly_ux"))
+        self.role.delete_message.assert_called_once_with(7)
+        self.default.delete_message.assert_not_called()
+
+        self.assertTrue(self.tpr.delete_message(8))
+        self.default.delete_message.assert_called_once_with(8)
+
+    def test_wait_for_relay_answer_routes_by_token(self):
+        self.role.wait_for_answer.return_value = MagicMock(
+            state="answered", answer={"via": "button", "value": "qa0"}
+        )
+        answer = self.tpr.wait_for_relay_answer(7, timeout=1, token="rly_ux")
+        self.assertEqual(answer, {"via": "button", "value": "qa0"})
+        self.role.wait_for_answer.assert_called_once_with(
+            7, timeout=1, long_poll_chunk=5
+        )
+        self.default.wait_for_answer.assert_not_called()
+
+    def test_send_question_message_routes_by_token(self):
+        self.role.send_message.return_value = MagicMock(message_id=13)
+        req = _make_request(
+            tool_name="AskUserQuestion",
+            tool_input={"question": "q", "options": [{"label": "A"}]},
+        )
+        with patch.object(self.tpr, "set_telegram_message_id"):
+            mid = self.tpr.send_question_message(req, "ws", 0, 1, token="rly_ux")
+        self.assertEqual(mid, 13)
+        self.role.send_message.assert_called_once()
+        self.default.send_message.assert_not_called()
+
+    def test_default_destination_helpers_have_no_token_parameter(self):
+        """Permissions and idle notifications are default-destination only
+        (brd §6) — they must not grow a ``token`` knob."""
+        for fn in (self.tpr.send_permission_message, self.tpr.send_idle_notification):
+            self.assertNotIn(
+                "token", inspect.signature(fn).parameters, f"{fn.__name__} gained token"
+            )
+
+
+class TestFinalizeMessage(unittest.TestCase):
+    """``finalize_message`` bakes an answer in, then strips the keyboard."""
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+        self.default = MagicMock(name="default")
+        self.role = MagicMock(name="role")
+        self._patches = _router_state(
+            tpr,
+            _default_token="__td__",
+            _clients={"__td__": self.default, "rly_ux": self.role},
+            _server_url="https://relay.example",
+        )
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def test_patches_then_cancels_against_the_tokens_client(self):
+        ok = self.tpr.finalize_message(7, "BODY", "Yes <b>", token="rly_ux")
+        self.assertTrue(ok)
+        # PATCH first, cancel second: a cancelled message can still be edited,
+        # the reverse leaves a live keyboard up for the round trip.
+        self.assertEqual(
+            [name for name, _a, _k in self.role.mock_calls],
+            ["edit_message", "cancel_message"],
+        )
+        self.role.edit_message.assert_called_once_with(
+            7, text="BODY\n\n✍️ Yes &lt;b&gt;"
+        )
+        self.role.cancel_message.assert_called_once_with(7)
+        self.assertEqual(self.default.mock_calls, [])
+
+    def test_default_prefix_and_override(self):
+        self.tpr.finalize_message(7, "B", "A")
+        self.default.edit_message.assert_called_once_with(7, text="B\n\n✍️ A")
+
+        self.default.reset_mock()
+        self.tpr.finalize_message(8, "B", "A", prefix="✅ ")
+        self.default.edit_message.assert_called_once_with(8, text="B\n\n✅ A")
+
+    def test_returns_false_when_patch_fails_but_still_cancels(self):
+        self.role.edit_message.side_effect = self.tpr.RelayError("boom")
+        ok = self.tpr.finalize_message(7, "BODY", "A", token="rly_ux")
+        self.assertFalse(ok)
+        # The keyboard must still come down even when the body edit failed.
+        self.role.cancel_message.assert_called_once_with(7)
+
+    def test_returns_false_when_cancel_fails(self):
+        self.role.cancel_message.side_effect = self.tpr.RelayError("boom")
+        ok = self.tpr.finalize_message(7, "BODY", "A", token="rly_ux")
+        self.assertFalse(ok)
+        self.role.edit_message.assert_called_once()
+
+
+class TestPostToolRoleRevoke(unittest.TestCase):
+    """PostToolUse re-resolves ``role`` -> token so it revokes against the chat
+    the message actually went to."""
+
+    ROLES_TOML = (
+        'default = "operator"\n'
+        "\n[role.operator]\ntitle = \"Operator\"\n"
+        "\n[role.ux]\naliases = [\"design\"]\ntitle = \"UX/UI designer\"\n"
+    )
+    BINDINGS_TOML = (
+        'server_url = "https://relay.example"\n'
+        'installation_token = "rly_op"\n'
+        "\n[roles]\nux = \"rly_ux\"\n"
+    )
+
+    def setUp(self):
+        import posttool_hook
+        import roles_config
+        self.posttool_hook = posttool_hook
+        self.roles_config = roles_config
+
+        self.tmp = tempfile.mkdtemp(prefix="claude-hooks-roles-")
+        ws = Path(self.tmp) / "workspace"
+        (ws / ".claude").mkdir(parents=True)
+        (ws / ".claude" / "roles.toml").write_text(self.ROLES_TOML)
+        self.workspace = str(ws)
+
+        bindings_path = Path(self.tmp) / "config.toml"
+        bindings_path.write_text(self.BINDINGS_TOML)
+        self.bindings = roles_config.load_bindings(bindings_path)
+
+        # find_roles_file walks *up* the filesystem and honours
+        # CLAUDE_PROJECT_DIR, which is set inside a Claude Code session — pin it
+        # at the fixture so the walk cannot reach real config.
+        env = patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.workspace})
+        env.start()
+        self.addCleanup(env.stop)
+        # load_bindings() with no argument would read the developer's real
+        # ~/.config/claude-tg-relay/config.toml.
+        binds = patch.object(
+            roles_config, "load_bindings", lambda *a, **k: self.bindings
+        )
+        binds.start()
+        self.addCleanup(binds.stop)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _revoke(self, request):
+        tpr = self.posttool_hook.telegram_permission_router
+        with patch.object(tpr, "remove_inline_buttons") as remove, \
+             patch.object(tpr, "set_message_reaction", return_value=True) as react:
+            ok = self.posttool_hook.revoke_telegram_message(request)
+        return ok, remove, react
+
+    def test_role_tagged_request_revoked_through_the_roles_client(self):
+        req = _make_request(
+            cwd=self.workspace, role="ux", telegram_message_id=99,
+        )
+        ok, remove, react = self._revoke(req)
+        self.assertTrue(ok)
+        remove.assert_called_once_with(99, token="rly_ux")
+        react.assert_called_once_with(99, "✅")
+
+    def test_request_without_role_uses_the_default_client(self):
+        req = _make_request(cwd=self.workspace, telegram_message_id=99)
+        ok, remove, _ = self._revoke(req)
+        self.assertTrue(ok)
+        remove.assert_called_once_with(99, token=None)
+
+    def test_resolution_failure_falls_back_to_the_default_client(self):
+        req = _make_request(cwd=self.workspace, role="ux", telegram_message_id=99)
+        with patch.object(
+            self.roles_config, "load_catalog", side_effect=RuntimeError("broken")
+        ):
+            ok, remove, _ = self._revoke(req)
+        self.assertTrue(ok)
+        remove.assert_called_once_with(99, token=None)
+
+    def test_no_roles_catalog_falls_back_to_the_default_client(self):
+        """A row tagged with a role whose workspace has since lost its
+        roles.toml still revokes — against the default client."""
+        empty = tempfile.mkdtemp(prefix="claude-hooks-noroles-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(empty, ignore_errors=True))
+        req = _make_request(cwd=empty, role="ux", telegram_message_id=99)
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": empty}):
+            ok, remove, _ = self._revoke(req)
+        self.assertTrue(ok)
+        remove.assert_called_once_with(99, token=None)
+
+    def test_unknown_role_id_falls_back_to_the_default_role_token(self):
+        """An unknown role id resolves through 15-01's fallback chain to the
+        default role — whose token is the machine's default installation."""
+        req = _make_request(cwd=self.workspace, role="ghost", telegram_message_id=99)
+        ok, remove, _ = self._revoke(req)
+        self.assertTrue(ok)
+        remove.assert_called_once_with(99, token="rly_op")
 
 
 if __name__ == "__main__":

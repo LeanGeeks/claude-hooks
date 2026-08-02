@@ -94,6 +94,7 @@ class PermissionRequest:
     resolved_at: Optional[str] = None  # ISO timestamp when resolved
     expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
     agent_id: Optional[str] = None  # subagent id (None for parent session)
+    role: Optional[str] = None  # resolved role id; None = default destination
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -186,6 +187,7 @@ def create_request(
     permission_suggestions: List[str],
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     agent_id: Optional[str] = None,
+    role: Optional[str] = None,
 ) -> PermissionRequest:
     """
     Create a new pending permission request.
@@ -198,6 +200,9 @@ def create_request(
         permission_suggestions: Suggested permission patterns from hook input
         ttl_seconds: Time-to-live in seconds
         agent_id: Subagent id (None for parent session)
+        role: Resolved role id this request was routed to (None = default
+            destination). The role's *token* is deliberately not persisted —
+            it is re-resolved from this id when needed.
 
     Returns:
         PermissionRequest object with request_id
@@ -222,6 +227,7 @@ def create_request(
         updated_at=now,
         expires_at=_expires_at(ttl_seconds),
         agent_id=agent_id,
+        role=role,
     )
 
     # Append to state file with lock
