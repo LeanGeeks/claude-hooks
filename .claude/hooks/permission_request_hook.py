@@ -32,6 +32,7 @@ import os
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -60,6 +61,19 @@ from telegram_permission_router import (
     set_message_reaction,
 )
 import session_yolo_store
+
+# ── Per-question record for AskUserQuestion groups ────────────────────────────
+# A small dataclass (not a tuple) so 15-04/15-05 can add fields without
+# rewriting every unpack site in the wait phase.
+
+@dataclass
+class _ChildRecord:
+    """One question's relay state, held for the wait phase and future PATCHes."""
+    child: "PermissionRequest"   # state-store row
+    question: Dict[str, Any]     # original question dict from tool_input
+    message_id: int              # relay message id
+    body: str                    # rendered body text (needed by 15-04/15-05 to PATCH)
+
 
 # Debug logging
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
@@ -243,6 +257,21 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
                 'decision': {
                     'behavior': 'allow',
                     'updatedInput': updated_input,
+                }
+            }
+        }
+
+    elif action == 'deny_mixed_roles':
+        # AskUserQuestion addressed two or more distinct human roles in one call.
+        # Bail immediately — nothing was sent, nothing was stored.
+        reason = decision.get('reason', '')
+        debug_log(f"Mixed-role rejection: {reason[:120]}")
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'PermissionRequest',
+                'decision': {
+                    'behavior': 'deny',
+                    'reason': reason,
                 }
             }
         }
@@ -454,8 +483,8 @@ def handle_ask_user_question(
     workspace_name: str,
 ) -> Optional[Dict[str, Any]]:
     """
-    Handle AskUserQuestion: send each question to Telegram, race the terminal,
-    build {question: answer} on success.
+    Handle AskUserQuestion: resolve role aliases, send each question to Telegram,
+    race the terminal, build {question: answer} on success.
 
     Returns a hook output dict (with `updatedInput.answers`) on Telegram win,
     or None to fall through to terminal (which handles the native UI).
@@ -463,6 +492,88 @@ def handle_ask_user_question(
     questions = tool_input.get('questions', [])
     if not questions:
         return None
+
+    # ── Role resolution (epic 15 — lazy import so a missing/broken
+    # roles_config degrades silently to the pre-roles path, not an exception) ──
+    # Matching the deferred-import pattern already used in this function below.
+    catalog = None
+    _bindings = None
+    _rc = None  # roles_config module reference (needed for retry path)
+    try:
+        import roles_config as _rc
+        catalog = _rc.load_catalog(cwd)
+        _bindings = _rc.load_bindings()
+        # Log config errors once per call — never into the Telegram message body.
+        if catalog is not None:
+            for _err in catalog.errors:
+                error_log(f"roles.toml: {_err}")
+        if _bindings is not None:
+            for _err in _bindings.errors:
+                error_log(f"relay config: {_err}")
+    except Exception as _e:  # noqa: BLE001
+        error_log(f"roles_config load failed: {_e}; using legacy mode")
+        catalog = None
+        _bindings = None
+        _rc = None
+
+    # Per-question resolution: (original_q, alias|None, cleaned_header, Destination|None)
+    # catalog is None  → legacy mode → destination=None for every question.
+    # catalog is set   → destination is a Destination dataclass for every question.
+    _per_q = []
+    if catalog is not None and _rc is not None:
+        for q in questions:
+            header = q.get('header', '')
+            alias, cleaned = _rc.parse_header_alias(header)
+            dest = _rc.resolve_destination(catalog, _bindings, alias)
+            _per_q.append((q, alias, cleaned, dest))
+
+        # Mixed-role check: all questions in one call must resolve to the same
+        # role_id.  Two unknown aliases both falling to the default are ONE role
+        # and must pass (brd §5.3).  Skipped entirely in legacy mode.
+        _role_ids = {entry[3].role_id for entry in _per_q}
+        if len(_role_ids) > 1:
+            # Collect one (alias, title) per distinct role_id (first occurrence).
+            _seen: Dict[str, Any] = {}
+            for _q, alias, _c, dest in _per_q:
+                if dest.role_id not in _seen:
+                    _seen[dest.role_id] = (alias, dest.title)
+            _parts = []
+            for _rid, (alias, title) in _seen.items():
+                _tag = f"@{alias}" if alias else f"@{_rid}"
+                _parts.append(f"{_tag} -> {title}")
+            return {
+                "action": "deny_mixed_roles",
+                "reason": (
+                    f"This AskUserQuestion call addressed {len(_role_ids)} different human roles "
+                    f"({', '.join(_parts)}). "
+                    "Each call must target exactly one role, because a question group cannot "
+                    "span two Telegram chats. Split this into one AskUserQuestion call per role."
+                ),
+            }
+    else:
+        # Legacy mode: no alias parsing, no routing, destination=None for all.
+        for q in questions:
+            _per_q.append((q, None, q.get('header', ''), None))
+
+    # Single destination for the whole call (None = legacy mode).
+    destination = _per_q[0][3]
+
+    # destination.token is None → roles are configured but this role is
+    # unreachable on this machine (no binding, broken chain).  Distinct from
+    # legacy mode (destination is None).  Return None → terminal only.
+    if destination is not None and destination.token is None:
+        error_log(
+            f"Role '{destination.role_id}' is unreachable (no binding or broken chain); "
+            "falling back to terminal"
+        )
+        return None
+
+    # ── Send the question group ───────────────────────────────────────────────
+    # token/role_title/notes for this attempt (may be updated on retry).
+    token = destination.token if destination is not None else None
+    role_title = destination.title if destination is not None else None
+    role_id_for_store = destination.role_id if destination is not None else None
+    notes = destination.notes if destination is not None else ()
 
     # One child request per question. Each gets its own relay message and
     # state-store entry; relay button values ``qa<N>`` (or a free-text reply)
@@ -474,35 +585,127 @@ def handle_ask_user_question(
     # once. The hook still polls children in order — each only goes terminal
     # when the whole group finalizes, so the sequential loop below stays valid.
     group_id = uuid.uuid4().hex
-    children = []  # list of (PermissionRequest, question_dict, message_id)
-    for i, q in enumerate(questions):
-        child = create_request(
-            session_id=session_id,
-            cwd=cwd,
-            tool_name='AskUserQuestion',
-            tool_input={
-                'question': q.get('question', ''),
-                'header': q.get('header', ''),
-                'options': q.get('options', []),
-                'multiSelect': q.get('multiSelect', False),
-            },
-            permission_suggestions=[],
-            ttl_seconds=REQUEST_TTL,
-        )
-        msg_id = send_question_message(child, workspace_name, i, len(questions), group_id)
-        if not msg_id:
-            error_log(f"Failed to send AskUserQuestion message for child {child.request_id}; falling back to terminal")
+    children: list  # list of _ChildRecord
+
+    def _try_send_group(
+        grp_id: str,
+        _token: Optional[str],
+        _role_title: Optional[str],
+        _role_id: Optional[str],
+        _notes: tuple,
+    ) -> Optional[list]:
+        """Send all questions as one group; return list of _ChildRecord or None.
+
+        On partial failure (one message fails): cancels already-sent siblings
+        through ``_token`` and marks their rows terminal so posttool_hook's
+        sweep leaves them alone.  Returns None on any failure.
+        """
+        records: list = []
+        for i, (q, _alias, cleaned_header, _dest) in enumerate(_per_q):
+            # Cleaned header (alias stripped) goes to Telegram; the raw header
+            # stays in tool_input so updatedInput's native UI chip is untouched.
+            _h = cleaned_header if destination is not None else q.get('header', '')
+            _child = create_request(
+                session_id=session_id,
+                cwd=cwd,
+                tool_name='AskUserQuestion',
+                tool_input={
+                    'question': q.get('question', ''),
+                    'header': _h,
+                    'options': q.get('options', []),
+                    'multiSelect': q.get('multiSelect', False),
+                },
+                permission_suggestions=[],
+                ttl_seconds=REQUEST_TTL,
+                role=_role_id,
+            )
+            _body = telegram_router.render_question_body(
+                _child, workspace_name, i, len(questions),
+                role_title=_role_title, notes=_notes,
+            )
+            _mid = send_question_message(
+                _child, workspace_name, i, len(questions), grp_id,
+                token=_token, role_title=_role_title, notes=_notes,
+            )
+            if _mid is None:
+                # Cancel already-sent siblings and mark their rows terminal.
+                for rec in records:
+                    try:
+                        remove_inline_buttons(rec.message_id, token=_token)
+                    except Exception as _ce:
+                        debug_log(f"Failed to cancel sibling {rec.message_id}: {_ce}")
+                    try:
+                        update_request_state(
+                            rec.child.request_id,
+                            RequestState.DENY,
+                            resolution_source=RESOLUTION_SOURCE_TIMEOUT,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                return None
+            records.append(_ChildRecord(child=_child, question=q, message_id=_mid, body=_body))
+        return records
+
+    children = _try_send_group(group_id, token, role_title, role_id_for_store, notes)
+
+    # ── Send-failure fallback ─────────────────────────────────────────────────
+    if children is None:
+        # Was already targeting the default (or legacy mode)? Give up → terminal.
+        if destination is None or destination.is_default:
+            error_log(
+                "Failed to send AskUserQuestion to default destination; "
+                "falling back to terminal"
+            )
             return None
-        children.append((child, q, msg_id))
+        # Retry once against the default destination with a runtime-failure note.
+        # The retry uses fresh request_ids and a fresh group_id so the relay's
+        # idempotency key (req:{request_id}:send) cannot 422 on the changed body.
+        _default_dest = _rc.resolve_destination(catalog, _bindings, None)
+        if _default_dest.token is None:
+            error_log(
+                "Default destination unreachable after send failure; terminal only"
+            )
+            return None
+        _retry_note = (
+            f"Intended for {destination.title} — "
+            "the relay could not deliver to them (not bound or send failed)."
+        )
+        token = _default_dest.token
+        role_title = _default_dest.title
+        role_id_for_store = _default_dest.role_id
+        # The retry carries only the delivery-failure note; static notes from
+        # the original resolution are irrelevant (the default is now the target).
+        notes = (_retry_note,)
+        group_id = uuid.uuid4().hex
+        children = _try_send_group(
+            group_id, token, role_title, role_id_for_store, notes
+        )
+        if children is None:
+            error_log(
+                "Retry send to default also failed; falling back to terminal"
+            )
+            return None
 
     debug_log(f"Sent {len(children)} question messages; polling for answers")
 
-    # Race the relay long-poll for each child against the local state store's
-    # ``resolved_terminal`` signal. Process children in order so the UI feels
-    # sequential; the relay still attributes button taps to the right message.
+    # Escalation deadline seam (15-05 wires this up).
+    # On the send-failure fallback path the value is always None — the default
+    # destination is already the target, so suppressing escalation is correct.
+    # On all other paths 15-05 will compute time.time() + <duration> here.
+    _escalation_deadline: Optional[float] = None
+
+    # ── Wait loop ─────────────────────────────────────────────────────────────
+    # Sequential structure is INTENTIONALLY preserved (15-04 replaces it).
+    # The ONLY changes from the pre-15-03 loop are:
+    #   1. token= on wait_for_relay_answer
+    #   2. token= on remove_inline_buttons in the terminal-resolution branch
+    # Everything else is identical to the pre-15-03 loop.
     answers: Dict[str, str] = {}
     deadline = time.time() + REQUEST_TTL
-    for child, q, child_msg_id in children:
+    for rec in children:
+        child = rec.child
+        q = rec.question
+        child_msg_id = rec.message_id
         if time.time() >= deadline:
             return None
         # Tight inner loop: short relay long-poll chunks interleaved with a
@@ -516,27 +719,28 @@ def handle_ask_user_question(
             # one we happen to be polling — otherwise a loop parked on an earlier
             # child never fires and that child's keyboard is left live.
             if any(
-                (st := get_request(c.request_id))
+                (st := get_request(r.child.request_id))
                 and st.state == RequestState.RESOLVED_TERMINAL.value
-                for c, _cq, _cm in children
+                for r in children
             ):
                 debug_log("AskUserQuestion resolved via terminal; revoking all messages")
                 from permission_state_store import resolve_via_terminal
-                for sib, _sq, sib_msg in children:
-                    sib_state = get_request(sib.request_id)
+                for r in children:
+                    sib_state = get_request(r.child.request_id)
                     if sib_state and sib_state.state == RequestState.PENDING.value:
-                        resolve_via_terminal(sib.request_id)
+                        resolve_via_terminal(r.child.request_id)
                     # Strip the keyboard on every sibling (idempotent for the one
                     # the posttool hook already revoked).
                     try:
-                        remove_inline_buttons(sib_msg)
-                        set_message_reaction(sib_msg, '✅')
+                        remove_inline_buttons(r.message_id, token=token)  # ← 15-03 change
+                        set_message_reaction(r.message_id, '✅')
                     except Exception as e:
-                        debug_log(f"Failed to revoke message {sib_msg}: {e}")
+                        debug_log(f"Failed to revoke message {r.message_id}: {e}")
                 return None
             chunk = min(25, max(1, int(deadline - time.time())))
             answer = wait_for_relay_answer(
-                child_msg_id, timeout=chunk, long_poll_chunk=chunk
+                child_msg_id, timeout=chunk, long_poll_chunk=chunk,
+                token=token,  # ← 15-03 change
             )
             if answer is None:
                 continue
@@ -565,7 +769,10 @@ def handle_ask_user_question(
         if not resolved:
             return None
 
-    # All answered via Telegram — build updatedInput preserving original question structure.
+    # All answered via Telegram — build updatedInput preserving the original
+    # question structure exactly.  updatedInput is built from the *original*
+    # tool_input so the raw ``@ux Layout`` header chips are untouched in the
+    # terminal; the cleaned headers live only on the child rows sent to Telegram.
     return {
         'action': 'answer',
         'updatedInput': {

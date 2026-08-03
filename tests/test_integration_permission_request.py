@@ -472,6 +472,8 @@ class TestTerminalResolutionRace(unittest.TestCase):
         self.assertEqual(args[0], "test-id")
         self.assertEqual(args[1], RequestState.ALLOW)
 
+    @patch("roles_config.load_bindings")
+    @patch("roles_config.load_catalog", return_value=None)
     @patch("permission_request_hook.wait_for_relay_answer")
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.get_request")
@@ -484,6 +486,8 @@ class TestTerminalResolutionRace(unittest.TestCase):
         mock_get_request,
         mock_create_request,
         mock_wait_relay,
+        _mock_catalog,       # load_catalog → None (legacy mode)
+        _mock_bindings,      # load_bindings → MagicMock (unused in legacy mode)
     ):
         """handle_ask_user_question: when the current child resolves via
         terminal, remove_inline_buttons is called for *that child's* message_id
@@ -524,8 +528,11 @@ class TestTerminalResolutionRace(unittest.TestCase):
 
         self.assertIsNone(result)
         # The current child's relay message (555) must have been cancelled.
-        mock_remove_buttons.assert_any_call(555)
+        # Legacy mode → token=None.
+        mock_remove_buttons.assert_any_call(555, token=None)
 
+    @patch("roles_config.load_bindings")
+    @patch("roles_config.load_catalog", return_value=None)
     @patch("permission_request_hook.wait_for_relay_answer")
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.get_request")
@@ -538,6 +545,8 @@ class TestTerminalResolutionRace(unittest.TestCase):
         mock_get_request,
         mock_create_request,
         mock_wait_relay,
+        _mock_catalog,       # load_catalog → None (legacy mode)
+        _mock_bindings,      # load_bindings → MagicMock (unused in legacy mode)
     ):
         """Two questions, answered in the terminal. The PostToolUse hook only
         flips the *most recent* child (the last one) to resolved_terminal, while
@@ -585,8 +594,9 @@ class TestTerminalResolutionRace(unittest.TestCase):
 
         self.assertIsNone(result)
         # Both the first child's message (501) and the last (502) get revoked.
-        mock_remove_buttons.assert_any_call(501)
-        mock_remove_buttons.assert_any_call(502)
+        # Legacy mode → token=None.
+        mock_remove_buttons.assert_any_call(501, token=None)
+        mock_remove_buttons.assert_any_call(502, token=None)
 
 
 class TestAutoDenyAtTtl(unittest.TestCase):
@@ -1391,6 +1401,668 @@ class TestPostToolRoleRevoke(unittest.TestCase):
         ok, remove, _ = self._revoke(req)
         self.assertTrue(ok)
         remove.assert_called_once_with(99, token="rly_op")
+
+
+# ── Helpers shared by TestAliasRouting ────────────────────────────────────────
+
+def _make_catalog(default="operator", roles=None, workspace_id="leangeeks"):
+    """Build a minimal RoleCatalog fixture for alias-routing tests."""
+    import roles_config as rc
+    if roles is None:
+        roles = {
+            "operator": rc.Role(
+                role_id="operator", title="Operator",
+                aliases=("operator", "op"), escalate_after=None,
+            ),
+            "ux": rc.Role(
+                role_id="ux", title="UX/UI designer",
+                aliases=("ux", "design"), escalate_after=None,
+            ),
+        }
+    alias_index = {}
+    for rid, role in roles.items():
+        for a in role.aliases:
+            alias_index[a] = rid
+    return rc.RoleCatalog(
+        workspace_id=workspace_id,
+        default_role=default,
+        roles=roles,
+        alias_index=alias_index,
+        errors=(),
+        path=None,
+    )
+
+
+def _make_bindings(default_token="rly_op", roles=None, server_url="https://relay.example"):
+    """Build a minimal Bindings fixture for alias-routing tests."""
+    import roles_config as rc
+    return rc.Bindings(
+        server_url=server_url,
+        default_token=default_token,
+        roles=roles or {"ux": "rly_ux"},
+        workspace_roles={},
+        escalate_after={},
+        workspace_escalate_after={},
+        errors=(),
+    )
+
+
+class TestAliasRouting(unittest.TestCase):
+    """handle_ask_user_question: alias resolution, mixed-role rejection,
+    send-failure retry, and the compatibility floor (no roles.toml)."""
+
+    def setUp(self):
+        import permission_request_hook as hook
+        import telegram_permission_router as tpr
+        import roles_config as rc
+        self.hook = hook
+        self.tpr = tpr
+        self.rc = rc
+
+        self.catalog = _make_catalog()
+        self.bindings = _make_bindings()
+
+        # A minimal _send_relay capture helper used by several tests.
+        self._sends = []
+
+    # ── Compatibility floor ────────────────────────────────────────────────────
+
+    def test_no_roles_toml_identical_relay_payload(self):
+        """No roles.toml (catalog=None) → identical relay call to pre-15-03.
+
+        The compatibility-floor criterion is asserted on the recorded relay
+        call, not merely the return value (first standing risk in state.md).
+        """
+        import permission_request_hook as hook
+        captured = []
+
+        def _capture_send(**kw):
+            captured.append(kw)
+            return 100
+
+        with patch("roles_config.load_catalog", return_value=None), \
+             patch("roles_config.load_bindings", return_value=_make_bindings()), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_capture_send), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = hook.handle_ask_user_question(
+                session_id="sess",
+                cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Sidebar or top nav?",
+                     "header": "Layout",
+                     "options": [{"label": "Sidebar"}, {"label": "Top"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(captured), 1)
+        call = captured[0]
+        # Token must be None (default client — no role routing).
+        self.assertIsNone(call["token"])
+        # Body must NOT contain a "for:" role line or any ⚠️ note.
+        self.assertNotIn("for:", call["text"])
+        self.assertNotIn("⚠️", call["text"])
+        # Body must contain the header and question verbatim.
+        self.assertIn("Layout", call["text"])
+        self.assertIn("Sidebar or top nav?", call["text"])
+        # updatedInput preserves original tool_input (raw header untouched).
+        answers = result["updatedInput"]["answers"]
+        self.assertIn("Sidebar or top nav?", answers)
+
+    def test_no_roles_toml_no_role_in_state_store(self):
+        """Legacy mode: create_request must NOT receive a role argument."""
+        import permission_request_hook as hook
+
+        with patch("roles_config.load_catalog", return_value=None), \
+             patch("roles_config.load_bindings", return_value=_make_bindings()), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", return_value=42), \
+             patch("telegram_permission_router.set_telegram_message_id"), \
+             patch("permission_request_hook.create_request",
+                   return_value=_make_request()) as mock_cr:
+            hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [{"question": "Q?", "options": []}]},
+                workspace_name="ws",
+            )
+
+        mock_cr.assert_called_once()
+        self.assertIsNone(mock_cr.call_args.kwargs.get("role"))
+
+    # ── Role-tagged routing ────────────────────────────────────────────────────
+
+    def test_ux_tag_routes_to_ux_token(self):
+        """@ux Layout → sent to rly_ux, for: UX/UI designer, header stripped."""
+        captured = []
+
+        def _se(**kw):
+            captured.append(kw)
+            return 200
+
+        with patch("roles_config.load_catalog", return_value=self.catalog), \
+             patch("roles_config.load_bindings", return_value=self.bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Sidebar or top nav?",
+                     "header": "@ux Layout",
+                     "options": [{"label": "Sidebar"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(captured), 1)
+        call = captured[0]
+        # Routed to the ux token.
+        self.assertEqual(call["token"], "rly_ux")
+        # for: line present.
+        self.assertIn("for: UX/UI designer", call["text"])
+        # Alias stripped from rendered header (only "Layout" remains, not "@ux").
+        self.assertIn("Layout", call["text"])
+        self.assertNotIn("@ux", call["text"])
+        # updatedInput retains the raw header (terminal chip untouched).
+        orig_qs = result["updatedInput"]["questions"]
+        self.assertEqual(orig_qs[0]["header"], "@ux Layout")
+
+    def test_untagged_question_in_roles_workspace_goes_to_default(self):
+        """No alias → default token, for: Operator shown."""
+        captured = []
+
+        def _se(**kw):
+            captured.append(kw)
+            return 300
+
+        with patch("roles_config.load_catalog", return_value=self.catalog), \
+             patch("roles_config.load_bindings", return_value=self.bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Any Q?", "header": "NoAlias", "options": [{"label": "A"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        call = captured[0]
+        self.assertEqual(call["token"], "rly_op")
+        self.assertIn("for: Operator", call["text"])
+
+    def test_unknown_alias_routes_to_default_with_warning(self):
+        """@uxx (unknown) → default token, ⚠️ note in body."""
+        captured = []
+
+        def _se(**kw):
+            captured.append(kw)
+            return 400
+
+        with patch("roles_config.load_catalog", return_value=self.catalog), \
+             patch("roles_config.load_bindings", return_value=self.bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q?", "header": "@uxx Something", "options": [{"label": "A"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        call = captured[0]
+        self.assertEqual(call["token"], "rly_op")
+        # Full exact phrase sourced from roles_config (15-01 owns it).
+        # A loose substring check would pass even if the wording regressed.
+        self.assertIn("Unknown role @uxx — routed to Operator.", call["text"])
+
+    def test_role_no_binding_routes_to_default_with_note(self):
+        """Role exists in catalog but has no binding → default + ⚠️ Intended for."""
+        rc = self.rc
+        import roles_config as _rc
+
+        # Build a catalog with an "arch" role but no binding for it.
+        arch_role = _rc.Role(
+            role_id="arch", title="Tech lead",
+            aliases=("arch",), escalate_after=None,
+        )
+        catalog = _make_catalog(roles={
+            "operator": _rc.Role(
+                role_id="operator", title="Operator",
+                aliases=("operator",), escalate_after=None,
+            ),
+            "arch": arch_role,
+        })
+        # Bindings: only default token, no "arch" entry.
+        bindings = _make_bindings(default_token="rly_op", roles={})
+
+        captured = []
+
+        def _se(**kw):
+            captured.append(kw)
+            return 500
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "DB?", "header": "@arch Storage", "options": [{"label": "PG"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        call = captured[0]
+        self.assertEqual(call["token"], "rly_op")
+        # Full exact phrase from roles_config.resolve_destination (line 544).
+        self.assertIn(
+            "Intended for Tech lead — not reachable from this machine.",
+            call["text"],
+        )
+
+    # ── Mixed-role rejection ───────────────────────────────────────────────────
+
+    def test_two_distinct_roles_returns_deny_mixed(self):
+        """Two questions targeting different roles → deny, zero relay sends,
+        zero state-store rows."""
+        import os
+        import roles_config as _rc
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        send_calls = []
+        create_calls = []
+
+        # Count rows in the isolated state store BEFORE the call.
+        # The runner redirects CLAUDE_PERMISSION_STATE_FILE to a temp dir
+        # (run_all_tests.py / conftest.py), so this never touches the
+        # developer's real ~/.claude/permission_requests.jsonl.
+        _state_file = os.environ.get("CLAUDE_PERMISSION_STATE_FILE", "")
+
+        def _row_count():
+            if not _state_file or not os.path.exists(_state_file):
+                return 0
+            with open(_state_file) as _f:
+                return sum(1 for _l in _f if _l.strip())
+
+        rows_before = _row_count()
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("telegram_permission_router._send_relay",
+                   side_effect=lambda **kw: (send_calls.append(kw), 1)[1]), \
+             patch("permission_request_hook.create_request",
+                   side_effect=lambda **kw: (create_calls.append(kw), _make_request())[1]):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q1?", "header": "@ux Layout", "options": []},
+                    {"question": "Q2?", "header": "@op Something", "options": []},
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        # Must return a deny_mixed_roles decision with the full task-specified
+        # reason string — both the dynamic count+alias pairs and the static
+        # explanatory tail that the hook owns.
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "deny_mixed_roles")
+        self.assertEqual(
+            result["reason"],
+            "This AskUserQuestion call addressed 2 different human roles "
+            "(@ux -> UX/UI designer, @op -> Operator). "
+            "Each call must target exactly one role, because a question group cannot "
+            "span two Telegram chats. Split this into one AskUserQuestion call per role.",
+        )
+        # Zero relay sends and zero mock create_request calls.
+        self.assertEqual(len(send_calls), 0)
+        self.assertEqual(len(create_calls), 0)
+        # Zero rows written to the isolated state store (direct file count —
+        # absence-of-error is not sufficient per task spec).
+        self.assertEqual(
+            _row_count(), rows_before,
+            "Mixed-role deny must not write any state-store rows",
+        )
+
+    def test_deny_mixed_roles_becomes_behavior_deny(self):
+        """build_output_decision maps deny_mixed_roles → behavior: deny."""
+        from permission_request_hook import build_output_decision
+        out = build_output_decision(
+            {"action": "deny_mixed_roles",
+             "reason": "This AskUserQuestion call addressed 2 different human roles..."},
+            _make_request(),
+        )
+        self.assertIsNotNone(out)
+        dec = out["hookSpecificOutput"]["decision"]
+        self.assertEqual(dec["behavior"], "deny")
+        self.assertIn("2 different human roles", dec["reason"])
+
+    def test_two_unknown_aliases_same_role_sends_normally(self):
+        """Two unknown aliases → both fall back to default → one role → send OK."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+        captured = []
+        msg_counter = {"n": 0}
+
+        def _se(**kw):
+            captured.append(kw)
+            msg_counter["n"] += 1
+            return msg_counter["n"] * 100
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q1?", "header": "@ghost1 X", "options": [{"label": "A"}]},
+                    {"question": "Q2?", "header": "@ghost2 Y", "options": [{"label": "B"}]},
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        # Two questions sent, result is an answer decision.
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "answer")
+        self.assertEqual(len(captured), 2)
+        # Both go to the default token.
+        self.assertTrue(all(c["token"] == "rly_op" for c in captured))
+
+    # ── destination.token is None ─────────────────────────────────────────────
+
+    def test_unreachable_token_returns_none(self):
+        """destination.token is None → return None, nothing sent."""
+        import roles_config as _rc
+
+        # Build a catalog with a "ux" role that has no binding resolution.
+        catalog = _make_catalog()
+        # Empty bindings: default role has no token either (server_url + no token).
+        # We want only "ux" unreachable but default reachable for the default dest.
+        # For this test, force destination.token=None by patching resolve_destination.
+        _unreachable = _rc.Destination(
+            role_id="ux", title="UX/UI designer",
+            token=None, is_default=False,
+            requested_role_id=None, requested_title=None,
+            escalate_after=None, notes=(),
+        )
+        send_calls = []
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=self.bindings), \
+             patch("roles_config.resolve_destination", return_value=_unreachable), \
+             patch("telegram_permission_router._send_relay",
+                   side_effect=lambda **kw: (send_calls.append(kw), 1)[1]):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q?", "header": "@ux H", "options": []}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(send_calls), 0)
+
+    # ── Send failure fallback ─────────────────────────────────────────────────
+
+    def test_send_failure_to_role_retries_against_default(self):
+        """A failed send to a role token → cancel siblings → retry against default
+        with fresh ids and delivery-failure note, escalation suppressed (None)."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        send_calls = []
+        msg_counter = {"n": 0}
+
+        def _se(**kw):
+            send_calls.append(kw)
+            # First send (to ux token) fails; subsequent (default) succeed.
+            if kw.get("token") == "rly_ux":
+                return None
+            msg_counter["n"] += 1
+            return msg_counter["n"] * 100
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q?", "header": "@ux Layout", "options": [{"label": "A"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        # Result is a successful answer (retry worked).
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "answer")
+
+        # First call is to rly_ux (failed); retry calls are to rly_op.
+        self.assertTrue(send_calls[0]["token"] == "rly_ux")
+        retry_calls = [c for c in send_calls if c.get("token") == "rly_op"]
+        self.assertGreater(len(retry_calls), 0)
+
+        # Retry body contains the delivery-failure note — full exact phrase
+        # (15-03 owns this wording; a partial match would pass if it regressed).
+        retry_text = retry_calls[0]["text"]
+        self.assertIn(
+            "Intended for UX/UI designer — "
+            "the relay could not deliver to them (not bound or send failed).",
+            retry_text,
+        )
+
+        # Fresh ids: retry must use a new request_id AND a new group_id.
+        # _send_relay keys idempotency on req:{request_id}:send, so reusing
+        # either id on a body that differs by one note earns a 422 from the
+        # relay.  Removing the `group_id = uuid.uuid4().hex` line at line 679
+        # of the hook would fail the second assertion below.
+        first_rid = send_calls[0]["request_id"]
+        retry_rid = retry_calls[0]["request_id"]
+        self.assertNotEqual(first_rid, retry_rid)
+        first_gid = send_calls[0]["group_id"]
+        retry_gid = retry_calls[0]["group_id"]
+        self.assertNotEqual(first_gid, retry_gid)
+
+    def test_send_failure_to_default_returns_none(self):
+        """A failed send to the default token → return None, no retry."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        send_calls = []
+
+        def _se(**kw):
+            send_calls.append(kw)
+            return None  # every send fails
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("telegram_permission_router._send_relay", side_effect=_se), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    # No alias → default destination → failure → no retry.
+                    {"question": "Q?", "header": "Plain", "options": []}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNone(result)
+        # Only one send attempt (no retry).
+        self.assertEqual(len(send_calls), 1)
+
+    # ── State-store row carries role; updatedInput raw headers untouched ───────
+
+    def test_role_stored_in_state_row(self):
+        """create_request receives role=<role_id> for a tagged question."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        create_calls = []
+
+        def _cr(**kw):
+            create_calls.append(kw)
+            return _make_request()
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.create_request", side_effect=_cr), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", return_value=42), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q?", "header": "@ux Layout", "options": [{"label": "A"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertEqual(len(create_calls), 1)
+        self.assertEqual(create_calls[0]["role"], "ux")
+
+    def test_updated_input_raw_headers_untouched(self):
+        """updatedInput keeps original headers with the @alias prefix."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value={"via": "button", "value": "qa0"}), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(state="pending")), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons"), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", return_value=42), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Sidebar or nav?",
+                     "header": "@ux Layout",
+                     "options": [{"label": "Sidebar"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNotNone(result)
+        # updatedInput carries original tool_input structure.
+        updated = result["updatedInput"]
+        # The questions list is from the original tool_input.
+        self.assertEqual(updated["questions"][0]["header"], "@ux Layout")
+        # answers key is the question text.
+        self.assertIn("Sidebar or nav?", updated["answers"])
+
+    # ── Terminal resolution cancels via role token ─────────────────────────────
+
+    def test_terminal_resolution_cancels_via_role_token(self):
+        """When answered in the terminal, every sibling is cancelled through
+        the role's token (not the default token)."""
+        catalog = _make_catalog()
+        bindings = _make_bindings()
+
+        from permission_state_store import RequestState
+
+        cancel_calls = []
+
+        with patch("roles_config.load_catalog", return_value=catalog), \
+             patch("roles_config.load_bindings", return_value=bindings), \
+             patch("permission_request_hook.wait_for_relay_answer",
+                   return_value=None), \
+             patch("permission_request_hook.get_request",
+                   return_value=_make_request(
+                       state=RequestState.RESOLVED_TERMINAL.value)), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.remove_inline_buttons",
+                   side_effect=lambda mid, *, token=None:
+                       cancel_calls.append({"mid": mid, "token": token})), \
+             patch("permission_request_hook.set_message_reaction"), \
+             patch("telegram_permission_router._send_relay", return_value=77), \
+             patch("telegram_permission_router.set_telegram_message_id"):
+            result = self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Q?", "header": "@ux Layout", "options": [{"label": "A"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+
+        self.assertIsNone(result)
+        # All cancellations must use the ux token.
+        self.assertGreater(len(cancel_calls), 0)
+        self.assertTrue(all(c["token"] == "rly_ux" for c in cancel_calls))
 
 
 if __name__ == "__main__":
