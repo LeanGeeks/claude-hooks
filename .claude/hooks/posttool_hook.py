@@ -30,6 +30,12 @@ import telegram_permission_router
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
 DEBUG_LOG = Path.home() / ".claude" / "posttool_debug.log"
 
+# Backstop on the *reduced* terminal-answers value written onto the state-store
+# row. Nothing realistic approaches it after the reduction below; capping the
+# raw ``tool_response`` instead would truncate real captures into invalid JSON
+# and silently disable the structured path for exactly the rich calls it serves.
+MAX_TERMINAL_ANSWERS_BYTES = 8192
+
 
 def log_debug(message: str):
     """Log debug message if debug mode is enabled."""
@@ -40,6 +46,62 @@ def log_debug(message: str):
                 f.write(f"[{timestamp}] {message}\n")
         except Exception:
             pass
+
+
+def reduce_tool_response(tool_response) -> str:
+    """Reduce an ``AskUserQuestion`` ``tool_response`` to what the wait phase needs.
+
+    ``tool_response`` is a dict ``{questions, answers, annotations}``. Almost all
+    of its bulk is ``questions`` (option descriptions) and
+    ``annotations[*].preview``, and none of that is needed to render an answer in
+    Telegram. We keep exactly two maps, both keyed by the verbatim question text::
+
+        {"answers": {...}, "notes": {...}}
+
+    Anything that is not a dict (older Claude Code, or a shape change) is stored
+    as ``str(...)`` unchanged and left to the parser's prose tier.
+
+    The result is capped at ``MAX_TERMINAL_ANSWERS_BYTES`` as a backstop only,
+    shedding notes first and then the longest answers, so what survives is
+    always still valid JSON.
+    """
+    if not isinstance(tool_response, dict):
+        return str(tool_response)
+
+    answers = dict(tool_response.get("answers") or {})
+    annotations = tool_response.get("annotations") or {}
+    notes = {}
+    if isinstance(annotations, dict):
+        notes = {
+            q: a["notes"]
+            for q, a in annotations.items()
+            if isinstance(a, dict) and "notes" in a
+        }
+
+    reduced = {"answers": answers, "notes": notes}
+
+    def _encode() -> str:
+        return json.dumps(reduced, ensure_ascii=False)
+
+    encoded = _encode()
+    if len(encoded.encode("utf-8")) <= MAX_TERMINAL_ANSWERS_BYTES:
+        return encoded
+
+    # Backstop path: shed the least useful content first so the value stays
+    # parseable rather than being truncated into invalid JSON.
+    reduced["notes"] = {}
+    encoded = _encode()
+    while (
+        len(encoded.encode("utf-8")) > MAX_TERMINAL_ANSWERS_BYTES
+        and reduced["answers"]
+    ):
+        longest = max(
+            reduced["answers"],
+            key=lambda k: len(k) + len(str(reduced["answers"][k])),
+        )
+        del reduced["answers"][longest]
+        encoded = _encode()
+    return encoded
 
 
 def resolve_role_token(request) -> "str | None":
@@ -115,6 +177,7 @@ def main():
         cwd = input_data.get('cwd', os.getcwd())
         tool_name = input_data.get('tool_name', '')
         tool_input = input_data.get('tool_input', {})
+        tool_response = input_data.get('tool_response')
         agent_id = input_data.get('agent_id') or None
 
         log_debug(f"Session: {session_id}")
@@ -142,8 +205,19 @@ def main():
         log_debug(f"Found pending request: {pending_request.request_id}")
         log_debug(f"  Message ID: {pending_request.telegram_message_id}")
 
+        # Carry the terminal's answers onto the row so the parked
+        # PermissionRequest hook can patch them into whichever chat the question
+        # went to (brd §5.5). Only AskUserQuestion has an ``answers`` map; every
+        # other tool's response would just bloat the append-only JSONL.
+        terminal_answers = None
+        if tool_name == 'AskUserQuestion' and tool_response is not None:
+            try:
+                terminal_answers = reduce_tool_response(tool_response)
+            except Exception as e:  # noqa: BLE001 — never affect tool execution
+                log_debug(f"Failed to reduce tool_response: {type(e).__name__}: {e}")
+
         # Mark as resolved via terminal
-        updated = resolve_via_terminal(pending_request.request_id)
+        updated = resolve_via_terminal(pending_request.request_id, terminal_answers)
 
         if not updated:
             log_debug("Failed to update request state (already resolved?)")

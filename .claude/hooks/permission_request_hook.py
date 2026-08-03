@@ -27,15 +27,18 @@ Action mappings:
 """
 
 import json
+import queue
+import re
 import sys
 import os
+import threading
 import time
 import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import telegram_permission_router as telegram_router
 
@@ -45,6 +48,7 @@ from permission_state_store import (
     RequestState,
     create_request,
     get_request,
+    resolve_via_terminal,
     update_request_state,
     cleanup_expired_requests,
     RESOLUTION_SOURCE_TELEGRAM,
@@ -53,12 +57,12 @@ from permission_state_store import (
 )
 from telegram_permission_router import (
     load_telegram_config,
+    finalize_message,
     send_permission_message,
     send_question_message,
     wait_for_relay_answer,
     relay_answer_to_decision,
     remove_inline_buttons,
-    set_message_reaction,
 )
 import session_yolo_store
 
@@ -89,6 +93,29 @@ POLL_INTERVAL = 0.5  # seconds between state store polls
 # Noticing a terminal resolution a few seconds late is harmless; re-reading the
 # (growing) state file twice a second for 12h is not.
 STATE_STORE_POLL_INTERVAL = 10  # seconds
+
+# ── AskUserQuestion wait-phase tuning (15-04) ────────────────────────────────
+# Relay long-poll chunk cap, unchanged from the sequential loop. The result
+# queue makes wake-up latency independent of chunk size, so shorter chunks would
+# only add request volume.
+LONG_POLL_CHUNK = 25  # seconds
+# Main-loop tick. Bounds how late a terminal resolution is noticed; a child
+# answering wakes the loop immediately through the queue.
+WAIT_TICK_SECONDS = 2.0
+# Floor on one child-thread poll cycle. A relay that fails instantly (or a test
+# double) would otherwise spin a thread hot for the full 12h TTL.
+CHILD_POLL_FLOOR_SECONDS = 1.0
+
+# Literal ``answers[q]`` values that mean "the user picked nothing" — the real
+# content then lives in ``annotations[q]["notes"]``. Matched exactly, never as a
+# "any parenthesised value" heuristic: ``(none of these)`` is a legitimate
+# free-text answer and must survive untouched.
+TERMINAL_ANSWER_PLACEHOLDERS = frozenset({"(notes only)", "(no option selected)"})
+
+# Shown for a question we could not match an answer to (parse failed, no
+# ``terminal_answers`` recorded, or Claude Code's askUserQuestionTimeout
+# auto-continued with only a subset of the questions answered).
+TERMINAL_ANSWER_FALLBACK_TEXT = "Answered in the terminal"
 
 
 def debug_log(message: str):
@@ -476,6 +503,312 @@ def _wait_state_store_only(
     return None
 
 
+def parse_terminal_answers(
+    stored: Optional[str], questions: List[str]
+) -> Dict[str, str]:
+    """Turn the row's ``terminal_answers`` into ``{question text: answer text}``.
+
+    Three tiers, in order. Never raises: ``None``, ``""``, invalid JSON and
+    unrelated prose all return ``{}``, and any question left unmatched is simply
+    absent from the result (the caller renders the generic fallback text).
+
+    1. **Structured** — the real path. ``json.loads`` the reduced payload and
+       read ``answers[q]`` by exact question text. When the answer is a
+       placeholder (empty, ``(notes only)``, ``(no option selected)``) and
+       ``notes[q]`` carries content, the notes are rendered instead; a
+       placeholder with no notes is dropped, because patching
+       ``✅ (notes only)`` into someone's chat is worse than useless.
+    2. **Prose** — defensive only, for a shape change that stops the payload
+       being JSON. Exact question-text matching against ``"Q"="A"`` pairs.
+       Deliberately *no* positional zip: on real data the pair count disagrees
+       with the question count precisely when the parse is already wrong, so
+       zipping would mis-assign answers rather than degrade cleanly.
+    3. Nothing matched → ``{}``.
+    """
+    if not stored:
+        return {}
+
+    try:
+        data = json.loads(stored)
+    except Exception:  # noqa: BLE001 — not JSON is an expected input here
+        data = None
+
+    if isinstance(data, dict):
+        answers = data.get("answers")
+        notes = data.get("notes")
+        if not isinstance(answers, dict):
+            answers = {}
+        if not isinstance(notes, dict):
+            notes = {}
+        parsed: Dict[str, str] = {}
+        for question in questions:
+            if question not in answers:
+                # ``answers`` can be partial — askUserQuestionTimeout
+                # auto-continues with whatever was selected so far.
+                continue
+            raw = answers[question]
+            value = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
+            if not value.strip() or value in TERMINAL_ANSWER_PLACEHOLDERS:
+                note = notes.get(question)
+                if isinstance(note, str) and note.strip():
+                    parsed[question] = note
+                continue
+            parsed[question] = value
+        return parsed
+
+    pairs = dict(re.findall(r'"([^"]*)"="([^"]*)"', stored))
+    return {q: pairs[q] for q in questions if pairs.get(q)}
+
+
+def _child_wait_loop(
+    group_key: str,
+    message_id: int,
+    token: Optional[str],
+    deadline: float,
+    results: "queue.Queue",
+    stop: threading.Event,
+) -> None:
+    """Thread body: long-poll one relay message until it answers or the TTL.
+
+    Pushes ``(group_key, message_id, result)`` where ``result`` is the answer
+    dict, a ``{"_state": ...}`` sentinel, or ``None`` on a chunk timeout. Does
+    nothing else — no state-store writes happen off the main thread.
+
+    Swallows every exception and pushes a sentinel rather than dying silently:
+    a thread that raises would leave the main loop waiting for a result that
+    never arrives, until the 12h TTL.
+    """
+    try:
+        while not stop.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return
+            chunk = min(LONG_POLL_CHUNK, max(1, int(remaining)))
+            started = time.time()
+            result = wait_for_relay_answer(
+                message_id, timeout=chunk, long_poll_chunk=chunk, token=token
+            )
+            if result is not None:
+                # Answer or {"_state": ...}: either way this child is done.
+                results.put((group_key, message_id, result))
+                return
+            results.put((group_key, message_id, None))
+            elapsed = time.time() - started
+            if elapsed < CHILD_POLL_FLOOR_SECONDS:
+                stop.wait(CHILD_POLL_FLOOR_SECONDS - elapsed)
+    except BaseException as e:  # noqa: BLE001 — must never hang the main loop
+        try:
+            error_log(
+                f"AskUserQuestion wait thread for message {message_id} failed: "
+                f"{type(e).__name__}: {e}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            results.put((group_key, message_id, {"_state": "thread_error"}))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _any_child_resolved_in_terminal(groups: Dict[str, List["_ChildRecord"]]) -> bool:
+    """True when *any* child row reads ``resolved_terminal``.
+
+    The PostToolUse hook only flips the most recent pending child
+    (``find_pending_request_by_tool_session`` returns a single row), but that
+    signals the whole AskUserQuestion was answered at the keyboard. Detecting it
+    on any child is what stops a loop parked elsewhere leaving keyboards live.
+    """
+    for records in groups.values():
+        for rec in records:
+            row = get_request(rec.child.request_id)
+            if row and row.state == RequestState.RESOLVED_TERMINAL.value:
+                return True
+    return False
+
+
+def _finalize_on_terminal_win(
+    groups: Dict[str, List["_ChildRecord"]],
+    group_tokens: Dict[str, Optional[str]],
+) -> None:
+    """The terminal answered first: show every open message what was decided.
+
+    Runs on the main thread only. Patches each message with ``✅ <answer>`` and
+    strips its keyboard (``finalize_message`` PATCHes then cancels, in that
+    order), then sweeps still-pending sibling rows to ``resolved_terminal``.
+
+    Every rung of the ladder leaves the keyboard stripped: a question we cannot
+    match an answer to gets the generic text, and a failed PATCH still cancels.
+    """
+    # Read every row once — the sweep below reuses these.
+    rows = {}
+    for records in groups.values():
+        for rec in records:
+            rows[rec.child.request_id] = get_request(rec.child.request_id)
+
+    # PostToolUse only ever flips one row, and not necessarily the child that
+    # detected the terminal state — so scan them all and take the first value.
+    stored = None
+    for records in groups.values():
+        for rec in records:
+            row = rows.get(rec.child.request_id)
+            value = getattr(row, "terminal_answers", None) if row else None
+            if value:
+                stored = value
+                break
+        if stored:
+            break
+
+    question_texts = [
+        (rec.question or {}).get("question", "")
+        for records in groups.values()
+        for rec in records
+    ]
+    answers = parse_terminal_answers(stored, question_texts)
+
+    for group_key, records in groups.items():
+        token = group_tokens.get(group_key)
+        for rec in records:
+            text = answers.get((rec.question or {}).get("question", "")) \
+                or TERMINAL_ANSWER_FALLBACK_TEXT
+            try:
+                finalize_message(
+                    rec.message_id, rec.body, text, prefix="✅ ", token=token
+                )
+            except Exception as e:  # noqa: BLE001 — a dead chat must not block
+                debug_log(f"Failed to finalize message {rec.message_id}: {e}")
+
+    # Sweep the siblings PostToolUse did not touch. No ``terminal_answers`` is
+    # passed, so this cannot blank out the value recorded a moment earlier.
+    for records in groups.values():
+        for rec in records:
+            row = rows.get(rec.child.request_id)
+            if row and row.state == RequestState.PENDING.value:
+                try:
+                    resolve_via_terminal(rec.child.request_id)
+                except Exception as e:  # noqa: BLE001
+                    debug_log(
+                        f"Failed to mark {rec.child.request_id} terminal-resolved: {e}"
+                    )
+
+
+def _wait_for_group_answers(
+    groups: Dict[str, List["_ChildRecord"]],
+    group_tokens: Dict[str, Optional[str]],
+    deadline: float,
+) -> Optional[Tuple[str, Dict[str, str]]]:
+    """Race every open question group; the first to answer in full wins.
+
+    One daemon thread per open child message long-polls the relay and pushes its
+    result onto a queue. **The main thread owns everything else**: terminal
+    detection, every state-store write, and the decision.
+
+    Returns ``(group_key, {question: answer})`` for the winning group, or
+    ``None`` when the terminal answered first, no group can be answered any
+    more, or the TTL elapsed. ``None`` always means "native terminal UI stands".
+
+    Daemon threads are never joined: when the hook exits, threads still parked
+    in a long-poll die with the process. ``stop`` only spares a doomed thread
+    one more relay round trip.
+    """
+    results: "queue.Queue" = queue.Queue()
+    stop = threading.Event()
+
+    # message_id -> (group_key, record). Message ids are relay-global, so this
+    # stays unambiguous once 15-05 adds the escalation group.
+    index: Dict[int, Tuple[str, "_ChildRecord"]] = {}
+    for group_key, records in groups.items():
+        for rec in records:
+            index[rec.message_id] = (group_key, rec)
+
+    answers: Dict[str, Dict[str, str]] = {gk: {} for gk in groups}
+    answered_ids: Dict[str, set] = {gk: set() for gk in groups}
+    unanswerable: Dict[str, set] = {gk: set() for gk in groups}
+
+    try:
+        for group_key, records in groups.items():
+            for rec in records:
+                threading.Thread(
+                    target=_child_wait_loop,
+                    args=(
+                        group_key,
+                        rec.message_id,
+                        group_tokens.get(group_key),
+                        deadline,
+                        results,
+                        stop,
+                    ),
+                    name=f"askq-wait-{rec.message_id}",
+                    daemon=True,
+                ).start()
+
+        while time.time() < deadline:
+            # 1. The terminal beats every group, always checked first.
+            if _any_child_resolved_in_terminal(groups):
+                debug_log("AskUserQuestion resolved via terminal; finalizing messages")
+                _finalize_on_terminal_win(groups, group_tokens)
+                return None
+
+            # 2. Drain what the threads produced. ``get`` returns immediately
+            #    while the queue is non-empty, so a group finalizing server-side
+            #    (which wakes all of its children at once) drains across
+            #    consecutive ticks without any of them waiting.
+            try:
+                group_key, message_id, result = results.get(timeout=WAIT_TICK_SECONDS)
+            except queue.Empty:
+                continue
+
+            entry = index.get(message_id)
+            if entry is None:
+                continue
+            rec = entry[1]
+
+            if result is None:
+                continue  # chunk timeout — that thread is still polling
+            if isinstance(result, dict) and "_state" in result:
+                debug_log(
+                    f"Question {rec.child.request_id} relay state={result['_state']}"
+                )
+                unanswerable[group_key].add(message_id)
+            else:
+                decision = relay_answer_to_decision(rec.child, result)
+                if not decision or decision.get("action") != "reply":
+                    debug_log(f"Unexpected decision shape for question: {decision}")
+                    unanswerable[group_key].add(message_id)
+                else:
+                    reply_text = decision.get("reply_text", "")
+                    answers[group_key][(rec.question or {}).get("question", "")] = reply_text
+                    answered_ids[group_key].add(message_id)
+                    # Mark this child terminal so the PostToolUse hook's
+                    # pending-request sweep won't later try to cancel its
+                    # (already group-finalized) relay message.
+                    update_request_state(
+                        rec.child.request_id,
+                        RequestState.REPLY,
+                        reply_text=reply_text,
+                        resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+                    )
+
+            # 3. A group is won when every one of its children has answered.
+            if (
+                not unanswerable[group_key]
+                and len(answered_ids[group_key]) == len(groups[group_key])
+            ):
+                return group_key, answers[group_key]
+
+            # 4. A group with an expired/cancelled child can never finalize
+            #    server-side (``_finalize_group_if_complete`` needs every
+            #    member), so it is dead. When no group is left alive, fall back
+            #    to the terminal — exactly as the sequential loop did.
+            if all(unanswerable[gk] for gk in groups):
+                debug_log("Every question group is unanswerable; falling back")
+                return None
+
+        debug_log("AskUserQuestion wait phase reached the TTL deadline")
+        return None
+    finally:
+        stop.set()
+
+
 def handle_ask_user_question(
     session_id: str,
     cwd: str,
@@ -686,7 +1019,7 @@ def handle_ask_user_question(
             )
             return None
 
-    debug_log(f"Sent {len(children)} question messages; polling for answers")
+    debug_log(f"Sent {len(children)} question messages; waiting for answers")
 
     # Escalation deadline seam (15-05 wires this up).
     # On the send-failure fallback path the value is always None — the default
@@ -694,80 +1027,22 @@ def handle_ask_user_question(
     # On all other paths 15-05 will compute time.time() + <duration> here.
     _escalation_deadline: Optional[float] = None
 
-    # ── Wait loop ─────────────────────────────────────────────────────────────
-    # Sequential structure is INTENTIONALLY preserved (15-04 replaces it).
-    # The ONLY changes from the pre-15-03 loop are:
-    #   1. token= on wait_for_relay_answer
-    #   2. token= on remove_inline_buttons in the terminal-resolution branch
-    # Everything else is identical to the pre-15-03 loop.
-    answers: Dict[str, str] = {}
-    deadline = time.time() + REQUEST_TTL
-    for rec in children:
-        child = rec.child
-        q = rec.question
-        child_msg_id = rec.message_id
-        if time.time() >= deadline:
-            return None
-        # Tight inner loop: short relay long-poll chunks interleaved with a
-        # terminal-resolution check on the local state store.
-        resolved = False
-        while time.time() < deadline and not resolved:
-            # The PostToolUse hook only flips the *most recent* pending child to
-            # resolved_terminal (find_pending_request_by_tool_session returns one
-            # row), but that signals the whole AskUserQuestion was answered in the
-            # terminal. So detect the terminal state on ANY child — not just the
-            # one we happen to be polling — otherwise a loop parked on an earlier
-            # child never fires and that child's keyboard is left live.
-            if any(
-                (st := get_request(r.child.request_id))
-                and st.state == RequestState.RESOLVED_TERMINAL.value
-                for r in children
-            ):
-                debug_log("AskUserQuestion resolved via terminal; revoking all messages")
-                from permission_state_store import resolve_via_terminal
-                for r in children:
-                    sib_state = get_request(r.child.request_id)
-                    if sib_state and sib_state.state == RequestState.PENDING.value:
-                        resolve_via_terminal(r.child.request_id)
-                    # Strip the keyboard on every sibling (idempotent for the one
-                    # the posttool hook already revoked).
-                    try:
-                        remove_inline_buttons(r.message_id, token=token)  # ← 15-03 change
-                        set_message_reaction(r.message_id, '✅')
-                    except Exception as e:
-                        debug_log(f"Failed to revoke message {r.message_id}: {e}")
-                return None
-            chunk = min(25, max(1, int(deadline - time.time())))
-            answer = wait_for_relay_answer(
-                child_msg_id, timeout=chunk, long_poll_chunk=chunk,
-                token=token,  # ← 15-03 change
-            )
-            if answer is None:
-                continue
-            if "_state" in answer:
-                # The relay marked this message expired/cancelled — fall back.
-                debug_log(
-                    f"Question {child.request_id} relay state={answer['_state']}; falling back"
-                )
-                return None
-            decision = relay_answer_to_decision(child, answer)
-            if not decision or decision.get('action') != 'reply':
-                debug_log(f"Unexpected decision shape for question: {decision}")
-                return None
-            answers[q.get('question', '')] = decision.get('reply_text', '')
-            # Mark this child terminal so the PostToolUse hook's pending-request
-            # sweep won't later try to cancel its (already group-finalized)
-            # relay message.
-            update_request_state(
-                child.request_id,
-                RequestState.REPLY,
-                reply_text=decision.get('reply_text', ''),
-                resolution_source=RESOLUTION_SOURCE_TELEGRAM,
-            )
-            resolved = True
+    # ── Wait phase ────────────────────────────────────────────────────────────
+    # One group today; 15-05 adds the escalation duplicate as a second entry and
+    # changes nothing else here.
+    groups: Dict[str, list] = {group_id: children}
+    group_tokens: Dict[str, Optional[str]] = {group_id: token}
 
-        if not resolved:
-            return None
+    won = _wait_for_group_answers(groups, group_tokens, time.time() + REQUEST_TTL)
+    if won is None:
+        # Terminal win, every group dead, or the TTL elapsed — the native UI is
+        # live throughout, so there is never an auto-deny here.
+        return None
+
+    # ``won`` is ``(group_key, answers)``. 15-05 needs the key to annotate an
+    # escalated answer with " (answered by <role>)" (brd §5.6); with one group
+    # there is nothing to attribute, so only the answers are used.
+    answers = won[1]
 
     # All answered via Telegram — build updatedInput preserving the original
     # question structure exactly.  updatedInput is built from the *original*

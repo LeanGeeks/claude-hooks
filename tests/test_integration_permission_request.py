@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -477,12 +478,10 @@ class TestTerminalResolutionRace(unittest.TestCase):
     @patch("permission_request_hook.wait_for_relay_answer")
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.get_request")
-    @patch("permission_request_hook.remove_inline_buttons")
-    @patch("permission_request_hook.set_message_reaction")
+    @patch("permission_request_hook.finalize_message")
     def test_handle_ask_user_question_terminal_cancels_current_child_message(
         self,
-        mock_set_reaction,
-        mock_remove_buttons,
+        mock_finalize,
         mock_get_request,
         mock_create_request,
         mock_wait_relay,
@@ -490,9 +489,9 @@ class TestTerminalResolutionRace(unittest.TestCase):
         _mock_bindings,      # load_bindings → MagicMock (unused in legacy mode)
     ):
         """handle_ask_user_question: when the current child resolves via
-        terminal, remove_inline_buttons is called for *that child's* message_id
-        before returning None."""
-        import telegram_permission_router as tpr
+        terminal, *that child's* message is finalized (PATCH + keyboard strip)
+        before returning None. 15-04 replaced the bare ``remove_inline_buttons``
+        with ``finalize_message`` so the reader sees what was decided."""
         from permission_request_hook import handle_ask_user_question
         from permission_state_store import RequestState
 
@@ -527,21 +526,25 @@ class TestTerminalResolutionRace(unittest.TestCase):
             )
 
         self.assertIsNone(result)
-        # The current child's relay message (555) must have been cancelled.
-        # Legacy mode → token=None.
-        mock_remove_buttons.assert_any_call(555, token=None)
+        # The current child's relay message (555) must have been finalized:
+        # generic text (no terminal_answers on the row), ✅ prefix, and — legacy
+        # mode — the default destination (token=None).
+        mock_finalize.assert_called_once()
+        args, kwargs = mock_finalize.call_args
+        self.assertEqual(args[0], 555)
+        self.assertEqual(args[2], "Answered in the terminal")
+        self.assertEqual(kwargs["prefix"], "✅ ")
+        self.assertIsNone(kwargs["token"])
 
     @patch("roles_config.load_bindings")
     @patch("roles_config.load_catalog", return_value=None)
     @patch("permission_request_hook.wait_for_relay_answer")
     @patch("permission_request_hook.create_request")
     @patch("permission_request_hook.get_request")
-    @patch("permission_request_hook.remove_inline_buttons")
-    @patch("permission_request_hook.set_message_reaction")
+    @patch("permission_request_hook.finalize_message")
     def test_handle_ask_user_question_terminal_revokes_all_group_messages(
         self,
-        mock_set_reaction,
-        mock_remove_buttons,
+        mock_finalize,
         mock_get_request,
         mock_create_request,
         mock_wait_relay,
@@ -550,9 +553,8 @@ class TestTerminalResolutionRace(unittest.TestCase):
     ):
         """Two questions, answered in the terminal. The PostToolUse hook only
         flips the *most recent* child (the last one) to resolved_terminal, while
-        the loop is parked on the first child. Every sibling's keyboard must
-        still be revoked — not just the last one."""
-        import telegram_permission_router as tpr
+        the first child's thread is still parked in a long-poll. Every sibling's
+        keyboard must still be stripped — not just the last one."""
         from permission_request_hook import handle_ask_user_question
         from permission_state_store import RequestState
 
@@ -593,10 +595,16 @@ class TestTerminalResolutionRace(unittest.TestCase):
             )
 
         self.assertIsNone(result)
-        # Both the first child's message (501) and the last (502) get revoked.
+        # Both the first child's message (501) and the last (502) get finalized.
         # Legacy mode → token=None.
-        mock_remove_buttons.assert_any_call(501, token=None)
-        mock_remove_buttons.assert_any_call(502, token=None)
+        finalized = {
+            call.args[0]: call for call in mock_finalize.call_args_list
+        }
+        self.assertEqual(set(finalized), {501, 502})
+        for call in finalized.values():
+            self.assertEqual(call.args[2], "Answered in the terminal")
+            self.assertEqual(call.kwargs["prefix"], "✅ ")
+            self.assertIsNone(call.kwargs["token"])
 
 
 class TestAutoDenyAtTtl(unittest.TestCase):
@@ -1488,7 +1496,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_capture_send), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = hook.handle_ask_user_question(
@@ -1529,7 +1536,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", return_value=42), \
              patch("telegram_permission_router.set_telegram_message_id"), \
              patch("permission_request_hook.create_request",
@@ -1561,7 +1567,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1604,7 +1609,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1636,7 +1640,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1688,7 +1691,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1805,7 +1807,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1886,7 +1887,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", side_effect=_se), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -1977,7 +1977,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", return_value=42), \
              patch("telegram_permission_router.set_telegram_message_id"):
             self.hook.handle_ask_user_question(
@@ -2004,7 +2003,6 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(state="pending")), \
              patch("permission_request_hook.update_request_state"), \
              patch("permission_request_hook.remove_inline_buttons"), \
-             patch("permission_request_hook.set_message_reaction"), \
              patch("telegram_permission_router._send_relay", return_value=42), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -2028,14 +2026,14 @@ class TestAliasRouting(unittest.TestCase):
     # ── Terminal resolution cancels via role token ─────────────────────────────
 
     def test_terminal_resolution_cancels_via_role_token(self):
-        """When answered in the terminal, every sibling is cancelled through
-        the role's token (not the default token)."""
+        """When answered in the terminal, every sibling is finalized (patched
+        then cancelled) through the role's token, not the default token."""
         catalog = _make_catalog()
         bindings = _make_bindings()
 
         from permission_state_store import RequestState
 
-        cancel_calls = []
+        finalize_calls = []
 
         with patch("roles_config.load_catalog", return_value=catalog), \
              patch("roles_config.load_bindings", return_value=bindings), \
@@ -2045,10 +2043,9 @@ class TestAliasRouting(unittest.TestCase):
                    return_value=_make_request(
                        state=RequestState.RESOLVED_TERMINAL.value)), \
              patch("permission_request_hook.update_request_state"), \
-             patch("permission_request_hook.remove_inline_buttons",
-                   side_effect=lambda mid, *, token=None:
-                       cancel_calls.append({"mid": mid, "token": token})), \
-             patch("permission_request_hook.set_message_reaction"), \
+             patch("permission_request_hook.finalize_message",
+                   side_effect=lambda mid, body, text, *, prefix="", token=None:
+                       finalize_calls.append({"mid": mid, "token": token})), \
              patch("telegram_permission_router._send_relay", return_value=77), \
              patch("telegram_permission_router.set_telegram_message_id"):
             result = self.hook.handle_ask_user_question(
@@ -2060,9 +2057,498 @@ class TestAliasRouting(unittest.TestCase):
             )
 
         self.assertIsNone(result)
-        # All cancellations must use the ux token.
-        self.assertGreater(len(cancel_calls), 0)
-        self.assertTrue(all(c["token"] == "rly_ux" for c in cancel_calls))
+        # All finalizations must use the ux token.
+        self.assertGreater(len(finalize_calls), 0)
+        self.assertTrue(all(c["token"] == "rly_ux" for c in finalize_calls))
+
+
+# ── Helpers shared by the wait-phase tests (15-04) ───────────────────────────
+
+class _ScriptedRelay:
+    """Deterministic stand-in for ``wait_for_relay_answer``, scripted per
+    message id, so the child threads resolve in a fixed order.
+
+    ``script[message_id]`` is a list of results returned one per poll; the last
+    entry repeats forever. A result is an answer dict, a ``{"_state": ...}``
+    sentinel, ``None`` (chunk timeout), or an ``Exception`` instance — which is
+    raised, to exercise the thread's own error containment.
+    """
+
+    def __init__(self, script):
+        self._script = {mid: list(seq) for mid, seq in script.items()}
+        self._lock = threading.Lock()
+        self.calls = []            # (message_id, token) in call order
+        self.threads = set()       # threads that actually polled
+
+    def __call__(self, message_id, timeout=None, long_poll_chunk=None, token=None):
+        with self._lock:
+            self.calls.append((message_id, token))
+            self.threads.add(threading.current_thread())
+            seq = self._script.get(message_id) or [None]
+            result = seq.pop(0) if len(seq) > 1 else seq[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def _call_with_timeout(fn, seconds=15):
+    """Run ``fn`` on a worker thread and fail if it does not finish in time.
+
+    Every wait-loop test goes through this. A bug in the loop must fail the
+    suite, not park it on the 12h TTL.
+
+    Returns a dict with ``result`` (fn's return value) and ``thread`` (the
+    thread fn ran on, so a test can assert what happened *off* it).
+    """
+    box = {}
+
+    def _target():
+        box["thread"] = threading.current_thread()
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread
+            box["error"] = exc
+
+    worker = threading.Thread(target=_target, name="wait-loop-under-test", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise AssertionError(f"wait phase did not return within {seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box
+
+
+class TestConcurrentWaitPhase(unittest.TestCase):
+    """15-04 Part 1: one daemon thread per open child message, drained by a
+    queue on the main thread.
+
+    With one group this must be behaviour-identical to the sequential loop it
+    replaced; what is newly observable is that the children are polled at the
+    same time instead of one after another.
+    """
+
+    def setUp(self):
+        import permission_request_hook as hook
+        self.hook = hook
+
+    def _questions(self, count):
+        return [
+            {"question": f"Q{i}?", "header": f"H{i}",
+             "options": [{"label": f"A{i}"}, {"label": f"B{i}"}]}
+            for i in range(count)
+        ]
+
+    def _run(self, count, script, *, extra_patches=(), timeout=15, floor=None):
+        """Send ``count`` questions in legacy mode and run the wait phase under
+        ``script``. Message ids are 801, 802, ... in question order."""
+        relay = _ScriptedRelay(script)
+        msg_ids = [801 + i for i in range(count)]
+        children = [
+            _make_request(
+                request_id=f"child-{i}",
+                tool_name="AskUserQuestion",
+                tool_input={"question": f"Q{i}?", "header": f"H{i}",
+                            "options": [{"label": f"A{i}"}, {"label": f"B{i}"}]},
+            )
+            for i in range(count)
+        ]
+        sent = iter(msg_ids)
+        writes = []
+
+        def _record_write(*args, **kwargs):
+            writes.append((threading.current_thread(), args, kwargs))
+            return None
+
+        stack = [
+            patch("roles_config.load_catalog", return_value=None),
+            patch("roles_config.load_bindings", return_value=_make_bindings()),
+            patch("permission_request_hook.create_request", side_effect=children),
+            patch("permission_request_hook.send_question_message",
+                  side_effect=lambda *a, **k: next(sent)),
+            patch("permission_request_hook.wait_for_relay_answer", relay),
+            patch("permission_request_hook.get_request",
+                  side_effect=lambda rid: _make_request(request_id=rid, state="pending")),
+            patch("permission_request_hook.update_request_state",
+                  side_effect=_record_write),
+            patch("permission_request_hook.finalize_message"),
+        ]
+        if floor is not None:
+            stack.append(
+                patch.object(self.hook, "CHILD_POLL_FLOOR_SECONDS", floor)
+            )
+        stack.extend(extra_patches)
+
+        for p in stack:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in stack])
+
+        box = _call_with_timeout(
+            lambda: self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": self._questions(count)},
+                workspace_name="ws",
+            ),
+            seconds=timeout,
+        )
+        box["relay"] = relay
+        box["writes"] = writes
+        box["message_ids"] = msg_ids
+        return box
+
+    def test_simultaneous_answers_are_all_collected(self):
+        """A group finalizing server-side wakes every child at once, so several
+        results land on the queue together. All of them must be collected."""
+        answer = {"via": "button", "value": "qa0"}
+        box = self._run(3, {801: [answer], 802: [answer], 803: [answer]})
+
+        result = box["result"]
+        self.assertIsNotNone(result)
+        self.assertEqual(result["action"], "answer")
+        self.assertEqual(
+            result["updatedInput"]["answers"],
+            {"Q0?": "A0", "Q1?": "A1", "Q2?": "A2"},
+        )
+
+    def test_answers_arriving_at_different_times_are_all_collected(self):
+        """The last child answers on its first poll while the first two are
+        still parked. Nothing may be dropped or overwritten."""
+        answer = {"via": "button", "value": "qa1"}
+        box = self._run(
+            3,
+            {801: [None, None, answer], 802: [None, answer], 803: [answer]},
+            floor=0.01,
+        )
+        self.assertEqual(
+            box["result"]["updatedInput"]["answers"],
+            {"Q0?": "B0", "Q1?": "B1", "Q2?": "B2"},
+        )
+
+    def test_children_are_polled_concurrently_not_in_sequence(self):
+        """The sequential loop this replaced polled child 1 until it answered
+        before touching child 2. Every child must now be in flight at once."""
+        answer = {"via": "button", "value": "qa0"}
+        box = self._run(
+            3,
+            {801: [None, answer], 802: [None, answer], 803: [None, answer]},
+            floor=0.25,
+        )
+        first_three = [mid for mid, _token in box["relay"].calls[:3]]
+        self.assertEqual(set(first_three), set(box["message_ids"]))
+        self.assertIsNotNone(box["result"])
+
+    def test_a_raising_child_thread_does_not_hang_the_main_loop(self):
+        """A thread body that raises must push a sentinel, not die silently —
+        otherwise the main loop waits for a result that never arrives."""
+        answer = {"via": "button", "value": "qa0"}
+        box = self._run(
+            2,
+            {801: [RuntimeError("relay client exploded")], 802: [answer]},
+            timeout=10,
+        )
+        # The group can never finalize with a dead child -> native UI stands.
+        self.assertIsNone(box["result"])
+
+    def test_every_child_expired_returns_none_and_patches_nothing(self):
+        """Expired/cancelled relay messages: return None, native UI intact."""
+        expired = {"_state": "expired"}
+        box = self._run(2, {801: [expired], 802: [expired]})
+        self.assertIsNone(box["result"])
+        self.hook.finalize_message.assert_not_called()
+
+    def test_one_cancelled_child_kills_the_only_group(self):
+        """A group whose member is cancelled can never finalize server-side
+        (``_finalize_group_if_complete`` needs every member), so the hook falls
+        back to the terminal — exactly as the sequential loop did."""
+        box = self._run(
+            2,
+            {801: [{"_state": "cancelled"}], 802: [None]},
+            timeout=10,
+            floor=0.01,
+        )
+        self.assertIsNone(box["result"])
+
+    def test_no_state_store_writes_happen_off_the_main_thread(self):
+        """Terminal detection, state writes and the decision all stay on the
+        thread that owns the hook; the child threads only long-poll."""
+        answer = {"via": "button", "value": "qa0"}
+        box = self._run(3, {801: [answer], 802: [answer], 803: [answer]})
+
+        main_thread = box["thread"]
+        self.assertEqual(len(box["writes"]), 3)
+        for thread, _args, _kwargs in box["writes"]:
+            self.assertIs(thread, main_thread)
+        # ... and the polling really did happen elsewhere (otherwise the
+        # assertion above would be vacuous).
+        self.assertTrue(box["relay"].threads)
+        self.assertNotIn(main_thread, box["relay"].threads)
+
+
+class TestTerminalAnswerPropagation(unittest.TestCase):
+    """15-04 Part 2: whoever was asked sees what the terminal decided, not a
+    dead prompt (brd §5.5)."""
+
+    ANSWERS = {
+        "Sidebar or top nav?": "Sidebar",
+        "Which database?": "(notes only)",
+    }
+    NOTES = {"Which database?": "Postgres, but only once we shard."}
+
+    def setUp(self):
+        import permission_request_hook as hook
+        self.hook = hook
+        self.stored = json.dumps({"answers": self.ANSWERS, "notes": self.NOTES})
+
+    def _questions(self):
+        return [
+            {"question": "Sidebar or top nav?", "header": "@ux Layout",
+             "options": [{"label": "Sidebar"}]},
+            {"question": "Which database?", "header": "@ux Storage",
+             "options": [{"label": "Postgres"}]},
+        ]
+
+    def _run_terminal_win(self, stored, *, roles=True):
+        """Terminal-resolved rows for both children; returns the finalize calls."""
+        from permission_state_store import RequestState
+
+        questions = self._questions()
+        created = iter([
+            _make_request(
+                request_id=f"child-{i + 1}",
+                tool_name="AskUserQuestion",
+                tool_input={
+                    "question": q["question"],
+                    "header": q.get("header", ""),
+                    "options": q.get("options", []),
+                },
+            )
+            for i, q in enumerate(questions)
+        ])
+        msg_ids = iter([901, 902])
+        finalize_calls = []
+
+        def _row(request_id):
+            return _make_request(
+                request_id=request_id,
+                state=RequestState.RESOLVED_TERMINAL.value,
+                terminal_answers=stored,
+            )
+
+        catalog = _make_catalog() if roles else None
+        stack = [
+            patch("roles_config.load_catalog", return_value=catalog),
+            patch("roles_config.load_bindings", return_value=_make_bindings()),
+            patch("permission_request_hook.create_request", side_effect=created),
+            patch("permission_request_hook.send_question_message",
+                  side_effect=lambda *a, **k: next(msg_ids)),
+            patch("permission_request_hook.wait_for_relay_answer", return_value=None),
+            patch("permission_request_hook.get_request", side_effect=_row),
+            patch("permission_request_hook.update_request_state"),
+            patch("permission_request_hook.finalize_message",
+                  side_effect=lambda mid, body, text, *, prefix="", token=None:
+                      finalize_calls.append(
+                          {"mid": mid, "body": body, "text": text,
+                           "prefix": prefix, "token": token})),
+            patch("telegram_permission_router.set_telegram_message_id"),
+        ]
+        for p in stack:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in stack])
+
+        box = _call_with_timeout(
+            lambda: self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": self._questions()},
+                workspace_name="leangeeks",
+            )
+        )
+        self.assertIsNone(box["result"])  # terminal wins -> native UI acted
+        return finalize_calls
+
+    def test_each_message_is_patched_with_its_own_answer(self):
+        calls = {c["mid"]: c for c in self._run_terminal_win(self.stored)}
+        self.assertEqual(set(calls), {901, 902})
+        self.assertEqual(calls[901]["text"], "Sidebar")
+        # (notes only) is a placeholder — the notes are rendered instead.
+        self.assertEqual(calls[902]["text"], self.NOTES["Which database?"])
+
+    def test_patch_uses_the_check_prefix_and_the_roles_token(self):
+        for call in self._run_terminal_win(self.stored):
+            self.assertEqual(call["prefix"], "✅ ")
+            self.assertEqual(call["token"], "rly_ux")
+            # The body kept by 15-03 is reused verbatim, so the PATCH does not
+            # lose the question the reader is looking at.
+            self.assertIn("Question", call["body"])
+
+    def test_unparseable_terminal_answers_still_patch_the_generic_text(self):
+        for stored in ("{not json", "", None, "Tool ran without output"):
+            with self.subTest(stored=stored):
+                calls = self._run_terminal_win(stored)
+                self.assertEqual(len(calls), 2)
+                for call in calls:
+                    self.assertEqual(call["text"], "Answered in the terminal")
+                    self.assertEqual(call["prefix"], "✅ ")
+
+    def test_a_partial_answer_map_leaves_the_others_generic(self):
+        stored = json.dumps({"answers": {"Sidebar or top nav?": "Sidebar"}, "notes": {}})
+        calls = {c["mid"]: c for c in self._run_terminal_win(stored)}
+        self.assertEqual(calls[901]["text"], "Sidebar")
+        self.assertEqual(calls[902]["text"], "Answered in the terminal")
+
+    def test_terminal_answers_are_read_from_whichever_row_carries_them(self):
+        """PostToolUse only ever flips one row, and not necessarily the child
+        that detected the terminal state."""
+        from permission_state_store import RequestState
+
+        msg_ids = iter([901, 902])
+        finalize_calls = []
+
+        def _row(request_id):
+            # Only the *second* child carries the recorded answers.
+            return _make_request(
+                request_id=request_id,
+                state=RequestState.RESOLVED_TERMINAL.value,
+                terminal_answers=self.stored if request_id.endswith("2") else None,
+            )
+
+        created = iter([
+            _make_request(request_id="child-1", tool_name="AskUserQuestion",
+                          tool_input={"question": "Sidebar or top nav?"}),
+            _make_request(request_id="child-2", tool_name="AskUserQuestion",
+                          tool_input={"question": "Which database?"}),
+        ])
+
+        with patch("roles_config.load_catalog", return_value=None), \
+             patch("roles_config.load_bindings", return_value=_make_bindings()), \
+             patch("permission_request_hook.create_request", side_effect=created), \
+             patch("permission_request_hook.send_question_message",
+                   side_effect=lambda *a, **k: next(msg_ids)), \
+             patch("permission_request_hook.wait_for_relay_answer", return_value=None), \
+             patch("permission_request_hook.get_request", side_effect=_row), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.finalize_message",
+                   side_effect=lambda mid, body, text, *, prefix="", token=None:
+                       finalize_calls.append({"mid": mid, "text": text})):
+            box = _call_with_timeout(
+                lambda: self.hook.handle_ask_user_question(
+                    session_id="sess", cwd="/tmp/ws",
+                    tool_input={"questions": self._questions()},
+                    workspace_name="leangeeks",
+                )
+            )
+
+        self.assertIsNone(box["result"])
+        texts = {c["mid"]: c["text"] for c in finalize_calls}
+        self.assertEqual(texts[901], "Sidebar")
+        self.assertEqual(texts[902], self.NOTES["Which database?"])
+
+    def test_still_pending_siblings_are_swept_without_blanking_the_answers(self):
+        """The sweep passes no ``terminal_answers`` so it cannot overwrite what
+        PostToolUse recorded a moment earlier."""
+        from permission_state_store import RequestState
+
+        msg_ids = iter([901, 902])
+        swept = []
+
+        def _row(request_id):
+            # child-1 is still pending; only child-2 was flipped by PostToolUse.
+            if request_id.endswith("1"):
+                return _make_request(request_id=request_id, state="pending")
+            return _make_request(
+                request_id=request_id,
+                state=RequestState.RESOLVED_TERMINAL.value,
+                terminal_answers=self.stored,
+            )
+
+        created = iter([
+            _make_request(request_id="child-1", tool_name="AskUserQuestion"),
+            _make_request(request_id="child-2", tool_name="AskUserQuestion"),
+        ])
+
+        with patch("roles_config.load_catalog", return_value=None), \
+             patch("roles_config.load_bindings", return_value=_make_bindings()), \
+             patch("permission_request_hook.create_request", side_effect=created), \
+             patch("permission_request_hook.send_question_message",
+                   side_effect=lambda *a, **k: next(msg_ids)), \
+             patch("permission_request_hook.wait_for_relay_answer", return_value=None), \
+             patch("permission_request_hook.get_request", side_effect=_row), \
+             patch("permission_request_hook.update_request_state"), \
+             patch("permission_request_hook.finalize_message"), \
+             patch("permission_request_hook.resolve_via_terminal",
+                   side_effect=lambda rid, *a, **k: swept.append((rid, a, k))):
+            _call_with_timeout(
+                lambda: self.hook.handle_ask_user_question(
+                    session_id="sess", cwd="/tmp/ws",
+                    tool_input={"questions": self._questions()},
+                    workspace_name="leangeeks",
+                )
+            )
+
+        self.assertEqual([rid for rid, _a, _k in swept], ["child-1"])
+        for _rid, args, kwargs in swept:
+            self.assertEqual(args, ())
+            self.assertEqual(kwargs, {})
+
+    def test_no_roles_configured_still_strips_the_keyboard(self):
+        """The compatibility floor: with no roles.toml a terminal win behaves as
+        before except that the body now carries the answer. Exercised through
+        the *real* ``finalize_message`` against a fake relay client, so the
+        PATCH-then-cancel really happens."""
+        import telegram_permission_router as tpr
+        from permission_state_store import RequestState
+
+        fake = MagicMock(name="default-client")
+        child = _make_request(
+            request_id="child-1",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Sidebar or top nav?", "header": "Layout",
+                        "options": [{"label": "Sidebar"}]},
+        )
+        row = _make_request(
+            request_id="child-1",
+            state=RequestState.RESOLVED_TERMINAL.value,
+            terminal_answers=self.stored,
+        )
+
+        patches = _router_state(
+            tpr,
+            _default_token="__td__",
+            _clients={"__td__": fake},
+            _server_url="https://relay.example",
+        ) + [
+            patch("roles_config.load_catalog", return_value=None),
+            patch("roles_config.load_bindings", return_value=_make_bindings()),
+            patch("permission_request_hook.create_request", return_value=child),
+            patch("permission_request_hook.send_question_message", return_value=903),
+            patch("permission_request_hook.wait_for_relay_answer", return_value=None),
+            patch("permission_request_hook.get_request", return_value=row),
+            patch("permission_request_hook.update_request_state"),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+
+        box = _call_with_timeout(
+            lambda: self.hook.handle_ask_user_question(
+                session_id="sess", cwd="/tmp/ws",
+                tool_input={"questions": [
+                    {"question": "Sidebar or top nav?", "header": "Layout",
+                     "options": [{"label": "Sidebar"}]}
+                ]},
+                workspace_name="leangeeks",
+            )
+        )
+
+        self.assertIsNone(box["result"])
+        # PATCH carries the answer, then the keyboard comes down — in that order.
+        self.assertEqual(
+            [name for name, _a, _k in fake.mock_calls],
+            ["edit_message", "cancel_message"],
+        )
+        self.assertTrue(
+            fake.edit_message.call_args.kwargs["text"].endswith("\n\n✅ Sidebar")
+        )
+        fake.cancel_message.assert_called_once_with(903)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,12 @@ class PermissionRequest:
     expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
     agent_id: Optional[str] = None  # subagent id (None for parent session)
     role: Optional[str] = None  # resolved role id; None = default destination
+    # What the terminal answered, recorded by the PostToolUse hook so the parked
+    # PermissionRequest hook can patch it into the chat the question went to.
+    # JSON: {"answers": {question: answer}, "notes": {question: notes}} — a
+    # *reduced* view of ``tool_response``, never the raw payload (the store is
+    # append-only JSONL, re-read in full on every hook invocation).
+    terminal_answers: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -336,6 +342,7 @@ def update_request_state(
     reply_text: Optional[str] = None,
     actor_user_id: Optional[int] = None,
     resolution_source: Optional[str] = None,
+    terminal_answers: Optional[str] = None,
 ) -> Optional[PermissionRequest]:
     """
     Update the state of a request.
@@ -350,6 +357,9 @@ def update_request_state(
         reply_text: Optional reply text (for reply actions)
         actor_user_id: Optional Telegram user ID who performed the action
         resolution_source: Optional source of resolution ("telegram" | "terminal" | "timeout")
+        terminal_answers: Optional reduced JSON of the terminal's answers.
+            Written only when a value is passed, so a later sweep over sibling
+            rows cannot blank out what PostToolUse recorded a moment earlier.
 
     Returns:
         Updated PermissionRequest if successful, None if request not found
@@ -418,6 +428,8 @@ def update_request_state(
                             data['reply_text'] = reply_text
                         if actor_user_id is not None:
                             data['actor_user_id'] = actor_user_id
+                        if terminal_answers is not None:
+                            data['terminal_answers'] = terminal_answers
                         if resolution_source is not None:
                             data['resolution_source'] = resolution_source
                             data['resolved_at'] = now
@@ -786,7 +798,9 @@ def find_pending_request_by_tool_session(
     return matching_requests[0]
 
 
-def resolve_via_terminal(request_id: str) -> Optional[PermissionRequest]:
+def resolve_via_terminal(
+    request_id: str, terminal_answers: Optional[str] = None
+) -> Optional[PermissionRequest]:
     """
     Mark a request as resolved via terminal prompt.
 
@@ -795,6 +809,11 @@ def resolve_via_terminal(request_id: str) -> Optional[PermissionRequest]:
 
     Args:
         request_id: The request ID to mark as terminal-resolved
+        terminal_answers: Reduced JSON of what the terminal answered
+            (AskUserQuestion only). Written **only when a value is passed** —
+            the PermissionRequest hook's own sweep over still-pending sibling
+            rows calls this with no answers and must not blank out what
+            PostToolUse just recorded.
 
     Returns:
         Updated PermissionRequest if successful, None otherwise
@@ -803,6 +822,7 @@ def resolve_via_terminal(request_id: str) -> Optional[PermissionRequest]:
         request_id,
         RequestState.RESOLVED_TERMINAL,
         resolution_source=RESOLUTION_SOURCE_TERMINAL,
+        terminal_answers=terminal_answers,
     )
 
 
