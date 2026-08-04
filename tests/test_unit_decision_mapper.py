@@ -96,7 +96,7 @@ class TestDecisionMapper(unittest.TestCase):
         mock_enable.assert_called_once_with("test-session")
 
     def test_reply_decision(self):
-        """Test reply action returns deny with reason at root level."""
+        """Test reply action returns deny with message inside decision."""
         request = self.create_mock_request()
         decision = {
             "action": "reply",
@@ -108,10 +108,10 @@ class TestDecisionMapper(unittest.TestCase):
         self.assertIsNotNone(output)
         self.assertEqual(output["hookSpecificOutput"]["hookEventName"], "PermissionRequest")
         self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        # reason must be at the root of the output dict, not inside decision
-        self.assertIn("reason", output)
-        self.assertNotIn("reason", output["hookSpecificOutput"]["decision"])
-        self.assertIn("Please use a different approach", output["reason"])
+        # message must be inside decision (decision.message reaches the model)
+        self.assertIn("message", output["hookSpecificOutput"]["decision"])
+        self.assertNotIn("reason", output)
+        self.assertIn("Please use a different approach", output["hookSpecificOutput"]["decision"]["message"])
 
     def test_reply_decision_short(self):
         """Test reply action with short text."""
@@ -122,9 +122,10 @@ class TestDecisionMapper(unittest.TestCase):
 
         self.assertIsNotNone(output)
         self.assertEqual(output["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        # reason at root, not inside decision
-        self.assertNotIn("reason", output["hookSpecificOutput"]["decision"])
-        self.assertIn("No", output["reason"])
+        # message inside decision, no root-level reason
+        self.assertIn("message", output["hookSpecificOutput"]["decision"])
+        self.assertNotIn("reason", output)
+        self.assertIn("No", output["hookSpecificOutput"]["decision"]["message"])
 
     def test_unknown_action_fallback(self):
         """Test unknown action returns None (fallback to terminal)."""

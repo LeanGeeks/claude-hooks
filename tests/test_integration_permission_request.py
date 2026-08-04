@@ -84,33 +84,31 @@ class TestBuildOutputDecision(unittest.TestCase):
             _make_request(),
         )
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        # reason must be at the root of the output dict, not inside decision
-        self.assertIn("Use a different approach", out["reason"])
-        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        # message must be inside decision (decision.message reaches the model)
+        self.assertIn("Use a different approach", out["hookSpecificOutput"]["decision"]["message"])
+        self.assertNotIn("reason", out)
 
     def test_reply_emitted_json_shape(self):
-        """Emitted JSON: reason at root, behavior inside decision, round-trips cleanly.
+        """Emitted JSON: message inside decision, round-trips cleanly.
 
-        This test catches the pre-fix bug where reason was nested inside decision
-        (hookSpecificOutput.decision.reason) instead of at the root level.
-        The old test_reply only checked that some text was present; it would still
-        pass (via KeyError → test failure) once the fix was in place, but it could
-        not distinguish wrong-location from right-location when the bug existed.
+        This test catches the wrong-location bug: root-level `reason` is not
+        forwarded to the model for PermissionRequest — only `decision.message`
+        reaches Claude (per deny_reason_mechanism.md).
         """
         out = build_output_decision(
             {"action": "reply", "reply_text": "Please clarify your intent"},
             _make_request(),
         )
-        # Structure: reason sibling of hookSpecificOutput, not inside decision.
-        self.assertIn("reason", out)
-        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        # Structure: message inside decision, no root-level reason.
+        self.assertNotIn("reason", out)
+        self.assertIn("message", out["hookSpecificOutput"]["decision"])
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
         # Exact text
-        self.assertEqual(out["reason"], "User reply: Please clarify your intent")
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["message"], "User reply: Please clarify your intent")
         # Round-trip through JSON (this is what stdout → harness actually does)
         roundtripped = json.loads(json.dumps(out))
-        self.assertEqual(roundtripped["reason"], "User reply: Please clarify your intent")
-        self.assertNotIn("reason", roundtripped["hookSpecificOutput"]["decision"])
+        self.assertEqual(roundtripped["hookSpecificOutput"]["decision"]["message"], "User reply: Please clarify your intent")
+        self.assertNotIn("reason", roundtripped)
 
     def test_no_decision_returns_none(self):
         self.assertIsNone(build_output_decision(None, _make_request()))
@@ -644,21 +642,24 @@ class TestAutoDenyAtTtl(unittest.TestCase):
         dec = out["hookSpecificOutput"]["decision"]
         self.assertEqual(dec["behavior"], "deny")
         self.assertNotIn("interrupt", dec)  # agent continues so it can retry
-        # reason must be at the root of the output dict, not inside decision
-        self.assertNotIn("reason", dec)
-        reason = out["reason"].lower()
-        self.assertIn("could not be delivered", reason)
-        self.assertIn("retried", reason)
+        # message must be inside decision (decision.message reaches the model);
+        # root-level reason must be absent — it does not reach Claude for PermissionRequest.
+        self.assertNotIn("reason", out)
+        self.assertIn("message", dec)
+        message = dec["message"].lower()
+        self.assertIn("could not be delivered", message)
+        self.assertIn("retried", message)
 
     def test_delivered_but_unanswered_note(self):
         out = _auto_deny_output(_make_request(), delivery_failed=False)
         dec = out["hookSpecificOutput"]["decision"]
         self.assertEqual(dec["behavior"], "deny")
-        # reason must be at the root of the output dict, not inside decision
-        self.assertNotIn("reason", dec)
-        reason = out["reason"].lower()
-        self.assertIn("no response", reason)
-        self.assertNotIn("could not be delivered", reason)
+        # message inside decision, no root-level reason
+        self.assertNotIn("reason", out)
+        self.assertIn("message", dec)
+        message = dec["message"].lower()
+        self.assertIn("no response", message)
+        self.assertNotIn("could not be delivered", message)
 
     def test_note_includes_non_whitelisted_parts(self):
         with patch.object(
@@ -667,9 +668,9 @@ class TestAutoDenyAtTtl(unittest.TestCase):
             return_value="not in allowlist: cowsay",
         ):
             out = _auto_deny_output(_make_request(), delivery_failed=True)
-        # reason must be at the root, not inside decision
-        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
-        self.assertIn("cowsay", out["reason"])
+        # message inside decision, no root-level reason
+        self.assertNotIn("reason", out)
+        self.assertIn("cowsay", out["hookSpecificOutput"]["decision"]["message"])
 
     def test_record_auto_deny_transitions_pending_to_deny(self):
         req = create_request(
@@ -1806,7 +1807,7 @@ class TestAliasRouting(unittest.TestCase):
         )
 
     def test_deny_mixed_roles_becomes_behavior_deny(self):
-        """build_output_decision maps deny_mixed_roles → behavior: deny."""
+        """build_output_decision maps deny_mixed_roles → behavior: deny with decision.message."""
         from permission_request_hook import build_output_decision
         out = build_output_decision(
             {"action": "deny_mixed_roles",
@@ -1816,17 +1817,19 @@ class TestAliasRouting(unittest.TestCase):
         self.assertIsNotNone(out)
         dec = out["hookSpecificOutput"]["decision"]
         self.assertEqual(dec["behavior"], "deny")
-        # reason must be at the root of the output dict, not inside decision
-        self.assertNotIn("reason", dec)
-        self.assertIn("2 different human roles", out["reason"])
+        # message must be inside decision (decision.message reaches the model);
+        # root-level reason must be absent — it is not part of PermissionRequest contract.
+        self.assertIn("message", dec)
+        self.assertNotIn("reason", out)
+        self.assertIn("2 different human roles", dec["message"])
 
     def test_deny_mixed_roles_emitted_json_shape(self):
-        """Emitted JSON: reason at root, behavior inside decision, round-trips cleanly.
+        """Emitted JSON: message inside decision, round-trips cleanly.
 
-        This is the test the existing suite was missing. The pre-fix hook put
-        reason inside hookSpecificOutput.decision, so the harness printed only
-        'Permission denied by hook' to the agent instead of the actual explanation.
-        This test directly asserts the wire shape — the schema the harness parses.
+        The correct wire shape for PermissionRequest deny-with-explanation is
+        decision.message (per deny_reason_mechanism.md). Root-level reason does
+        not reach Claude for PermissionRequest — only decision.message does.
+        This test directly asserts the wire shape the harness parses.
         """
         from permission_request_hook import build_output_decision
         _full_reason = (
@@ -1840,17 +1843,18 @@ class TestAliasRouting(unittest.TestCase):
             _make_request(),
         )
         self.assertIsNotNone(out)
-        # reason must be at root, not nested inside decision
-        self.assertIn("reason", out)
-        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        # message inside decision, no root-level reason
+        self.assertNotIn("reason", out)
+        self.assertIn("message", out["hookSpecificOutput"]["decision"])
         # behavior is correct
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        # exact full reason string (dynamic part + static tail)
-        self.assertEqual(out["reason"], _full_reason)
+        # exact full reason string (dynamic part + static tail), including the
+        # task-specified static tail "Split this into one AskUserQuestion call per role."
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["message"], _full_reason)
         # round-trip through JSON (exactly what stdout → harness does)
         roundtripped = json.loads(json.dumps(out))
-        self.assertEqual(roundtripped["reason"], _full_reason)
-        self.assertNotIn("reason", roundtripped["hookSpecificOutput"]["decision"])
+        self.assertEqual(roundtripped["hookSpecificOutput"]["decision"]["message"], _full_reason)
+        self.assertNotIn("reason", roundtripped)
 
     def test_two_unknown_aliases_same_role_sends_normally(self):
         """Two unknown aliases → both fall back to default → one role → send OK."""
