@@ -8,10 +8,12 @@ Isolation rules (see task file "Testing" section):
 - All fixtures are written as temporary TOML files.
 """
 
+import json
 import os
 import sys
 import tempfile
 import textwrap
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -972,6 +974,279 @@ arch = "designr"
             d.notes[0],
             'Intended for Tech lead / architect — its binding on this machine is broken (points at unknown role "designr").',
         )
+
+
+# ── roles_report ─────────────────────────────────────────────────────────────
+
+
+class TestRolesReport(unittest.TestCase):
+    """roles_report returns structured data with no token material."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.tmp = Path(self._tmp)
+        os.environ["CLAUDE_PROJECT_DIR"] = _ISOLATION_DIR
+
+    def _report(self):
+        return rc.roles_report(_example_catalog(self.tmp), _example_bindings(self.tmp))
+
+    def test_report_top_level_fields(self):
+        r = self._report()
+        self.assertEqual(r["workspace_id"], "leangeeks")
+        self.assertEqual(r["default_role"], "operator")
+        self.assertIsNotNone(r["path"])
+        self.assertIsInstance(r["roles"], list)
+        self.assertEqual(len(r["roles"]), 4)
+        self.assertFalse(r["has_errors"])
+        self.assertEqual(r["errors"], [])
+
+    def test_destination_kinds(self):
+        by_role = {r["role_id"]: r for r in self._report()["roles"]}
+        self.assertEqual(by_role["operator"]["destination"], "default token")
+        self.assertEqual(by_role["ux"]["destination"], "own binding")
+        self.assertEqual(by_role["architect"]["destination"], "-> operator")
+        self.assertEqual(by_role["prod"]["destination"], "(none)")
+
+    def test_escalation_strings(self):
+        by_role = {r["role_id"]: r for r in self._report()["roles"]}
+        # operator (default role): N/A
+        self.assertEqual(by_role["operator"]["escalate_str"], "—")
+        # ux: workspace override 5m wins over catalog 15m
+        self.assertEqual(by_role["ux"]["escalate_str"], "5m")
+        # architect: catalog says false → never (shown even though same token as default)
+        self.assertEqual(by_role["architect"]["escalate_str"], "never")
+        # prod: no binding, falls back → N/A
+        self.assertEqual(by_role["prod"]["escalate_str"], "—")
+
+    def test_fallback_title_only_for_unbound_non_default(self):
+        by_role = {r["role_id"]: r for r in self._report()["roles"]}
+        self.assertEqual(by_role["prod"]["fallback_title"], "Operator")
+        self.assertIsNone(by_role["operator"]["fallback_title"])
+        self.assertIsNone(by_role["ux"]["fallback_title"])
+        self.assertIsNone(by_role["architect"]["fallback_title"])
+
+    def test_catalog_errors_propagate(self):
+        content = """\
+default = "a"
+
+[role.a]
+aliases = ["shared"]
+title = "A"
+
+[role.b]
+aliases = ["shared"]
+title = "B"
+"""
+        ws = _make_workspace(self.tmp, content)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(self.tmp / "nonexistent.toml")
+        r = rc.roles_report(cat, b)
+        self.assertTrue(r["has_errors"])
+        self.assertGreater(len(r["errors"]), 0)
+        self.assertTrue(any("shared" in e for e in r["errors"]))
+
+    def test_no_token_material_in_report(self):
+        """Token strings must not appear anywhere in the serialised report."""
+        cfg = _write(self.tmp, "token_config.toml", """\
+installation_token = "rly_RECOGNISABLE_DEFAULT"
+
+[roles]
+ux = "rly_RECOGNISABLE_UX"
+""")
+        ws = _make_workspace(self.tmp, _EXAMPLE_ROLES_TOML)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(cfg)
+        r = rc.roles_report(cat, b)
+        serialised = json.dumps(r)
+        for fragment in ("rly_RECOGNISABLE_DEFAULT", "rly_RECOGNISABLE_UX",
+                         "RECOGNISABLE_DEFAULT", "RECOGNISABLE_UX"):
+            self.assertNotIn(fragment, serialised,
+                             f"token fragment {fragment!r} leaked into report")
+
+    def test_report_is_json_serialisable_and_round_trips(self):
+        r = self._report()
+        serialised = json.dumps(r)
+        back = json.loads(serialised)
+        self.assertEqual(back["workspace_id"], "leangeeks")
+        self.assertEqual(len(back["roles"]), 4)
+        self.assertEqual(back["has_errors"], False)
+
+    def test_aliases_present_in_each_role(self):
+        by_role = {r["role_id"]: r for r in self._report()["roles"]}
+        # aliases always includes the role_id (added by load_catalog)
+        for role_id, entry in by_role.items():
+            self.assertIn(role_id, entry["aliases"],
+                          f"role_id {role_id!r} absent from aliases {entry['aliases']!r}")
+
+    def test_no_binding_shows_none_destination(self):
+        """A role with nothing in [roles] and not the default shows '(none)'."""
+        content = """\
+default = "op"
+
+[role.op]
+title = "Operator"
+
+[role.ux]
+aliases = ["ux"]
+title = "Designer"
+"""
+        ws = _make_workspace(self.tmp, content)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(self.tmp / "nonexistent.toml")
+        r = rc.roles_report(cat, b)
+        by_role = {row["role_id"]: row for row in r["roles"]}
+        self.assertEqual(by_role["ux"]["destination"], "(none)")
+        self.assertEqual(by_role["ux"]["fallback_title"], "Operator")
+
+    def test_reference_destination_shows_ref_name(self):
+        """A role whose binding is a role-alias reference shows '-> <ref>'."""
+        content = """\
+default = "op"
+
+[role.op]
+title = "Operator"
+
+[role.arch]
+aliases = ["arch"]
+title = "Architect"
+"""
+        ws = _make_workspace(self.tmp, content)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        cfg = _write(self.tmp, "ref_config.toml", """\
+installation_token = "rly_op"
+
+[roles]
+arch = "op"
+""")
+        b = rc.load_bindings(cfg)
+        r = rc.roles_report(cat, b)
+        by_role = {row["role_id"]: row for row in r["roles"]}
+        self.assertEqual(by_role["arch"]["destination"], "-> op")
+
+
+# ── format_roles_table ────────────────────────────────────────────────────────
+
+
+class TestFormatRolesTable(unittest.TestCase):
+    """format_roles_table produces correct human-readable output."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self.tmp = Path(self._tmp)
+        os.environ["CLAUDE_PROJECT_DIR"] = _ISOLATION_DIR
+
+    def _table(self) -> str:
+        cat = _example_catalog(self.tmp)
+        b = _example_bindings(self.tmp)
+        return rc.format_roles_table(rc.roles_report(cat, b))
+
+    def test_header_lines_present(self):
+        table = self._table()
+        self.assertIn("workspace: leangeeks", table)
+        self.assertIn("default:   operator", table)
+
+    def test_column_headers_present(self):
+        table = self._table()
+        for hdr in ("ALIASES", "ROLE", "TITLE", "DESTINATION", "ESCALATE"):
+            self.assertIn(hdr, table)
+
+    def test_destination_values_present(self):
+        table = self._table()
+        self.assertIn("default token", table)
+        self.assertIn("own binding", table)
+        self.assertIn("-> operator", table)
+        self.assertIn("(none)", table)
+
+    def test_escalation_values_present(self):
+        table = self._table()
+        self.assertIn("5m", table)
+        self.assertIn("never", table)
+        self.assertIn("—", table)  # em dash for N/A
+
+    def test_fallback_line_present(self):
+        table = self._table()
+        self.assertIn("↳ falls back to Operator", table)
+
+    def test_errors_section_appears(self):
+        content = """\
+default = "a"
+
+[role.a]
+aliases = ["shared"]
+title = "A"
+
+[role.b]
+aliases = ["shared"]
+title = "B"
+"""
+        ws = _make_workspace(self.tmp, content)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(self.tmp / "nonexistent.toml")
+        r = rc.roles_report(cat, b)
+        table = rc.format_roles_table(r)
+        self.assertIn("errors:", table)
+        self.assertIn("shared", table)
+
+    def test_no_token_material_in_table(self):
+        """The formatted table must never expose any token string."""
+        cfg = _write(self.tmp, "token_config.toml", """\
+installation_token = "rly_RECOGNISABLE_DEFAULT"
+
+[roles]
+ux = "rly_RECOGNISABLE_UX"
+""")
+        ws = _make_workspace(self.tmp, _EXAMPLE_ROLES_TOML)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(cfg)
+        table = rc.format_roles_table(rc.roles_report(cat, b))
+        for fragment in ("rly_RECOGNISABLE_DEFAULT", "rly_RECOGNISABLE_UX",
+                         "RECOGNISABLE_DEFAULT", "RECOGNISABLE_UX"):
+            self.assertNotIn(fragment, table,
+                             f"token fragment {fragment!r} leaked into table")
+
+    def test_no_errors_section_on_clean_config(self):
+        table = self._table()
+        self.assertNotIn("errors:", table)
+
+    def test_table_is_string(self):
+        self.assertIsInstance(self._table(), str)
+
+    def test_path_included_in_header(self):
+        table = self._table()
+        # path is the absolute path to roles.toml; just check the key parts
+        self.assertIn("roles.toml", table)
+
+
+# ── docs/roles.example.toml ───────────────────────────────────────────────────
+
+
+class TestRolesExampleToml(unittest.TestCase):
+    """docs/roles.example.toml must parse cleanly through both tomllib and load_catalog."""
+
+    def setUp(self):
+        os.environ["CLAUDE_PROJECT_DIR"] = _ISOLATION_DIR
+
+    def test_parses_with_tomllib(self):
+        example_path = Path(__file__).parent.parent / "docs" / "roles.example.toml"
+        self.assertTrue(example_path.is_file(),
+                        f"docs/roles.example.toml not found at {example_path}")
+        with open(example_path, "rb") as fh:
+            parsed = tomllib.load(fh)
+        self.assertIn("default", parsed)
+        self.assertIn("role", parsed)
+
+    def test_loads_through_load_catalog_with_zero_errors(self):
+        example_path = Path(__file__).parent.parent / "docs" / "roles.example.toml"
+        self.assertTrue(example_path.is_file(),
+                        f"docs/roles.example.toml not found at {example_path}")
+        cat = rc.load_catalog(str(example_path.parent.parent), path=example_path)
+        self.assertIsNotNone(cat, "load_catalog returned None for roles.example.toml")
+        self.assertEqual(cat.errors, (),
+                         f"unexpected errors loading roles.example.toml: {cat.errors}")
+        # Confirm the four BRD roles are present
+        for role_id in ("operator", "ux", "architect", "prod"):
+            self.assertIn(role_id, cat.roles,
+                          f"expected role {role_id!r} in roles.example.toml")
 
 
 def tearDownModule():

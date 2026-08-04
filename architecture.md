@@ -41,12 +41,17 @@ relay HTTP API itself.
     permission_state_store.py    local JSON state store; cross-hook race coordination
     posttool_hook.py             PostToolUse: cancel relay msg when terminal resolved
     notification_hook.py         Notification(idle_prompt): forward last msg to Telegram
+    roles_config.py              role catalog + binding loader; roles_report, format_roles_table
   settings.json                  permissions allow/deny (+ statusline); hooks merged in by installer
 install-claude-config.sh         merges permissions + wires hooks into global settings.json
 shell/
   profiles.example.toml          shipped template for ~/.claude/profiles.toml
   amux-spawn.bash                shell integration: auto-generates aliases from profiles
   amux-spawn-completion.bash     bash completion for amux-spawn + profile names
+  claude-roles                   diagnostic: per-role destination + errors (claude-roles --help)
+docs/
+  roles.example.toml             copy-paste template for .claude/roles.toml
+  roles-prompt-example.md        agent-facing prose to adapt into CLAUDE.md
 relay-server/
   relay_server/
     app.py                       FastAPI app: HTTP API + Telegram webhook + update dispatch
@@ -203,6 +208,19 @@ all sibling keyboards live until every question is answered. Buttons carry
 `updatedInput.answers`. Falls back to the native terminal UI if Telegram is
 unreachable or the user answers in the terminal.
 
+**Multi-destination routing (epic 15, opt-in per workspace):** when
+`.claude/roles.toml` is present, an agent can prefix the `header` field with
+`@alias` (e.g. `@ux Layout`) to route the question to a specific human role.
+The router parses the alias, resolves it through the binding chain in
+`~/.config/claude-tg-relay/config.toml`, and sends the group to the role's
+Telegram chat instead of the default one.  If the role is unreachable the
+question falls back to the default role with an explanatory note in the message.
+One call always maps to one role — mixed aliases are rejected with a deny that
+names both and instructs the agent to split into separate calls.  A workspace
+with no `roles.toml` behaves exactly as before: single default destination,
+no new fields.  `claude-roles` (the `shell/claude-roles` diagnostic) shows the
+resolved destination and escalation for each role in the current workspace.
+
 ### Idle notification (current)
 
 ```
@@ -271,6 +289,74 @@ flow (env reaches child via tmux `update-environment`, no `ps` leak).
 
 **Install:** `install-claude-config.sh` copies `shell/profiles.example.toml`
 to `~/.claude/profiles.toml` if the file does not exist (never overwrites).
+
+---
+
+## Human roles for AskUserQuestion (epic 15)
+
+Role routing is opt-in and workspace-scoped: a workspace with no
+`.claude/roles.toml` behaves exactly as before — same destination, same
+rendering, no new fields.
+
+### Configuration — two files, deliberate split
+
+**`.claude/roles.toml`** (committed, workspace vocabulary) defines aliases,
+titles, the default role, and per-role escalation policy.  It carries **no
+role descriptions** and no tokens: descriptions are free-form prose for an agent
+to read in `CLAUDE.md`; tokens are per-machine secrets.  See
+`docs/roles.example.toml` for a copy-paste template.
+
+**`~/.config/claude-tg-relay/config.toml`** (per-machine, never committed)
+binds each role alias to an installation token or a reference to another role.
+A value starting with `rly_` is a real token; anything else is a role reference
+resolved transitively.  Per-workspace overrides go in
+`[workspace.<id>.roles]` and `[workspace.<id>.escalate_after]`.
+
+### Resolution precedence
+
+For role `R` in workspace `W` the binding lookup is:
+
+1. `[workspace.W.roles].R`
+2. `[roles].R`
+3. Top-level `installation_token`, **only** if `R` is the default role.
+4. Unresolved → fall back to the default role with an explanatory note in the
+   Telegram message body.
+
+Escalation follows the same four-level shape
+(`[workspace.W.escalate_after].R` → `[escalate_after].R` → per-role →
+top-level).
+
+### @alias → role → token routing chain
+
+An agent addresses a role by prefixing `header` with `@alias` (e.g.
+`@ux Layout`).  The router:
+
+1. Strips the prefix and identifies the role from `catalog.alias_index`.
+2. Resolves the binding chain to a token (or falls back to the default role).
+3. Sends the message group to that token's installation.
+4. If `escalate_after` fires, a duplicate group goes to the default
+   destination; the first group to finalise wins and the other is patched +
+   cancelled.
+
+### Constraints
+
+Two facts about the relay shaped every decision:
+
+* **`AskUserQuestion`'s input schema is closed** — `additionalProperties: false`
+  at both levels.  The role tag rides in the `header` string because no new
+  field can be added.
+* **Question groups are scoped to a single chat** — `_load_group_members`
+  filters by `telegram_chat_id`.  A group split across two chats can never
+  finalise, which is why **one call addresses exactly one role** and mixing is
+  rejected with a deny.
+
+### Diagnostic
+
+`claude-roles` (installed to `~/.claude/shell/` and symlinked into
+`~/.local/bin/`) shows each role's resolved destination, escalation setting, and
+any config errors without ever printing token material.  `claude-roles --check`
+probes the relay for each distinct token and reports `bound` / `not bound` /
+`invalid token`.
 
 ---
 

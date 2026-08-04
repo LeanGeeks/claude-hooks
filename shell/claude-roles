@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Diagnostic tool for AskUserQuestion role routing (epic 15).
+
+Usage:
+    claude-roles [--workspace-dir DIR] [--check] [--json]
+
+Offline by default: reads .claude/roles.toml for DIR and the machine
+bindings at ~/.config/claude-tg-relay/config.toml, then prints one row per
+role showing its destination and escalation setting.
+
+--check probes each distinct role token against the relay (network required)
+and reports bound / not bound / invalid for each.  It is the only part of
+this tool that contacts the relay.
+
+Exit codes:
+    0  clean — including "no roles.toml" (that is valid, not a problem)
+    1  any catalog or binding errors
+    2  (with --check) any role token is unbound or invalid
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+# ── Import roles_config — installed path first, then repo checkout ─────────────
+#
+# Resolution mirrors telegram_permission_router.py:53:
+#   1. ~/.claude/hooks/roles_config.py  (after install-claude-config.sh)
+#   2. Walk up from this script's location for .claude/hooks/roles_config.py
+#      (repo checkout at any depth; works when running shell/claude-roles
+#      straight from the repo root or a subdirectory)
+
+
+def _load_roles_config():
+    # 1. Installed path
+    installed = Path.home() / ".claude" / "hooks" / "roles_config.py"
+    if installed.is_file():
+        spec = importlib.util.spec_from_file_location("roles_config", installed)
+        mod = importlib.util.module_from_spec(spec)
+        # Register before exec so @dataclass and from __future__ can find the module.
+        sys.modules["roles_config"] = mod
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return mod
+
+    # 2. Walk up from this script
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / ".claude" / "hooks" / "roles_config.py"
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location("roles_config", candidate)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["roles_config"] = mod
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+            return mod
+
+    return None
+
+
+rc = _load_roles_config()
+if rc is None:
+    print(
+        "error: roles_config.py not found — run install-claude-config.sh first",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ── --check: live relay probe ─────────────────────────────────────────────────
+#
+# This is the ONLY networked part of this tool.  roles_config.py is pure
+# (network-free by spec); everything else in this script is offline.
+
+
+def _check_tokens(catalog, bindings) -> tuple[list[dict], bool]:
+    """Probe each distinct role token against ``GET /v1/installations/me``.
+
+    Returns ``(results, any_problem)`` where each result carries ``role_ids``
+    and ``status`` (and optionally ``label`` / ``installation_id`` on success).
+    No token material appears in any result.
+    """
+    server_url: str | None = bindings.server_url
+    if not server_url:
+        return (
+            [{"role_ids": ["(all roles)"],
+              "status": "cannot check — server_url not set in config.toml"}],
+            True,
+        )
+
+    try:
+        import httpx
+    except ImportError:
+        return (
+            [{"role_ids": ["(all roles)"],
+              "status": "cannot check — httpx is not installed"}],
+            True,
+        )
+
+    # Collect distinct tokens, mapping each to the role_ids that use it.
+    # rc._resolve_token is a private helper but intentionally accessed here;
+    # the script is the named consumer for the --check probe.
+    token_roles: dict[str, list[str]] = {}
+    for role_id in catalog.roles:
+        token, _ = rc._resolve_token(catalog, bindings, role_id)
+        if token is not None:
+            token_roles.setdefault(token, []).append(role_id)
+
+    if not token_roles:
+        return [], False
+
+    results: list[dict] = []
+    any_problem = False
+    base = server_url.rstrip("/")
+
+    for token, role_ids in token_roles.items():
+        result: dict = {"role_ids": role_ids}
+        try:
+            resp = httpx.get(
+                f"{base}/v1/installations/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("chat_bound"):
+                    result["status"] = "bound"
+                    result["label"] = data.get("label", "")
+                    result["installation_id"] = data.get("id")
+                else:
+                    result["status"] = "not bound — run relay-client bind"
+                    any_problem = True
+            elif resp.status_code == 401:
+                result["status"] = "invalid token (401)"
+                any_problem = True
+            else:
+                result["status"] = f"unexpected status {resp.status_code}"
+                any_problem = True
+        except Exception as exc:
+            result["status"] = f"connection error: {exc}"
+            any_problem = True
+
+        results.append(result)
+
+    return results, any_problem
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Show AskUserQuestion role routing status for a workspace.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit 0: clean (or no roles.toml — that is valid)\n"
+            "exit 1: catalog or binding errors\n"
+            "exit 2: (--check) any token unbound or invalid"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-dir",
+        default=".",
+        metavar="DIR",
+        help="workspace directory to inspect (default: current directory)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="probe each distinct token against the relay (requires network)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_out",
+        help="emit machine-readable JSON instead of a table",
+    )
+    args = parser.parse_args()
+
+    workspace_dir = str(Path(args.workspace_dir).resolve())
+
+    catalog = rc.load_catalog(workspace_dir)
+    bindings = rc.load_bindings()
+
+    # No roles.toml: valid state, default routing only
+    if catalog is None:
+        if args.json_out:
+            print(json.dumps({
+                "roles": None,
+                "message": "no roles configured (default destination only)",
+            }))
+        else:
+            print("no roles configured (default destination only)")
+        return 0
+
+    report = rc.roles_report(catalog, bindings)
+
+    check_problem = False
+    if args.check:
+        check_results, check_problem = _check_tokens(catalog, bindings)
+        report["check"] = check_results
+
+    if args.json_out:
+        print(json.dumps(report))
+    else:
+        print(rc.format_roles_table(report))
+
+        if args.check and report.get("check"):
+            n = len(report["check"])
+            print()
+            print(f"checking {n} token group(s) against {bindings.server_url or '(no server_url)'}...")
+            for r in report["check"]:
+                roles_str = ", ".join(r["role_ids"])
+                status = r["status"]
+                if r.get("label"):
+                    status += f" ({r['label']}, id={r['installation_id']})"
+                print(f"  {roles_str}: {status}")
+
+    if report.get("has_errors"):
+        return 1
+    if check_problem:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

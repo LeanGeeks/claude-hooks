@@ -1,0 +1,78 @@
+# .claude/roles.toml — committed, machine-readable workspace role catalog.
+#
+# This file defines the role vocabulary for this workspace.
+# What does NOT belong here:
+#   - role descriptions (those go in CLAUDE.md or any prompt file as free-form
+#     prose; nothing generates, validates, or syncs them — that is intentional)
+#   - installation tokens (those go in ~/.config/claude-tg-relay/config.toml,
+#     which is per-machine and must never be committed)
+#   - Telegram chat IDs (the relay learns those from the bind handshake)
+#
+# See docs/roles-prompt-example.md for the agent-facing prose to adapt into
+# CLAUDE.md so an agent knows when and how to address each role.
+# See ~/.config/claude-tg-relay/config.toml for token bindings.
+
+# workspace_id: optional.  Defaults to the workspace directory name when absent.
+# Scopes per-workspace overrides in ~/.config/claude-tg-relay/config.toml
+# (e.g. [workspace.myproject.roles] and [workspace.myproject.escalate_after]).
+workspace_id = "myproject"
+
+# default: required.  The role that receives questions with no @alias prefix
+# and the fallback destination when a tagged role is unreachable.
+default = "operator"
+
+# escalate_after: optional top-level default for all roles.
+# When a role doesn't answer within this window, a duplicate question group is
+# sent to the default role so the operator can decide instead.
+# Accepted forms: "30m", "2h", "90s", "45" (seconds), false / "off" / "0"
+# (never escalate).  Per-role and per-machine overrides take precedence.
+escalate_after = "30m"
+
+# Alias uniqueness rules:
+#   - Aliases must be unique across all roles in this file.
+#   - The [role.<id>] key (e.g. "operator") is itself always a valid alias,
+#     even when not listed in the aliases array.
+#   - On a collision the first definition in file order keeps the alias; the
+#     duplicate is silently dropped by the hooks (a bad roles.toml must never
+#     break a question — brd §5.1) and surfaced only in `claude-roles` output.
+
+[role.operator]
+# The operator is the person at the keyboard.  All untagged questions arrive
+# here.  Aliases are the short tags an agent writes in @alias position.
+# Keep the alias you type in headers to 2-4 characters: the harness shows the
+# header as a chip ~12 chars wide, so "@designer " eats most of it before the
+# actual header text begins.  A role may list longer readable synonyms (see
+# [role.ux] for an example) — those are valid for routing but prefer the short
+# form in AskUserQuestion headers.
+# The role id ("operator") is always a valid alias even when not listed here.
+aliases = ["op"]
+title   = "Operator"
+# The operator never escalates to themselves, so escalate_after is omitted.
+# (No entry = inherits the top-level default, but the routing engine suppresses
+# escalation for the default role regardless.)
+
+
+[role.ux]
+# "ux" (2 chars) is the short form agents type in headers.  "design" is a
+# readable synonym that is valid for routing but exceeds the 2-4 char guideline
+# — do not use it in AskUserQuestion header strings.
+aliases = ["ux", "design"]
+title   = "UX/UI designer"
+# Per-role escalation override: if the designer doesn't answer in 15m,
+# a duplicate question goes to the operator.  The machine's
+# [workspace.myproject.escalate_after] can tighten or relax this further.
+escalate_after = "15m"
+
+
+[role.architect]
+aliases = ["arch"]
+title   = "Tech lead / architect"
+# false / "off" / "never" / 0 all mean: wait forever, never escalate.
+# Use this when a decision genuinely cannot be delegated to the operator.
+escalate_after = false
+
+
+[role.prod]
+# No explicit aliases beyond the role id itself.  An agent writes @prod.
+title = "Product lead"
+# Inherits the top-level escalate_after = "30m".

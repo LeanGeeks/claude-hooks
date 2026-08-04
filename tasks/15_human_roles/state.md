@@ -24,7 +24,7 @@ Each task file is written for a fresh-context agent and carries its own
 | 15-03 | [Alias routing](./15-03-alias-routing.md) | done | 15-02 | Header parse/strip, destination resolution, mixed-role deny, send-failure retry, rendering |
 | 15-04 | [Wait phase](./15-04-wait-phase_opus.md) | done | 15-03 | Sequential loop → thread-per-message; terminal answers patched into the role's chat |
 | 15-05 | [Escalation](./15-05-escalation_opus.md) | done | 15-04 | Deadline, duplicate group to the default, first-group-wins |
-| 15-06 | [Installer, diagnostics, docs](./15-06-installer-diagnostics-docs.md) | in_progress | 15-05 | `shell/claude-roles`, example TOML, prompt snippet, installer, `architecture.md` |
+| 15-06 | [Installer, diagnostics, docs](./15-06-installer-diagnostics-docs.md) | done | 15-05 | `shell/claude-roles`, example TOML, prompt snippet, installer, `architecture.md` |
 | 15-07 | [Live verification](./15-07-live-verification_human.md) | todo | 15-06 | **human** — needs a real relay and a second bound chat; no agent can provision either |
 
 ## Implementer model

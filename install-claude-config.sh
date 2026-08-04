@@ -411,6 +411,35 @@ else
     log_warn "Shell snippet not found at $AMUX_SNIPPET_SRC — skipping"
 fi
 
+# ── claude-roles diagnostic tool (epic 15) ────────────────────────────────────
+# Standalone Python script — no .py extension, matching shell/claude-history.
+# Installed into CLAUDE_SHELL_DIR alongside the .bash snippets; symlinked into
+# ~/.local/bin when that directory is on PATH so it is reachable as a bare
+# command.  Never creates or copies any roles.toml — that file is per-workspace,
+# committed, and hand-authored.
+
+CLAUDE_ROLES_SRC="$SCRIPT_DIR/shell/claude-roles"
+CLAUDE_ROLES_INSTALLED=false
+
+if [[ -f "$CLAUDE_ROLES_SRC" ]]; then
+    cp "$CLAUDE_ROLES_SRC" "$CLAUDE_SHELL_DIR/claude-roles"
+    chmod +x "$CLAUDE_SHELL_DIR/claude-roles"
+    log_info "Installed: claude-roles → $CLAUDE_SHELL_DIR/claude-roles"
+    # Symlink into ~/.local/bin only when the directory exists AND is on PATH,
+    # to avoid creating a dangling symlink the user will never find.
+    if [[ -d "$USER_BIN_DIR" ]]; then
+        case ":$PATH:" in
+            *":$USER_BIN_DIR:"*)
+                ln -sf "$CLAUDE_SHELL_DIR/claude-roles" "$USER_BIN_DIR/claude-roles"
+                log_info "  Symlinked: $USER_BIN_DIR/claude-roles → $CLAUDE_SHELL_DIR/claude-roles"
+                ;;
+        esac
+    fi
+    CLAUDE_ROLES_INSTALLED=true
+else
+    log_warn "claude-roles not found at $CLAUDE_ROLES_SRC — skipping"
+fi
+
 # Print the opt-in instructions once (NOT applied automatically).
 if [[ "$SNIPPET_INSTALLED" == true ]]; then
     echo ""
@@ -806,6 +835,22 @@ if [[ "$SNIPPET_INSTALLED" == true ]]; then
     echo "      source $CLAUDE_SHELL_DIR/amux-spawn.bash       # profiles + amux"
 else
     echo "  - shell snippets: not installed"
+fi
+
+# Show claude-roles status and workspace roles.toml hint
+if [[ "$CLAUDE_ROLES_INSTALLED" == true ]]; then
+    echo "  - claude-roles: installed ($CLAUDE_SHELL_DIR/claude-roles)"
+    ROLES_TOML="$SCRIPT_DIR/.claude/roles.toml"
+    if [[ -f "$ROLES_TOML" ]]; then
+        echo "  - roles.toml: found ($ROLES_TOML)"
+        echo "    Inspect routing with: claude-roles  (run from the workspace directory)"
+    else
+        echo "  - roles.toml: not configured in this workspace (default routing only)"
+        echo "    Template: $SCRIPT_DIR/docs/roles.example.toml"
+        echo "    After creating .claude/roles.toml run: claude-roles"
+    fi
+else
+    echo "  - claude-roles: not installed"
 fi
 
 # Show model profiles status

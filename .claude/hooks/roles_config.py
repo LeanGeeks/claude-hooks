@@ -12,6 +12,8 @@ load_bindings    — parse ~/.config/claude-tg-relay/config.toml into Bindings
 resolve_destination — full fallback chain: alias → role → token → Destination
 parse_header_alias  — split "@ux Layout" into ("ux", "Layout")
 parse_duration      — parse "30m" / "2h" / "90s" / "45" / false / "off" → float | None
+roles_report     — structured summary of roles + destinations (no token material)
+format_roles_table  — human-readable table rendering of a roles_report dict
 """
 
 from __future__ import annotations
@@ -589,3 +591,190 @@ def resolve_destination(
         escalate_after=escalate_after,
         notes=tuple(notes),
     )
+
+
+# ── Diagnostic helpers ────────────────────────────────────────────────────────
+
+
+def _format_duration(seconds: float) -> str:
+    """Format *seconds* as a short human-readable string (``"5m"``, ``"2h"``, …)."""
+    secs = int(seconds)
+    if secs >= 3600 and secs % 3600 == 0:
+        return f"{secs // 3600}h"
+    if secs >= 60 and secs % 60 == 0:
+        return f"{secs // 60}m"
+    return f"{secs}s"
+
+
+def _destination_kind(
+    catalog: RoleCatalog,
+    bindings: Bindings,
+    role_id: str,
+) -> tuple[str, str | None]:
+    """Return ``(kind, ref)`` describing *role_id*'s immediate binding.
+
+    *kind* is one of:
+
+    * ``'default_token'`` — uses the top-level ``installation_token`` directly.
+    * ``'own_binding'``   — has an explicit ``rly_*`` entry in a ``[roles]`` table.
+    * ``'reference'``     — binding is a role-alias reference; *ref* is the raw
+      value as written in the config.
+    * ``'none'``          — no binding on this machine.
+
+    No token material is returned.
+    """
+    role_obj = catalog.roles[role_id]
+    ws_id = catalog.workspace_id
+    ws_roles = bindings.workspace_roles.get(ws_id, {})
+
+    val, _ = _find_in_dict(role_id, role_obj.aliases, ws_roles)
+    if val is None:
+        val, _ = _find_in_dict(role_id, role_obj.aliases, bindings.roles)
+
+    if val is not None:
+        if val.startswith("rly_"):
+            return "own_binding", None
+        return "reference", val
+
+    if role_id == catalog.default_role and bindings.default_token:
+        return "default_token", None
+    return "none", None
+
+
+def _resolve_escalation(
+    catalog: RoleCatalog,
+    bindings: Bindings,
+    role_id: str,
+) -> float | None:
+    """Four-level escalation lookup for *role_id*, without same-token suppression.
+
+    Returns the *configured* escalation so the diagnostic table shows what is
+    set, even when :func:`resolve_destination` suppresses it at runtime because
+    a referenced role resolves to the same token as the default.
+    """
+    ws_id = catalog.workspace_id
+    ws_ea = bindings.workspace_escalate_after.get(ws_id, {})
+    role_aliases = catalog.roles[role_id].aliases
+    ea, found = _find_ea_in_dict(role_id, role_aliases, ws_ea)
+    if found:
+        return ea
+    ea, found = _find_ea_in_dict(role_id, role_aliases, bindings.escalate_after)
+    if found:
+        return ea
+    return catalog.roles[role_id].escalate_after
+
+
+def roles_report(catalog: RoleCatalog, bindings: Bindings) -> dict:
+    """Return a structured summary of roles, their destinations, and errors.
+
+    The returned dict is JSON-serialisable.  It never contains token material:
+    ``destination`` is one of ``'default token'``, ``'own binding'``,
+    ``'-> <ref>'``, or ``'(none)'``.
+
+    This is the data source for both :func:`format_roles_table` and the
+    ``claude-roles --json`` output.
+    """
+    roles_out = []
+    for role_id, role_obj in catalog.roles.items():
+        kind, ref = _destination_kind(catalog, bindings, role_id)
+
+        if kind == "reference":
+            destination = f"-> {ref}"
+        elif kind == "own_binding":
+            destination = "own binding"
+        elif kind == "default_token":
+            destination = "default token"
+        else:
+            destination = "(none)"
+
+        # Escalation is N/A for the default role and for unbound roles that
+        # fall back — neither can escalate usefully.
+        if role_id == catalog.default_role or kind == "none":
+            escalate_str = "—"  # em dash: N/A
+        else:
+            ea = _resolve_escalation(catalog, bindings, role_id)
+            escalate_str = "never" if ea is None else _format_duration(ea)
+
+        # Fallback note: the title of the role that will take over
+        fallback_title: str | None = None
+        if kind == "none" and role_id != catalog.default_role:
+            fallback_title = catalog.roles[catalog.default_role].title
+
+        roles_out.append({
+            "role_id": role_id,
+            "title": role_obj.title,
+            "aliases": list(role_obj.aliases),
+            "destination": destination,
+            "escalate_str": escalate_str,
+            "fallback_title": fallback_title,
+        })
+
+    all_errors = list(catalog.errors) + list(bindings.errors)
+    return {
+        "workspace_id": catalog.workspace_id,
+        "path": str(catalog.path) if catalog.path else None,
+        "default_role": catalog.default_role,
+        "roles": roles_out,
+        "errors": all_errors,
+        "has_errors": bool(all_errors),
+    }
+
+
+def format_roles_table(report: dict) -> str:
+    """Render a :func:`roles_report` dict as a human-readable table string.
+
+    No token material is present in the input dict, so none can appear in the
+    output.  The caller may print the result directly.
+    """
+    lines: list[str] = []
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    path_part = f"   ({report['path']})" if report.get("path") else ""
+    lines.append(f"workspace: {report['workspace_id']}{path_part}")
+    lines.append(f"default:   {report['default_role']}")
+    lines.append("")
+
+    roles = report.get("roles", [])
+    if not roles:
+        return "\n".join(lines)
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    col_headers = ["ALIASES", "ROLE", "TITLE", "DESTINATION", "ESCALATE"]
+    rows: list[tuple[str, str, str, str, str]] = []
+    for r in roles:
+        rows.append((
+            ", ".join(r["aliases"]),
+            r["role_id"],
+            r["title"],
+            r["destination"],
+            r["escalate_str"],
+        ))
+
+    widths = [len(h) for h in col_headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    hdr = "  ".join(h.ljust(widths[i]) for i, h in enumerate(col_headers[:-1]))
+    lines.append((hdr + "  " + col_headers[-1]).rstrip())
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    dest_offset = sum(widths[i] + 2 for i in range(3))  # ALIASES + ROLE + TITLE
+    for role_data, row in zip(roles, rows):
+        data = "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row[:-1]))
+        lines.append((data + "  " + row[-1]).rstrip())
+
+        # ↳ fallback note, indented under the DESTINATION column
+        if role_data.get("fallback_title"):
+            lines.append(" " * dest_offset + f"↳ falls back to {role_data['fallback_title']}")
+
+    # ── Errors section ───────────────────────────────────────────────────────
+    errors = report.get("errors", [])
+    if errors:
+        lines.append("")
+        lines.append("errors:")
+        for err in errors:
+            lines.append(f"  {err}")
+
+    return "\n".join(lines)
