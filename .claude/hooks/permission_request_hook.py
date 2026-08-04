@@ -38,7 +38,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Callable, Optional, Dict, Any, List, Tuple
 
 import telegram_permission_router as telegram_router
 
@@ -105,6 +105,11 @@ WAIT_TICK_SECONDS = 2.0
 # Floor on one child-thread poll cycle. A relay that fails instantly (or a test
 # double) would otherwise spin a thread hot for the full 12h TTL.
 CHILD_POLL_FLOOR_SECONDS = 1.0
+# Shortest queue wait the loop will use when it is about to escalate (15-05).
+# The tick shrinks towards the escalation deadline so the second group goes out
+# on time instead of up to ``WAIT_TICK_SECONDS`` late; the floor keeps a
+# rounding error from turning into a hot spin.
+ESCALATION_TICK_FLOOR = 0.05
 
 # Literal ``answers[q]`` values that mean "the user picked nothing" — the real
 # content then lives in ``annotations[q]["notes"]``. Matched exactly, never as a
@@ -560,6 +565,34 @@ def parse_terminal_answers(
     return {q: pairs[q] for q in questions if pairs.get(q)}
 
 
+def _humanize_duration(seconds: float) -> str:
+    """Render an escalation delay the way it was written in config.
+
+    ``parse_duration`` hands back seconds, so the ``"15m"`` an operator typed
+    arrives here as ``900.0``. The escalation banner is read by a human, so it
+    has to say ``15m`` — not ``900s`` and certainly not ``900.0``.
+
+    Sub-second values (only realistic in tests) keep a fractional ``s``.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+    total = int(round(value))
+    if total <= 0:
+        return f"{value:g}s"
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs:
+        parts.append(f"{secs}s")
+    return "".join(parts)
+
+
 def _child_wait_loop(
     group_key: str,
     message_id: int,
@@ -691,20 +724,84 @@ def _finalize_on_terminal_win(
                     )
 
 
+def _finalize_losing_groups(
+    groups: Dict[str, List["_ChildRecord"]],
+    group_tokens: Dict[str, Optional[str]],
+    winning_key: str,
+    answers: Dict[str, str],
+) -> None:
+    """One group answered in full; show the other one what was decided.
+
+    The winner finalizes itself server-side (``app.py:1203`` strips the whole
+    group's keyboards once it completes), so only the loser needs client-side
+    cleanup: each of its messages is PATCHed with the winning answer and then
+    cancelled, including any child that had already been answered — a partially
+    answered losing group must not keep a live keyboard.
+
+    Both groups carry the same questions in the same order, so they are paired
+    **by index**. The answer patched into the chat is the *unannotated* one: the
+    ``(answered by …)`` suffix of brd §5.6 is addressed to the agent, and in the
+    chat it would be redundant and confusing.
+
+    Every row of the losing group is then marked ``REPLY`` so ``posttool_hook``'s
+    pending-request sweep skips it, just like the winner's rows (which the wait
+    loop marked as their answers arrived).
+    """
+    winner_texts = [
+        (rec.question or {}).get("question", "")
+        for rec in groups.get(winning_key, [])
+    ]
+
+    for group_key, records in groups.items():
+        if group_key == winning_key:
+            continue
+        token = group_tokens.get(group_key)
+        for idx, rec in enumerate(records):
+            text = answers.get(winner_texts[idx], "") if idx < len(winner_texts) else ""
+            try:
+                finalize_message(rec.message_id, rec.body, text, prefix="✅ ", token=token)
+            except Exception as e:  # noqa: BLE001 — a dead chat must not block
+                debug_log(f"Failed to finalize losing message {rec.message_id}: {e}")
+            try:
+                update_request_state(
+                    rec.child.request_id,
+                    RequestState.REPLY,
+                    reply_text=text,
+                    resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+                )
+            except Exception as e:  # noqa: BLE001
+                debug_log(
+                    f"Failed to mark losing row {rec.child.request_id} terminal: {e}"
+                )
+
+
 def _wait_for_group_answers(
     groups: Dict[str, List["_ChildRecord"]],
     group_tokens: Dict[str, Optional[str]],
     deadline: float,
+    *,
+    escalate_at: Optional[float] = None,
+    send_escalation: Optional[
+        Callable[[], Optional[Tuple[str, List["_ChildRecord"], Optional[str]]]]
+    ] = None,
 ) -> Optional[Tuple[str, Dict[str, str]]]:
     """Race every open question group; the first to answer in full wins.
 
     One daemon thread per open child message long-polls the relay and pushes its
     result onto a queue. **The main thread owns everything else**: terminal
-    detection, every state-store write, and the decision.
+    detection, every state-store write, the escalation send, and the decision.
 
     Returns ``(group_key, {question: answer})`` for the winning group, or
     ``None`` when the terminal answered first, no group can be answered any
     more, or the TTL elapsed. ``None`` always means "native terminal UI stands".
+
+    ``escalate_at`` (15-05) is an absolute deadline; when it is reached with the
+    call still open, ``send_escalation`` is invoked **once** on this thread. It
+    returns ``(group_key, records, token)`` for a freshly sent duplicate group,
+    or ``None`` when the send failed — in which case the role group simply stays
+    live and nothing is retried (brd §5.1). A group registered this way is added
+    to ``groups`` / ``group_tokens`` **in place**, so the caller can finalize
+    whichever group loses the race once this returns.
 
     Daemon threads are never joined: when the hook exits, threads still parked
     in a long-poll die with the process. ``stop`` only spares a doomed thread
@@ -714,7 +811,7 @@ def _wait_for_group_answers(
     stop = threading.Event()
 
     # message_id -> (group_key, record). Message ids are relay-global, so this
-    # stays unambiguous once 15-05 adds the escalation group.
+    # stays unambiguous with the escalation group live alongside the role one.
     index: Dict[int, Tuple[str, "_ChildRecord"]] = {}
     for group_key, records in groups.items():
         for rec in records:
@@ -724,22 +821,25 @@ def _wait_for_group_answers(
     answered_ids: Dict[str, set] = {gk: set() for gk in groups}
     unanswerable: Dict[str, set] = {gk: set() for gk in groups}
 
+    def _start_child(group_key: str, rec: "_ChildRecord") -> None:
+        threading.Thread(
+            target=_child_wait_loop,
+            args=(
+                group_key,
+                rec.message_id,
+                group_tokens.get(group_key),
+                deadline,
+                results,
+                stop,
+            ),
+            name=f"askq-wait-{rec.message_id}",
+            daemon=True,
+        ).start()
+
     try:
         for group_key, records in groups.items():
             for rec in records:
-                threading.Thread(
-                    target=_child_wait_loop,
-                    args=(
-                        group_key,
-                        rec.message_id,
-                        group_tokens.get(group_key),
-                        deadline,
-                        results,
-                        stop,
-                    ),
-                    name=f"askq-wait-{rec.message_id}",
-                    daemon=True,
-                ).start()
+                _start_child(group_key, rec)
 
         while time.time() < deadline:
             # 1. The terminal beats every group, always checked first.
@@ -748,19 +848,62 @@ def _wait_for_group_answers(
                 _finalize_on_terminal_win(groups, group_tokens)
                 return None
 
-            # 2. Drain what the threads produced. ``get`` returns immediately
+            # 2. The escalation deadline (15-05). Checked after terminal
+            #    detection and before the drain, so an already-resolved call
+            #    never sends a second group. Fires at most once: a failed send
+            #    is logged and dropped, never retried — the role group is still
+            #    the real destination and the operator can answer at the
+            #    keyboard.
+            if escalate_at is not None and time.time() >= escalate_at:
+                escalate_at = None
+                added = None
+                if send_escalation is not None:
+                    try:
+                        added = send_escalation()
+                    except Exception as e:  # noqa: BLE001 — never kill the wait
+                        error_log(
+                            f"Escalation send raised {type(e).__name__}: {e}; "
+                            "leaving the role group live"
+                        )
+                if added is not None:
+                    esc_key, esc_records, esc_token = added
+                    groups[esc_key] = esc_records
+                    group_tokens[esc_key] = esc_token
+                    answers[esc_key] = {}
+                    answered_ids[esc_key] = set()
+                    unanswerable[esc_key] = set()
+                    for rec in esc_records:
+                        index[rec.message_id] = (esc_key, rec)
+                        _start_child(esc_key, rec)
+                    debug_log(
+                        f"Escalation group {esc_key} sent "
+                        f"({len(esc_records)} message(s)); both groups now live"
+                    )
+
+            # 3. Drain what the threads produced. ``get`` returns immediately
             #    while the queue is non-empty, so a group finalizing server-side
             #    (which wakes all of its children at once) drains across
-            #    consecutive ticks without any of them waiting.
+            #    consecutive ticks without any of them waiting. The tick shrinks
+            #    towards a pending escalation deadline — driving it off the queue
+            #    rather than a sleep is what keeps that deadline from drifting by
+            #    a whole long-poll chunk.
+            tick = WAIT_TICK_SECONDS
+            if escalate_at is not None:
+                tick = min(
+                    tick, max(ESCALATION_TICK_FLOOR, escalate_at - time.time())
+                )
             try:
-                group_key, message_id, result = results.get(timeout=WAIT_TICK_SECONDS)
+                _, message_id, result = results.get(timeout=tick)
             except queue.Empty:
                 continue
 
             entry = index.get(message_id)
             if entry is None:
                 continue
-            rec = entry[1]
+            # Use group_key from the index so the two cannot diverge if a
+            # message id were ever reused across groups or a stale queue item
+            # arrived after a group's re-registration.
+            group_key, rec = entry
 
             if result is None:
                 continue  # chunk timeout — that thread is still polling
@@ -788,17 +931,20 @@ def _wait_for_group_answers(
                         resolution_source=RESOLUTION_SOURCE_TELEGRAM,
                     )
 
-            # 3. A group is won when every one of its children has answered.
+            # 4. A group is won when every one of its children has answered.
             if (
                 not unanswerable[group_key]
                 and len(answered_ids[group_key]) == len(groups[group_key])
             ):
                 return group_key, answers[group_key]
 
-            # 4. A group with an expired/cancelled child can never finalize
+            # 5. A group with an expired/cancelled child can never finalize
             #    server-side (``_finalize_group_if_complete`` needs every
-            #    member), so it is dead. When no group is left alive, fall back
-            #    to the terminal — exactly as the sequential loop did.
+            #    member), so it is dead. **Per group** (15-05): one group dying
+            #    is that group losing the race, not the call failing — the other
+            #    may still win. Only when every registered group is dead does
+            #    the call fall back to the terminal, exactly as the sequential
+            #    loop did when there was only ever one group.
             if all(unanswerable[gk] for gk in groups):
                 debug_log("Every question group is unanswerable; falling back")
                 return None
@@ -907,6 +1053,12 @@ def handle_ask_user_question(
     role_title = destination.title if destination is not None else None
     role_id_for_store = destination.role_id if destination is not None else None
     notes = destination.notes if destination is not None else ()
+    # Escalation delay for this attempt (15-05). ``resolve_destination`` already
+    # returns None whenever there is nobody to escalate *to* — no policy
+    # configured, the role IS the default, the role's binding resolves to the
+    # default token anyway (same human), or the alias fell back to the default.
+    # The send-failure retry below zeroes it for the same reason.
+    escalate_after = destination.escalate_after if destination is not None else None
 
     # One child request per question. Each gets its own relay message and
     # state-store entry; relay button values ``qa<N>`` (or a free-text reply)
@@ -926,12 +1078,16 @@ def handle_ask_user_question(
         _role_title: Optional[str],
         _role_id: Optional[str],
         _notes: tuple,
+        _banner: Optional[str] = None,
     ) -> Optional[list]:
         """Send all questions as one group; return list of _ChildRecord or None.
 
         On partial failure (one message fails): cancels already-sent siblings
         through ``_token`` and marks their rows terminal so posttool_hook's
         sweep leaves them alone.  Returns None on any failure.
+
+        ``_banner`` (15-05) goes on **every** message of the group, not only the
+        first: whichever one the operator opens has to explain itself.
         """
         records: list = []
         for i, (q, _alias, cleaned_header, _dest) in enumerate(_per_q):
@@ -954,11 +1110,12 @@ def handle_ask_user_question(
             )
             _body = telegram_router.render_question_body(
                 _child, workspace_name, i, len(questions),
-                role_title=_role_title, notes=_notes,
+                role_title=_role_title, notes=_notes, banner=_banner,
             )
             _mid = send_question_message(
                 _child, workspace_name, i, len(questions), grp_id,
                 token=_token, role_title=_role_title, notes=_notes,
+                banner=_banner,
             )
             if _mid is None:
                 # Cancel already-sent siblings and mark their rows terminal.
@@ -1009,6 +1166,9 @@ def handle_ask_user_question(
         # The retry carries only the delivery-failure note; static notes from
         # the original resolution are irrelevant (the default is now the target).
         notes = (_retry_note,)
+        # The default destination IS the target now, so there is nobody left to
+        # escalate to (brd §5.4).
+        escalate_after = None
         group_id = uuid.uuid4().hex
         children = _try_send_group(
             group_id, token, role_title, role_id_for_store, notes
@@ -1021,28 +1181,107 @@ def handle_ask_user_question(
 
     debug_log(f"Sent {len(children)} question messages; waiting for answers")
 
-    # Escalation deadline seam (15-05 wires this up).
-    # On the send-failure fallback path the value is always None — the default
-    # destination is already the target, so suppressing escalation is correct.
-    # On all other paths 15-05 will compute time.time() + <duration> here.
+    # ── Escalation deadline (15-05) ───────────────────────────────────────────
+    # Waiting is unbounded by default (brd §5.4, decision 5): with no
+    # ``escalate_after`` configured nothing below changes observable behaviour.
+    _start = time.time()
+    _wait_deadline = _start + REQUEST_TTL
     _escalation_deadline: Optional[float] = None
+    if escalate_after is not None and catalog is not None and _rc is not None:
+        if escalate_after < REQUEST_TTL:
+            _escalation_deadline = _start + escalate_after
+        else:
+            # A delay longer than the window we wait in would never fire; say so
+            # rather than pretending escalation is armed.
+            error_log(
+                f"escalate_after ({escalate_after:g}s) exceeds the request TTL "
+                f"({REQUEST_TTL}s); escalation suppressed for this call"
+            )
+
+    # What the escalation group needs to know once it has been sent: its
+    # group_id (to recognise it as the winner) and the default role's title (the
+    # attribution appended to the answers, brd §5.6).
+    _escalation: Dict[str, Any] = {"group_id": None, "title": None}
+
+    def _send_escalation_group() -> Optional[Tuple[str, list, Optional[str]]]:
+        """Send a duplicate of this call to the **default role**.
+
+        Not the router's implicit default client: the default role can carry its
+        own explicit binding (brd §3.3), so ``resolve_destination(..., None)`` is
+        the authority on both the token and the title.
+
+        Returns ``(group_id, records, token)``, or ``None`` when the escalation
+        could not be sent — the caller then leaves the role group live and does
+        not retry.
+        """
+        try:
+            _dest = _rc.resolve_destination(catalog, _bindings, None)
+        except Exception as e:  # noqa: BLE001
+            error_log(f"Could not resolve the escalation destination: {e}")
+            return None
+        if _dest.token is None:
+            error_log(
+                "Escalation destination (default role) is unreachable from this "
+                "machine; leaving the role group live"
+            )
+            return None
+
+        # The alias is the one the agent actually wrote (``@design`` if that is
+        # what it used), paired with the role's title.
+        _alias_tag = _per_q[0][1] or destination.role_id
+        _banner = (
+            f"@{_alias_tag} ({destination.title}) hasn't answered in "
+            f"{_humanize_duration(escalate_after)} — you can decide instead."
+        )
+        # A new group_id and fresh request_ids: distinct ids give distinct
+        # idempotency keys (``req:{request_id}:send``) and keep
+        # ``set_telegram_message_id`` writing to the right row.
+        _esc_group_id = uuid.uuid4().hex
+        # ``role_title`` is the *default* role's — this copy really is addressed
+        # to the operator. Reroute notes belong to the role group, not here.
+        _records = _try_send_group(
+            _esc_group_id, _dest.token, _dest.title, _dest.role_id, (), _banner
+        )
+        if _records is None:
+            error_log(
+                "Escalation send failed; the role group stays live and the "
+                "escalation is not retried"
+            )
+            return None
+        _escalation["group_id"] = _esc_group_id
+        _escalation["title"] = _dest.title
+        return _esc_group_id, _records, _dest.token
 
     # ── Wait phase ────────────────────────────────────────────────────────────
-    # One group today; 15-05 adds the escalation duplicate as a second entry and
-    # changes nothing else here.
+    # The role group starts alone; the escalation duplicate is registered into
+    # these two dicts by the wait loop if and when its deadline is reached.
     groups: Dict[str, list] = {group_id: children}
     group_tokens: Dict[str, Optional[str]] = {group_id: token}
 
-    won = _wait_for_group_answers(groups, group_tokens, time.time() + REQUEST_TTL)
+    won = _wait_for_group_answers(
+        groups,
+        group_tokens,
+        _wait_deadline,
+        escalate_at=_escalation_deadline,
+        send_escalation=_send_escalation_group,
+    )
     if won is None:
         # Terminal win, every group dead, or the TTL elapsed — the native UI is
         # live throughout, so there is never an auto-deny here.
         return None
 
-    # ``won`` is ``(group_key, answers)``. 15-05 needs the key to annotate an
-    # escalated answer with " (answered by <role>)" (brd §5.6); with one group
-    # there is nothing to attribute, so only the answers are used.
-    answers = won[1]
+    winning_key, answers = won
+
+    # The loser (if any) gets the winning answers patched in and its keyboards
+    # stripped; the winner finalized itself server-side.
+    _finalize_losing_groups(groups, group_tokens, winning_key, answers)
+
+    # brd §5.6: an escalated call answered by the default role rather than the
+    # tagged one is attributed back to the agent, because the answer value is the
+    # only channel it has. The chat gets the answer unannotated (above).
+    if _escalation["group_id"] is not None and winning_key == _escalation["group_id"]:
+        _suffix = f" (answered by {_escalation['title']})"
+        answers = {q: f"{a}{_suffix}" for q, a in answers.items()}
 
     # All answered via Telegram — build updatedInput preserving the original
     # question structure exactly.  updatedInput is built from the *original*

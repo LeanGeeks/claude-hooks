@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -2119,6 +2120,37 @@ def _call_with_timeout(fn, seconds=15):
     return box
 
 
+def _call_on_main_with_timeout(fn, seconds=15):
+    """Run ``fn`` on the calling thread (which must be the process main thread)
+    and raise ``AssertionError`` if it does not return within ``seconds``.
+
+    A background watchdog thread sends ``KeyboardInterrupt`` to the main thread
+    after the deadline.  The caller must run on ``threading.main_thread()``; if
+    it does not, the interrupt would land on the wrong thread.  New invariant
+    tests use this instead of ``_call_with_timeout`` so they can assert that
+    state-store writes happen on ``threading.main_thread()`` rather than on a
+    ``_call_with_timeout`` worker.
+    """
+    import _thread as _thr
+
+    done = threading.Event()
+
+    def _watchdog():
+        if not done.wait(seconds):
+            _thr.interrupt_main()
+
+    watchdog = threading.Thread(target=_watchdog, name="test-watchdog", daemon=True)
+    watchdog.start()
+    try:
+        result = fn()
+    except KeyboardInterrupt:
+        raise AssertionError(f"wait phase did not return within {seconds}s")
+    finally:
+        done.set()
+        watchdog.join(timeout=0.5)
+    return result
+
+
 class TestConcurrentWaitPhase(unittest.TestCase):
     """15-04 Part 1: one daemon thread per open child message, drained by a
     queue on the main thread.
@@ -2282,6 +2314,100 @@ class TestConcurrentWaitPhase(unittest.TestCase):
         # assertion above would be vacuous).
         self.assertTrue(box["relay"].threads)
         self.assertNotIn(main_thread, box["relay"].threads)
+
+    def test_resolve_via_terminal_does_not_happen_off_the_main_thread(self):
+        """``_finalize_on_terminal_win`` sweeps still-pending siblings with
+        ``resolve_via_terminal``; that write must not migrate to a child
+        polling thread.
+
+        Uses ``_call_on_main_with_timeout`` so the assertion target is
+        ``threading.main_thread()`` rather than whichever worker thread
+        ``_call_with_timeout`` would pick — the pin stays correct even if the
+        suite is later driven from a non-main thread.
+        """
+        self.assertIs(
+            threading.current_thread(), threading.main_thread(),
+            "This invariant test must be driven from the main thread",
+        )
+        from permission_state_store import RequestState
+
+        resolve_threads = []
+
+        def _tracking_resolve(request_id, terminal_answers=None):
+            resolve_threads.append(threading.current_thread())
+
+        def _row(request_id):
+            # child-0: PostToolUse already resolved it → triggers terminal-win
+            # detection in _any_child_resolved_in_terminal.
+            # child-1: still pending → triggers the resolve_via_terminal sweep
+            # inside _finalize_on_terminal_win.
+            state = (
+                RequestState.RESOLVED_TERMINAL.value
+                if request_id == "child-0"
+                else "pending"
+            )
+            return _make_request(request_id=request_id, state=state)
+
+        children_iter = iter([
+            _make_request(
+                request_id="child-0",
+                tool_name="AskUserQuestion",
+                tool_input={"question": "Q0?", "header": "H0", "options": []},
+            ),
+            _make_request(
+                request_id="child-1",
+                tool_name="AskUserQuestion",
+                tool_input={"question": "Q1?", "header": "H1", "options": []},
+            ),
+        ])
+        msg_ids = iter([801, 802])
+
+        stack = [
+            patch("roles_config.load_catalog", return_value=None),
+            patch("roles_config.load_bindings", return_value=_make_bindings()),
+            patch("permission_request_hook.create_request",
+                  side_effect=children_iter),
+            patch("permission_request_hook.send_question_message",
+                  side_effect=lambda *a, **k: next(msg_ids)),
+            patch("permission_request_hook.wait_for_relay_answer", return_value=None),
+            patch("permission_request_hook.get_request", side_effect=_row),
+            patch("permission_request_hook.update_request_state"),
+            patch("permission_request_hook.resolve_via_terminal",
+                  side_effect=_tracking_resolve),
+            patch("permission_request_hook.finalize_message"),
+            patch("telegram_permission_router.set_telegram_message_id"),
+            patch.object(self.hook, "CHILD_POLL_FLOOR_SECONDS", 0.01),
+            patch.object(self.hook, "WAIT_TICK_SECONDS", 0.05),
+        ]
+        for p in stack:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in stack])
+
+        _call_on_main_with_timeout(
+            lambda: self.hook.handle_ask_user_question(
+                session_id="sess",
+                cwd="/tmp/ws",
+                tool_input={
+                    "questions": [
+                        {"question": "Q0?", "header": "H0", "options": []},
+                        {"question": "Q1?", "header": "H1", "options": []},
+                    ]
+                },
+                workspace_name="ws",
+            ),
+            seconds=10,
+        )
+
+        self.assertGreater(
+            len(resolve_threads), 0,
+            "no resolve_via_terminal calls recorded — test is vacuous",
+        )
+        for t in resolve_threads:
+            self.assertIs(
+                t,
+                threading.main_thread(),
+                f"resolve_via_terminal called on {t.name!r}; expected main thread",
+            )
 
 
 class TestTerminalAnswerPropagation(unittest.TestCase):
@@ -2549,6 +2675,734 @@ class TestTerminalAnswerPropagation(unittest.TestCase):
             fake.edit_message.call_args.kwargs["text"].endswith("\n\n✅ Sidebar")
         )
         fake.cancel_message.assert_called_once_with(903)
+
+
+# ── Helpers shared by the escalation tests (15-05) ───────────────────────────
+
+def _esc_catalog(escalate_after):
+    """Catalog whose ``ux`` role carries an escalation policy."""
+    import roles_config as rc
+    return _make_catalog(roles={
+        "operator": rc.Role(
+            role_id="operator", title="Operator",
+            aliases=("operator", "op"), escalate_after=None,
+        ),
+        "ux": rc.Role(
+            role_id="ux", title="UX/UI designer",
+            aliases=("ux", "design"), escalate_after=escalate_after,
+        ),
+    })
+
+
+class _SendCapture:
+    """Records every ``_send_relay`` call and hands out message ids per group.
+
+    The first group sent gets ids 801, 802, …; the second (the escalation
+    duplicate) 901, 902, …  ``gate`` is set the moment a second group id
+    appears, which is what lets a test hold the role group's answers back until
+    the escalation group is really live.
+
+    ``fail_token`` makes every send to that destination fail, for the
+    failed-escalation case.
+    """
+
+    def __init__(self, fail_token=None):
+        self.calls = []
+        self.gate = threading.Event()
+        self.fail_token = fail_token
+        self._bases = {}
+        self._next_base = 801
+
+    def __call__(self, **kw):
+        gid = kw.get("group_id")
+        if gid not in self._bases:
+            self._bases[gid] = self._next_base
+            self._next_base += 100
+            if len(self._bases) > 1:
+                self.gate.set()
+        kw = dict(kw)
+        kw["message_id"] = None
+        self.calls.append(kw)
+        if self.fail_token is not None and kw.get("token") == self.fail_token:
+            return None
+        sent = sum(
+            1 for c in self.calls
+            if c.get("group_id") == gid and c["message_id"] is not None
+        )
+        kw["message_id"] = self._bases[gid] + sent
+        return kw["message_id"]
+
+    def for_group(self, index):
+        """Calls belonging to the ``index``-th distinct group, in send order."""
+        gids = list(self._bases)
+        gid = gids[index]
+        return [c for c in self.calls if c.get("group_id") == gid]
+
+
+class _GatedRelay:
+    """``wait_for_relay_answer`` double built for the two-group race.
+
+    ``answers[mid]`` is what that message eventually returns (an answer dict or
+    a ``{"_state": …}`` sentinel); a message id with no entry never answers.
+    Ids listed in ``gated`` withhold their result — returning a chunk timeout,
+    so the child thread keeps polling — until ``gate`` is set.
+    """
+
+    def __init__(self, answers, gate=None, gated=()):
+        self.answers = dict(answers)
+        self.gate = gate
+        self.gated = set(gated)
+        self.calls = []
+        self._lock = threading.Lock()
+
+    def __call__(self, message_id, timeout=None, long_poll_chunk=None, token=None):
+        with self._lock:
+            self.calls.append((message_id, token))
+        if message_id in self.gated and (self.gate is None or not self.gate.is_set()):
+            return None
+        return self.answers.get(message_id)
+
+
+class TestHumanizedDuration(unittest.TestCase):
+    """The banner is read by a human: ``parse_duration`` hands back seconds, so
+    the ``15m`` an operator wrote must come back out as ``15m``."""
+
+    def setUp(self):
+        import permission_request_hook as hook
+        self.hook = hook
+
+    def test_minutes_hours_and_mixtures(self):
+        cases = {
+            900.0: "15m",      # the case brd §5.4 and the task both name
+            1800: "30m",
+            3600.0: "1h",
+            5400: "1h30m",
+            45: "45s",
+            90: "1m30s",
+        }
+        for seconds, expected in cases.items():
+            with self.subTest(seconds=seconds):
+                self.assertEqual(self.hook._humanize_duration(seconds), expected)
+
+    def test_sub_second_values_keep_a_fraction(self):
+        self.assertEqual(self.hook._humanize_duration(0.25), "0.25s")
+
+    def test_garbage_never_raises(self):
+        self.assertEqual(self.hook._humanize_duration("nonsense"), "nonsense")
+
+
+class TestEscalation(unittest.TestCase):
+    """15-05: the escalation deadline, the duplicate group, and the race
+    between two live groups."""
+
+    QUESTIONS = [
+        {"question": "Sidebar or top nav?", "header": "@ux Layout",
+         "options": [{"label": "Sidebar"}, {"label": "Top nav"}]},
+        {"question": "Which accent colour?", "header": "@ux Colour",
+         "options": [{"label": "Blue"}, {"label": "Green"}]},
+    ]
+    ANSWER = {"via": "button", "value": "qa0"}
+    VERBATIM = {"Sidebar or top nav?": "Sidebar", "Which accent colour?": "Blue"}
+
+    def setUp(self):
+        import permission_request_hook as hook
+        self.hook = hook
+
+    def _run(
+        self,
+        relay,
+        *,
+        sends=None,
+        escalate_after=0.2,
+        catalog=None,
+        bindings=None,
+        questions=None,
+        rows=None,
+        extra_patches=(),
+        timeout=15,
+        use_main_thread=False,
+    ):
+        """Run ``handle_ask_user_question`` for a @ux-tagged call under ``relay``.
+
+        Nothing here touches the network, a real ``RelayClient`` or a real
+        ``roles.toml``: the catalog, the bindings, the relay send and the
+        long-poll are all doubles.
+
+        ``use_main_thread=True`` drives ``handle_ask_user_question`` directly on
+        the calling thread (which must be ``threading.main_thread()``) using
+        ``_call_on_main_with_timeout`` instead of spawning a worker.  Invariant
+        tests that assert against ``threading.main_thread()`` pass this flag.
+        """
+        questions = self.QUESTIONS if questions is None else questions
+        catalog = _esc_catalog(escalate_after) if catalog is None else catalog
+        bindings = _make_bindings() if bindings is None else bindings
+        sends = _SendCapture() if sends is None else sends
+
+        created = []
+        writes = []
+        finalized = []
+
+        def _create(**kw):
+            row = _make_request(
+                request_id=f"child-{len(created)}",
+                tool_name="AskUserQuestion",
+                tool_input=kw["tool_input"],
+                role=kw.get("role"),
+            )
+            created.append(row)
+            return row
+
+        def _row(request_id):
+            if rows is not None:
+                return rows(request_id)
+            return _make_request(request_id=request_id, state="pending")
+
+        stack = [
+            patch("roles_config.load_catalog", return_value=catalog),
+            patch("roles_config.load_bindings", return_value=bindings),
+            patch("permission_request_hook.create_request", side_effect=_create),
+            patch("permission_request_hook.wait_for_relay_answer", relay),
+            patch("permission_request_hook.get_request", side_effect=_row),
+            patch("permission_request_hook.update_request_state",
+                  side_effect=lambda rid, state, **kw: writes.append((rid, state, kw))),
+            patch("permission_request_hook.resolve_via_terminal"),
+            patch("permission_request_hook.remove_inline_buttons"),
+            patch("permission_request_hook.finalize_message",
+                  side_effect=lambda mid, body, text, *, prefix="", token=None:
+                      finalized.append({"mid": mid, "body": body, "text": text,
+                                        "prefix": prefix, "token": token})),
+            patch("telegram_permission_router._send_relay", side_effect=sends),
+            patch("telegram_permission_router.set_telegram_message_id"),
+            patch.object(self.hook, "CHILD_POLL_FLOOR_SECONDS", 0.05),
+        ]
+        stack.extend(extra_patches)
+        for p in stack:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in stack])
+
+        fn = lambda: self.hook.handle_ask_user_question(
+            session_id="sess", cwd="/tmp/ws",
+            tool_input={"questions": questions},
+            workspace_name="leangeeks",
+        )
+        if use_main_thread:
+            result = _call_on_main_with_timeout(fn, seconds=timeout)
+            box = {"result": result, "thread": threading.main_thread()}
+        else:
+            box = _call_with_timeout(fn, seconds=timeout)
+        box.update(sends=sends, relay=relay, writes=writes,
+                   finalized=finalized, created=created)
+        return box
+
+    def _run_with_captured_seam(self, **kwargs):
+        """Run with the wait loop replaced by a probe.
+
+        Gives a test the exact ``escalate_at`` the hook armed and, on demand,
+        runs the escalation send synchronously — so the send path can be
+        asserted against a realistic ``15m`` policy without waiting 15 minutes.
+        """
+        seam = {}
+        fire = kwargs.pop("fire", False)
+
+        def _probe(groups, group_tokens, deadline, *,
+                   escalate_at=None, send_escalation=None):
+            seam["escalate_at"] = escalate_at
+            seam["deadline"] = deadline
+            seam["groups"] = dict(groups)
+            if escalate_at is not None and fire:
+                seam["added"] = send_escalation()
+            return None
+
+        started = time.time()
+        box = self._run(
+            _GatedRelay({}),
+            extra_patches=[
+                patch.object(self.hook, "_wait_for_group_answers", side_effect=_probe)
+            ],
+            **kwargs,
+        )
+        seam["started"] = started
+        box["seam"] = seam
+        return box
+
+    # ── 1. The escalation deadline ────────────────────────────────────────────
+
+    def test_no_escalate_after_sends_one_group_and_never_escalates(self):
+        """Decision 5: waiting is unbounded by default. With no policy the call
+        behaves exactly as it did under 15-04, however long it waits."""
+        relay = _ScriptedRelay({
+            801: [None] * 6 + [self.ANSWER],
+            802: [None] * 6 + [self.ANSWER],
+        })
+        box = self._run(relay, escalate_after=None)
+
+        self.assertEqual(box["result"]["updatedInput"]["answers"], self.VERBATIM)
+        self.assertEqual(len(box["sends"].calls), 2)
+        self.assertEqual(len({c["group_id"] for c in box["sends"].calls}), 1)
+        self.assertTrue(all(c["token"] == "rly_ux" for c in box["sends"].calls))
+        self.assertTrue(all("⏳" not in c["text"] for c in box["sends"].calls))
+        self.assertEqual(box["finalized"], [])
+
+    def test_escalate_after_arms_a_deadline_at_start_plus_duration(self):
+        box = self._run_with_captured_seam(escalate_after=900.0)
+        seam = box["seam"]
+        self.assertIsNotNone(seam["escalate_at"])
+        self.assertAlmostEqual(seam["escalate_at"] - seam["started"], 900.0, delta=5)
+        # …and it sits inside the TTL window the loop waits in.
+        self.assertLess(seam["escalate_at"], seam["deadline"])
+
+    def test_escalate_after_beyond_the_ttl_window_is_suppressed(self):
+        box = self._run_with_captured_seam(
+            escalate_after=self.hook.REQUEST_TTL + 60
+        )
+        self.assertIsNone(box["seam"]["escalate_at"])
+
+    def test_the_wait_loop_is_driven_by_the_queue_not_by_sleep(self):
+        """A ``time.sleep``-driven tick would let the deadline drift by a whole
+        long-poll chunk; the loop must wake on the queue instead."""
+        src = inspect.getsource(self.hook._wait_for_group_answers)
+        self.assertIn("results.get(timeout=", src)
+        self.assertNotIn("time.sleep", src)
+
+    # ── 2. Sending the escalation group ───────────────────────────────────────
+
+    def test_escalation_group_is_a_full_duplicate_to_the_default_role(self):
+        """Exactly ``len(questions)`` messages, a new group id, the right
+        group_total, the default role's token and title, and the ⏳ banner on
+        **every** message — whichever one the operator opens must explain
+        itself."""
+        box = self._run_with_captured_seam(escalate_after=900.0, fire=True)
+        sends = box["sends"]
+
+        role_calls = sends.for_group(0)
+        esc_calls = sends.for_group(1)
+        self.assertEqual(len(role_calls), 2)
+        self.assertEqual(len(esc_calls), len(self.QUESTIONS))
+        self.assertNotEqual(role_calls[0]["group_id"], esc_calls[0]["group_id"])
+
+        banner = ("⏳ @ux (UX/UI designer) hasn't answered in 15m — "
+                  "you can decide instead.")
+        for call in esc_calls:
+            self.assertEqual(call["token"], "rly_op")
+            self.assertEqual(call["group_total"], len(self.QUESTIONS))
+            self.assertIn(banner, call["text"])
+            # role_title is the DEFAULT role's — this copy is addressed to the
+            # operator, not to the designer.
+            self.assertIn("for: Operator", call["text"])
+        # …and the role group never carried a banner.
+        self.assertTrue(all("⏳" not in c["text"] for c in role_calls))
+
+        # Same cleaned headers, options and questions as the original.
+        self.assertEqual(
+            [c["text"].count("Sidebar") for c in role_calls],
+            [c["text"].count("Sidebar") for c in esc_calls],
+        )
+        # Fresh request ids → distinct req:{request_id}:send idempotency keys.
+        self.assertFalse(
+            {c["request_id"] for c in role_calls} & {c["request_id"] for c in esc_calls}
+        )
+        # New rows carry the default role id.
+        self.assertEqual([r.role for r in box["created"][2:]], ["operator", "operator"])
+
+    def test_escalation_banner_uses_the_alias_the_agent_actually_wrote(self):
+        """``@design`` is an alias of the same role; the banner must quote what
+        the agent typed, paired with the role's title."""
+        questions = [dict(q, header=q["header"].replace("@ux", "@design"))
+                     for q in self.QUESTIONS]
+        box = self._run_with_captured_seam(
+            escalate_after=900.0, fire=True, questions=questions
+        )
+        for call in box["sends"].for_group(1):
+            self.assertIn(
+                "⏳ @design (UX/UI designer) hasn't answered in 15m", call["text"]
+            )
+
+    def test_unreachable_default_role_cannot_be_escalated_to(self):
+        """No binding for the default role → the send is skipped, the role group
+        stays live, nothing is retried."""
+        box = self._run_with_captured_seam(
+            escalate_after=900.0, fire=True,
+            bindings=_make_bindings(default_token=None, roles={"ux": "rly_ux"}),
+        )
+        self.assertIsNone(box["seam"]["added"])
+        self.assertEqual(len(box["sends"].calls), 2)  # the role group only
+
+    # ── 3. Deciding between two groups ────────────────────────────────────────
+
+    def test_role_group_wins_answers_verbatim_escalation_finalized(self):
+        sends = _SendCapture()
+        relay = _GatedRelay(
+            {801: self.ANSWER, 802: self.ANSWER},
+            gate=sends.gate, gated=(801, 802),
+        )
+        box = self._run(relay, sends=sends)
+
+        # Both groups really were live before the race was decided.
+        self.assertEqual(len(box["sends"].calls), 4)
+        # brd §5.6: the tagged role answered, so nothing is attributed.
+        self.assertEqual(box["result"]["updatedInput"]["answers"], self.VERBATIM)
+
+        # Only the loser needs client-side cleanup; the winner finalized
+        # itself server-side.
+        patched = {c["mid"]: c for c in box["finalized"]}
+        self.assertEqual(set(patched), {901, 902})
+        self.assertEqual(patched[901]["text"], "Sidebar")   # paired by index
+        self.assertEqual(patched[902]["text"], "Blue")
+        for call in patched.values():
+            self.assertEqual(call["prefix"], "✅ ")
+            self.assertEqual(call["token"], "rly_op")
+            self.assertIn("Question", call["body"])
+
+        # Every row of BOTH groups is terminal, so posttool_hook's pending
+        # sweep skips them all.
+        replied = {rid for rid, state, _kw in box["writes"]
+                   if state is RequestState.REPLY}
+        self.assertEqual(replied, {"child-0", "child-1", "child-2", "child-3"})
+
+    def test_escalation_group_wins_answers_attributed_role_finalized(self):
+        sends = _SendCapture()
+        relay = _GatedRelay({901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(relay, sends=sends)
+
+        # brd §5.6: the operator decided, and the agent is told so.
+        self.assertEqual(
+            box["result"]["updatedInput"]["answers"],
+            {"Sidebar or top nav?": "Sidebar (answered by Operator)",
+             "Which accent colour?": "Blue (answered by Operator)"},
+        )
+
+        patched = {c["mid"]: c for c in box["finalized"]}
+        self.assertEqual(set(patched), {801, 802})
+        # The chat gets the UNANNOTATED answer — the suffix is for the agent.
+        self.assertEqual(patched[801]["text"], "Sidebar")
+        self.assertEqual(patched[802]["text"], "Blue")
+        for call in patched.values():
+            self.assertEqual(call["prefix"], "✅ ")
+            self.assertEqual(call["token"], "rly_ux")
+
+        replied = {rid for rid, state, _kw in box["writes"]
+                   if state is RequestState.REPLY}
+        self.assertEqual(replied, {"child-0", "child-1", "child-2", "child-3"})
+
+    def test_a_partially_answered_losing_group_is_still_fully_finalized(self):
+        """One of the designer's two questions was answered before the operator
+        took over: both of their messages must still be patched and cancelled."""
+        sends = _SendCapture()
+        relay = _GatedRelay({801: self.ANSWER, 901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(relay, sends=sends)
+
+        self.assertEqual(
+            box["result"]["updatedInput"]["answers"],
+            {"Sidebar or top nav?": "Sidebar (answered by Operator)",
+             "Which accent colour?": "Blue (answered by Operator)"},
+        )
+        patched = {c["mid"] for c in box["finalized"]}
+        self.assertEqual(patched, {801, 802})
+        replied = {rid for rid, state, _kw in box["writes"]
+                   if state is RequestState.REPLY}
+        self.assertEqual(replied, {"child-0", "child-1", "child-2", "child-3"})
+
+    def test_terminal_resolution_cancels_both_groups(self):
+        """The terminal beats every group (brd §5.5) — including one sent
+        seconds earlier by the escalation."""
+        sends = _SendCapture()
+
+        def _rows(request_id):
+            # Answered at the keyboard only once the escalation group is live.
+            state = (RequestState.RESOLVED_TERMINAL.value
+                     if sends.gate.is_set() else "pending")
+            return _make_request(request_id=request_id, state=state)
+
+        box = self._run(_GatedRelay({}), sends=sends, rows=_rows)
+
+        self.assertIsNone(box["result"])          # native UI acted
+        self.assertEqual(len(box["sends"].calls), 4)
+        by_mid = {c["mid"]: c for c in box["finalized"]}
+        self.assertEqual(set(by_mid), {801, 802, 901, 902})
+        self.assertEqual(by_mid[801]["token"], "rly_ux")
+        self.assertEqual(by_mid[901]["token"], "rly_op")
+
+    def test_one_group_expiring_does_not_end_the_call(self):
+        """15-04 read "a dead child kills the call"; with two groups a dead
+        group is only that group losing."""
+        sends = _SendCapture()
+        expired = {"_state": "expired"}
+        relay = _GatedRelay(
+            {801: expired, 802: expired, 901: self.ANSWER, 902: self.ANSWER},
+            gate=sends.gate, gated=(801, 802),
+        )
+        box = self._run(relay, sends=sends)
+
+        self.assertEqual(
+            box["result"]["updatedInput"]["answers"],
+            {"Sidebar or top nav?": "Sidebar (answered by Operator)",
+             "Which accent colour?": "Blue (answered by Operator)"},
+        )
+
+    def test_both_groups_expiring_returns_none_and_leaves_the_native_ui(self):
+        sends = _SendCapture()
+        expired = {"_state": "expired"}
+        relay = _GatedRelay(
+            {801: expired, 802: expired, 901: expired, 902: expired},
+            gate=sends.gate, gated=(801, 802),
+        )
+        box = self._run(relay, sends=sends)
+
+        self.assertIsNone(box["result"])
+        self.assertEqual(len(box["sends"].calls), 4)   # escalation did fire
+        self.assertEqual(box["finalized"], [])         # nothing to patch
+
+    def test_a_failed_escalation_send_leaves_the_role_group_live(self):
+        """brd §5.1: log it, keep waiting on the role group, never retry."""
+        sends = _SendCapture(fail_token="rly_op")
+        relay = _GatedRelay(
+            {801: self.ANSWER, 802: self.ANSWER},
+            gate=sends.gate, gated=(801, 802),
+        )
+        box = self._run(relay, sends=sends)
+
+        # The call still resolves through the role group, unattributed.
+        self.assertEqual(box["result"]["updatedInput"]["answers"], self.VERBATIM)
+        # Exactly one escalation attempt, no retry.
+        self.assertEqual(
+            len([c for c in box["sends"].calls if c["token"] == "rly_op"]), 1
+        )
+        # No loser to clean up.
+        self.assertEqual(box["finalized"], [])
+
+    # ── Invariants ────────────────────────────────────────────────────────────
+
+    def test_no_state_store_writes_happen_off_the_hook_thread_two_group(self):
+        """Off-main-thread write invariant with TWO groups live (MEDIUM pin).
+
+        Child threads only push results onto the queue; the hook's own loop
+        thread is the only place that drains it and calls update_request_state.
+        This test would fail immediately if a write were moved into
+        _child_wait_loop or any other off-loop thread.
+        """
+        thread_writes = []
+
+        def _record_write(rid, state, **kw):
+            thread_writes.append(threading.current_thread())
+
+        sends = _SendCapture()
+        # Escalation group wins so both groups are fully live during the race.
+        relay = _GatedRelay({901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(
+            relay,
+            sends=sends,
+            extra_patches=[
+                patch(
+                    "permission_request_hook.update_request_state",
+                    side_effect=_record_write,
+                ),
+            ],
+        )
+
+        hook_thread = box["thread"]  # the thread that owns the hook's main loop
+        self.assertGreater(
+            len(thread_writes), 0, "no writes recorded — test is vacuous"
+        )
+        for t in thread_writes:
+            self.assertIs(
+                t, hook_thread,
+                f"state-store write on {t.name!r}; expected {hook_thread.name!r}",
+            )
+
+    def test_create_request_does_not_happen_off_the_main_thread(self):
+        """``_send_escalation_group`` calls ``create_request`` for each question
+        in the duplicate group; those writes must not migrate to a child
+        polling thread.
+
+        Asserts against ``threading.main_thread()`` so the pin holds even if
+        the suite is later driven from a non-main thread.
+        """
+        self.assertIs(
+            threading.current_thread(), threading.main_thread(),
+            "This invariant test must be driven from the main thread",
+        )
+
+        create_threads = []
+        created_rows = []
+
+        def _tracking_create(**kw):
+            create_threads.append(threading.current_thread())
+            row = _make_request(
+                request_id=f"child-{len(created_rows)}",
+                tool_name="AskUserQuestion",
+                tool_input=kw["tool_input"],
+                role=kw.get("role"),
+            )
+            created_rows.append(row)
+            return row
+
+        sends = _SendCapture()
+        # Escalation group (901, 902) answers immediately; role group never does.
+        relay = _GatedRelay({901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(
+            relay,
+            sends=sends,
+            escalate_after=0.05,
+            use_main_thread=True,
+            extra_patches=[
+                patch(
+                    "permission_request_hook.create_request",
+                    side_effect=_tracking_create,
+                ),
+            ],
+        )
+
+        # Escalation fires → _try_send_group → create_request for each question.
+        # Role-group creates (before the wait phase) are also on the main thread.
+        self.assertGreater(
+            len(create_threads), 0,
+            "no create_request calls recorded — test is vacuous",
+        )
+        for t in create_threads:
+            self.assertIs(
+                t,
+                threading.main_thread(),
+                f"create_request called on {t.name!r}; expected main thread",
+            )
+
+    def test_set_telegram_message_id_does_not_happen_off_the_main_thread(self):
+        """When the escalation group is sent, ``send_question_message`` calls
+        ``set_telegram_message_id`` on each new row; that write must not migrate
+        to a child polling thread.
+
+        Asserts against ``threading.main_thread()`` so the pin holds even if
+        the suite is later driven from a non-main thread.
+        """
+        self.assertIs(
+            threading.current_thread(), threading.main_thread(),
+            "This invariant test must be driven from the main thread",
+        )
+
+        msg_id_threads = []
+
+        def _tracking_set_msg_id(request_id, message_id):
+            msg_id_threads.append(threading.current_thread())
+
+        sends = _SendCapture()
+        # Escalation group (901, 902) answers immediately; role group never does.
+        relay = _GatedRelay({901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(
+            relay,
+            sends=sends,
+            escalate_after=0.05,
+            use_main_thread=True,
+            extra_patches=[
+                patch(
+                    "telegram_permission_router.set_telegram_message_id",
+                    side_effect=_tracking_set_msg_id,
+                ),
+            ],
+        )
+
+        # All sends (initial role group + escalation group) call set_telegram_message_id.
+        self.assertGreater(
+            len(msg_id_threads), 0,
+            "no set_telegram_message_id calls recorded — test is vacuous",
+        )
+        for t in msg_id_threads:
+            self.assertIs(
+                t,
+                threading.main_thread(),
+                f"set_telegram_message_id called on {t.name!r}; expected main thread",
+            )
+
+    def test_tick_shrinks_toward_the_escalation_deadline(self):
+        """The queue-drain timeout shrinks toward a pending escalation deadline
+        so the send is not delayed by up to WAIT_TICK_SECONDS (task §1).
+
+        With WAIT_TICK_SECONDS=2.0 and escalate_after=0.15, a non-shrinking
+        loop would block for 2 s before firing — this asserts at least one
+        tick is smaller than the full WAIT_TICK_SECONDS cap.
+        """
+        import queue as _queue
+
+        ticks = []
+        orig_get = _queue.Queue.get
+
+        def _recording_get(self_q, block=True, timeout=None):
+            if timeout is not None:
+                ticks.append(timeout)
+            return orig_get(self_q, block=block, timeout=timeout)
+
+        sends = _SendCapture()
+        relay = _GatedRelay({901: self.ANSWER, 902: self.ANSWER})
+        box = self._run(
+            relay,
+            sends=sends,
+            escalate_after=0.15,
+            extra_patches=[patch.object(_queue.Queue, "get", _recording_get)],
+        )
+
+        self.assertIsNotNone(box["result"])
+        # At least one drain tick must have been shrunk below WAIT_TICK_SECONDS.
+        self.assertTrue(
+            any(t < self.hook.WAIT_TICK_SECONDS for t in ticks),
+            f"no shrunk tick observed; all ticks={ticks}",
+        )
+        # The cap must never be exceeded.
+        for t in ticks:
+            self.assertLessEqual(t, self.hook.WAIT_TICK_SECONDS)
+
+    # ── Escalation does not fire ──────────────────────────────────────────────
+
+    def test_no_escalation_when_the_role_is_the_default(self):
+        box = self._run_with_captured_seam(
+            escalate_after=900.0,
+            questions=[dict(q, header="Layout") for q in self.QUESTIONS[:1]],
+        )
+        self.assertIsNone(box["seam"]["escalate_at"])
+
+    def test_no_escalation_when_the_binding_resolves_to_the_default_token(self):
+        """``ux = "operator"`` in the machine config: same human, nobody to
+        escalate to."""
+        box = self._run_with_captured_seam(
+            escalate_after=900.0,
+            bindings=_make_bindings(roles={"ux": "operator"}),
+        )
+        self.assertIsNone(box["seam"]["escalate_at"])
+
+    def test_no_escalation_when_the_role_fell_back_to_the_default(self):
+        """Unreachable ≠ unanswered (decision 6): the question already went to
+        the operator, so there is nowhere to escalate."""
+        # No ``ux`` entry anywhere → resolve_destination reroutes to the
+        # operator and reports no escalation policy.
+        box = self._run_with_captured_seam(
+            escalate_after=900.0,
+            bindings=_make_bindings(roles={"arch": "rly_arch"}),
+        )
+        self.assertIsNone(box["seam"]["escalate_at"])
+        self.assertTrue(
+            all(c["token"] == "rly_op" for c in box["sends"].calls)
+        )
+
+    def test_no_escalation_after_a_send_failure_rerouted_to_the_default(self):
+        """The retry already targets the default destination."""
+        seam = {}
+
+        def _probe(groups, group_tokens, deadline, *,
+                   escalate_at=None, send_escalation=None):
+            seam["escalate_at"] = escalate_at
+            return None
+
+        sends = _SendCapture(fail_token="rly_ux")
+        self._run(
+            _GatedRelay({}),
+            sends=sends,
+            escalate_after=900.0,
+            extra_patches=[
+                patch.object(self.hook, "_wait_for_group_answers", side_effect=_probe)
+            ],
+        )
+        # The role send failed and the retry went to the default token…
+        self.assertEqual(sends.calls[0]["token"], "rly_ux")
+        self.assertTrue(any(c["token"] == "rly_op" for c in sends.calls))
+        # …so escalation is suppressed.
+        self.assertIsNone(seam["escalate_at"])
 
 
 if __name__ == "__main__":
