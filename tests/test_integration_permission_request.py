@@ -84,10 +84,33 @@ class TestBuildOutputDecision(unittest.TestCase):
             _make_request(),
         )
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
-        self.assertIn(
-            "Use a different approach",
-            out["hookSpecificOutput"]["decision"]["reason"],
+        # reason must be at the root of the output dict, not inside decision
+        self.assertIn("Use a different approach", out["reason"])
+        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+
+    def test_reply_emitted_json_shape(self):
+        """Emitted JSON: reason at root, behavior inside decision, round-trips cleanly.
+
+        This test catches the pre-fix bug where reason was nested inside decision
+        (hookSpecificOutput.decision.reason) instead of at the root level.
+        The old test_reply only checked that some text was present; it would still
+        pass (via KeyError → test failure) once the fix was in place, but it could
+        not distinguish wrong-location from right-location when the bug existed.
+        """
+        out = build_output_decision(
+            {"action": "reply", "reply_text": "Please clarify your intent"},
+            _make_request(),
         )
+        # Structure: reason sibling of hookSpecificOutput, not inside decision.
+        self.assertIn("reason", out)
+        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        # Exact text
+        self.assertEqual(out["reason"], "User reply: Please clarify your intent")
+        # Round-trip through JSON (this is what stdout → harness actually does)
+        roundtripped = json.loads(json.dumps(out))
+        self.assertEqual(roundtripped["reason"], "User reply: Please clarify your intent")
+        self.assertNotIn("reason", roundtripped["hookSpecificOutput"]["decision"])
 
     def test_no_decision_returns_none(self):
         self.assertIsNone(build_output_decision(None, _make_request()))
@@ -621,14 +644,19 @@ class TestAutoDenyAtTtl(unittest.TestCase):
         dec = out["hookSpecificOutput"]["decision"]
         self.assertEqual(dec["behavior"], "deny")
         self.assertNotIn("interrupt", dec)  # agent continues so it can retry
-        reason = dec["reason"].lower()
+        # reason must be at the root of the output dict, not inside decision
+        self.assertNotIn("reason", dec)
+        reason = out["reason"].lower()
         self.assertIn("could not be delivered", reason)
         self.assertIn("retried", reason)
 
     def test_delivered_but_unanswered_note(self):
         out = _auto_deny_output(_make_request(), delivery_failed=False)
-        reason = out["hookSpecificOutput"]["decision"]["reason"].lower()
-        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        dec = out["hookSpecificOutput"]["decision"]
+        self.assertEqual(dec["behavior"], "deny")
+        # reason must be at the root of the output dict, not inside decision
+        self.assertNotIn("reason", dec)
+        reason = out["reason"].lower()
         self.assertIn("no response", reason)
         self.assertNotIn("could not be delivered", reason)
 
@@ -639,7 +667,9 @@ class TestAutoDenyAtTtl(unittest.TestCase):
             return_value="not in allowlist: cowsay",
         ):
             out = _auto_deny_output(_make_request(), delivery_failed=True)
-        self.assertIn("cowsay", out["hookSpecificOutput"]["decision"]["reason"])
+        # reason must be at the root, not inside decision
+        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        self.assertIn("cowsay", out["reason"])
 
     def test_record_auto_deny_transitions_pending_to_deny(self):
         req = create_request(
@@ -1786,7 +1816,41 @@ class TestAliasRouting(unittest.TestCase):
         self.assertIsNotNone(out)
         dec = out["hookSpecificOutput"]["decision"]
         self.assertEqual(dec["behavior"], "deny")
-        self.assertIn("2 different human roles", dec["reason"])
+        # reason must be at the root of the output dict, not inside decision
+        self.assertNotIn("reason", dec)
+        self.assertIn("2 different human roles", out["reason"])
+
+    def test_deny_mixed_roles_emitted_json_shape(self):
+        """Emitted JSON: reason at root, behavior inside decision, round-trips cleanly.
+
+        This is the test the existing suite was missing. The pre-fix hook put
+        reason inside hookSpecificOutput.decision, so the harness printed only
+        'Permission denied by hook' to the agent instead of the actual explanation.
+        This test directly asserts the wire shape — the schema the harness parses.
+        """
+        from permission_request_hook import build_output_decision
+        _full_reason = (
+            "This AskUserQuestion call addressed 2 different human roles "
+            "(@ux -> UX/UI designer, @op -> Operator). "
+            "Each call must target exactly one role, because a question group cannot "
+            "span two Telegram chats. Split this into one AskUserQuestion call per role."
+        )
+        out = build_output_decision(
+            {"action": "deny_mixed_roles", "reason": _full_reason},
+            _make_request(),
+        )
+        self.assertIsNotNone(out)
+        # reason must be at root, not nested inside decision
+        self.assertIn("reason", out)
+        self.assertNotIn("reason", out["hookSpecificOutput"]["decision"])
+        # behavior is correct
+        self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        # exact full reason string (dynamic part + static tail)
+        self.assertEqual(out["reason"], _full_reason)
+        # round-trip through JSON (exactly what stdout → harness does)
+        roundtripped = json.loads(json.dumps(out))
+        self.assertEqual(roundtripped["reason"], _full_reason)
+        self.assertNotIn("reason", roundtripped["hookSpecificOutput"]["decision"])
 
     def test_two_unknown_aliases_same_role_sends_normally(self):
         """Two unknown aliases → both fall back to default → one role → send OK."""

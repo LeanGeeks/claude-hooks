@@ -273,9 +273,9 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
                 'hookEventName': 'PermissionRequest',
                 'decision': {
                     'behavior': 'deny',
-                    'reason': f"User reply: {reply_text}"
                 }
-            }
+            },
+            'reason': f"User reply: {reply_text}",
         }
 
     elif action == 'answer':
@@ -303,9 +303,9 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
                 'hookEventName': 'PermissionRequest',
                 'decision': {
                     'behavior': 'deny',
-                    'reason': reason,
                 }
-            }
+            },
+            'reason': reason,
         }
 
     # Unknown action - fall back to terminal
@@ -457,9 +457,9 @@ def _auto_deny_output(
             'hookEventName': 'PermissionRequest',
             'decision': {
                 'behavior': 'deny',
-                'reason': reason,
             }
-        }
+        },
+        'reason': reason,
     }
 
 
