@@ -11,7 +11,7 @@ import pytest_asyncio
 
 from relay_server.app import create_app
 from relay_server.db import connect, init_schema
-from relay_server.telegram_backend import FakeTelegramBackend
+from relay_server.telegram_backend import FakeTelegramBackend, TelegramApiError
 from relay_server.tokens import generate_token, hash_token
 
 from tests.conftest import (  # type: ignore[attr-defined]
@@ -91,6 +91,124 @@ async def test_cancel_uses_edit_reply_markup(
     assert len(erm) == 1
     assert erm[0].kwargs["keyboard"] is None
     assert not any(c.method == "edit_message" for c in backend.calls)
+
+
+# ---- Idempotent finalize (15-07) ------------------------------------------
+#
+# The client finalizes a message by PATCHing the body and then cancelling.
+# ``editMessageText`` with no ``reply_markup`` already drops the keyboard, so
+# the cancel that follows asks Telegram to remove a keyboard that is no longer
+# there — answered with 400 "message is not modified". That is the *happy* path
+# of every finalize, and it used to surface as an HTTP 500 the caller logged and
+# ignored (three of them in 15-07's live run, all on runs that otherwise passed).
+
+
+def _not_modified() -> TelegramApiError:
+    return TelegramApiError(
+        400,
+        "Bad Request: message is not modified: specified new message content"
+        " and reply markup are exactly the same as a current content and reply"
+        " markup of the message",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_idempotent_when_the_keyboard_is_already_gone(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """Cancel's contract is *this message has no keyboard and is closed*, not
+    *change something*. Already being in that state is success."""
+    token = seeded["token"]
+    msg_id = await _create(app_client, token)
+
+    async def _raise(**_kwargs):
+        raise _not_modified()
+
+    backend.edit_reply_markup = _raise  # type: ignore[method-assign]
+
+    r = await app_client.post(
+        f"/v1/messages/{msg_id}/cancel",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200, r.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_reports_a_real_telegram_failure_as_502(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """Only "not modified" is benign. Anything else is an upstream fault and
+    must say so with a gateway status, not an anonymous 500."""
+    token = seeded["token"]
+    msg_id = await _create(app_client, token)
+
+    async def _raise(**_kwargs):
+        raise TelegramApiError(400, "Bad Request: message to edit not found")
+
+    backend.edit_reply_markup = _raise  # type: ignore[method-assign]
+
+    r = await app_client.post(
+        f"/v1/messages/{msg_id}/cancel",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 502
+    assert r.json()["detail"] == "telegram_error"
+
+
+@pytest.mark.asyncio
+async def test_cancel_still_closes_the_message_when_telegram_balks(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """The state flip precedes the Bot API call, so a message whose keyboard was
+    already stripped is still closed to further answers — the long-poller that
+    is parked on it must be woken rather than left to time out."""
+    token = seeded["token"]
+    msg_id = await _create(app_client, token)
+
+    async def _raise(**_kwargs):
+        raise _not_modified()
+
+    backend.edit_reply_markup = _raise  # type: ignore[method-assign]
+
+    await app_client.post(
+        f"/v1/messages/{msg_id}/cancel",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    r = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"wait": 5},
+    )
+    assert r.status_code == 200
+    assert r.json()["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_patch_is_idempotent_when_the_body_already_reads_that_way(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    token = seeded["token"]
+    msg_id = await _create(app_client, token)
+
+    async def _raise(**_kwargs):
+        raise _not_modified()
+
+    backend.edit_message = _raise  # type: ignore[method-assign]
+
+    r = await app_client.patch(
+        f"/v1/messages/{msg_id}",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"text": "same"},
+    )
+    assert r.status_code == 200, r.text
 
 
 # ---- Cross-installation isolation -----------------------------------------

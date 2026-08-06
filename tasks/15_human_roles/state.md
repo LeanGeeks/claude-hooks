@@ -22,10 +22,10 @@ Each task file is written for a fresh-context agent and carries its own
 | 15-01 | [Role config loader](./15-01-role-config-loader.md) | done | — | Pure `roles_config.py`: both TOML files, alias table, token/reference chase, escalation precedence. Also adds the one `REQUIRED_HOOKS` installer line — see Ordering |
 | 15-02 | [Multi-destination transport](./15-02-multi-destination-transport_opus.md) | done | 15-01 | Token-keyed client registry, `role` on the state-store row, role-aware PostToolUse revoke |
 | 15-03 | [Alias routing](./15-03-alias-routing.md) | done | 15-02 | Header parse/strip, destination resolution, mixed-role deny, send-failure retry, rendering |
-| 15-04 | [Wait phase](./15-04-wait-phase_opus.md) | done | 15-03 | Sequential loop → thread-per-message; terminal answers patched into the role's chat |
+| 15-04 | [Wait phase](./15-04-wait-phase_opus.md) | done | 15-03 | Sequential loop → thread-per-message; terminal answers patched into the role's chat. **Amended 2026-08-06** — G3 fix, see *Post-mortem* below |
 | 15-05 | [Escalation](./15-05-escalation_opus.md) | done | 15-04 | Deadline, duplicate group to the default, first-group-wins |
 | 15-06 | [Installer, diagnostics, docs](./15-06-installer-diagnostics-docs.md) | done | 15-05 | `shell/claude-roles`, example TOML, prompt snippet, installer, `architecture.md` |
-| 15-07 | [Live verification](./15-07-live-verification_human.md) | blocked | 15-06 | **human** — needs a real relay and a second bound chat; no agent can provision either. Awaiting human evidence; all engineering tasks are complete and committed |
+| 15-07 | [Live verification](./15-07-live-verification_human.md) | blocked | 15-06 | **human** — run 2026-08-06: G1, G2, G4 pass; **G3 fails** (terminal answers never reach the role's chat). Diagnosed and fixed same day under **15-04** + the relay server; **awaiting a full gate re-run**. See *Live run — 2026-08-06* and *Post-mortem* below |
 
 ## Implementer model
 
@@ -122,3 +122,205 @@ This started as an assumption that the prose string the *model* sees
 against it would have silently mangled roughly half of real calls — the
 regex matched 2 of 4 answers on a real multi-question call. Worth remembering
 the next time a hook payload shape looks obvious.
+
+## Live run — 2026-08-06
+
+Workspace `ai-playground-2`; operator = installation `anton-t480s` (id=2, the
+default token), ux = installation `anton-roles-test` (id=5), role `ux` carrying
+`escalate_after = "1m"`. Pre-flight green: `claude-roles --check` reported both
+roles `bound`, and no deployed hook differed from the repo (only
+`test_task03.py`, which is not deployed). Driven live by Anton at the keyboard
+with both chats open; full turn-by-turn log in
+`ai-playground-2/15-07-live-run-notes.md`.
+
+**G1 pass · G2 pass · G3 FAIL · G4 pass.**
+
+| Gate | Result | Evidence |
+|---|---|---|
+| G1a — tagged | **pass** | Landed in the **ux chat only**, operator empty. Body carried italic `for: UX/UI designer`; header rendered `Layout` with `@ux ` stripped; terminal chip kept raw `@ux Layout`. Agent received `…="Top nav"`, no attribution suffix |
+| G1b — untagged | **pass** | Landed in the **operator chat only**, ux empty. Header `Deploy target`. A `for: Operator` line **is** rendered on untagged questions. Agent received `…="Staging"`, no suffix |
+| G2a — escalation, operator answers | **pass** | Fired 14:52:40, duplicate in operator chat at ~14:53:40, first line exactly `⏳ @ux (UX/UI designer) hasn't answered in 1m — you can decide instead.` followed by `for: Operator`. ux chat's keyboard still live at that moment. After answering the duplicate, ux message patched to `✅ Boxed in card`, keyboard gone. Agent received **`Boxed in card (answered by Operator)`** |
+| G2b — answered in time | **pass** | Fired 15:16:13, answered in ux chat 15:16:46 (33s). Watched operator chat to ~15:18:30 — **no duplicate ever appeared**, nothing at all. Agent received `…="Filled red"`, no suffix |
+| G2c — duplicate, ux answers anyway | **pass** | Fired 15:21:41, duplicate with ⏳ banner and live keyboard in operator chat ~15:22:41. Answered in ux chat → operator duplicate patched to `✅ Inline per field`, keyboard gone. Agent received `…="Inline per field"`, no suffix |
+| G3a — terminal win, option picked | **FAIL** | Run twice (15:26:01, 15:36:45), identical both times. Answered `Amber and charcoal` in the terminal, Telegram untouched. **ux chat body left byte-identical and unpatched, no `✅` line at all**; keyboard stripped. Captured `PostToolUse` payload shows `answers: {"Which accent palette should the dashboard use?": "Amber and charcoal"}` — the input is well-formed |
+| G3b — terminal win, notes only | **FAIL** (notes sub-case **not exercisable**) | Re-run 15:49:58, two tagged questions, answered entirely in the terminal. **Neither message patched**, and `@ux Typography`'s **keyboard was left live** while `@ux Density`'s was stripped. Payload again well-formed (`annotations: {}`). The notes-without-selection case could not be produced by the picker UI — see below |
+| G4a — permission prompt | **pass** | `chmod` was auto-approved without prompting; `frobnicate-15-07 --check` raised a real request. Arrived in the **operator chat only**, ux empty, **no `for:` role line** (correct per §6). Tapped **Allow** → message finalized, command reached the shell (exit 127, `command not found`) |
+| G4b — idle notification | **pass** | Arrived 16:29 in the **operator chat only**, ux empty: `ai-playground-2` / `💤 Idle — waiting for input` plus the quoted last message. Unchanged from pre-epic behaviour |
+
+Two optional extras were also run, both **pass**: an unknown alias (`@uxx`)
+reached the operator chat carrying `⚠️ Unknown role @uxx — routed to Operator.`
+with the bad tag stripped from the rendered header; and a mixed-role call
+(`@ux` + `@op`) was denied with *"addressed 2 different human roles (@ux ->
+UX/UI designer, @op -> Operator) … Split this into one AskUserQuestion call per
+role"*, sending **nothing to either chat** and flashing the terminal picker for
+about a second before it withdrew.
+
+### The failure — G3, terminal win (owning task: 15-04)
+
+**Expected** (brd §5.5): when the answer arrives at the keyboard, every role
+message is patched with the terminal's answers and then has its keyboard
+stripped, degrading at worst to `✅ Answered in the terminal`.
+
+**Observed, in the ux chat, on all three terminal-answered runs:** the answer is
+never patched in. The body stays byte-identical to what was sent — no `✅` line,
+not the real answer, not the generic fallback, not `(notes only)`. The keyboard
+is stripped inconsistently: stripped on both single-question runs and on the
+second message of the two-question run, but **left live on the first message**
+of the two-question run, leaving an orphaned prompt inviting an answer to an
+already-finished question.
+
+Nothing was written to `~/.claude/permission_telegram_errors.log` during any
+terminal-win run — the failure is entirely silent.
+
+The discriminator is **terminal vs Telegram**, not question count. Every
+Telegram-answered run in the session patched correctly (G1a, G1b, G2a, G2b,
+G2c, the unknown-alias extra, and one mis-executed G3b attempt); no
+terminal-answered run did. An early reading that blamed single-question calls
+was retracted once that mis-executed run was identified — it had been answered
+in Telegram, which its `2.` button-index prefix and `✍️` text-reply marker
+gave away.
+
+Per the task file, the payload was captured rather than guessed at: a
+`PostToolUse` stdin-dumping hook was added to
+`ai-playground-2/.claude/settings.local.json` and the case re-fired. The
+captured `tool_response` is exactly the shape `fixtures/posttool_askuserquestion.json`
+documents, with a correctly keyed `answers` map — so **15-04's input is not the
+defect**; the answers are simply never applied to the role chat's messages.
+Dumps are in `ai-playground-2/15-07-posttool-dump.log`.
+
+**The `(notes only)` sub-case is real — but not reproducible on demand.**
+*(Corrected 2026-08-06 after the diagnosis below.)* The live run could not
+produce it through either known picker variant, and this section previously
+concluded it might not occur at all. It does:
+`fixtures/posttool_askuserquestion.json` case 3 is a **live capture from
+2026-08-02** carrying `answers[q] == "(notes only)"` with the real content in
+`annotations[q]["notes"]` — two of the four questions in that call, in fact.
+Which picker variant produces it is still unknown, so **G3b's notes sub-case is
+retired from the manual gate set** and covered by unit test instead
+(`test_notes_only_answer_reaches_the_chat_as_the_note`). Re-run G3b for the
+option-selected and free-text shapes only.
+
+### New lines in `~/.claude/permission_telegram_errors.log`
+
+Baseline 214443 bytes → 214749 bytes. Three lines, all identical in kind:
+
+```
+[2026-08-06T10:42:47Z] Relay cancel_message failed: relay HTTP 500: Internal Server Error
+[2026-08-06T10:55:02Z] Relay cancel_message failed: relay HTTP 500: Internal Server Error
+[2026-08-06T11:23:04Z] Relay cancel_message failed: relay HTTP 500: Internal Server Error
+```
+
+Local time is UTC+4, so these map to **G1a (14:42), G2a (14:55) and G2c
+(15:23)** — the three runs where an escalation duplicate existed and a losing
+group had to be finalized. All three of those runs **passed** every visible
+assertion: both chats were patched and both keyboards came off. So a
+`cancel_message` is returning HTTP 500 on the loser-finalization path without
+any user-visible consequence. Not a gate failure and not diagnosed here, but it
+is a real server-side error being swallowed, and it is worth a look under
+**15-05 / 15-02** before this epic closes.
+
+*(Diagnosed and fixed 2026-08-06 — see Fix B below. The attribution above is
+right: all three are `_finalize_losing_groups`.)*
+
+## Post-mortem and fixes — 2026-08-06
+
+Diagnosed from `~/.claude/permission_request_debug.log`, which had recorded the
+whole thing. The live report located the 500s correctly (`_finalize_losing_groups`)
+but **neither defect worked the way anyone expected**, and G3's was not in the
+code the report pointed at.
+
+### G3 root cause: a terminal win arrives disguised as group death
+
+`_finalize_on_terminal_win` was never the problem — it was never *called*. The
+log for the 11:26 UTC run (G3a), start to finish:
+
+```
+11:26:07  Sent 1 question messages; waiting for answers
+11:26:13  Question 583214c0d539 relay state=cancelled
+11:26:13  Every question group is unanswerable; falling back
+11:26:13  AskUserQuestion: no Telegram answer; native UI will handle
+```
+
+`posttool_hook` does two things in order: `resolve_via_terminal` writes
+`terminal_answers` and flips the row, **then** `revoke_telegram_message` cancels
+the relay message. The parked wait loop's child thread sees that cancel and
+reports `state=cancelled`; the main loop's drain marks the group unanswerable
+and returns at the group-death exit — *before* looping back to the terminal
+check, which sat only at the top of a tick. The terminal-win path lost to the
+group-death path by one iteration, deterministically, every time.
+
+So the keyboard stripping the report observed was **PostToolUse's own
+single-message revoke**, not the wait loop. That also explains the G3b
+inconsistency exactly: with two questions PostToolUse revokes one row
+(`find_pending_request_by_tool_session` returns a single row), one cancel is
+enough to trip `all(unanswerable[gk] for gk in groups)`, and the sibling it
+never touched keeps a live keyboard forever. Confirmed in the 11:50 log:
+`Sent 2 question messages`, one `state=cancelled`, immediate fallback.
+
+**Fix A** — `permission_request_hook.py`. Terminal detection is now `_terminal_win()`
+and is consulted at **every** exit from the wait loop, not just the top of a
+tick. The group-death exit gets a 1.5s grace re-poll (`TERMINAL_GRACE_SECONDS`):
+the ordering already guarantees the row is written before the cancel is
+observable, but the costs are asymmetric — a wrongly-negative answer silently
+leaves a chat unpatched, a needless second on a dead group costs nothing.
+
+### Fix B: `cancel_message` 500s whenever a finalize succeeds
+
+`finalize_message` PATCHes the body and then cancels. The PATCH is
+`editMessageText` with no `reply_markup`, **which already removes the keyboard**
+— so the cancel that follows asks Telegram to strip a keyboard that is no longer
+there, and gets `400 Bad Request: message is not modified`. `TelegramApiError`
+was caught nowhere in `app.py`, so FastAPI turned it into a bare HTTP 500. That
+is the happy path of every finalize, which is why all three 500s sat on runs
+that passed every visible assertion.
+
+Fixed in `relay-server/relay_server/app.py`: `cancel_message` and
+`patch_message` treat "not modified" as success (both endpoints state an intent
+— *this message has no keyboard* — not a diff), surface any other
+`TelegramApiError` as a **502** instead of an anonymous 500, and wake the
+long-pollers on the failure path too.
+
+Worth knowing for the re-run: `client.py:186` retries 5xx, so each of those
+three logged lines was actually several round trips. The fix removes the retry
+storm along with the log line.
+
+**Fix A and Fix B are coupled**: `_finalize_on_terminal_win` uses the same
+`finalize_message`, so without Fix B the restored terminal-win path would 500 on
+every single call. It would still *look* correct — the PATCH does the visible
+work — and only the error log would show it.
+
+### Fix C: `revoke_telegram_message` reported success unconditionally
+
+It returned `set_message_reaction`, a no-op shim that always returns True, and
+discarded the actual `remove_inline_buttons` result — making `posttool_hook`'s
+"Revoked Telegram message" log line unfalsifiable. Now returns the cancel's own
+result.
+
+### Why the unit tests were green through all of this
+
+They covered the *pure* pieces thoroughly — `reduce_tool_response`,
+`parse_terminal_answers`, the 8KB backstop, the row round-trip — and
+`_finalize_on_terminal_win` in isolation. Nothing drove `_wait_for_group_answers`
+to the exit under which a terminal win actually arrives. The four new tests in
+`TestConcurrentWaitPhase` force PostToolUse's exact interleaving (the relay
+parks until the loop has performed one terminal check, and only then reports
+`cancelled`); **each was confirmed to fail against the pre-fix code** — the
+first-pass version of them passed against it, because the row was flipped early
+enough that the top-of-tick check won and the exit under test was never reached.
+A regression test for a race is worth exactly as much as its proof that it fails.
+
+### Status
+
+15-07 stays **blocked pending the re-run**. Fixes A–C are in with tests
+(hooks 691 pass, relay 136 pass), so the **entire gate set is now re-run** — per
+15-04's own instruction, since these paths share the wait loop.
+
+Two things to do before the re-run:
+
+1. **Deploy the relay server.** Fix B lives on
+   `claude-hooks-tg-relay.h02.activecdn.net`; the hooks alone do not carry it.
+   Without it G3 will still *appear* to pass and quietly re-fill the error log.
+2. **Re-install the hooks** (`./install-claude-config.sh`).
+
+And re-baseline `~/.claude/permission_telegram_errors.log` by byte count first —
+that delta is what caught Fix B, and this run should produce **zero** new lines.

@@ -147,16 +147,25 @@ def revoke_telegram_message(request) -> bool:
             token would 404.
 
     Returns:
-        True if successful, False otherwise
+        True if the cancel actually landed, False otherwise.
+
+        The return value tracks ``remove_inline_buttons`` alone. ``set_message_reaction``
+        is a no-op shim (the relay exposes no reaction API) that returns True
+        unconditionally, so reporting *its* result made the caller's
+        "Revoked Telegram message" log line unfalsifiable — it printed just the
+        same when the cancel had failed.
     """
     message_id = request.telegram_message_id
     token = resolve_role_token(request)
 
-    # Remove buttons
-    telegram_permission_router.remove_inline_buttons(message_id, token=token)
+    cancelled = telegram_permission_router.remove_inline_buttons(
+        message_id, token=token
+    )
 
-    # Add reaction
-    return telegram_permission_router.set_message_reaction(message_id, '✅')
+    # Reaction shim; kept for when the relay grows a reaction API.
+    telegram_permission_router.set_message_reaction(message_id, '✅')
+
+    return cancelled
 
 
 def main():

@@ -110,6 +110,17 @@ CHILD_POLL_FLOOR_SECONDS = 1.0
 # on time instead of up to ``WAIT_TICK_SECONDS`` late; the floor keeps a
 # rounding error from turning into a hot spin.
 ESCALATION_TICK_FLOOR = 0.05
+# How long the wait loop keeps re-reading the rows for a terminal resolution
+# before it accepts that a group really is dead, and how often it looks. Only
+# ever paid on the way out of the loop, never per tick.
+#
+# The poll interval is deliberately not tighter: ``get_request`` takes the state
+# file's lock and scans it whole, once per child, so a busy interval here both
+# burns IO and contends with the PostToolUse write this loop is waiting for.
+# Six passes is already generous insurance against an ordering that should not
+# be possible in the first place (see ``_terminal_win``).
+TERMINAL_GRACE_SECONDS = 1.5
+TERMINAL_GRACE_POLL_SECONDS = 0.25
 
 # Literal ``answers[q]`` values that mean "the user picked nothing" — the real
 # content then lives in ``annotations[q]["notes"]``. Matched exactly, never as a
@@ -659,6 +670,37 @@ def _any_child_resolved_in_terminal(groups: Dict[str, List["_ChildRecord"]]) -> 
     return False
 
 
+def _terminal_win(
+    groups: Dict[str, List["_ChildRecord"]],
+    group_tokens: Dict[str, Optional[str]],
+    *,
+    grace_seconds: float = 0.0,
+) -> bool:
+    """Detect a terminal resolution and finalize every message if there is one.
+
+    Returns True when the terminal won (the caller returns ``None``, letting the
+    native UI stand). Must be consulted at **every** exit from the wait loop, not
+    only at the top of a tick — see ``grace_seconds``.
+
+    ``grace_seconds`` re-polls the rows for a short while before answering False.
+    The PostToolUse hook writes ``resolved_terminal`` *before* it cancels the
+    relay message, so by the time a cancel is observable the row is already
+    written and no grace is needed. The grace exists because the cost is
+    asymmetric: a wrongly-negative answer silently leaves a chat unpatched (the
+    G3 failure of 15-07), while a needless second of latency on a genuinely dead
+    group costs nothing — the native UI is live throughout either way.
+    """
+    deadline = time.time() + max(0.0, grace_seconds)
+    while True:
+        if _any_child_resolved_in_terminal(groups):
+            debug_log("AskUserQuestion resolved via terminal; finalizing messages")
+            _finalize_on_terminal_win(groups, group_tokens)
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(TERMINAL_GRACE_POLL_SECONDS)
+
+
 def _finalize_on_terminal_win(
     groups: Dict[str, List["_ChildRecord"]],
     group_tokens: Dict[str, Optional[str]],
@@ -843,9 +885,7 @@ def _wait_for_group_answers(
 
         while time.time() < deadline:
             # 1. The terminal beats every group, always checked first.
-            if _any_child_resolved_in_terminal(groups):
-                debug_log("AskUserQuestion resolved via terminal; finalizing messages")
-                _finalize_on_terminal_win(groups, group_tokens)
+            if _terminal_win(groups, group_tokens):
                 return None
 
             # 2. The escalation deadline (15-05). Checked after terminal
@@ -946,9 +986,25 @@ def _wait_for_group_answers(
             #    the call fall back to the terminal, exactly as the sequential
             #    loop did when there was only ever one group.
             if all(unanswerable[gk] for gk in groups):
+                # ...**unless** the terminal is what killed them. PostToolUse
+                # resolves the row and then cancels the relay message, so a
+                # terminal win reaches this loop as a `cancelled` child — i.e.
+                # disguised as group death. Checking here (not only at the top
+                # of the next tick, which this `return` would never reach) is
+                # what makes brd §5.5 hold: without it the loop falls back
+                # silently and every role chat keeps its unpatched body, which
+                # is exactly how G3 failed on 2026-08-06.
+                if _terminal_win(
+                    groups, group_tokens, grace_seconds=TERMINAL_GRACE_SECONDS
+                ):
+                    return None
                 debug_log("Every question group is unanswerable; falling back")
                 return None
 
+        # The TTL is the other way out, and a terminal resolution can land in
+        # the same tick that crosses it.
+        if _terminal_win(groups, group_tokens):
+            return None
         debug_log("AskUserQuestion wait phase reached the TTL deadline")
         return None
     finally:

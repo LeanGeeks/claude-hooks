@@ -2368,6 +2368,142 @@ class TestConcurrentWaitPhase(unittest.TestCase):
         )
         self.assertIsNone(box["result"])
 
+    # ── Terminal win arriving disguised as group death (15-07 G3) ────────────
+    #
+    # PostToolUse resolves the row and *then* cancels the relay message, so a
+    # terminal win reaches this loop as a `cancelled` child — indistinguishable,
+    # at the queue, from a group that genuinely died. The loop used to take the
+    # group-death exit and return before its next terminal check, leaving every
+    # role chat holding an unpatched body. Live-verified failure on 2026-08-06.
+
+    def _terminal_run(self, count, cancelled_ids, stored, **kwargs):
+        """Run the wait phase with PostToolUse's exact interleaving.
+
+        The ordering is the entire point, so it is forced rather than hoped for:
+        the relay parks until the loop has performed one terminal check (which
+        therefore sees ``pending``), and only then reports ``cancelled``. The
+        row reads ``resolved_terminal`` from that moment on — reproducing
+        PostToolUse writing the row and *then* cancelling the message, which
+        lands the whole terminal win inside a single loop iteration, after that
+        iteration's check at the top has already run.
+
+        Without this, the top-of-tick check wins the race and the group-death
+        exit under test is never reached — a green test that proves nothing.
+        """
+        from permission_state_store import RequestState
+
+        checked = threading.Event()   # the loop has looked at the rows once
+        flipped = threading.Event()   # PostToolUse has written resolved_terminal
+        never = threading.Event()     # parks the siblings; never set
+
+        def _get_request(rid):
+            state = (
+                RequestState.RESOLVED_TERMINAL.value
+                if flipped.is_set()
+                else "pending"
+            )
+            checked.set()
+            return _make_request(
+                request_id=rid, state=state, terminal_answers=stored
+            )
+
+        def _relay(message_id, timeout=None, long_poll_chunk=None, token=None):
+            if message_id not in cancelled_ids:
+                # A sibling PostToolUse never touched, parked in its long poll.
+                # It must not report chunk timeouts: each one wakes the drain,
+                # and a drain that spins is a drain that can reach the *next*
+                # tick's terminal check — which would let the top-of-loop path
+                # satisfy these assertions and quietly stop testing the exit.
+                never.wait(30)
+                return None
+            checked.wait(5)
+            flipped.set()
+            return {"_state": "cancelled"}
+
+        return self._run(
+            count,
+            {},
+            extra_patches=[
+                patch("permission_request_hook.wait_for_relay_answer", _relay),
+                patch("permission_request_hook.get_request", _get_request),
+                patch("permission_request_hook.resolve_via_terminal"),
+            ],
+            **kwargs,
+        )
+
+    def test_cancelled_child_with_a_terminal_row_patches_the_real_answer(self):
+        """The G3a shape: one question, answered at the keyboard.
+
+        The cancel must not be read as group death — the chat gets the answer
+        the terminal produced, not silence and not the generic fallback."""
+        box = self._terminal_run(
+            1,
+            {801},
+            json.dumps({"answers": {"Q0?": "Amber and charcoal"}, "notes": {}}),
+            timeout=10,
+        )
+
+        self.assertIsNone(box["result"], "the native UI must still stand")
+        calls = self.hook.finalize_message.call_args_list
+        self.assertEqual(len(calls), 1, "the one open message must be finalized")
+        self.assertEqual(calls[0].args[0], 801)
+        self.assertEqual(calls[0].args[2], "Amber and charcoal")
+        self.assertEqual(calls[0].kwargs["prefix"], "✅ ")
+
+    def test_every_sibling_is_finalized_not_just_the_cancelled_one(self):
+        """The G3b shape: two questions, one cancel observed.
+
+        PostToolUse only ever flips and cancels a single row, so the sibling it
+        never touched is the one that used to keep a live keyboard forever —
+        an orphaned prompt inviting an answer to a finished question."""
+        box = self._terminal_run(
+            2,
+            {801},
+            json.dumps(
+                {"answers": {"Q0?": "Serif", "Q1?": "Comfortable"}, "notes": {}}
+            ),
+            timeout=10,
+        )
+
+        self.assertIsNone(box["result"])
+        finalized = {
+            c.args[0]: c.args[2] for c in self.hook.finalize_message.call_args_list
+        }
+        self.assertEqual(finalized, {801: "Serif", 802: "Comfortable"})
+
+    def test_notes_only_answer_reaches_the_chat_as_the_note(self):
+        """``answers[q] == "(notes only)"`` is real — captured live on
+        2026-08-02 (fixture case 3). The note is the answer; patching the
+        literal placeholder into someone's chat would be worse than useless."""
+        box = self._terminal_run(
+            1,
+            {801},
+            json.dumps({
+                "answers": {"Q0?": "(notes only)"},
+                "notes": {"Q0?": "Prefer the denser grid, but check mobile."},
+            }),
+            timeout=10,
+        )
+
+        self.assertIsNone(box["result"])
+        calls = self.hook.finalize_message.call_args_list
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].args[2], "Prefer the denser grid, but check mobile."
+        )
+
+    def test_a_genuinely_dead_group_still_falls_back_to_the_terminal(self):
+        """The guard above must not swallow real group death: rows that never
+        went terminal still take the fallback, and patch nothing."""
+        box = self._run(
+            2,
+            {801: [{"_state": "expired"}], 802: [None]},
+            timeout=10,
+            floor=0.01,
+        )
+        self.assertIsNone(box["result"])
+        self.hook.finalize_message.assert_not_called()
+
     def test_no_state_store_writes_happen_off_the_main_thread(self):
         """Terminal detection, state writes and the decision all stay on the
         thread that owns the hook; the child threads only long-poll."""

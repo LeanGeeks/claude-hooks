@@ -36,6 +36,7 @@ from .models import (
 from .telegram_backend import (
     FakeTelegramBackend,
     HttpTelegramBackend,
+    TelegramApiError,
     TelegramBackend,
     TelegramForbidden,
 )
@@ -700,6 +701,18 @@ def create_app(
         except TelegramForbidden:
             await _unbind_installation(conn, installation_id)
             raise HTTPException(status_code=409, detail="not_bound")
+        except TelegramApiError as exc:
+            # Re-patching a message with the text it already carries is a no-op,
+            # not a failure — the caller's intent (the body reads like this) is
+            # satisfied. Anything else is a genuine upstream fault and says so
+            # with a 502 rather than an anonymous 500.
+            if not _is_not_modified(exc):
+                logger.warning(
+                    "patch_message: telegram rejected edit for %s: %s",
+                    message_id,
+                    exc.description,
+                )
+                raise HTTPException(status_code=502, detail="telegram_error")
         return {}
 
     @app.delete("/v1/messages/{message_id}", status_code=204)
@@ -753,6 +766,22 @@ def create_app(
             waiters.notify(message_id)
             await _unbind_installation(conn, installation_id)
             raise HTTPException(status_code=409, detail="not_bound")
+        except TelegramApiError as exc:
+            # Cancel is idempotent by contract, and Telegram reports "no
+            # keyboard to remove" as a 400 rather than a success. The common
+            # caller is a client-side finalize: PATCH the body (``editMessageText``
+            # with no ``reply_markup`` already drops the keyboard) and then
+            # cancel to flip the state. That second call *always* lands here on
+            # the happy path, so treating it as an error made every finalize
+            # log a 500 while behaving perfectly — see 15-07's error-log delta.
+            if not _is_not_modified(exc):
+                waiters.notify(message_id)
+                logger.warning(
+                    "cancel_message: telegram rejected keyboard strip for %s: %s",
+                    message_id,
+                    exc.description,
+                )
+                raise HTTPException(status_code=502, detail="telegram_error")
         waiters.notify(message_id)
         return {}
 
@@ -1171,6 +1200,20 @@ async def _toggle_multi_selection(
             return new_idxs
 
     return await run_in_thread(_w)
+
+
+def _is_not_modified(exc: TelegramApiError) -> bool:
+    """True for Telegram's "message is not modified" 400.
+
+    Telegram raises it when an edit would be a no-op — the body already reads
+    that way, or the keyboard the caller wants removed is already gone. For an
+    endpoint whose contract is *make it so* rather than *change it*, that is the
+    success case wearing an error's clothes.
+
+    Matched on the description because the Bot API gives it no distinct
+    ``error_code``; every "not modified" variant shares the phrase.
+    """
+    return "not modified" in (exc.description or "").lower()
 
 
 def _member_answered(row: sqlite3.Row) -> bool:
