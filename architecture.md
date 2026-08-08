@@ -252,6 +252,17 @@ each session in **tmux**. Relevant facts:
   `send-keys`; `amux peek <name> [lines]` reads pane output) and a REST API at
   `$AMUX_URL` (default `:8822`) backed by `amux-server.py`, auth token at
   `~/.amux/auth_token`.
+- **This repo requires a *forked* amux, not upstream 0.3.0.** Epic 10's spawn
+  chain needs launch behaviours the stock CLI does not expose — `--no-attach`,
+  `--no-default-model`, env propagation via `update-environment`, and
+  `--session-id` kept out of `CC_FLAGS`. Install it with **`./install-amux.sh`**
+  (clone → branch → verify → `/usr/local/bin/amux`, CLI only) **before**
+  `install-claude-config.sh`; the two are coupled only at runtime, since
+  `amux-spawn` resolves `amux` from `PATH`. Details and the pinned commit:
+  [tasks/12_amux_extensions.md](./tasks/12_amux_extensions.md). Note the fork
+  does **not** bump `CC_VERSION` — `amux --version` still prints `0.3.0`, so the
+  installer's feature probe, not the version string, is what distinguishes fork
+  from upstream.
 
 This is the substrate the **reply-from-Telegram** feature (task 09) builds on:
 amux's `send` is the only available way to inject a remote reply as a new user

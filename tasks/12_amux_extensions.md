@@ -183,7 +183,22 @@ not the exit code (Decision 3).
 
 - Build against a local clone/fork; **pin the amux version** `amux-spawn` targets.
 - Deploy by replacing `/usr/local/bin/amux` with the extended build; `amux-spawn`
-  calls `amux` on `PATH` (no hard-coded path). Document the install step.
+  calls `amux` on `PATH` (no hard-coded path).
+- **The install step is `./install-amux.sh`** in claude-hooks (added 2026-08-08):
+  clones the fork to `../amux`, checks out the branch, warns on drift from the
+  pin, syntax-gates the script, installs **CLI only** to `/usr/local/bin` (stage
+  + atomic rename, one-time `amux.pre-epic10.bak`), and verifies by byte-identity
+  plus a probe for the five extension markers — needed because the fork keeps
+  `CC_VERSION="0.3.0"`, so `amux --version` cannot tell fork from upstream. When
+  it cannot elevate it prints the root command and waits for it to be run. Run it
+  **before** `install-claude-config.sh`.
+- ⚠️ **The extension branch is unpushed** (verified 2026-08-08 via
+  `git ls-remote`): `origin` carries only `main` @ `c6a6c1c`, and all six
+  extension commits (`76cc680`, `f86fb62`, `fa6ccc1`, `cab8ac9`, `b2293cb`,
+  `9b05d10`) exist **only in the local `../amux` clone on the dev machine**. Until
+  someone runs `git -C ../amux push -u origin feat/epic-10-amux-extensions`, a
+  fresh machine cannot install the fork — `install-amux.sh` clones `main`, fails
+  at the checkout step, and prints that push command.
 - **Installed for testing (not merged):** `9b05d10`'s `amux` is live at
   `/usr/local/bin/amux` (**CLI only**; `amux-server.py`/`amux-remote` left untouched
   — they carry unrelated fork drift and aren't in the spawn chain). Backup at
