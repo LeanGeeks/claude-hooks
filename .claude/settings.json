@@ -220,6 +220,7 @@
       "Bash(pkill:*)",
       "Bash(pgrep:*)",
       "Bash(ps:*)",
+      "Bash(free:*)",
       "Bash(jobs:*)",
       "Bash(fg:*)",
       "Bash(nproc:*)",
