@@ -1,6 +1,6 @@
 # 15-07 — Live verification
 
-**Status:** todo · **Depends on:** 15-06
+**Status:** done · **Depends on:** 15-06
 **Agent:** human — do **not** spawn Implementer / Reviewer / Fixer / Committer
 **Read first:** [brd.md](./brd.md) §5 (routing behaviour), [state.md](./state.md) (gates)
 

@@ -25,7 +25,7 @@ Each task file is written for a fresh-context agent and carries its own
 | 15-04 | [Wait phase](./15-04-wait-phase_opus.md) | done | 15-03 | Sequential loop → thread-per-message; terminal answers patched into the role's chat. **Amended 2026-08-06** — G3 fix, see *Post-mortem* below |
 | 15-05 | [Escalation](./15-05-escalation_opus.md) | done | 15-04 | Deadline, duplicate group to the default, first-group-wins |
 | 15-06 | [Installer, diagnostics, docs](./15-06-installer-diagnostics-docs.md) | done | 15-05 | `shell/claude-roles`, example TOML, prompt snippet, installer, `architecture.md` |
-| 15-07 | [Live verification](./15-07-live-verification_human.md) | blocked | 15-06 | **human** — run 2026-08-06: G1, G2, G4 pass; **G3 fails** (terminal answers never reach the role's chat). Diagnosed and fixed same day under **15-04** + the relay server; **awaiting a full gate re-run**. See *Live run — 2026-08-06* and *Post-mortem* below |
+| 15-07 | [Live verification](./15-07-live-verification_human.md) | done | 15-06 | **human** — first run 2026-08-06: G3 failed. Fixed same day under **15-04** + the relay server (`3de5d1e`). **Full re-run 2026-08-06 with h02 redeployed: all eight steps pass (six briefed + two added live for the uncontaminated terminal win), G1–G4 pass, error-log gate clean (delta 0 bytes).** See *Live re-run — 2026-08-06* below |
 
 ## Implementer model
 
@@ -309,7 +309,7 @@ first-pass version of them passed against it, because the row was flipped early
 enough that the top-of-tick check won and the exit under test was never reached.
 A regression test for a race is worth exactly as much as its proof that it fails.
 
-### Status
+### Status *(superseded — the re-run happened; see *Live re-run — 2026-08-06* below, where 15-07 passes and closes)*
 
 15-07 stays **blocked pending the re-run**. Fixes A–C are in with tests
 (hooks 691 pass, relay 136 pass), so the **entire gate set is now re-run** — per
@@ -324,3 +324,92 @@ Two things to do before the re-run:
 
 And re-baseline `~/.claude/permission_telegram_errors.log` by byte count first —
 that delta is what caught Fix B, and this run should produce **zero** new lines.
+
+## Live re-run — 2026-08-06
+
+Workspace `ai-playground-2`; operator = installation `anton-t480s` (id=2, default
+token), ux = installation `anton-roles-test` (id=5), role `ux` carrying
+`escalate_after = "30s"` (halved from the first run). Pre-flight green:
+`claude-roles --check` reported both roles `bound`, and no deployed hook differed
+from the repo (only `test_task03.py`, which is not deployed). **Anton confirmed
+the relay on `claude-hooks-tg-relay.h02.activecdn.net` was redeployed since
+`3de5d1e`**, so Fix B was live for this run — which §6 then corroborates
+independently. Driven live by Anton at the keyboard with both chats open; full
+turn-by-turn log in `ai-playground-2/15-07-live-run-notes.md`.
+
+**All eight steps pass · §6 clean (delta 0 bytes) · G1–G4 all pass.**
+(Six from the re-run brief, plus steps 7 and 8 added live at Anton's request to
+capture the *uncontaminated* terminal win — see the table.)
+
+| Step | Result | Evidence |
+|---|---|---|
+| 1 — terminal win, two tagged questions (G3, 15-04) | **pass** | Both `@ux Palette` and `@ux Typeface` landed in **ux only**, both bodies carried `for: UX/UI designer`, both keyboards live, terminal chips kept the raw `@ux …`. Answered **both in the terminal picker**. Both ux messages patched to `✅` with the **real labels** — not `Answered in the terminal`, not `(notes only)` — and **both** keyboards gone (confirmed explicitly for the sibling). Agent received `…="Amber and charcoal", …="Inter"`, no suffix. **All three 2026-08-06 failure modes absent.** |
+| 1b — bonus: terminal win *after* escalation | **pass** | Anton exceeded 30s at the picker, so the duplicate group fired into **operator** mid-step. The terminal win then had to finalize **two** groups: both operator duplicates were also patched to `✅ <real label>` with keyboards gone. Banner first line verified verbatim: `⏳ @ux (UX/UI designer) hasn't answered in 30s — you can decide instead.` |
+| 2 — tagged, answered in Telegram, no escalation (G1a, 15-03) | **pass** | `@ux Layout` landed in **ux only**, operator empty. `for: UX/UI designer` present; header rendered `Layout` with `@ux ` stripped; terminal chip kept raw `@ux Layout`. Answered in ux within 20s, then watched operator a further 60s — **no duplicate, no question of any kind**. Agent received `…="Left sidebar"`, **no** suffix |
+| 3 — untagged (G1b, 15-03) | **pass** | `Deploy target` landed in **operator only**, ux empty. A `for:` line **is** rendered on untagged questions — italic `for: Operator`, same as the first run. Agent received `…="Staging"`, **no** suffix |
+| 4 — escalation, operator answers the duplicate (G2a, 15-05) | **pass** | Fired 19:09:24, duplicate due 19:09:54 and arrived on schedule in **operator**, first line exactly `⏳ @ux (UX/UI designer) hasn't answered in 30s — you can decide instead.` followed by `for: Operator`. **ux keyboard confirmed still live at that moment** — a genuine race. Answered the duplicate in operator → ux message patched to `✅ Comfortable`, keyboard gone. Agent received **`"How dense should the default table layout be?"="Comfortable (answered by Operator)"`** |
+| 5 — escalation, ux answers anyway (G2c, 15-05) | **pass** | Fired 19:13:37, duplicate due 19:14:07, arrived in **operator** with ⏳ banner and live keyboard; **ux keyboard also still live** at that moment. Answered in **ux** → operator duplicate patched to `✅ 8px scale`, keyboard gone. Agent received `…="8px scale"`, **no** suffix |
+| 6 — permission prompt (G4a, 15-02) | **pass** | `chmod 644` was auto-approved silently again; `frobnicate-15-07 --check` raised a real request. Arrived in **operator only**, ux empty, **no `for:` line** (correct per brd §6). Named the command; tapped **Allow** from Telegram → message finalized and the command reached the shell (exit 127, `command not found`) |
+| 7 — **clean** terminal win, ONE question, no escalation (G3a, 15-04) | **pass** | *Added at Anton's request — step 1 was terminal-answered but contaminated by its escalation overrun, so the uncontaminated case was untested.* `@ux Motion`, answered in the terminal in 15s, well inside the 30s deadline. ux message patched to `✅ Fade` (real label), keyboard gone; **operator stayed empty for 60s** — no duplicate ever fired. Agent received `…="Fade"`, no suffix |
+| 8 — **clean** terminal win, TWO questions, no escalation (G3b orphan, 15-04) | **pass** | `@ux Radius` + `@ux Empty states`. Q1 option-selected, **Q2 answered as free text** (`Cropped ilustration`, typo Anton's) — so this call covers the option-selected **and** free-text shapes the post-mortem asked for. Answer landed 0.8s inside the deadline, so **no escalation fired**. Both ux messages patched — `✅ Rounded 12px` and `✅ Cropped ilustration`, the real free-text string, **not** `(notes only)`, **not** `Answered in the terminal` — and **both keyboards gone**. Operator empty. **This is the G3b orphan under its exact conditions**: two questions, only **one** `state=cancelled` (PostToolUse's single-row revoke), no duplicate group to change the `all(unanswerable[gk] …)` arithmetic |
+
+### §6 — error-log gate: **PASS**
+
+`~/.claude/permission_telegram_errors.log`: baseline **219590** bytes →
+**219590** bytes, **delta 0**. No new lines of any kind; in particular **none** of
+the three `Relay cancel_message failed: relay HTTP 500` lines the first run
+produced. Rotation/truncation ruled out — the byte count is *identical* rather
+than merely small, and the log's last entry is `2026-08-06T14:09:27Z`, an hour
+before this run began (19:09 local = 15:09 UTC).
+
+This is the observation that certifies the rest: both directions of
+loser-finalization (steps 4 and 5) plus a terminal win over two live groups
+(step 1b) ran **silent as well as visibly correct**, which is exactly what Fix B
+was for.
+
+### Fix A, visible in `~/.claude/permission_request_debug.log`
+
+Steps 7 and 8 put the repair on the record at the exact line that failed. Step 8:
+
+```
+[15:33:36.850] Sent 2 question messages; waiting for answers
+[15:34:06.026] Question 20251d8d020a relay state=cancelled
+[15:34:06.038] AskUserQuestion resolved via terminal; finalizing messages
+[15:34:06.604] AskUserQuestion: no Telegram answer; native UI will handle
+```
+
+The pre-fix log's `Every question group is unanswerable; falling back` is
+**replaced** by `resolved via terminal; finalizing messages`, 12ms after the
+cancel (7ms on step 7). Only **one** question logged `state=cancelled` and the
+finalize still covered the whole call — the orphan condition, handled.
+
+### Notes worth keeping
+
+- **The tool-result wrapper does not indicate the answer path.** An earlier draft
+  of this section claimed `The user answered: …` marked a non-`None` hook return
+  (escalation) vs `Your questions have been answered: …` for terminal answers.
+  **That is wrong** — step 8 is a terminal answer and used the former. The
+  discriminator is whether the answer string matches an offered option label:
+  step 4's `Comfortable (answered by Operator)` did not (suffix appended) and
+  step 8's `Cropped ilustration` did not (free text); both drew the cautionary
+  wrapper. Exact label matches drew the other. **An agent cannot infer the answer
+  path from the wrapper** — consistent with brd §5.6's closing point.
+- **Step 1's overrun was luck worth having.** It exercised a combination the
+  step set does not otherwise cover — a terminal win that must finalize the
+  escalation duplicates as well as the originals — and it passed. But it also
+  meant the *uncontaminated* terminal win was untested, which is why steps 7 and
+  8 were added; they are the ones that actually load-test Fix A's repair.
+- **Wall-clock stamps taken by the driving agent are unreliable to ±20s.** The
+  pre-fire `date` ran ~7s before the hook sent, and the post-return `date` was
+  ~21s of model-generation latency late. On step 8 that produced a confident but
+  wrong reading that escalation had fired. `permission_request_debug.log` has the
+  real timestamps; prefer it for any timing claim in future runs.
+- **`✍️` vs `✅` for typed answers — idea, not a defect.** Anton expected
+  `✍️ Cropped ilustration` for an answer he typed rather than picked. Current
+  behaviour is per spec (`✅ <answer text>`); `✍️` is the Telegram *text-reply*
+  marker, not a terminal-input marker. Distinguishing typed from picked in the
+  role's chat is a reasonable refinement — follow-up idea against **15-04**.
+- The retired G3b notes-only sub-case was **not** hunted for, per the re-run
+  brief; it stays covered by
+  `test_notes_only_answer_reaches_the_chat_as_the_note`. The free-text shape it
+  was to be re-run alongside **is** now covered, by step 8's Q2.
