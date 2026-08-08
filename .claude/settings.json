@@ -226,6 +226,7 @@
       "Bash(lsof:*)",
       "Bash(amux:*)",
       "Bash(tmux:*)",
+      "Bash(shellcheck:*)",
       "Bash(bash:*)",
       "Bash(sh:*)",
       "Bash(ssh:*)",
@@ -266,7 +267,8 @@
       "Bash(dig:*)",
       "Bash(magick:*)",
       "Bash(whoami:*)",
-      "Bash(mktemp:*)"
+      "Bash(mktemp:*)",
+      "Bash(ffmpeg:*)"
     ],
     "deny": [
       "Bash(shred:*)",
