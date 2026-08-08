@@ -98,6 +98,25 @@ if ! command -v git &> /dev/null; then
     exit 1
 fi
 
+# Identifies the fork in any remote URL, ssh or https.
+FORK_SLUG="aDorofeev/amux"
+# Remote name used when an existing clone has no remote pointing at the fork.
+FORK_REMOTE_NAME="amux-fork"
+
+# Prefer SSH when it answers without prompting, else HTTPS (the fork is public,
+# so HTTPS works with no credentials). BatchMode/no-prompt keep the probe from
+# hanging on a passphrase or credential prompt; the real fetch runs unrestricted.
+pick_fork_url() {
+    # No StrictHostKeyChecking override on purpose: an unknown host key should
+    # fail the probe and fall through to HTTPS, not be silently trusted here.
+    if GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="ssh -oBatchMode=yes" \
+            git ls-remote --heads "$AMUX_REPO_SSH" >/dev/null 2>&1; then
+        echo "$AMUX_REPO_SSH"
+    else
+        echo "$AMUX_REPO_HTTPS"
+    fi
+}
+
 echo ""
 log_step "amux fork installer — $AMUX_BRANCH → $TARGET"
 echo ""
@@ -110,33 +129,67 @@ log_step "Step 1/5: Fetching the fork clone at $AMUX_DIR"
 
 CLONE_ACTION="updated"
 if [[ -d "$AMUX_DIR/.git" ]]; then
-    REMOTE_URL="$(git -C "$AMUX_DIR" remote get-url origin 2>/dev/null || echo "")"
-    if [[ "$REMOTE_URL" != *"aDorofeev/amux"* ]]; then
-        log_warn "origin is '$REMOTE_URL', not the aDorofeev/amux fork"
-        log_warn "  Branch '$AMUX_BRANCH' may not exist there — continuing anyway"
+    log_info "Existing clone found at $AMUX_DIR"
+
+    # A pre-existing clone here is usually UPSTREAM amux (mixpeek/amux) from a
+    # normal amux install, not the fork. Never graft a remote onto whatever
+    # happens to occupy the path — confirm it is an amux checkout first.
+    if ! git -C "$AMUX_DIR" cat-file -e HEAD:amux 2>/dev/null; then
+        log_error "$AMUX_DIR is a git repo but has no 'amux' file at HEAD — not an amux clone."
+        log_error "  Move it aside, or pass --dir <path> to use a different location."
+        exit 1
     fi
-    log_info "Existing clone found — fetching origin"
-    if ! git -C "$AMUX_DIR" fetch origin --quiet; then
-        log_warn "git fetch failed (offline?) — continuing with the local clone"
+
+    # Find a remote already pointing at the fork; otherwise add one, leaving
+    # `origin` untouched so an upstream clone keeps tracking upstream.
+    FORK_REMOTE=""
+    while read -r _name _url _; do
+        if [[ "$_url" == *"$FORK_SLUG"* ]]; then FORK_REMOTE="$_name"; break; fi
+    done < <(git -C "$AMUX_DIR" remote -v 2>/dev/null)
+
+    if [[ -n "$FORK_REMOTE" ]]; then
+        log_info "Fork remote: $FORK_REMOTE → $(git -C "$AMUX_DIR" remote get-url "$FORK_REMOTE")"
+    else
+        ORIGIN_URL="$(git -C "$AMUX_DIR" remote get-url origin 2>/dev/null || echo "none")"
+        FORK_URL="$(pick_fork_url)"
+        log_warn "No remote here points at $FORK_SLUG (origin is '$ORIGIN_URL')"
+        log_info "Adding remote '$FORK_REMOTE_NAME' → $FORK_URL (origin left as is)"
+        if git -C "$AMUX_DIR" remote get-url "$FORK_REMOTE_NAME" >/dev/null 2>&1; then
+            git -C "$AMUX_DIR" remote set-url "$FORK_REMOTE_NAME" "$FORK_URL"
+        else
+            git -C "$AMUX_DIR" remote add "$FORK_REMOTE_NAME" "$FORK_URL"
+        fi
+        FORK_REMOTE="$FORK_REMOTE_NAME"
+        CLONE_ACTION="updated (fork remote added)"
+    fi
+
+    log_info "Fetching $FORK_REMOTE"
+    if ! git -C "$AMUX_DIR" fetch "$FORK_REMOTE" --quiet; then
+        log_warn "git fetch failed (offline? no access?) — continuing with the local clone"
     fi
 elif [[ -e "$AMUX_DIR" ]]; then
     log_error "$AMUX_DIR exists but is not a git clone. Move it aside or pass --dir."
     exit 1
 else
-    log_info "Cloning $AMUX_REPO_SSH → $AMUX_DIR"
-    if git clone --quiet "$AMUX_REPO_SSH" "$AMUX_DIR" 2>/dev/null; then
-        CLONE_ACTION="cloned (ssh)"
-    else
-        log_warn "SSH clone failed (no key for GitHub?) — retrying over HTTPS"
+    FORK_REMOTE="origin"
+    CLONE_URL="$(pick_fork_url)"
+    log_info "Cloning $CLONE_URL → $AMUX_DIR"
+    if git clone --quiet "$CLONE_URL" "$AMUX_DIR"; then
+        CLONE_ACTION="cloned"
+    elif [[ "$CLONE_URL" != "$AMUX_REPO_HTTPS" ]]; then
+        log_warn "Clone over SSH failed — retrying over HTTPS"
         if git clone --quiet "$AMUX_REPO_HTTPS" "$AMUX_DIR"; then
             CLONE_ACTION="cloned (https)"
         else
-            log_error "Could not clone the fork from either $AMUX_REPO_SSH or $AMUX_REPO_HTTPS"
+            log_error "Could not clone the fork from $AMUX_REPO_SSH or $AMUX_REPO_HTTPS"
             exit 1
         fi
+    else
+        log_error "Could not clone the fork from $CLONE_URL"
+        exit 1
     fi
 fi
-log_info "Clone: $CLONE_ACTION ($AMUX_DIR)"
+log_info "Clone: $CLONE_ACTION ($AMUX_DIR), fork remote '$FORK_REMOTE'"
 
 # =============================================================================
 # STEP 2: Switch to the extension branch, check the pin
@@ -165,11 +218,11 @@ if [[ "$CURRENT_BRANCH" == "$AMUX_BRANCH" ]]; then
 elif git -C "$AMUX_DIR" show-ref --verify --quiet "refs/heads/$AMUX_BRANCH"; then
     git -C "$AMUX_DIR" checkout --quiet "$AMUX_BRANCH"
     log_info "Switched to local branch $AMUX_BRANCH"
-elif git -C "$AMUX_DIR" show-ref --verify --quiet "refs/remotes/origin/$AMUX_BRANCH"; then
-    git -C "$AMUX_DIR" checkout --quiet -b "$AMUX_BRANCH" --track "origin/$AMUX_BRANCH"
-    log_info "Created tracking branch $AMUX_BRANCH from origin/$AMUX_BRANCH"
+elif git -C "$AMUX_DIR" show-ref --verify --quiet "refs/remotes/$FORK_REMOTE/$AMUX_BRANCH"; then
+    git -C "$AMUX_DIR" checkout --quiet -b "$AMUX_BRANCH" --track "$FORK_REMOTE/$AMUX_BRANCH"
+    log_info "Created tracking branch $AMUX_BRANCH from $FORK_REMOTE/$AMUX_BRANCH"
 else
-    log_error "Branch '$AMUX_BRANCH' not found locally or on origin."
+    log_error "Branch '$AMUX_BRANCH' not found locally or on remote '$FORK_REMOTE'."
     log_error "  The E1-E5 extensions live on an unmerged branch; the fork's main does NOT have them."
     log_error "  If the branch exists only on another machine, push it from there first:"
     log_error "      git -C <that-clone> push -u origin $AMUX_BRANCH"
@@ -179,16 +232,16 @@ fi
 
 # Fast-forward only: never rewrite local work, and a diverged branch is a
 # condition the pin check below should report rather than paper over.
-if git -C "$AMUX_DIR" show-ref --verify --quiet "refs/remotes/origin/$AMUX_BRANCH"; then
-    if ! git -C "$AMUX_DIR" merge --ff-only --quiet "origin/$AMUX_BRANCH" 2>/dev/null; then
-        log_warn "Could not fast-forward to origin/$AMUX_BRANCH (diverged or no upstream) — using local HEAD"
+if git -C "$AMUX_DIR" show-ref --verify --quiet "refs/remotes/$FORK_REMOTE/$AMUX_BRANCH"; then
+    if ! git -C "$AMUX_DIR" merge --ff-only --quiet "$FORK_REMOTE/$AMUX_BRANCH" 2>/dev/null; then
+        log_warn "Could not fast-forward to $FORK_REMOTE/$AMUX_BRANCH (diverged or no upstream) — using local HEAD"
     fi
 else
     # This clone has the branch but the fork does not: the extension commits were
     # never pushed, so no other machine can install them from GitHub.
-    log_warn "origin/$AMUX_BRANCH does not exist — this branch is local-only, never pushed"
+    log_warn "$FORK_REMOTE/$AMUX_BRANCH does not exist — this branch is local-only, never pushed"
     log_warn "  Other machines cannot install the fork until you publish it:"
-    log_warn "      git -C $AMUX_DIR push -u origin $AMUX_BRANCH"
+    log_warn "      git -C $AMUX_DIR push -u $FORK_REMOTE $AMUX_BRANCH"
 fi
 
 HEAD_SHORT="$(git -C "$AMUX_DIR" rev-parse --short HEAD)"

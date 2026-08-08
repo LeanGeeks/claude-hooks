@@ -192,13 +192,17 @@ not the exit code (Decision 3).
   `CC_VERSION="0.3.0"`, so `amux --version` cannot tell fork from upstream. When
   it cannot elevate it prints the root command and waits for it to be run. Run it
   **before** `install-claude-config.sh`.
-- ⚠️ **The extension branch is unpushed** (verified 2026-08-08 via
-  `git ls-remote`): `origin` carries only `main` @ `c6a6c1c`, and all six
-  extension commits (`76cc680`, `f86fb62`, `fa6ccc1`, `cab8ac9`, `b2293cb`,
-  `9b05d10`) exist **only in the local `../amux` clone on the dev machine**. Until
-  someone runs `git -C ../amux push -u origin feat/epic-10-amux-extensions`, a
-  fresh machine cannot install the fork — `install-amux.sh` clones `main`, fails
-  at the checkout step, and prints that push command.
+- **The extension branch is published** (pushed 2026-08-08, after an initial
+  window where it was local-only): `feat/epic-10-amux-extensions` @ `9b05d10` is
+  on the fork, which is **public over HTTPS** — so a machine with no GitHub SSH
+  key can still install it.
+- **A machine that already has an upstream amux clone at the target path** (e.g.
+  `~/.bin/amux` from a normal amux install, `origin` = `mixpeek/amux`) is the
+  common case on servers, not an edge case. `install-amux.sh` handles it by
+  adding the fork as a **second remote** (`amux-fork`) and checking the branch
+  out from there, leaving `origin` pointing at upstream. It refuses only if the
+  directory is a git repo with no `amux` file at HEAD — i.e. some unrelated
+  project occupying the path.
 - **Installed for testing (not merged):** `9b05d10`'s `amux` is live at
   `/usr/local/bin/amux` (**CLI only**; `amux-server.py`/`amux-remote` left untouched
   — they carry unrelated fork drift and aren't in the spawn chain). Backup at
