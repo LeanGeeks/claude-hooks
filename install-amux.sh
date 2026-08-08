@@ -324,17 +324,45 @@ fi
 # The privileged work is described once as a list of ops, and both the runner
 # and the printed "run this as root" block derive their form from it — so the
 # command we execute and the command we tell you to run can never drift apart.
+# Each op sets OP_ARGV (what gets executed) and OP_DISPLAY (the copy-paste form
+# printed when the user has to run it as root). They are the same command; only
+# the backup renders differently, because its no-clobber guard reads better as a
+# shell test than as the `sh -c` boilerplate needed to keep it one argv.
+#
+# `cp -n` is deliberately avoided: GNU coreutils 9.2+ warns that -n is
+# non-portable and may change behaviour, and its suggested `--update=none` is
+# itself GNU-only. `test -e || cp` is POSIX, silent, and idempotent — which
+# matters because the printed command may be pasted more than once, and a second
+# unguarded run would overwrite the genuine pre-fork backup with the fork build.
 op_argv() {
+    OP_DISPLAY=""
     case "$1" in
-        mkdir)   OP_ARGV=(mkdir -p "$INSTALL_DIR") ;;
-        backup)  OP_ARGV=(cp -n "$TARGET" "$BACKUP") ;;
+        mkdir)
+            OP_ARGV=(mkdir -p "$INSTALL_DIR")
+            ;;
+        backup)
+            # SC2016: the single quotes are intentional — $1/$2 are the inner
+            # sh's positional parameters, passed as argv after the script name.
+            # shellcheck disable=SC2016
+            OP_ARGV=(sh -c 'test -e "$1" || cp "$2" "$1"' amux-install "$BACKUP" "$TARGET")
+            OP_DISPLAY="[ -e $(printf '%q' "$BACKUP") ] || cp $(printf '%q' "$TARGET") $(printf '%q' "$BACKUP")"
+            ;;
         # Stage + rename: bash reads scripts incrementally, so overwriting the
         # target in place can corrupt an amux invocation that is running right
         # now. The rename swaps the inode; in-flight processes keep the old one.
-        install) OP_ARGV=(install -m0755 "$SRC" "$STAGE") ;;
-        mv)      OP_ARGV=(mv -f "$STAGE" "$TARGET") ;;
-        *)       log_error "internal: unknown op '$1'"; exit 1 ;;
+        install)
+            OP_ARGV=(install -m0755 "$SRC" "$STAGE")
+            ;;
+        mv)
+            OP_ARGV=(mv -f "$STAGE" "$TARGET")
+            ;;
+        *)  log_error "internal: unknown op '$1'"; exit 1 ;;
     esac
+    if [[ -z "$OP_DISPLAY" ]]; then
+        # %q quotes for the shell, so paths with spaces survive copy-paste.
+        OP_DISPLAY="$(printf '%q ' "${OP_ARGV[@]}")"
+        OP_DISPLAY="${OP_DISPLAY% }"
+    fi
 }
 
 INSTALL_STATUS="unchanged"
@@ -406,14 +434,11 @@ else
         echo "  ┌────────────────────────────────────────────────────────────────────"
         for op in "${OPS[@]}"; do
             op_argv "$op"
-            # %q quotes for the shell, so paths with spaces survive copy-paste.
-            QUOTED="$(printf '%q ' "${OP_ARGV[@]}")"
-            QUOTED="${QUOTED% }"
-            echo "  │  $QUOTED"
+            echo "  │  $OP_DISPLAY"
             if [[ -n "$ONE_LINER" ]]; then
-                ONE_LINER="$ONE_LINER && $QUOTED"
+                ONE_LINER="$ONE_LINER && $OP_DISPLAY"
             else
-                ONE_LINER="$QUOTED"
+                ONE_LINER="$OP_DISPLAY"
             fi
         done
         echo "  └────────────────────────────────────────────────────────────────────"
