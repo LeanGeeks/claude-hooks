@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.0"]
+# dependencies = ["mcp>=2.0,<3"]
 # ///
 """Context usage MCP server — exposes get_context_usage tool."""
 
@@ -9,9 +9,9 @@ import os
 from fnmatch import fnmatch
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("context-usage")
+mcp = MCPServer("context-usage", version="1.0.0")
 
 DEFAULT_CONTEXT_WINDOW = 1_000_000
 MODELS_JSON = Path(__file__).parent / "models.json"
