@@ -496,6 +496,62 @@ def _resolve_token(
     return None, "reference chain too long (>8 hops)"
 
 
+# ── Escalation resolution ─────────────────────────────────────────────────────
+#
+# Shared by resolve_destination (what actually happens at runtime) and by
+# roles_report (what the diagnostic table shows).  Both must agree: a table that
+# advertises an escalation the resolver suppresses is worse than no column.
+
+
+def _escalation_is_possible(
+    catalog: RoleCatalog,
+    bindings: Bindings,
+    role_id: str,
+    token: str | None,
+) -> bool:
+    """True when escalating *role_id* would reach a human other than its own.
+
+    False for the default role — there is nobody above it — and false whenever
+    the role's binding resolves to the *same* token as the default role, since
+    the duplicate group would land in the chat that already holds the original.
+    """
+    if role_id == catalog.default_role:
+        return False
+    default_token, _ = _resolve_token(catalog, bindings, catalog.default_role)
+    return token != default_token
+
+
+def _resolve_escalation(
+    catalog: RoleCatalog,
+    bindings: Bindings,
+    role_id: str,
+) -> float | None:
+    """Four-level escalation lookup for *role_id*, ignoring reachability.
+
+    Precedence — the first level where the key is PRESENT wins, even when its
+    value is ``None`` (an explicit "never" beats a duration set below it):
+    ``[workspace.<ws>.escalate_after]`` → ``[escalate_after]`` → the role's own
+    ``escalate_after`` in roles.toml (which already has the file's top-level
+    default merged in at load time).
+
+    Alias-aware, mirroring :func:`_find_in_dict`, so ``arch = "45m"`` resolves
+    for a role whose id is ``architect``.
+
+    Callers must gate this on :func:`_escalation_is_possible`; on its own this
+    reports what is *configured*, not what will happen.
+    """
+    ws_id = catalog.workspace_id
+    ws_ea = bindings.workspace_escalate_after.get(ws_id, {})
+    role_aliases = catalog.roles[role_id].aliases
+    ea, found = _find_ea_in_dict(role_id, role_aliases, ws_ea)
+    if found:
+        return ea
+    ea, found = _find_ea_in_dict(role_id, role_aliases, bindings.escalate_after)
+    if found:
+        return ea
+    return catalog.roles[role_id].escalate_after
+
+
 # ── resolve_destination ───────────────────────────────────────────────────────
 
 
@@ -560,25 +616,8 @@ def resolve_destination(
     # ── Step 6: escalation ───────────────────────────────────────────────────
     # Fires only when: no fallback, role ≠ default, token ≠ default token.
     escalate_after: float | None = None
-    if not fallback_happened and role_id != catalog.default_role:
-        default_token, _ = _resolve_token(catalog, bindings, catalog.default_role)
-        if token != default_token:
-            ws_id = catalog.workspace_id
-            ws_ea = bindings.workspace_escalate_after.get(ws_id, {})
-            role_aliases = catalog.roles[role_id].aliases
-            # Four-level precedence; first level where the key is PRESENT wins
-            # (even when value is None — an explicit "never" beats a lower-level
-            # duration). Alias-aware: mirrors _find_in_dict for token binding so
-            # `arch = "45m"` in [escalate_after] resolves for role_id "architect".
-            ea, found = _find_ea_in_dict(role_id, role_aliases, ws_ea)
-            if found:
-                escalate_after = ea
-            else:
-                ea, found = _find_ea_in_dict(role_id, role_aliases, bindings.escalate_after)
-                if found:
-                    escalate_after = ea
-                else:
-                    escalate_after = catalog.roles[role_id].escalate_after
+    if not fallback_happened and _escalation_is_possible(catalog, bindings, role_id, token):
+        escalate_after = _resolve_escalation(catalog, bindings, role_id)
 
     role_obj = catalog.roles[role_id]
     return Destination(
@@ -641,29 +680,6 @@ def _destination_kind(
     return "none", None
 
 
-def _resolve_escalation(
-    catalog: RoleCatalog,
-    bindings: Bindings,
-    role_id: str,
-) -> float | None:
-    """Four-level escalation lookup for *role_id*, without same-token suppression.
-
-    Returns the *configured* escalation so the diagnostic table shows what is
-    set, even when :func:`resolve_destination` suppresses it at runtime because
-    a referenced role resolves to the same token as the default.
-    """
-    ws_id = catalog.workspace_id
-    ws_ea = bindings.workspace_escalate_after.get(ws_id, {})
-    role_aliases = catalog.roles[role_id].aliases
-    ea, found = _find_ea_in_dict(role_id, role_aliases, ws_ea)
-    if found:
-        return ea
-    ea, found = _find_ea_in_dict(role_id, role_aliases, bindings.escalate_after)
-    if found:
-        return ea
-    return catalog.roles[role_id].escalate_after
-
-
 def roles_report(catalog: RoleCatalog, bindings: Bindings) -> dict:
     """Return a structured summary of roles, their destinations, and errors.
 
@@ -687,13 +703,21 @@ def roles_report(catalog: RoleCatalog, bindings: Bindings) -> dict:
         else:
             destination = "(none)"
 
-        # Escalation is N/A for the default role and for unbound roles that
-        # fall back — neither can escalate usefully.
-        if role_id == catalog.default_role or kind == "none":
-            escalate_str = "—"  # em dash: N/A
+        # Escalation: report the EFFECTIVE value — what resolve_destination
+        # will actually do — not merely what roles.toml configures. A role can
+        # carry `escalate_after = "30m"` and still never escalate: the default
+        # role has nobody above it, an unbound role has already fallen back, and
+        # a role bound to the default's own token would only duplicate the
+        # question into the chat that already has it.
+        dest = resolve_destination(catalog, bindings, role_id)
+        if dest.role_id != role_id or not _escalation_is_possible(
+            catalog, bindings, role_id, dest.token
+        ):
+            escalate_str = "—"  # em dash: no escalation is possible here
+        elif dest.escalate_after is None:
+            escalate_str = "never"  # reachable, but escalation is switched off
         else:
-            ea = _resolve_escalation(catalog, bindings, role_id)
-            escalate_str = "never" if ea is None else _format_duration(ea)
+            escalate_str = _format_duration(dest.escalate_after)
 
         # Fallback note: the title of the role that will take over
         fallback_title: str | None = None

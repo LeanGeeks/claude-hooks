@@ -46,7 +46,7 @@ default:   operator
 ALIASES              ROLE       TITLE                   DESTINATION      ESCALATE
 op, operator         operator   Operator                default token    —
 ux, design, designer ux         UX/UI designer          own binding      5m
-arch, tech-lead      architect  Tech lead / architect   -> operator      never
+arch, tech-lead      architect  Tech lead / architect   -> operator      —
 prod                 prod       Product lead            (none)           —
                                                         ↳ falls back to Operator
 
@@ -58,6 +58,18 @@ errors:
 pasted into issues and chats. `DESTINATION` is one of `default token`,
 `own binding`, `-> <role>` (a reference, brd §3.2), or `(none)`. That is enough
 to debug routing, and it leaks nothing.
+
+`ESCALATE` reports the **effective** value — what the hook will actually do —
+not what `roles.toml` configures. `—` means no escalation is possible: the
+default role has nobody above it, an unbound role has already fallen back
+(brd §5.4), and a role resolving to the default's own token would only duplicate
+the question into the chat that already holds it. That last case is why
+`architect` above shows `—` and not `never`, despite carrying
+`escalate_after = false`: `arch = "operator"` already decided the outcome.
+`never` is reserved for the one shape where escalation *could* fire and was
+switched off — a role with its own distinct binding and `escalate_after = false`.
+A column that advertised an escalation the resolver suppresses would be worse
+than no column.
 
 `--check` calls `GET /v1/installations/me` with each distinct token and appends
 a status: `bound`, `not bound — run relay-client bind`, or `invalid token (401)`.

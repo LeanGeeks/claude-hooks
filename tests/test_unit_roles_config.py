@@ -1009,14 +1009,109 @@ class TestRolesReport(unittest.TestCase):
 
     def test_escalation_strings(self):
         by_role = {r["role_id"]: r for r in self._report()["roles"]}
-        # operator (default role): N/A
+        # operator (default role): N/A — nobody above it
         self.assertEqual(by_role["operator"]["escalate_str"], "—")
         # ux: workspace override 5m wins over catalog 15m
         self.assertEqual(by_role["ux"]["escalate_str"], "5m")
-        # architect: catalog says false → never (shown even though same token as default)
-        self.assertEqual(by_role["architect"]["escalate_str"], "never")
+        # architect: `arch = "operator"` resolves to the default's own token, so
+        # resolve_destination suppresses escalation regardless of what the
+        # catalog configures. The column reports the effective outcome (N/A),
+        # not the configured `escalate_after = false`.
+        self.assertEqual(by_role["architect"]["escalate_str"], "—")
         # prod: no binding, falls back → N/A
         self.assertEqual(by_role["prod"]["escalate_str"], "—")
+
+    def test_escalate_str_matches_resolve_destination_for_every_role(self):
+        """The table's ESCALATE column must never contradict the resolver.
+
+        This is the invariant behind the column: a diagnostic that advertises
+        an escalation resolve_destination will not perform is worse than no
+        column at all.
+        """
+        cat = _example_catalog(self.tmp)
+        b = _example_bindings(self.tmp)
+        for row in rc.roles_report(cat, b)["roles"]:
+            dest = rc.resolve_destination(cat, b, row["role_id"])
+            with self.subTest(role=row["role_id"]):
+                if row["escalate_str"] == "—":
+                    self.assertIsNone(dest.escalate_after)
+                elif row["escalate_str"] == "never":
+                    self.assertIsNone(dest.escalate_after)
+                    self.assertEqual(dest.role_id, row["role_id"])
+                else:
+                    self.assertIsNotNone(dest.escalate_after)
+                    self.assertEqual(
+                        row["escalate_str"], rc._format_duration(dest.escalate_after)
+                    )
+
+    def test_never_shown_only_when_the_role_is_separately_reachable(self):
+        """`never` means "reachable, escalation switched off" — not "unreachable".
+
+        A role with its own distinct token and `escalate_after = false` is the
+        only shape that can produce it; the same role bound to the default's
+        token reports N/A instead.
+        """
+        roles_toml = """\
+default = "operator"
+
+[role.operator]
+title = "Operator"
+
+[role.architect]
+title = "Tech lead"
+escalate_after = false
+"""
+        ws = _make_workspace(self.tmp, roles_toml)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+
+        own = rc.load_bindings(_write(self.tmp, "own.toml", """\
+installation_token = "rly_operator"
+
+[roles]
+architect = "rly_architect"
+"""))
+        by_role = {r["role_id"]: r for r in rc.roles_report(cat, own)["roles"]}
+        self.assertEqual(by_role["architect"]["escalate_str"], "never")
+
+        shared = rc.load_bindings(_write(self.tmp, "shared.toml", """\
+installation_token = "rly_operator"
+
+[roles]
+architect = "operator"
+"""))
+        by_role = {r["role_id"]: r for r in rc.roles_report(cat, shared)["roles"]}
+        self.assertEqual(by_role["architect"]["escalate_str"], "—")
+
+    def test_configured_duration_is_suppressed_when_bound_to_the_default_token(self):
+        """The htl case: a real duration configured, but the same human as the
+        operator, so no escalation can happen and the column must not say 30m."""
+        roles_toml = """\
+default = "operator"
+escalate_after = "30m"
+
+[role.operator]
+title = "Operator"
+
+[role.htl]
+aliases = ["arch"]
+title   = "Human Tech Lead"
+"""
+        ws = _make_workspace(self.tmp, roles_toml)
+        cat = rc.load_catalog(str(ws), path=ws / ".claude" / "roles.toml")
+        b = rc.load_bindings(_write(self.tmp, "htl.toml", """\
+installation_token = "rly_operator"
+
+[roles]
+htl = "operator"
+"""))
+        by_role = {r["role_id"]: r for r in rc.roles_report(cat, b)["roles"]}
+        self.assertEqual(by_role["htl"]["destination"], "-> operator")
+        self.assertEqual(by_role["htl"]["escalate_str"], "—")
+        # And the resolver agrees, with no reroute warning.
+        dest = rc.resolve_destination(cat, b, "htl")
+        self.assertEqual(dest.role_id, "htl")
+        self.assertIsNone(dest.escalate_after)
+        self.assertEqual(dest.notes, ())
 
     def test_fallback_title_only_for_unbound_non_default(self):
         by_role = {r["role_id"]: r for r in self._report()["roles"]}
@@ -1160,8 +1255,12 @@ class TestFormatRolesTable(unittest.TestCase):
     def test_escalation_values_present(self):
         table = self._table()
         self.assertIn("5m", table)
-        self.assertIn("never", table)
         self.assertIn("—", table)  # em dash for N/A
+        # "never" is deliberately absent from the example: its only `false` role
+        # (architect) binds to the default's own token, so the column reports
+        # N/A. See test_never_shown_only_when_the_role_is_separately_reachable
+        # for the shape that does render it.
+        self.assertNotIn("never", table)
 
     def test_fallback_line_present(self):
         table = self._table()
