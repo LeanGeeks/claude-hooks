@@ -475,6 +475,18 @@ def read_handle(name: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def delete_handle(name: str) -> None:
+    """Delete a tracked session's handle JSON from the registry (fail-soft).
+
+    Called by ``amux-spawn rm`` after the amux session has been torn down.
+    Silently ignores a missing file (idempotent).
+    """
+    try:
+        handle_path(name).unlink()
+    except OSError:
+        pass
+
+
 def write_handle(name: str, handle: dict[str, Any]) -> None:
     """Atomically write a handle (tmp file + rename) into the registry.
 

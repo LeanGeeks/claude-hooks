@@ -2,10 +2,9 @@
 """``amux-spawn`` — unified human + agent launcher for amux sessions (epic 10).
 
 This is the CLI: the ``spawn`` subcommand (task 10-01), the read subcommands
-``status`` / ``last`` / ``ls`` (task 10-03), and the supervise flag
-``--wait`` / ``--notify`` (task 10-04). Remaining stub:
-
-- ``a`` / ``attach``              -> 10-05 (quick-switch + completion)
+``status`` / ``last`` / ``ls`` (task 10-03), the supervise flag
+``--wait`` / ``--notify`` (task 10-04), attach / quick-switch ``a|attach``
+(task 10-05), and the end-of-life ``rm`` subcommand (task 10-06).
 
 State is DERIVED at read time (architecture §6); ``stuck`` is never persisted.
 Precedence: terminated -> stuck -> running -> idle. ``status`` bundles
@@ -922,6 +921,112 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return 1
 
 
+# ── rm: reap a tracked session (task 10-06) ──────────────────────────────────
+
+
+def _amux_rm(name: str) -> None:
+    """Run ``amux rm <name>`` (best-effort).
+
+    Tolerates the "unknown session" case — amux's ``resolve_session`` exits
+    non-zero with "not found" on stderr when the session was never registered
+    or was already removed from amux's registry (the tmux side may already be
+    gone).  Any OTHER failure is surfaced as a warning on STDERR so the caller
+    can diagnose it:
+
+    - ``FileNotFoundError``: amux binary is not on PATH.
+    - ``subprocess.TimeoutExpired``: amux took > 10 s.
+    - Non-zero returncode with unrecognised stderr: unexpected amux error.
+
+    Never raises.
+    """
+    try:
+        result = subprocess.run(
+            ["amux", "rm", name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        _eprint(f"amux-spawn rm: warning: amux binary not found; skipping 'amux rm {name}'")
+        return
+    except subprocess.TimeoutExpired:
+        _eprint(f"amux-spawn rm: warning: 'amux rm {name}' timed out (>10 s)")
+        return
+    except Exception as exc:  # noqa: BLE001
+        _eprint(f"amux-spawn rm: warning: 'amux rm {name}' failed unexpectedly: {exc}")
+        return
+
+    if result.returncode != 0:
+        stderr_text = (result.stderr or "").strip()
+        if "not found" in stderr_text:
+            # amux resolve_session emits "error: session '<name>' not found"
+            # when the session was never registered or was already cleaned up.
+            # This is expected; stay silent.
+            return
+        _eprint(
+            f"amux-spawn rm: warning: 'amux rm {name}' exited {result.returncode}"
+            + (f": {stderr_text}" if stderr_text else "")
+        )
+
+
+def cmd_rm(args: argparse.Namespace) -> int:
+    """``rm <handle>`` — reap a tracked session (registry end-of-life, task 10-06).
+
+    Resolves the handle via ``_resolve_handle`` (name-global / cwd-independent,
+    parity with ``status`` and ``last``).  Derives the state using 10-03
+    semantics.  If the derived state is ``running`` or ``stuck``, refuses with
+    a descriptive error and exits non-zero — UNLESS ``--force`` is given, in
+    which case the session is killed regardless.
+
+    On success (or with ``--force``):
+      1. Runs ``amux rm <name>`` to stop tmux + remove the amux registration +
+         delete ``<name>.meta.json``.  Tolerates any amux failure (unknown
+         session, amux unavailable, etc.).
+      2. Deletes ``~/.amux/spawn/<name>.json`` from the registry.
+
+    Output: a human one-liner by default; ``--json`` emits
+    ``{name, state_at_rm, killed}`` where ``killed`` is true iff the session
+    was live (running/stuck) when reaped.  Exit 0 on success; 1 on error.
+    """
+    name, handle = _resolve_handle(args.handle)
+    if handle is None:
+        _eprint(f"amux-spawn rm: no tracked handle found for '{name}'")
+        return 1
+
+    # Derive state using the same 10-03 logic as ``status``.
+    result = _derive_status(handle, None)
+    state = result.get("state", "unknown")
+
+    force = bool(getattr(args, "force", False))
+
+    # Guard: a live session is a kill — the caller must mean it.
+    if state in ("running", "stuck") and not force:
+        _eprint(
+            f"amux-spawn rm: session '{name}' is {state} — refusing to reap "
+            f"without --force"
+        )
+        _eprint("  (use --force to kill and remove the session)")
+        return 1
+
+    killed = state in ("running", "stuck")
+
+    # 1) Ask amux to stop the tmux session + remove its registration +
+    #    delete meta.json.  Tolerate any failure.
+    _amux_rm(name)
+
+    # 2) Remove the spawn registry handle.
+    lib.delete_handle(name)
+
+    # Output.
+    if args.json:
+        print(json.dumps({"name": name, "state_at_rm": state, "killed": killed}))
+    else:
+        verb = "killed and removed" if killed else "removed"
+        print(f"amux-spawn rm: {name} ({state}) {verb}")
+
+    return 0
+
+
 # ── profiles (task 13-02) ─────────────────────────────────────────────────────
 
 def cmd_profiles(args: argparse.Namespace) -> int:
@@ -1040,6 +1145,18 @@ def build_parser() -> argparse.ArgumentParser:
     lsp.add_argument("--dir", default=None, help="filter by an explicit workspace dir")
     lsp.add_argument("--run-id", default=None, help="filter by run_id")
 
+    rm = sub.add_parser(
+        "rm",
+        help="reap a tracked session (end-of-life: stop tmux + delete registry handle)",
+    )
+    rm.add_argument("handle", help="amux session name (handle key)")
+    rm.add_argument(
+        "--force",
+        action="store_true",
+        help="kill and remove even if the session is running or stuck",
+    )
+    rm.add_argument("--json", action="store_true", help="machine-readable JSON output")
+
     # Quick-switch (task 10-05): a|attach [<suffix>]
     for _acmd in ("a", "attach"):
         _ap = sub.add_parser(
@@ -1090,6 +1207,9 @@ def main(argv: list[str] | None = None) -> int:
         if subcommand == "last":
             return cmd_last(ns)
         return cmd_ls(ns)
+    if subcommand == "rm":
+        ns = build_parser().parse_args(argv)
+        return cmd_rm(ns)
     if subcommand in ("a", "attach"):
         ns = build_parser().parse_args(argv)
         return cmd_attach(ns)

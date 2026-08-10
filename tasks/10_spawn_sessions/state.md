@@ -18,8 +18,29 @@ settled.
 | [10-03](./10-03-reads.md) | reads: status/last/ls + reason-context | **done** (code+review+tests @ `db4545a`; 289 green) | 10-01, 10-02 |
 | [10-04](./10-04-supervise.md) | supervise (`--wait`/notify) | **done** (code+review+tests @ `0b899ad`; 310 green; `--wait`/`--notify`/`--timeout` + false-idle guard; live background-Bash verification batched into acceptance) | 10-01, 10-02 |
 | [10-05](./10-05-human-ergonomics.md) | attach/completion/shell | **done** (code+review+tests @ `5fa072b`; 334 green. Opt-in shell snippet — bashrc untouched. Live switch/TAB/integrated-launch batched into acceptance) | 10-01, 12 (E3) ✓ |
+| [10-06](./10-06-rm-reap.md) | `rm`: reap a tracked session (registry end-of-life) | **done** (2026-08-10; code+review(2 passes)+fix+tests; 708 green. `rm` refuses live w/o `--force`, tolerates amux "not found", warns on real amux failures, always deletes the handle. Driver: hyppie-flow ADR-0027 PM tick watchdog) | 10-01, 10-03, 12 ✓ |
 
-**All five 10-0x implementation tasks DONE (each Implementer→Reviewer PASS→Fixer→Committer). Suite 334 passing.**
+**All six 10-0x implementation tasks DONE (each Implementer→Reviewer PASS→Fixer→Committer). Suite 708 passing** (334 was the count at 10-05's commit `5fa072b`; later epics grew the suite to 686 at HEAD, +14 from 10-06's tests and +8 from its fix pass).
+
+### Log — 10-06 (2026-08-10)
+
+- Implemented `amux-spawn rm <handle>` in `.claude/bin/amux-spawn` (+ `delete_handle`
+  in `.claude/hooks/amux_spawn_lib.py`, beside `read_handle`/`write_handle`).
+  Reuses `_resolve_handle` + `_derive_status` — no new resolution or state logic.
+- Review pass 1: PASS with 1 MEDIUM (`_amux_rm` swallowed every failure via bare
+  `except Exception: pass`) + 1 LOW (dead argparse guard). Both fixed; review pass 2
+  PASS with zero issues.
+- `amux rm` failure policy (settled here): stderr containing "not found" ⇒ the tmux
+  side is already gone, tolerate silently; anything else (missing binary, timeout,
+  unexpected non-zero) ⇒ `_eprint` warning with returncode/stderr. The handle is
+  deleted in **every** path and exit stays 0. Predicate verified safe against the
+  installed amux source — only `resolve_session` emits "not found" from `cmd_rm`
+  ("directory not found" lives in `cmd_start`). Re-check on an amux bump.
+- 10-03's "no auto-cleanup — the registry accumulates" decision **stands**; `cmd_ls`
+  untouched. Cleanup is explicit via `rm` only.
+- **Downstream follow-up (other repo, not this one):** hyppie-flow's
+  `scripts/amux-reap.sh` can now reduce to `exec amux-spawn rm "$1"` instead of
+  hand-deleting `~/.amux/spawn/<name>.json` (ADR-0027).
 
 ## BRD §9 acceptance — live run 2026-06-23 (installer re-run by user; hooks now live)
 
