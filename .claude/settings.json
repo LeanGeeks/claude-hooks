@@ -273,7 +273,8 @@
       "Bash(whoami:*)",
       "Bash(id:*)",
       "Bash(mktemp:*)",
-      "Bash(ffmpeg:*)"
+      "Bash(ffmpeg:*)",
+      "Bash(agent-browser:*)"
     ],
     "deny": [
       "Bash(shred:*)",
