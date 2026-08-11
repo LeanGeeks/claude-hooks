@@ -21,6 +21,7 @@ import httpx
 import pytest
 
 from relay_server.callback_data import encode as encode_cb
+from relay_server.render import TAG, TAG_LINE
 
 from tests.conftest import TEST_WEBHOOK_SECRET  # type: ignore[attr-defined]
 
@@ -491,6 +492,99 @@ async def test_multi_select_pending_does_not_finalize_group(
                chat_id=chat_id, user_id=user_id, update_id=12)
     assert (await _answer(app_client, token, m1)).json()["answer"]["via"] == "button_multi"
     assert (await _answer(app_client, token, m2)).json()["answer"]["value"] == "qa0"
+
+
+# ---- The #unanswered tag across a group's life (19-03) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_group_of_four_finalizes_and_all_four_lose_the_tag(
+    app_client: httpx.AsyncClient, seeded: dict[str, object], backend
+) -> None:
+    """Every member is tagged while the group waits, and the finalize edit that
+    bakes each answer drops the tag on all four at once."""
+    token = seeded["token"]
+    chat_id = int(seeded["chat_id"])  # type: ignore[arg-type]
+    user_id = int(seeded["bound_user_id"])  # type: ignore[arg-type]
+
+    ids = [
+        await _create_grouped(
+            app_client, token, group_id="g4", group_total=4,
+            options=[("Yes", "qa0"), ("No", "qa1")], text=f"Q{i}",
+        )
+        for i in range(4)
+    ]
+    # Every member went out tagged.
+    for i, sent in enumerate(backend.sent[-4:]):
+        assert sent.text == f"Q{i}" + TAG_LINE
+
+    for n, mid in enumerate(ids):
+        await _tap(app_client, relay_msg_id=mid, option_idx=0,
+                   chat_id=chat_id, user_id=user_id, update_id=40 + n)
+
+    # The last tap finalized the group: keyboards stripped, answers baked, and
+    # not one of the four still carries the tag.
+    for i, tg_id in enumerate(range(1000, 1004)):
+        final = [e for e in _edits_for(backend, tg_id) if e.kwargs["keyboard"] is None]
+        assert final, f"expected a finalize edit on {tg_id}"
+        text = final[-1].kwargs["text"]
+        assert text == f"Q{i}\n\n✅ Yes"
+        assert TAG not in text
+        assert (await _answer(app_client, token, ids[i])).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_highlight_re_render_keeps_the_tag(
+    app_client: httpx.AsyncClient, seeded: dict[str, object], backend
+) -> None:
+    """A provisional tap re-renders the body while the message is still open —
+    the tag must survive, not be dropped by a call site rendering its own text."""
+    token = seeded["token"]
+    chat_id = int(seeded["chat_id"])  # type: ignore[arg-type]
+    user_id = int(seeded["bound_user_id"])  # type: ignore[arg-type]
+
+    m1 = await _create_grouped(
+        app_client, token, group_id="g2", group_total=2,
+        options=[("Yes", "qa0"), ("No", "qa1")], text="Q1",
+    )
+    await _create_grouped(
+        app_client, token, group_id="g2", group_total=2,
+        options=[("A", "qa0"), ("B", "qa1")], text="Q2",
+    )
+    await _tap(app_client, relay_msg_id=m1, option_idx=0,
+               chat_id=chat_id, user_id=user_id, update_id=50)
+
+    render = _edits_for(backend, 1000)[-1]
+    assert render.kwargs["text"] == "Q1" + TAG_LINE
+    assert render.kwargs["keyboard"] is not None
+
+
+@pytest.mark.asyncio
+async def test_multi_select_toggle_keeps_the_tag(
+    app_client: httpx.AsyncClient, seeded: dict[str, object], backend
+) -> None:
+    """Toggling options re-renders repeatedly while the message stays open: the
+    tag must survive every toggle and never double."""
+    token = seeded["token"]
+    chat_id = int(seeded["chat_id"])  # type: ignore[arg-type]
+    user_id = int(seeded["bound_user_id"])  # type: ignore[arg-type]
+
+    m1 = await _create_multi(
+        app_client, token, group_id="m", group_total=1,
+        options=[("A", "qa0"), ("B", "qa1")], text="Pick any",
+    )
+    for n, idx in enumerate((0, 1, 0)):
+        await _tap(app_client, relay_msg_id=m1, option_idx=idx,
+                   chat_id=chat_id, user_id=user_id, update_id=60 + n)
+        text = _edits_for(backend, 1000)[-1].kwargs["text"]
+        assert text == "Pick any" + TAG_LINE
+        assert text.count(TAG) == 1
+
+    # Submit (flat idx 2) → terminal, tag gone.
+    await _tap(app_client, relay_msg_id=m1, option_idx=2,
+               chat_id=chat_id, user_id=user_id, update_id=70)
+    final = [e for e in _edits_for(backend, 1000) if e.kwargs["keyboard"] is None][-1]
+    assert TAG not in final.kwargs["text"]
 
 
 @pytest.mark.asyncio

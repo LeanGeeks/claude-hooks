@@ -352,7 +352,9 @@ async def test_notification_sent_without_force_reply(
     await _create_notification(app_client, token, "idle")
     await _create_message(app_client, token)  # a question
     sends = [c for c in backend.calls if c.method == "send_message"]
-    by_reqd = {c.kwargs["text"]: c.kwargs for c in sends}
+    # Key on the first line: the question also carries a trailing #unanswered
+    # tag line, the notification does not (19-03).
+    by_reqd = {c.kwargs["text"].split("\n", 1)[0]: c.kwargs for c in sends}
     assert by_reqd["idle"]["force_reply"] is False
     assert by_reqd["idle"]["reply_required"] is True
     assert by_reqd["?"]["force_reply"] is True

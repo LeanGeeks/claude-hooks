@@ -33,12 +33,19 @@ from .models import (
     InstallationMeResponse,
     PatchMessageRequest,
 )
+from .render import (
+    payload_for as _payload_for,
+    render_body,
+    render_body_row,
+    strip_tag,
+)
 from .telegram_backend import (
     FakeTelegramBackend,
     HttpTelegramBackend,
     TelegramApiError,
     TelegramBackend,
     TelegramForbidden,
+    is_not_modified as _is_not_modified,
 )
 from .tokens import hash_token
 from .waiters import WaiterRegistry
@@ -494,6 +501,11 @@ def create_app(
         backend: TelegramBackend = request.app.state.backend
         installation_id = installation["id"]
 
+        # Canonicalize on ingest: whatever the client typed, the stored body is
+        # untagged (invariant 1). The tag is the render layer's alone, so a
+        # client echoing it back cannot pin it onto a resolved message.
+        body.text = strip_tag(body.text)
+
         request_hash = (
             _canonical_body_hash(body.model_dump()) if idempotency_key else ""
         )
@@ -601,7 +613,10 @@ def create_app(
             try:
                 tg_message_id = await backend.send_message(
                     chat_id=chat_id,
-                    text=body.text,
+                    # The row is 'open' by construction and has no usable id
+                    # yet (telegram_message_id is still the 0 placeholder), so
+                    # render from the payload we are about to store.
+                    text=render_body(body.model_dump(), "open"),
                     keyboard=keyboard_dump,
                     reply_required=body.reply_required,
                     message_id=message_id,
@@ -691,11 +706,18 @@ def create_app(
         backend: TelegramBackend = request.app.state.backend
         installation_id = installation["id"]
         row = await _load_message(conn, message_id, installation_id)
+        # The client's text becomes the new canonical body: stored untagged,
+        # displayed through the one renderer. Before this, payload_json kept the
+        # create-time text forever, so every later re-render (cancel, expiry,
+        # group finalize) would resurrect it over whatever the client had
+        # baked in — brd §2.8.
+        payload = _payload_for(row)
+        payload["text"] = strip_tag(body.text or "")
         try:
             await backend.edit_message(
                 chat_id=row["telegram_chat_id"],
                 telegram_message_id=row["telegram_message_id"],
-                text=body.text,
+                text=render_body(payload, row["state"]),
                 keyboard=None,
             )
         except TelegramForbidden:
@@ -713,6 +735,20 @@ def create_app(
                     exc.description,
                 )
                 raise HTTPException(status_code=502, detail="telegram_error")
+
+        # Write back only once Telegram has accepted (or already agreed with)
+        # the body, so the payload never claims a text the chat never showed.
+        payload_json = json.dumps(payload)
+
+        def _persist_text() -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE messages SET payload_json = ?"
+                    " WHERE id = ? AND installation_id = ?",
+                    (payload_json, message_id, installation_id),
+                )
+
+        await run_in_thread(_persist_text)
         return {}
 
     @app.delete("/v1/messages/{message_id}", status_code=204)
@@ -747,14 +783,50 @@ def create_app(
         installation_id = installation["id"]
         row = await _load_message(conn, message_id, installation_id)
 
-        def _cancel() -> None:
+        def _cancel() -> int:
             with conn:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE messages SET state='cancelled' WHERE id=? AND state='open'",
                     (message_id,),
                 )
+                return cur.rowcount
 
-        await run_in_thread(_cancel)
+        flipped = await run_in_thread(_cancel)
+        if flipped:
+            # Drop the tag by re-rendering the canonical body. Re-read *after*
+            # the flip: the row loaded above still says 'open' and would render
+            # the tag straight back on. Best-effort — a failed edit must never
+            # block the transition. Skipped when the row was already terminal so
+            # a late cancel cannot overwrite an answer another path baked in
+            # (group finalization writes text the payload does not carry).
+            fresh = await _load_message(conn, message_id, installation_id)
+            final_text = render_body_row(fresh)
+            if final_text.strip():
+                try:
+                    await backend.edit_message(
+                        chat_id=fresh["telegram_chat_id"],
+                        telegram_message_id=fresh["telegram_message_id"],
+                        text=final_text,
+                        keyboard=None,
+                    )
+                except TelegramApiError as exc:
+                    # An already-untagged body is the common case, not a fault.
+                    if not _is_not_modified(exc):
+                        logger.warning(
+                            "cancel_message: telegram rejected text edit for"
+                            " %s: %s",
+                            message_id,
+                            exc.description,
+                        )
+                except Exception:  # noqa: BLE001
+                    # Includes TelegramForbidden — the keyboard strip below
+                    # raises it too and owns the unbind/409 response.
+                    logger.warning(
+                        "cancel_message: text edit failed for %s"
+                        " (best-effort, continuing)",
+                        message_id,
+                        exc_info=True,
+                    )
         try:
             # Strip the inline keyboard via the dedicated Bot-API-shaped method.
             await backend.edit_reply_markup(
@@ -1010,13 +1082,6 @@ async def _load_installation_for_chat(
     return await run_in_thread(_q)
 
 
-def _payload_for(row: sqlite3.Row) -> dict[str, Any]:
-    try:
-        return json.loads(row["payload_json"])
-    except Exception:  # noqa: BLE001
-        return {}
-
-
 def _payload_keyboard_for(row: sqlite3.Row) -> list[list[dict[str, Any]]] | None:
     return _payload_for(row).get("keyboard")
 
@@ -1202,20 +1267,6 @@ async def _toggle_multi_selection(
     return await run_in_thread(_w)
 
 
-def _is_not_modified(exc: TelegramApiError) -> bool:
-    """True for Telegram's "message is not modified" 400.
-
-    Telegram raises it when an edit would be a no-op — the body already reads
-    that way, or the keyboard the caller wants removed is already gone. For an
-    endpoint whose contract is *make it so* rather than *change it*, that is the
-    success case wearing an error's clothes.
-
-    Matched on the description because the Bot API gives it no distinct
-    ``error_code``; every "not modified" variant shares the phrase.
-    """
-    return "not modified" in (exc.description or "").lower()
-
-
 def _member_answered(row: sqlite3.Row) -> bool:
     """True if a group member holds a *final* answer. A multi-select message
     carrying only a still-being-toggled selection (``via == multi_pending``)
@@ -1286,7 +1337,8 @@ async def _finalize_group_if_complete(
     members = await _load_group_members(conn, chat_id, group_id)
     for m in members:
         answer = json.loads(m["answer_json"]) if m["answer_json"] else {}
-        body = (_payload_for(m).get("text") or "") + _answer_line(answer)
+        # Members were re-loaded after the flip, so they render untagged.
+        body = render_body_row(m) + _answer_line(answer)
         try:
             await backend.edit_message(
                 chat_id=chat_id,
@@ -1595,7 +1647,8 @@ async def _handle_multi_select_button(
         await backend.edit_message(
             chat_id=chat_id,
             telegram_message_id=int(row["telegram_message_id"]),
-            text=_payload_for(row).get("text") or "",
+            # Still open and still awaiting the Submit tap — keeps the tag.
+            text=render_body_row(row),
             keyboard=highlighted,
             relay_message_id=int(row["id"]),
         )
@@ -1687,7 +1740,8 @@ async def _handle_grouped_button(
         await backend.edit_message(
             chat_id=chat_id,
             telegram_message_id=int(row["telegram_message_id"]),
-            text=_payload_for(row).get("text") or "",
+            # The group is still incomplete, so this member stays tagged.
+            text=render_body_row(row),
             keyboard=highlighted,
             relay_message_id=int(row["id"]),
         )
@@ -1723,7 +1777,7 @@ async def _handle_grouped_reply(
         return
     # Still collecting — show the typed answer and leave the buttons available
     # (un-highlighted) so the user can still switch to a preset option.
-    body = (_payload_for(row).get("text") or "") + f"\n\n{_REPLY_PREFIX}{_esc(text)}"
+    body = render_body_row(row) + f"\n\n{_REPLY_PREFIX}{_esc(text)}"
     try:
         await backend.edit_message(
             chat_id=chat_id,

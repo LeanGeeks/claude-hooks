@@ -6,11 +6,15 @@ What it does each tick
 ----------------------
 1. **Expired messages** — rows with ``state = 'open' AND expires_at < now``:
    - Transitions state to ``'expired'`` in the DB.
-   - Best-effort ``edit_reply_markup(..., keyboard=None)`` to strip the
-     Telegram inline keyboard.  We chose Option A from the spec: keyboard-only
-     strip, no text edit.  Rationale: avoids the extra ``editMessageText`` call
-     (rate-limit surface, extra failure point) and the user can already see the
-     question is gone when they open the chat.
+   - Best-effort ``edit_message`` re-rendering the canonical body, followed by
+     the ``edit_reply_markup(..., keyboard=None)`` keyboard strip.  **This
+     reverses task 05's "Option A"** (keyboard-only strip, no text edit), which
+     rejected the extra ``editMessageText`` as unjustified rate-limit surface.
+     Epic 19 is the justification: an expired message must lose its
+     ``#unanswered`` tag or Telegram's hashtag search — the pending-work index —
+     starts listing work nobody is waiting on (brd §4.3).  The reversal is to be
+     written up in ``tasks/05_telegram_prompt_lifecycle_management.md`` by
+     task 19-06.
    - Notifies the WaiterRegistry so any parked long-polls wake up immediately
      and return ``state=expired`` instead of waiting for their timeout.
    - Evicts the WaiterRegistry event after notification (memory hygiene — the
@@ -34,7 +38,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from .db import run_in_thread
-from .telegram_backend import TelegramBackend
+from .render import payload_for, render_body
+from .telegram_backend import TelegramApiError, TelegramBackend, is_not_modified
 from .waiters import WaiterRegistry
 
 logger = logging.getLogger(__name__)
@@ -64,9 +69,15 @@ async def reaper_tick(
     # ------------------------------------------------------------------ #
 
     def _fetch_expired() -> list:
-        """Return all open messages that have passed their expiry deadline."""
+        """Return all open messages that have passed their expiry deadline.
+
+        ``payload_json`` rides along in the same query because the text edit
+        below needs the canonical body: this pass holds the shared connection
+        lock and can cover dozens of rows, so a per-row re-read would be exactly
+        the wrong shape.
+        """
         return conn.execute(
-            "SELECT id, telegram_chat_id, telegram_message_id"
+            "SELECT id, telegram_chat_id, telegram_message_id, payload_json"
             " FROM messages"
             " WHERE state = 'open' AND expires_at < ?",
             (now_iso,),
@@ -112,7 +123,39 @@ async def reaper_tick(
             )
             continue
 
-        # Best-effort keyboard strip (Option A: reply_markup only, no text edit).
+        # Best-effort text re-render: the row is now 'expired', so the body
+        # renders without the ``#unanswered`` tag. The state we pass is the one
+        # we just wrote — rendering from a row that still said 'open' is how a
+        # tag survives its own expiry. Rows with no stored body (legacy or
+        # unreadable payloads) get the keyboard strip alone rather than an empty
+        # edit Telegram would reject.
+        body = render_body(payload_for(row), "expired")
+        if body.strip():
+            try:
+                await backend.edit_message(
+                    chat_id=chat_id,
+                    telegram_message_id=tg_message_id,
+                    text=body,
+                    keyboard=None,
+                )
+            except TelegramApiError as exc:
+                # A body that already reads that way is the common correct case.
+                if not is_not_modified(exc):
+                    logger.warning(
+                        "reaper: text edit failed for message %s (%s)"
+                        " (best-effort, continuing)",
+                        message_id,
+                        exc.description,
+                    )
+            except Exception:
+                logger.warning(
+                    "reaper: text edit failed for message %s"
+                    " (best-effort, continuing)",
+                    message_id,
+                    exc_info=True,
+                )
+
+        # Best-effort keyboard strip.
         try:
             await backend.edit_reply_markup(
                 chat_id=chat_id,

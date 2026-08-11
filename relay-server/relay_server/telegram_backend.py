@@ -49,6 +49,24 @@ class TelegramApiError(Exception):
         self.description = description
 
 
+def is_not_modified(exc: TelegramApiError) -> bool:
+    """True for Telegram's "message is not modified" 400.
+
+    Telegram raises it when an edit would be a no-op — the body already reads
+    that way, or the keyboard the caller wants removed is already gone. For an
+    endpoint whose contract is *make it so* rather than *change it*, that is the
+    success case wearing an error's clothes. An already-untagged message being
+    re-cancelled or expired is the common, correct case, not a fault.
+
+    Matched on the description because the Bot API gives it no distinct
+    ``error_code``; every "not modified" variant shares the phrase.
+
+    Lives here beside ``TelegramApiError`` because both the HTTP routes and the
+    reaper need it and the reaper cannot import ``app``.
+    """
+    return "not modified" in (exc.description or "").lower()
+
+
 @dataclass
 class SentMessage:
     chat_id: int

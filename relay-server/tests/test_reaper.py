@@ -8,6 +8,7 @@ deterministic.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,6 +16,7 @@ import pytest
 
 from relay_server.db import connect, init_schema, run_in_thread
 from relay_server.reaper import reaper_tick
+from relay_server.render import TAG, TAG_LINE
 from relay_server.telegram_backend import FakeTelegramBackend, TelegramApiError
 from relay_server.tokens import generate_token, hash_token
 from relay_server.waiters import WaiterRegistry
@@ -59,6 +61,7 @@ def _insert_message(
     expires_at: datetime | None = None,
     chat_id: int = 42,
     tg_message_id: int = 1000,
+    payload: dict | None = None,
 ) -> int:
     if expires_at is None:
         expires_at = _utcnow() - timedelta(seconds=1)  # expired by default
@@ -67,10 +70,27 @@ def _insert_message(
             "INSERT INTO messages("
             "installation_id, telegram_chat_id, telegram_message_id,"
             " kind, payload_json, state, created_at, expires_at)"
-            " VALUES (?, ?, ?, 'question', '{}', ?, datetime('now'), ?)",
-            (installation_id, chat_id, tg_message_id, state, _iso(expires_at)),
+            " VALUES (?, ?, ?, 'question', ?, ?, datetime('now'), ?)",
+            (
+                installation_id,
+                chat_id,
+                tg_message_id,
+                json.dumps(payload) if payload is not None else "{}",
+                state,
+                _iso(expires_at),
+            ),
         )
     return int(cur.lastrowid)
+
+
+def _question_payload(text: str) -> dict:
+    """A payload shaped like an open permission prompt (buttons → tagged)."""
+    return {
+        "kind": "question",
+        "text": text,
+        "keyboard": [[{"label": "Yes", "value": "y"}]],
+        "reply_required": False,
+    }
 
 
 def _insert_idem_key(conn, installation_id: int, key: str, *, age_hours: float) -> None:
@@ -137,6 +157,146 @@ async def test_expired_message_strips_keyboard(tmp_path: Path) -> None:
     assert kw["chat_id"] == 55
     assert kw["telegram_message_id"] == 9001
     assert kw["keyboard"] is None
+
+
+# ---- Expiry drops the #unanswered tag (19-03) ------------------------------
+#
+# This reverses task 05's "Option A" (keyboard-only strip, no text edit): an
+# expired prompt that keeps its tag would leave Telegram's hashtag search — the
+# pending-work index — listing work nobody is waiting on (brd §4.3).
+
+
+@pytest.mark.asyncio
+async def test_expiry_rewrites_the_body_without_the_tag(tmp_path: Path) -> None:
+    """Text edited, tag gone, keyboard stripped, waiter woken — in one tick."""
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn, chat_id=55)
+    mid = _insert_message(
+        conn, iid, state="open",
+        expires_at=_utcnow() - timedelta(seconds=10),
+        chat_id=55,
+        tg_message_id=9001,
+        payload=_question_payload("Allow the tool call?"),
+    )
+
+    backend = FakeTelegramBackend()
+    waiters = WaiterRegistry()
+    wait_task = asyncio.create_task(waiters.wait(mid, timeout=5.0))
+
+    await reaper_tick(conn, backend, waiters)
+
+    edits = [c for c in backend.calls if c.method == "edit_message"]
+    assert len(edits) == 1
+    assert edits[0].kwargs["chat_id"] == 55
+    assert edits[0].kwargs["telegram_message_id"] == 9001
+    assert edits[0].kwargs["text"] == "Allow the tool call?"
+    assert TAG not in edits[0].kwargs["text"]
+    assert edits[0].kwargs["keyboard"] is None
+
+    strips = [c for c in backend.calls if c.method == "edit_reply_markup"]
+    assert len(strips) == 1
+    assert strips[0].kwargs["keyboard"] is None
+
+    assert _get_message_state(conn, mid) == "expired"
+    assert await wait_task is True
+
+
+@pytest.mark.asyncio
+async def test_expiry_strips_a_tag_a_client_typed_itself(tmp_path: Path) -> None:
+    """Even a body whose stored text somehow carries the tag renders clean."""
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn)
+    _insert_message(
+        conn, iid, state="open",
+        payload=_question_payload("legacy body" + TAG_LINE),
+    )
+
+    backend = FakeTelegramBackend()
+    await reaper_tick(conn, backend, WaiterRegistry())
+
+    edits = [c for c in backend.calls if c.method == "edit_message"]
+    assert edits[0].kwargs["text"] == "legacy body"
+
+
+@pytest.mark.asyncio
+async def test_expiry_without_a_stored_body_skips_the_text_edit(
+    tmp_path: Path,
+) -> None:
+    """An empty ``editMessageText`` is a guaranteed Telegram rejection, so rows
+    with no readable body fall back to the keyboard strip alone."""
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn)
+    mid = _insert_message(conn, iid, state="open")  # payload_json == '{}'
+
+    backend = FakeTelegramBackend()
+    await reaper_tick(conn, backend, WaiterRegistry())
+
+    assert not any(c.method == "edit_message" for c in backend.calls)
+    assert any(c.method == "edit_reply_markup" for c in backend.calls)
+    assert _get_message_state(conn, mid) == "expired"
+
+
+@pytest.mark.asyncio
+async def test_not_modified_on_the_text_edit_does_not_stop_the_tick(
+    tmp_path: Path,
+) -> None:
+    """An already-untagged message being expired is the common correct case.
+    The transition completes, the keyboard is still stripped, and the rest of
+    the tick (further rows, the idempotency purge) still runs."""
+
+    class NotModifiedBackend(FakeTelegramBackend):
+        async def edit_message(self, **kwargs):
+            await super().edit_message(**kwargs)
+            raise TelegramApiError(
+                400, "Bad Request: message is not modified"
+            )
+
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn)
+    first = _insert_message(
+        conn, iid, state="open", tg_message_id=3001,
+        payload=_question_payload("one"),
+    )
+    second = _insert_message(
+        conn, iid, state="open", tg_message_id=3002,
+        payload=_question_payload("two"),
+    )
+    _insert_idem_key(conn, iid, "old-key", age_hours=25)
+
+    backend = NotModifiedBackend()
+    await reaper_tick(conn, backend, WaiterRegistry())  # must not raise
+
+    assert _get_message_state(conn, first) == "expired"
+    assert _get_message_state(conn, second) == "expired"
+    assert len([c for c in backend.calls if c.method == "edit_message"]) == 2
+    assert len([c for c in backend.calls if c.method == "edit_reply_markup"]) == 2
+    assert _count_idem_keys(conn) == 0
+
+
+@pytest.mark.asyncio
+async def test_text_edit_failure_does_not_prevent_expiry(tmp_path: Path) -> None:
+    """The text edit is best-effort: a hard Telegram failure must not block the
+    state transition, the keyboard strip, or the waiter wake-up."""
+
+    class BrokenBackend(FakeTelegramBackend):
+        async def edit_message(self, **kwargs):
+            raise TelegramApiError(400, "Bad Request: message to edit not found")
+
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn)
+    mid = _insert_message(
+        conn, iid, state="open", payload=_question_payload("body"),
+    )
+
+    backend = BrokenBackend()
+    waiters = WaiterRegistry()
+    wait_task = asyncio.create_task(waiters.wait(mid, timeout=5.0))
+
+    await reaper_tick(conn, backend, waiters)  # must not raise
+
+    assert _get_message_state(conn, mid) == "expired"
+    assert any(c.method == "edit_reply_markup" for c in backend.calls)
+    assert await wait_task is True
 
 
 @pytest.mark.asyncio
