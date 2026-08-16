@@ -51,12 +51,28 @@ ALTER TABLE messages ADD COLUMN nudge_tg_message_id INTEGER;
 CREATE INDEX IF NOT EXISTS messages_nudge_due ON messages(state, next_nudge_at);
 ```
 
-All three are nullable or defaulted, so the migration is `ALTER TABLE` with no
+And the tag-cleanup flag, for the same reason — one migration, one version bump
+(decided 2026-08-16, see [state.md](./state.md) log):
+
+```sql
+ALTER TABLE messages ADD COLUMN render_dirty INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS messages_render_dirty
+    ON messages(render_dirty) WHERE render_dirty = 1;
+```
+
+`render_dirty = 1` means *the row has left `open` but the Telegram message may
+still show `#unanswered`*. It exists because `_record_answer` flips state with
+no Telegram edit at all, so the tag's removal currently depends on the client's
+PATCH arriving — see state.md's log entry for the failure. **19-04 owns every
+read and write of this column**; 19-01 only defines it. The partial index keeps
+the sweep free in the overwhelmingly common case where no row is flagged.
+
+All four are nullable or defaulted, so the migration is `ALTER TABLE` with no
 table rebuild. Add them to `SCHEMA_SQL`'s `messages` definition too, so a fresh
 database and a migrated one converge — `test_schema.py` should assert exactly
 that. Leave `messages_state_expiry` alone; expiry still uses it.
 
-`MIGRATIONS[n]` is the `CREATE` plus the three `ALTER`s — there is no data to
+`MIGRATIONS[n]` is the `CREATE` plus the four `ALTER`s — there is no data to
 move.
 
 ### New module — `relay_server/availability.py`
@@ -138,16 +154,17 @@ New `relay-server/tests/test_availability.py`:
 - Property-ish: for random `now`/`delta` with an always-available config,
   `advance_active(now, d) == now + d`.
 
-Extend `test_schema.py`: fresh DB gets `recipients` and the three `messages`
+Extend `test_schema.py`: fresh DB gets `recipients` and the four `messages`
 columns; a v2 DB migrates to the same shape with existing message rows intact
-(`nudge_count` 0, the other two NULL); fresh and migrated schemas are asserted
-**identical**; version stamp is correct.
+(`nudge_count` 0, `render_dirty` 0, the other two NULL); fresh and migrated
+schemas are asserted **identical**; version stamp is correct.
 
 ## Done criteria
 
-- [ ] `recipients` and the three `messages` columns exist on fresh and migrated
+- [ ] `recipients` and the four `messages` columns exist on fresh and migrated
       databases, and the two schemas are provably identical.
-- [ ] Existing message rows survive the migration with sane defaults.
+- [ ] Existing message rows survive the migration with sane defaults
+      (`nudge_count` 0, `render_dirty` 0 — no row starts out flagged).
 - [ ] `availability.py` is importable with no relay state and holds no clock.
 - [ ] Every row of the behaviour table is a passing test, DST included.
 - [ ] A never-active window returns `None` in bounded time.

@@ -13,7 +13,7 @@ external unknown (hashtag search scope per client) was closed by the operator as
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | todo | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns), tz/windows parsing, `advance_active`. Touches no Telegram code. |
+| 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | todo | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns + `render_dirty`), tz/windows parsing, `advance_active`. Touches no Telegram code. |
 | 19-02 | [Preference commands](./19-02-preference-commands.md) | todo | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
 | 19-04 | [Nudge engine](./19-04-nudge-engine.md) | todo | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
@@ -90,6 +90,12 @@ nudge machinery in the picture at all.
    is 19-06's read-only diagnostic column.
 9. **Relay-local commands.** `/tz`, `/hours`, `/nudge`, `/me` are handled in the
    webhook beside `/bind` and have no dependency on epic 16's command queue.
+10. **Terminal cleanup is swept, not trusted** (decided 2026-08-16). Of the five
+    terminal paths, `_record_answer` reaches Telegram not at all — so neither the
+    tag nor a nudge may depend on the client's PATCH arriving. The reaper's
+    cleanup pass is the backstop for both; the existing renders remain the fast
+    path. 19-01 defines `render_dirty`, 19-04 is the only task that reads or
+    writes it.
 
 ## Cross-epic conflict — schema version
 
@@ -126,12 +132,46 @@ with a live `#unanswered` tag and nothing ever removes it: the reaper sweeps
 `state = 'open'` only.
 
 Pre-existing behaviour with a new symptom — hashtag search would list an item
-that is already resolved. Correctly scoped out of 19-03. **Open for decision
-before 19-04**, which treats the tag as ground truth and whose nudge cleanup
-(brd §5.7) hangs off the same chokepoint — a nudge orphaned this way would be
-worse than a stale tag. Candidate remedies: give `_record_answer` the same
-render-after-flip edit the cancel path now has, or widen the reaper sweep to
-catch terminal rows still carrying a tag.
+that is already resolved. Correctly scoped out of 19-03. **Resolved 2026-08-16 —
+see the entry below**, which also corrects this one: the remedy blocks 19-01,
+not 19-04.
+
+**2026-08-16 — both open decisions closed; the epic has none left.** Decided by
+Anton after re-reading the paths in the shipped code.
+
+1. **The `_record_answer` leak (above) is cleaned up by the reaper, not by an
+   eager edit.** A `render_dirty` flag on `messages`, set in `_record_answer`'s
+   existing `UPDATE` (value supplied by the caller via `awaits_human`, so
+   untagged rows are never flagged) and cleared by the PATCH and cancel renders
+   that already exist. A new reaper pass sweeps `render_dirty = 1 AND state !=
+   'open'`, and the same pass deletes orphaned nudges via `nudge_tg_message_id
+   IS NOT NULL AND state != 'open'`.
+
+   *Rejected:* giving `_record_answer` its own render-after-flip edit. It costs
+   an `editMessageText` on the hottest path in the system for **every** ungrouped
+   answer, and the hook's PATCH lands milliseconds later with the baked `✅`
+   text — two edits where there is one today, against brd §2.7's ~1 msg/s per
+   chat, precisely when several sessions are answering at once. It buys nothing
+   in the normal case (the PATCH already clears the tag within a second) and
+   only differs in the failure case, where the reaper's answer is "≤ one tick"
+   against "never". It would also drag brd §5.7's nudge deletion onto the same
+   hot path, where the sweep gets it for free.
+
+   **Scheduling correction: this blocks 19-01, not 19-04.** The flag is a column,
+   19-01 owns the epic's entire migration, and no other task may add one — so
+   deciding this after 19-01 lands would cost a second migration and another
+   reconciliation against epic 16. 19-01 now defines `render_dirty`; **19-04
+   owns every read and write of it.**
+
+2. **brd §5.3's assumption is confirmed: both coalescing keys are kept** — group
+   *and* chat-level. The chat-level rule was the planner's addition; without it
+   four sessions going idle in one tick emit four nudges, which is the original
+   complaint in new clothes. brd §5.3 no longer marks it optional.
+
+**Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
+decidable today for a structural reason — the relay does not know the workspace
+(the session name is composed client-side into the body), so it would need a new
+field before it is even possible.
 
 ## Relationship to epic 15
 

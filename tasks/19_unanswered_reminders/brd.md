@@ -1,6 +1,8 @@
 # Epic 19 — Unanswered prompts: hashtag recall, availability hours, nudge-replies
 
-**Status:** planning · **Owner:** Anton · **Created:** 2026-08-11 · **Rev:** 2
+**Status:** in progress (19-03 shipped) · **Owner:** Anton ·
+**Created:** 2026-08-11 · **Rev:** 3 (2026-08-16 — §2.2 fifth path, §4.3, §5.3
+confirmed, §6 cleanup pass)
 
 > Broken down into tasks — see [state.md](./state.md) for ordering and
 > cross-task invariants.
@@ -42,7 +44,7 @@ runs several machines). Timezone, hours and nudge-enable are therefore keyed on
 home too: it is *client-side workspace vocabulary*, unreadable by the reaper,
 which is the process that has to decide whether it is 03:00 for the recipient.
 
-**2.2 — Terminal transitions are spread over four code paths, and only some of
+**2.2 — Terminal transitions are spread over five code paths, and only some of
 them rewrite the message text.**
 
 | Path | Where | Touches text today? |
@@ -51,9 +53,17 @@ them rewrite the message text.**
 | Relay finalizes a group | `app.py` `_finalize_group_if_complete` | yes |
 | Cancel endpoint | `app.py:760` | no — `edit_reply_markup` only |
 | Reaper expiry | `reaper.py` — deliberate "Option A" | no — keyboard strip only |
+| **Ungrouped answer recorded** | `app.py:981` `_record_answer`, from the button tap at `:1895` and the plain-text reply at `:1807` | **no Telegram call at all** |
 
-So "the edit we already do removes the tag" does **not** hold for two of the
-four. The consequence is §4.2: the tag must be *relay-owned*, not hook-authored.
+So "the edit we already do removes the tag" does **not** hold for three of the
+five. The consequence is §4.2: the tag must be *relay-owned*, not hook-authored.
+
+The fifth row was found during 19-03 and this table originally listed four. It
+is the worst of the set: the other two at least edit the keyboard, so they hold
+a connection to Telegram at the moment of transition, while `_record_answer`
+flips state in SQLite and returns. Its tag is removed only if the woken hook's
+PATCH arrives — so it, alone, needs a sweep rather than a chokepoint. See
+state.md's 2026-08-16 log entry.
 
 **2.3 — Hashtags must be plain text.** Telegram does not linkify a `#tag` inside
 `<pre>`/`<code>`, and the relay sends HTML parse mode with code blocks in the
@@ -193,9 +203,12 @@ rules, together closing §2.8 and §2.9:
   stripped and re-rendered, not doubled.
 
 The client keeps composing whatever text it likes and stays entirely unaware the
-tag exists. That is what makes §2.2's four-path spread survivable.
+tag exists. That is what makes §2.2's five-path spread survivable.
 
-**4.3 — Two of the four paths grow a text edit.** The cancel endpoint
+**4.3 — Two of the paths grow a text edit, and the fifth gets a sweep.** The
+fifth (`_record_answer`, §2.2) cannot grow an edit worth paying for — see
+state.md's 2026-08-16 entry; it is cleaned up by the reaper instead. The cancel
+endpoint
 (`app.py:760`) and the reaper's expiry both currently strip only the keyboard;
 both must now rewrite the text to drop the tag, sourcing the body from the
 payload per §4.2. This reverses task 05's "Option A" choice for expiry, and the
@@ -233,11 +246,11 @@ matters because they have different keys:
   **oldest** open target, with the others carried as a count
   (`+2 more #unanswered`) rather than as their own messages.
 
-> Assumption to confirm: "series of multiple questions" was read as the
-> group case, with the chat-level burst rule added because the same tick can
-> otherwise emit four notifications for four sessions — which is the original
-> complaint in a new costume. If only the first was meant, the chat-level rule
-> is separable and can be dropped without touching anything else.
+**Both rules confirmed (Anton, 2026-08-16).** "Series of multiple questions"
+meant the group case; the chat-level burst rule was added by the planner and is
+kept, because the same tick can otherwise emit four notifications for four
+sessions — the original complaint in a new costume. It is no longer optional and
+19-04 implements both keys.
 
 **5.4 — Ladder, not a metronome.** Default `15m, 45m, 3h`, measured in *active*
 time (§3.4), capped at 3 by default. Each new nudge deletes its predecessor:
@@ -272,11 +285,14 @@ the part most worth adversarial tests against the fake backend.
 
 - **Schema v3.** New table keyed by `telegram_chat_id` (tz, windows, nudge
   enable, schedule). New columns on `messages`: `nudge_count`,
-  `next_nudge_at`, `nudge_tg_message_id`. The `messages_state_expiry` index
-  generalizes to cover `next_nudge_at`.
-- **Reaper.** A second pass beside expiry: rows `state='open' AND
-  next_nudge_at < now`, filtered by the recipient's availability, paced per
-  §2.7. No new process, no new long-poll, no client-side timer. Availability is
+  `next_nudge_at`, `nudge_tg_message_id`, `render_dirty`. The
+  `messages_state_expiry` index generalizes to cover `next_nudge_at`.
+- **Reaper.** Two new passes beside expiry. The nudge pass: rows `state='open'
+  AND next_nudge_at < now`, filtered by the recipient's availability, paced per
+  §2.7. The cleanup pass (2026-08-16): rows that have **left** `open` still
+  carrying a tag (`render_dirty = 1`) or a nudge (`nudge_tg_message_id IS NOT
+  NULL`) — the backstop for §2.2's fifth path. No new process, no new long-poll,
+  and no client-side timer for either. Availability is
   resolved once per chat per tick, not once per row.
 - **Seeding `next_nudge_at`.** Written at create time from the recipient's
   schedule, `NULL` when that chat has nudges off — which is what keeps the
@@ -292,8 +308,10 @@ the part most worth adversarial tests against the fake backend.
 - [ ] An open permission prompt shows `#unanswered`; tapping it lists every
       currently-open prompt and nothing that has been answered, denied,
       cancelled or expired.
-- [ ] The tag disappears on all four transition paths, including terminal-side
-      resolution and silent expiry.
+- [ ] The tag disappears on all five transition paths, including terminal-side
+      resolution and silent expiry — and including an ungrouped answer whose
+      client never comes back to PATCH (a sleeping machine), which is cleaned up
+      by the reaper within one tick rather than never.
 - [ ] A hook that PATCHes its own finalized text cannot leave a stale tag behind
       or produce a doubled one — and the `✍️`/`✅` answer it baked in **survives**
       the cancel that follows (§2.8/§2.9: the regression this epic could most

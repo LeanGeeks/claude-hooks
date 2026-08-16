@@ -18,7 +18,7 @@ the new reaper pass touches nothing — the chat is byte-for-byte as it is today
 ### Schema
 
 **Already landed in 19-01** — `nudge_count`, `next_nudge_at`,
-`nudge_tg_message_id` and the `messages_nudge_due` index. This task writes them;
+`nudge_tg_message_id`, `render_dirty` and the two indexes. This task writes them;
 it does not define them and must not add a migration.
 
 ### Config — `config.py`
@@ -65,6 +65,36 @@ A second pass beside expiry, in the same tick:
 5. Pace sends per brd §2.7 (~1/s per chat); a slow chat must not stall the tick
    for other chats or delay the expiry pass.
 
+### The cleanup sweep — `reaper.py`
+
+A third pass, closing the `_record_answer` hole (decided 2026-08-16 — see
+[state.md](./state.md) log). Both halves select on rows that have **left**
+`open`, which no existing sweep looks at:
+
+1. `render_dirty = 1 AND state != 'open'` → re-render from the payload and edit,
+   then clear the flag. The row is terminal, so `render_body` emits no tag.
+2. `nudge_tg_message_id IS NOT NULL AND state != 'open'` → delete the nudge and
+   clear the column. No flag needed; the id is its own predicate.
+
+Setting the flag is a one-word change to `_record_answer` (`app.py:981`), whose
+`UPDATE` already runs in a transaction: write `render_dirty = ?` alongside
+`state='answered'`, so the flip and the flag cannot diverge. **The value comes
+from the caller**, which has the row — both call sites (`app.py:1895` ungrouped
+button taps, `app.py:1807` ungrouped plain-text replies) compute it with 19-03's
+`awaits_human`, so an untagged row is never flagged and the sweep never edits a
+message that had no tag. That reuse is invariant 7 again: one definition of
+"waiting on a human", never a second.
+
+Clearing it belongs with the renders that already exist — the PATCH endpoint
+(`app.py:720`) and cancel (`app.py:803`) both call `render_body`, and in the
+normal case one of them lands within a second of the flip and clears the flag
+before the reaper ever looks. **The sweep is a net, not the mechanism.** Its
+only job is the case where the hook never arrives: machine sleeps, process dies,
+network drops.
+
+`_is_not_modified` already absorbs Telegram's 400 on a no-op edit, which is the
+expected outcome of a race between the sweep and a late PATCH.
+
 ### Ownership and cleanup
 
 - **A nudge belongs to exactly one row** — the one it replies to (brd §5.5).
@@ -72,7 +102,8 @@ A second pass beside expiry, in the same tick:
 - **Deletion hangs off the state transition**, in the same place 19-03 strips
   the tag: answer, group finalize, cancel, expiry. One chokepoint, four callers.
   Nothing may depend on a *hook* to clean up — a machine that sleeps mid-request
-  would leak the nudge forever.
+  would leak the nudge forever. The cleanup sweep above is what makes that true
+  for the one transition (`_record_answer`) that reaches Telegram not at all.
 - When the owner resolves while others are still pending, the nudge is deleted
   with it; the next tick nudges whatever is now oldest. Do not attempt to
   re-target a live nudge.
@@ -122,6 +153,15 @@ quote.
 - Ladder: three nudges then silence at the cap; each send deletes the prior.
 - Cleanup on all four transitions, including expiry in the same tick that would
   otherwise nudge.
+- **The `_record_answer` hole, both halves.** Flip an ungrouped row via a button
+  tap and via a plain-text reply, let **no** PATCH or cancel follow (the sleeping
+  machine), run a tick: the tag is gone from the rendered text, any nudge is
+  deleted, `render_dirty` and `nudge_tg_message_id` are cleared. Write this test
+  first and watch it fail — the leak is silent, with no exception to catch.
+- The normal case does **not** reach the sweep: flip, then PATCH, then tick —
+  assert the tick issued no edit at all (the flag was already clear).
+- An untagged terminal row (`kind='notification'`, or no keyboard) is never
+  flagged and never swept.
 - Send failure and delete failure → tick completes, expiry still runs.
 - Never-active window → `next_nudge_at` NULL, no nudge, no crash.
 - `TelegramForbidden` on a nudge send → that chat's open rows stop being due;
@@ -134,5 +174,8 @@ quote.
 - [ ] Ladder measured in active time, capped, each nudge replacing the last.
 - [ ] Every terminal transition deletes the nudge, including the two that
       originate on the client.
+- [ ] A row flipped by `_record_answer` with no PATCH or cancel following loses
+      both its tag and its nudge within one tick — and a row whose PATCH did
+      arrive costs the sweep no Telegram call.
 - [ ] The reaper's expiry pass is unaffected by any nudge failure.
 - [ ] Nothing under `.claude/hooks/` changed.
