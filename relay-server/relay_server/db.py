@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -44,11 +44,30 @@ CREATE TABLE IF NOT EXISTS messages (
     answer_json          TEXT,
     created_at           TIMESTAMP NOT NULL,
     answered_at          TIMESTAMP,
-    expires_at           TIMESTAMP NOT NULL
+    expires_at           TIMESTAMP NOT NULL,
+    nudge_count          INTEGER NOT NULL DEFAULT 0,
+    next_nudge_at        TIMESTAMP,
+    nudge_tg_message_id  INTEGER,
+    render_dirty         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS messages_state_expiry
     ON messages(state, expires_at);
+
+CREATE INDEX IF NOT EXISTS messages_nudge_due
+    ON messages(state, next_nudge_at);
+
+CREATE INDEX IF NOT EXISTS messages_render_dirty
+    ON messages(render_dirty) WHERE render_dirty = 1;
+
+CREATE TABLE IF NOT EXISTS recipients (
+    telegram_chat_id  INTEGER PRIMARY KEY,
+    tz                TEXT,
+    windows_json      TEXT,
+    nudge_enabled     INTEGER NOT NULL DEFAULT 0,
+    nudge_schedule    TEXT,
+    updated_at        TIMESTAMP NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS binding_codes (
     code             TEXT PRIMARY KEY,
@@ -91,6 +110,30 @@ MIGRATIONS: dict[int, list[str]] = {
         "INSERT INTO idempotency_keys(key, installation_id, response_json, created_at)"
         " SELECT key, installation_id, response_json, created_at FROM idempotency_keys_v1;",
         "DROP TABLE idempotency_keys_v1;",
+    ],
+    3: [
+        # Add recipients table (availability hours, nudge config, per chat).
+        """
+        CREATE TABLE IF NOT EXISTS recipients (
+            telegram_chat_id  INTEGER PRIMARY KEY,
+            tz                TEXT,
+            windows_json      TEXT,
+            nudge_enabled     INTEGER NOT NULL DEFAULT 0,
+            nudge_schedule    TEXT,
+            updated_at        TIMESTAMP NOT NULL
+        );
+        """,
+        # Add nudge-ladder columns to messages.
+        "ALTER TABLE messages ADD COLUMN nudge_count INTEGER NOT NULL DEFAULT 0;",
+        "ALTER TABLE messages ADD COLUMN next_nudge_at TIMESTAMP;",
+        "ALTER TABLE messages ADD COLUMN nudge_tg_message_id INTEGER;",
+        # Add render-dirty flag (owned by 19-04; defined here for one migration).
+        "ALTER TABLE messages ADD COLUMN render_dirty INTEGER NOT NULL DEFAULT 0;",
+        # Indexes for the new columns.
+        "CREATE INDEX IF NOT EXISTS messages_nudge_due"
+        " ON messages(state, next_nudge_at);",
+        "CREATE INDEX IF NOT EXISTS messages_render_dirty"
+        " ON messages(render_dirty) WHERE render_dirty = 1;",
     ],
 }
 
@@ -194,3 +237,63 @@ async def run_in_thread(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
     connection is only ever touched by one worker thread at a time.
     """
     return await asyncio.to_thread(_run_locked, fn, *args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Recipient helpers (availability / nudge config, per chat)
+# ---------------------------------------------------------------------------
+
+
+class RecipientRow:
+    """Parsed recipient row with defaults applied.
+
+    Absence of a row in the ``recipients`` table is a valid, meaningful state
+    ("unconfigured"): always available, nudges off.  An absent ``recipients``
+    row is equivalent to a row with all defaults.
+    """
+
+    __slots__ = ("telegram_chat_id", "tz", "windows_json", "nudge_enabled", "nudge_schedule")
+
+    def __init__(
+        self,
+        telegram_chat_id: int,
+        tz: str | None,
+        windows_json: str | None,
+        nudge_enabled: bool,
+        nudge_schedule: str | None,
+    ) -> None:
+        self.telegram_chat_id = telegram_chat_id
+        self.tz = tz
+        self.windows_json = windows_json
+        self.nudge_enabled = nudge_enabled
+        self.nudge_schedule = nudge_schedule
+
+
+def load_recipient(conn: sqlite3.Connection, chat_id: int) -> RecipientRow:
+    """Return the recipient record for *chat_id*, or a default row if absent.
+
+    Always returns a ``RecipientRow``; the caller never needs to handle
+    ``None``.  An absent row is indistinguishable from an explicitly
+    unconfigured one: tz ``None``, windows ``None`` (always available),
+    nudges off.
+    """
+    row = conn.execute(
+        "SELECT telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule"
+        " FROM recipients WHERE telegram_chat_id = ?",
+        (chat_id,),
+    ).fetchone()
+    if row is None:
+        return RecipientRow(
+            telegram_chat_id=chat_id,
+            tz=None,
+            windows_json=None,
+            nudge_enabled=False,
+            nudge_schedule=None,
+        )
+    return RecipientRow(
+        telegram_chat_id=int(row["telegram_chat_id"]),
+        tz=row["tz"],
+        windows_json=row["windows_json"],
+        nudge_enabled=bool(row["nudge_enabled"]),
+        nudge_schedule=row["nudge_schedule"],
+    )

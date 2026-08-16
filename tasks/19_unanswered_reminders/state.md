@@ -13,7 +13,7 @@ external unknown (hashtag search scope per client) was closed by the operator as
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | todo | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns + `render_dirty`), tz/windows parsing, `advance_active`. Touches no Telegram code. |
+| 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | done | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns + `render_dirty`), tz/windows parsing, `advance_active`. Touches no Telegram code. |
 | 19-02 | [Preference commands](./19-02-preference-commands.md) | todo | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
 | 19-04 | [Nudge engine](./19-04-nudge-engine.md) | todo | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
@@ -167,6 +167,29 @@ Anton after re-reading the paths in the shipped code.
    *and* chat-level. The chat-level rule was the planner's addition; without it
    four sessions going idle in one tick emit four nudges, which is the original
    complaint in new clothes. brd §5.3 no longer marks it optional.
+
+**2026-08-16 — 19-01 done.** Implemented, reviewed PASS (0 BLOCKER/HIGH, 4 LOW
+— dead inner imports, two wrong docstrings, an overcomplicated range — all
+fixed), committed. Relay tests 156 → 200 (+44 new); root hooks 708 green,
+unchanged.
+
+**Schema version confirmed against `main` at implementation time, not assumed:**
+`db.py` was `SCHEMA_VERSION = 2` with `MIGRATIONS` holding only key `2` and no
+`commands` table in the tree, exactly as the cross-epic note predicted. **Epic 19
+took 3**; `MIGRATIONS[3]` carries the `recipients` CREATE, the four `messages`
+ALTERs (`nudge_count`, `next_nudge_at`, `nudge_tg_message_id`, `render_dirty`)
+and both indexes. Epic 16's 16-01 must rebase to **4**. The epic's whole
+migration is now spent — **any later task in epic 19 that finds itself writing
+`ALTER TABLE` has misread its scope and must stop.**
+
+`render_dirty` is defined and deliberately unread: a tree-wide grep confirms no
+reader or writer exists yet, and no eager render-after-flip edit was added to
+`_record_answer`. 19-04 remains the sole owner of both.
+
+**Environment note for future sessions:** `relay-server/.venv` did not exist and
+was rebuilt from `requirements.txt` + `pip install -e .` to establish the
+baseline. It is gitignored. The relay suite is
+`cd relay-server && ./.venv/bin/python -m pytest tests -q`.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace
