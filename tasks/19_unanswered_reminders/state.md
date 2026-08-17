@@ -366,6 +366,54 @@ There were 11 `state='open'` rows at deploy time; none is a nudge candidate.
 This ticks one box of 19-07's regression sweep (relay container logs clean at
 deploy). Everything else in 19-07 needs real clients and a night.
 
+**2026-08-17 — LIVE DEFECT found after deploy and fixed: `/nudge on`'s backfill
+ignored `awaits_human`.** Found while checking the deployed DB before the operator
+ran `/nudge on`; reviewed PASS (1 LOW, fixed); committed and redeployed.
+Relay 249 → 252, root hooks 716.
+
+The backfill was `UPDATE messages SET next_nudge_at = ? WHERE telegram_chat_id = ?
+AND state = 'open' AND next_nudge_at IS NULL` — **no eligibility filter**. So
+`/nudge on` seeded every open row including `kind='notification'` idle-session
+rows, and the reaper's nudge pass trusted the seed without re-checking. Directly
+violates brd §4.1 / invariant 7: *an idle session left overnight must never
+produce a 09:00 ping.* Live and reachable — the deployed chat held 11 open
+notification rows. Demonstrated, not theorised: before the fix the new reaper test
+emitted a real send, `'text': '⏳ still waiting — Allow the tool call?',
+'reply_to_message_id': 8200`, for a notification row.
+
+**Why every review missed it — the lesson worth keeping.** The bug lived in the
+*seam between two tasks*. 19-02 owned the backfill and was implemented before
+19-04 existed; 19-04 owned the eligibility rule and correctly applied it to the
+create path it wrote. Each task's tests covered its own half — 19-04 tested
+create-time seeding against a notification row, 19-02 tested that the backfill
+seeded the right chat — and **nobody tested backfill × notification**, because
+neither task's author owned both sides. Invariant 7 said "19-04 reuses
+`awaits_human` rather than defining eligibility a second time", which the
+implementers honoured; what no one wrote down was that *every writer of
+`next_nudge_at`* must consult it, including one that already existed. When an
+invariant constrains a predicate, state it as a rule about **all writers of the
+column**, not about the task introducing the predicate.
+
+Fix, in two parts:
+1. **The defect** (`app.py`, `_backfill`): SELECT candidates → filter in Python
+   with the existing `awaits_human` → UPDATE only eligible ids. The UPDATE keeps
+   `state = 'open' AND next_nudge_at IS NULL` so a row answered between the SELECT
+   and the UPDATE cannot be given a stale due time (review LOW).
+2. **A backstop** (`reaper.py`, `_nudge_pass`): re-check `awaits_human` before
+   emitting — the pass already SELECTs `payload_json`, so it is nearly free. An
+   ineligible row is logged at WARNING with its id, has `next_nudge_at` cleared,
+   and is dropped **before** coalescing so it can neither become the target nor
+   inflate a `+N more`. Reuse, not a second predicate.
+
+**The class of bug is now closed, verified by grepping every writer of the
+column:** only two ever set it non-NULL — the create path (`_seed_next_nudge_at`,
+guarded since 19-04) and the backfill (guarded now). Everything else sets NULL or
+re-arms rows that already passed the reaper's check. A future third writer that
+bypassed both guards would be caught by the backstop.
+
+No bad data needed repair: nudges had never been enabled on any chat, so every
+`next_nudge_at` in the live DB was still NULL when the defect was found.
+
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace
 (the session name is composed client-side into the body), so it would need a new

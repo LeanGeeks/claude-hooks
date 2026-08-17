@@ -73,7 +73,7 @@ from .availability import (
 )
 from .config import RelayConfig
 from .db import RecipientRow, load_recipient, run_in_thread
-from .render import TAG, payload_for, render_body, strip_tag
+from .render import TAG, awaits_human, payload_for, render_body, strip_tag
 from .telegram_backend import (
     TelegramApiError,
     TelegramBackend,
@@ -704,6 +704,31 @@ async def _nudge_pass(
         chat_rows = [r for r in chat_rows if int(r["nudge_count"]) < ladder_len]
         if not chat_rows:
             continue
+
+        # Defensive eligibility re-check (brd §4.1, invariant 7 — secondary fix
+        # 19-08).  The create-time seed path filters through awaits_human; the
+        # backfill now does too; but a future writer that bypasses both could
+        # still set next_nudge_at on an ineligible row.  Re-checking here is
+        # nearly free (payload_json is already fetched) and keeps the ladder
+        # from emitting a spurious nudge at 03:00.  A bad seed is visible in
+        # the logs rather than silent.  This reuses render.awaits_human — it is
+        # not a second definition (invariant 7).
+        # _fetch_due's WHERE clause guarantees state='open'; pass it directly
+        # rather than reading it from the row (it is not in the SELECT list).
+        ineligible = [r for r in chat_rows if not awaits_human(payload_for(r), "open")]
+        if ineligible:
+            for r in ineligible:
+                logger.warning(
+                    "reaper: row %s is seeded (next_nudge_at set) but does not"
+                    " await a human (kind=%r state='open') — clearing"
+                    " next_nudge_at to prevent a spurious nudge",
+                    int(r["id"]),
+                    payload_for(r).get("kind"),
+                )
+            await _set_due(conn, [int(r["id"]) for r in ineligible], None)
+            chat_rows = [r for r in chat_rows if awaits_human(payload_for(r), "open")]
+            if not chat_rows:
+                continue
 
         if not is_active(now_dt, recipient.tz, windows):
             # Outside the recipient's hours: emit nothing and push every due row

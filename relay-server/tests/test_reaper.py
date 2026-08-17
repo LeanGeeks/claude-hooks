@@ -1532,3 +1532,46 @@ async def test_nudges_off_in_recipients_clears_a_stray_due_time(
 
     assert _replies(backend) == []
     assert _row(conn, mid)["next_nudge_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_and_clears_ineligible_seeded_row(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Defensive re-check: a bad seed on a kind='notification' row is never sent.
+
+    If any future writer sets next_nudge_at on an ineligible row (bypassing
+    awaits_human), the reaper must not emit a nudge.  It must:
+    - not call send_reply
+    - log a WARNING naming the row id
+    - clear next_nudge_at so the row does not re-appear every tick
+    (brd §4.1, invariant 7 — secondary fix in 19-08).
+    """
+    import logging
+
+    conn = _setup_db(tmp_path)
+    iid = _insert_installation(conn)
+    _set_recipient(conn, 42, nudge_enabled=True)
+    now = _utcnow()
+    # Directly seed a notification row — simulating the bug that the primary
+    # fix closes.  next_nudge_at is set by the fixture, bypassing awaits_human.
+    mid = _insert_open_row(
+        conn, iid, now=now, tg_message_id=8200,
+        kind="notification", keyboard=False, reply_required=True,
+        next_nudge_at=now - timedelta(seconds=1),
+    )
+
+    backend = FakeTelegramBackend()
+    with caplog.at_level(logging.WARNING, logger="relay_server.reaper"):
+        await reaper_tick(conn, backend, WaiterRegistry(), _cfg(), now=now)
+
+    assert _replies(backend) == [], "notification row must never be nudged"
+    row = _row(conn, mid)
+    assert row["next_nudge_at"] is None, (
+        "ineligible seeded row must have next_nudge_at cleared"
+    )
+    assert any(
+        str(mid) in record.message and record.levelno >= logging.WARNING
+        for record in caplog.records
+    ), f"expected a WARNING log naming row id {mid}; got: {caplog.records}"

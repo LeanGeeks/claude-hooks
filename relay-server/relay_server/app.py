@@ -1882,16 +1882,35 @@ async def _pref_nudge(
     nudge_at = advance_active(now, first_interval, recipient_after.tz, windows)
     nudge_at_iso = nudge_at.isoformat() if nudge_at else None
 
-    # Backfill open rows when transitioning off → on.
+    # Backfill open rows when transitioning off → on — only rows that actually
+    # await a human (brd §4.1, invariant 7).  awaits_human is a Python predicate
+    # over the decoded payload_json (kind != 'notification' AND reply_required /
+    # keyboard / group_id), so it cannot be expressed in SQL without duplicating
+    # it, and duplicating it is exactly what invariant 7 forbids.  Select the
+    # candidates, filter in Python, update only the eligible ids.
     if was_off:
         def _backfill() -> None:
-            with conn:
-                conn.execute(
-                    "UPDATE messages SET next_nudge_at = ?"
-                    " WHERE telegram_chat_id = ? AND state = 'open'"
-                    " AND next_nudge_at IS NULL",
-                    (nudge_at_iso, chat_id),
-                )
+            rows = conn.execute(
+                "SELECT id, payload_json, state FROM messages"
+                " WHERE telegram_chat_id = ? AND state = 'open'"
+                " AND next_nudge_at IS NULL",
+                (chat_id,),
+            ).fetchall()
+            eligible_ids = [
+                int(row["id"])
+                for row in rows
+                if awaits_human(_payload_for(row), row["state"])
+            ]
+            if eligible_ids:
+                with conn:
+                    conn.execute(
+                        "UPDATE messages SET next_nudge_at = ?"
+                        " WHERE state = 'open' AND next_nudge_at IS NULL"
+                        " AND id IN ({})".format(
+                            ",".join("?" * len(eligible_ids))
+                        ),
+                        (nudge_at_iso, *eligible_ids),
+                    )
 
         await run_in_thread(_backfill)
 

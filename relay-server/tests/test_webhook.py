@@ -976,6 +976,110 @@ async def test_pref_nudge_on_backfills_open_rows_only_this_chat(
 
 
 @pytest.mark.asyncio
+async def test_pref_nudge_on_backfill_excludes_notification_rows(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """/nudge on backfill must not seed kind='notification' rows (invariant 7).
+
+    Regression test: the backfill used to UPDATE every open row in the chat,
+    including idle-session notification rows.  brd §4.1 and invariant 7 say
+    idle notifications are excluded from the ladder — "an idle session left
+    overnight must never produce a 09:00 ping".  Only the prompt row
+    (kind='question' with a keyboard) should get next_nudge_at.
+    """
+    token = seeded["token"]
+    # Create an idle notification row (kind='notification', reply_required).
+    notif_id = await _create_notification(app_client, token, "session went idle")
+    # Create an open prompt row that actually awaits a human.
+    prompt_id = await _create_message(app_client, token)
+
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9931,
+    )
+    assert r.status_code == 200
+
+    conn = connect(db_path)
+    notif_row = conn.execute(
+        "SELECT next_nudge_at FROM messages WHERE id = ?", (notif_id,)
+    ).fetchone()
+    prompt_row = conn.execute(
+        "SELECT next_nudge_at FROM messages WHERE id = ?", (prompt_id,)
+    ).fetchone()
+    conn.close()
+
+    assert notif_row is not None
+    assert notif_row["next_nudge_at"] is None, (
+        "backfill must not seed kind='notification' rows (invariant 7)"
+    )
+    assert prompt_row is not None
+    assert prompt_row["next_nudge_at"] is not None, (
+        "backfill must seed the open prompt row"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_on_backfill_excludes_rows_awaiting_nobody(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """/nudge on backfill skips a non-notification row that awaits nobody.
+
+    A row with kind != 'notification' but with no reply_required, no keyboard,
+    and no group_id does not block the human — awaits_human returns False for
+    it, so it must not be seeded.
+    """
+    token = seeded["token"]
+    installation_id = int(seeded["installation_id"])  # type: ignore[arg-type]
+    chat_id = int(seeded["chat_id"])  # type: ignore[arg-type]
+
+    # Insert a 'question' row with none of the eligibility triggers set.
+    conn = connect(db_path)
+    import json as _json
+    payload = {"kind": "question", "text": "no triggers", "keyboard": None,
+               "reply_required": False}
+    cur = conn.execute(
+        "INSERT INTO messages"
+        " (installation_id, telegram_chat_id, telegram_message_id,"
+        "  kind, payload_json, state, created_at, expires_at)"
+        " VALUES (?, ?, 7001, 'question', ?, 'open', datetime('now'),"
+        "         datetime('now', '+1 hour'))",
+        (installation_id, chat_id, _json.dumps(payload)),
+    )
+    conn.commit()
+    nobody_id = int(cur.lastrowid)
+    conn.close()
+
+    r = await _send_pref_command(
+        app_client,
+        chat_id,
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9932,
+    )
+    assert r.status_code == 200
+
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT next_nudge_at FROM messages WHERE id = ?", (nobody_id,)
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    assert row["next_nudge_at"] is None, (
+        "backfill must not seed a row that awaits nobody"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pref_nudge_bad_schedule_no_row(
     app_client: httpx.AsyncClient,
     seeded: dict[str, object],
