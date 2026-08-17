@@ -1,12 +1,11 @@
 # Epic 19 — State & orchestration
 
-> **Status 2026-08-17: all six engineering tasks are done and committed
-> (`3e19dda`, `69212cb`, `5a6f609`, `447865a`, `6f45a04`, plus 19-06). Nothing is
-> deployed.** The live relay still runs pre-19-01 code, so the schema v3 migration
-> has not been applied anywhere. 19-07 (human) is the remaining gate: it needs a
-> real chat, real clients and an availability window that actually closes
-> overnight. Test baseline at handoff: **716 root hooks / 249 relay**, both green.
-> Do not deploy `447865a` without `6f45a04` on top of it — see the 19-05 entry.
+> **Status 2026-08-17: all six engineering tasks are done, committed and
+> DEPLOYED** (`3e19dda`, `69212cb`, `5a6f609`, `447865a`, `6f45a04`, `cac1d30`).
+> Schema v3 is live and migrated — see the deployment entry at the end of the Log.
+> 19-07 (human) is the remaining gate: it needs a real chat, real clients and an
+> availability window that actually closes overnight. Test baseline at handoff:
+> **716 root hooks / 249 relay**, both green.
 
 **For the implementing orchestrator.** Read this first, then [brd.md](./brd.md).
 Each task file is written for a fresh-context agent and carries its own "read
@@ -336,6 +335,36 @@ exit code (now calls `main()` and asserts 0).
 `active_now` verbatim — no local clock, no timezone conversion, confirmed by
 review. `install-claude-config.sh` needs **no** change, confirmed in writing as
 the task required.
+
+**2026-08-17 — deployed by Anton; schema v3 migration verified on live data.**
+`cd relay-server && docker compose up -d --build`. **The relay runs on this
+machine** (`h02-activecdn`) — no `ssh` needed, contrary to the blocker note in
+`docs/prompts/implementation_manager.md`; `docker compose` at `~/.bin/claude-hooks/relay-server`
+reaches it directly. Container `relay-server-relay-1` came up healthy, clean
+startup, **zero** errors/tracebacks in the logs.
+
+Verified read-only against `/var/lib/relay/relay.db` after the migration ran over
+a real database of **4,295 message rows**:
+
+| check | result |
+|---|---|
+| `schema_version` | **3** |
+| `recipients` table | present, exactly the 6 planned columns |
+| new `messages` columns | all four present |
+| indexes | `messages_nudge_due`, `messages_render_dirty`, and `messages_state_expiry` **preserved** |
+| rows with `nudge_count != 0` | 0 |
+| rows with `render_dirty != 0` | 0 |
+| rows with `next_nudge_at NOT NULL` | 0 |
+| rows with `nudge_tg_message_id NOT NULL` | 0 |
+| `recipients` rows | 0 |
+
+So 19-01's migration done-criteria are now confirmed on production data, not just
+on test fixtures, and **invariant 4 holds live**: with no `recipients` row anywhere,
+nudges are off, no row is seeded, and the new reaper passes have nothing to select.
+There were 11 `state='open'` rows at deploy time; none is a nudge candidate.
+
+This ticks one box of 19-07's regression sweep (relay container logs clean at
+deploy). Everything else in 19-07 needs real clients and a night.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace
