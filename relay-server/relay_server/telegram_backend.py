@@ -76,6 +76,16 @@ class SentMessage:
     reply_required: bool = False
 
 
+@dataclass
+class SentReply:
+    """A reply-shaped send (epic 19-04's nudge): target + text, no keyboard."""
+
+    chat_id: int
+    message_id: int
+    reply_to_message_id: int
+    text: str
+
+
 class TelegramBackend(Protocol):
     """Minimal surface used by the relay server."""
 
@@ -101,6 +111,20 @@ class TelegramBackend(Protocol):
 
     async def send_text(self, *, chat_id: int, text: str) -> None:
         """Send a plain text message that requires no relay tracking (e.g. /bind replies)."""
+
+    async def send_reply(
+        self, *, chat_id: int, text: str, reply_to_message_id: int
+    ) -> int:
+        """Send a reply-shaped message; return the Telegram-side message id.
+
+        The one entry point that sets ``reply_to_message_id`` (brd §2.10):
+        ``send_message`` has no reply-to and ``send_text`` is a bare send. Used
+        by the nudge engine (19-04) — the reply-quote is the affordance that
+        jumps back to the still-live original, so the nudge itself carries no
+        keyboard and no relay tracking. The returned id is stored on the row it
+        serves (``nudge_tg_message_id``) so the nudge can be deleted when its
+        target resolves.
+        """
 
     async def edit_message(
         self,
@@ -152,6 +176,10 @@ class FakeTelegramBackend:
 
     calls: list[FakeCall] = field(default_factory=list)
     sent: list[SentMessage] = field(default_factory=list)
+    # Reply-shaped sends (nudges) recorded separately: they carry a target the
+    # ordinary ``sent`` shape has no room for, and the reaper tests assert on
+    # both the target and the text.
+    replies: list[SentReply] = field(default_factory=list)
     _ids: itertools.count = field(default_factory=lambda: itertools.count(1000))
 
     async def send_message(
@@ -193,6 +221,30 @@ class FakeTelegramBackend:
         self.calls.append(
             FakeCall("send_text", {"chat_id": chat_id, "text": text})
         )
+
+    async def send_reply(
+        self, *, chat_id: int, text: str, reply_to_message_id: int
+    ) -> int:
+        tg_id = next(self._ids)
+        self.calls.append(
+            FakeCall(
+                "send_reply",
+                {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_to_message_id": reply_to_message_id,
+                },
+            )
+        )
+        self.replies.append(
+            SentReply(
+                chat_id=chat_id,
+                message_id=tg_id,
+                reply_to_message_id=reply_to_message_id,
+                text=text,
+            )
+        )
+        return tg_id
 
     async def edit_message(
         self,
@@ -399,6 +451,30 @@ class HttpTelegramBackend:
             "sendMessage",
             {"chat_id": chat_id, "text": text, "parse_mode": PARSE_MODE},
         )
+
+    async def send_reply(
+        self, *, chat_id: int, text: str, reply_to_message_id: int
+    ) -> int:
+        """Send a message quoting ``reply_to_message_id``; return its id.
+
+        ``allow_sending_without_reply`` is on: if the target message has been
+        deleted out from under us the nudge still lands (losing only its quote),
+        which is preferable to a send that fails every tick until the row's TTL
+        finally expires it.
+        """
+        result = await self._call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": PARSE_MODE,
+                "reply_parameters": {
+                    "message_id": reply_to_message_id,
+                    "allow_sending_without_reply": True,
+                },
+            },
+        )
+        return int(result["message_id"])
 
     async def edit_message(
         self,

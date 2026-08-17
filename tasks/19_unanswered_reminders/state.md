@@ -16,7 +16,7 @@ external unknown (hashtag search scope per client) was closed by the operator as
 | 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | done | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns + `render_dirty`), tz/windows parsing, `advance_active`. Touches no Telegram code. |
 | 19-02 | [Preference commands](./19-02-preference-commands.md) | done | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
-| 19-04 | [Nudge engine](./19-04-nudge-engine.md) | todo | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
+| 19-04 | [Nudge engine](./19-04-nudge-engine.md) | done | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
 | 19-05 | [Reply-to-nudge routing](./19-05-reply-routing.md) | todo | 19-04 | nudge ids resolve to their target; ambiguity counter ignores nudges |
 | 19-06 | [Diagnostics, docs, installer](./19-06-diagnostics-docs.md) | todo | 19-02, 19-05 | `claude-roles` column, `architecture.md`, `docs/availability.md`, task-05 reversal note |
 | 19-07 | [Live verification](./19-07-live-verification_human.md) | todo | 19-06 | **human** — needs a real chat, real clients and a window that actually closes overnight |
@@ -219,6 +219,46 @@ regression tests cover it. The `/nudge on` backfill is likewise guarded by an
 off → on transition — the resolved time is computed unconditionally for the echo,
 but the `next_nudge_at` write stays inside the transition check, so a repeat
 `/nudge on` cannot postpone open rows' nudges.
+
+**2026-08-17 — 19-04 done.** Implemented (opus, per the Implementer-model note
+above rather than the suffix-less filename), reviewed PASS (0 BLOCKER/HIGH/MEDIUM,
+2 LOW — both accepted, see below), committed. Relay tests 217 → 241; root hooks
+708 unchanged. **The 19-03 answer-bake regression test
+(`test_cancel_preserves_a_patched_finalized_body`, `tests/test_messages.py:248`)
+is unmodified and still passes** — 19-04 added `render_dirty` clearing to both
+renders that test depends on, and that failure mode is a silently wiped body, so
+this was the first thing reviewed.
+
+The `_record_answer` hole was demonstrated, not assumed: with the sweep alone
+disabled on the finished tree, both hole tests fail with the row `answered`,
+`render_dirty = 1`, the nudge id still set and **zero Telegram calls in the tick**.
+The implementer wrote the tests after the code rather than before and said so;
+the de-implementation check is what makes them credible.
+
+**Two accepted LOW behaviours — deliberate trade-offs, recorded so nobody
+"fixes" them blindly and so 19-07 knows to watch for them:**
+
+1. **A failed nudge send burns a ladder rung** (`nudge_count` is bumped even when
+   the send fails). The alternative — retry the same rung next tick — is
+   unbounded for a chat failing persistently for any reason that is not
+   `TelegramForbidden`, since only the cap bounds retries. Burning the rung keeps
+   total attempts bounded by `nudge_max`. Consequence: a chat with flaky sends may
+   receive fewer nudges than its ladder promises.
+2. **The per-tick pacing ceiling visits chats in message-age order, not
+   nudge-due-time order.** Not strictly FIFO under extreme load, but
+   self-correcting: a serviced chat advances off the due list. Revisit only if a
+   real chat is observed starving.
+
+**Shape 19-05 must build against:** a nudge has **no `messages` row of its own** —
+it exists only as `messages.nudge_tg_message_id` on the row it serves. That is
+what 19-05's reply lookup resolves against, and it is why nudges stay out of the
+ambiguity counter and the expiry sweep by construction.
+
+**Disclosed and accepted:** seeding costs one indexed `recipients` SELECT per
+created message that awaits a human. Unavoidable — only that table knows whether
+the chat has nudges on. It is a DB read, not a behaviour change; the stored row
+is byte-identical to today's when nudges are off, and an absent `recipients` row
+is a valid state that cannot error.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace

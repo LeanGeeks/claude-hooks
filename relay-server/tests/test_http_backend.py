@@ -188,3 +188,40 @@ async def test_set_webhook_payload_shape() -> None:
     assert captured["url"].endswith(f"/bot{BOT_TOKEN}/setWebhook")
     assert captured["body"]["url"] == "https://example.test/telegram/webhook/sek"
     assert captured["body"]["allowed_updates"] == ["message", "callback_query"]
+
+
+@pytest.mark.asyncio
+async def test_send_reply_quotes_the_target() -> None:
+    """The nudge send (19-04) is a plain sendMessage with reply_parameters.
+
+    ``allow_sending_without_reply`` is deliberate: a target deleted out from
+    under us must not turn into a send that fails on every tick.
+    """
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"ok": True, "result": {"message_id": 777}}
+        )
+
+    backend = _make_backend(handler)
+    try:
+        tg_id = await backend.send_reply(
+            chat_id=42, text="\u23f3 still waiting", reply_to_message_id=1234
+        )
+    finally:
+        await backend.aclose()
+
+    assert tg_id == 777
+    assert captured["url"].endswith(f"/bot{BOT_TOKEN}/sendMessage")
+    body = captured["body"]
+    assert body["chat_id"] == 42
+    assert body["parse_mode"] == "HTML"
+    assert body["reply_parameters"] == {
+        "message_id": 1234,
+        "allow_sending_without_reply": True,
+    }
+    # A nudge never carries a keyboard — the buttons live on the original.
+    assert "reply_markup" not in body

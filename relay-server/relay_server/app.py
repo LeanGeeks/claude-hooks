@@ -35,7 +35,12 @@ from .binding_codes import generate_code, normalise_code
 from .callback_data import decode as decode_callback_data
 from .config import RelayConfig, load_config
 from .db import connect, init_schema, load_recipient, run_in_thread
-from .reaper import reaper_loop
+from .reaper import (
+    delete_nudge,
+    next_nudge_due,
+    reaper_loop,
+    recipient_windows,
+)
 from .models import (
     AnswerResponse,
     BindingRequestResponse,
@@ -46,6 +51,7 @@ from .models import (
     PatchMessageRequest,
 )
 from .render import (
+    awaits_human,
     payload_for as _payload_for,
     render_body,
     render_body_row,
@@ -689,11 +695,22 @@ def create_app(
                     await _idem_abandon(conn, installation_id, idempotency_key)
                 raise
 
+            # Seed the nudge ladder (epic 19-04) alongside the Telegram id, in
+            # the one UPDATE that already runs here. Two reasons it belongs
+            # here and not in the INSERT: a row is only ever nudgeable once it
+            # has a real ``telegram_message_id`` to reply to, and with nudges
+            # off (the default) this writes NULL to a column whose default is
+            # NULL — no extra statement, no behaviour change (invariant 4).
+            next_nudge_iso = await _seed_next_nudge_at(
+                conn, config, chat_id, body, now
+            )
+
             def _update_tg_id() -> None:
                 with conn:
                     conn.execute(
-                        "UPDATE messages SET telegram_message_id = ? WHERE id = ?",
-                        (tg_message_id, message_id),
+                        "UPDATE messages SET telegram_message_id = ?,"
+                        " next_nudge_at = ? WHERE id = ?",
+                        (tg_message_id, next_nudge_iso, message_id),
                     )
 
             await run_in_thread(_update_tg_id)
@@ -773,10 +790,17 @@ def create_app(
         # the body, so the payload never claims a text the chat never showed.
         payload_json = json.dumps(payload)
 
+        # ``render_dirty`` is cleared here because this *is* the render the flag
+        # asks for: the body Telegram just accepted was produced by the one
+        # renderer from the canonical payload, so whatever tag a preceding
+        # ``_record_answer`` left behind is gone. In the normal case this lands
+        # within a second of the flip and the reaper's cleanup sweep finds
+        # nothing to do — which is what keeps the sweep a net rather than a
+        # second cost on the hot path (state.md 2026-08-16).
         def _persist_text() -> None:
             with conn:
                 conn.execute(
-                    "UPDATE messages SET payload_json = ?"
+                    "UPDATE messages SET payload_json = ?, render_dirty = 0"
                     " WHERE id = ? AND installation_id = ?",
                     (payload_json, message_id, installation_id),
                 )
@@ -816,10 +840,15 @@ def create_app(
         installation_id = installation["id"]
         row = await _load_message(conn, message_id, installation_id)
 
+        # The flip retires the nudge ladder and clears ``render_dirty`` in the
+        # same transaction: a terminal row has nothing left to schedule, and the
+        # re-render below is the render the flag would have asked for.
         def _cancel() -> int:
             with conn:
                 cur = conn.execute(
-                    "UPDATE messages SET state='cancelled' WHERE id=? AND state='open'",
+                    "UPDATE messages SET state='cancelled',"
+                    " next_nudge_at = NULL, render_dirty = 0"
+                    " WHERE id=? AND state='open'",
                     (message_id,),
                 )
                 return cur.rowcount
@@ -860,6 +889,18 @@ def create_app(
                         message_id,
                         exc_info=True,
                     )
+        # Cleanup hangs off the transition, not off the flip: a client that
+        # cancels a row some other path already answered (the usual
+        # PATCH-then-cancel finalize) must still take the nudge with it. The id
+        # is read from the pre-flip row — only the reaper writes it, and it
+        # cannot change under a cancel.
+        await delete_nudge(
+            conn,
+            backend,
+            message_id=message_id,
+            chat_id=int(row["telegram_chat_id"]),
+            nudge_tg_message_id=row["nudge_tg_message_id"],
+        )
         try:
             # Strip the inline keyboard via the dedicated Bot-API-shaped method.
             await backend.edit_reply_markup(
@@ -995,6 +1036,50 @@ async def _load_message(
     return row
 
 
+async def _seed_next_nudge_at(
+    conn: sqlite3.Connection,
+    config: RelayConfig,
+    chat_id: int,
+    body: CreateMessageRequest,
+    now: datetime,
+) -> str | None:
+    """When this new message's first nudge falls due (ISO), or ``None``.
+
+    ``None`` — i.e. the reaper's nudge pass never looks at this row — for:
+
+    * a chat with **nudges off**, which is the default and is what keeps an
+      unconfigured relay byte-for-byte as it is today (invariant 4);
+    * a message that is not waiting on a human, decided by 19-03's
+      :func:`render.awaits_human` and therefore excluding
+      ``kind='notification'`` (invariant 7: an idle session must never produce
+      a 09:00 ping, and there must not be a second definition of "waiting on a
+      human");
+    * a never-active window, where 19-01's ``advance_active`` returns None.
+
+    Deliberately fail-open: a message must still send if the nudge lookup goes
+    wrong, so any error here costs the row its ladder and nothing else.
+    """
+    try:
+        if not awaits_human(body.model_dump(), "open"):
+            return None
+        recipient = await run_in_thread(load_recipient, conn, int(chat_id))
+        if not recipient.nudge_enabled:
+            return None
+        due = next_nudge_due(
+            now,
+            recipient,
+            config,
+            nudge_count=0,
+            windows=recipient_windows(recipient),
+        )
+        return due.isoformat() if due is not None else None
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "failed to seed next_nudge_at for a new message in chat %s", chat_id
+        )
+        return None
+
+
 def _terminal_response(row: sqlite3.Row) -> AnswerResponse | None:
     state = row["state"]
     if state == "open":
@@ -1016,11 +1101,31 @@ async def _record_answer(
     waiters: WaiterRegistry,
     message_id: int,
     answer: dict[str, Any],
+    *,
+    render_dirty: bool,
 ) -> bool:
     """Atomically transition an open message to ``answered`` and wake waiters.
 
     Returns True if the row moved to ``answered`` (we did the write), False if
     it was no longer open (already answered, expired, cancelled, or missing).
+
+    This is brd §2.2's fifth terminal path and the only one that makes **no
+    Telegram call at all** — it flips ``state`` in SQLite and returns. So it
+    cannot remove the ``#unanswered`` tag itself; it records that the tag needs
+    removing (``render_dirty``) in the very same ``UPDATE`` as the state flip,
+    so the flag and the state cannot diverge, and the reaper's cleanup sweep
+    finishes the job if the hook's PATCH never arrives (state.md 2026-08-16,
+    invariant 10).
+
+    ``render_dirty`` comes from the **caller**, which has the row and computes
+    it with 19-03's ``awaits_human``: a row that carried no tag is never
+    flagged, so the sweep never edits a message that needs no edit. Deliberately
+    keyword-only and required — the value is not this function's to guess.
+
+    An eager render-after-flip ``editMessageText`` here was considered and
+    rejected: it costs an edit on the hottest path in the system for every
+    ungrouped answer, against brd §2.7's ~1 msg/s per chat, and buys nothing the
+    sweep does not (state.md 2026-08-16). Do not reintroduce it.
     """
     now_iso = _utcnow_iso()
 
@@ -1028,8 +1133,15 @@ async def _record_answer(
         with conn:
             cur = conn.execute(
                 "UPDATE messages SET state='answered',"
-                " answer_json=?, answered_at=? WHERE id=? AND state='open'",
-                (json.dumps(answer), now_iso, message_id),
+                " answer_json=?, answered_at=?, render_dirty=?,"
+                " next_nudge_at=NULL"
+                " WHERE id=? AND state='open'",
+                (
+                    json.dumps(answer),
+                    now_iso,
+                    1 if render_dirty else 0,
+                    message_id,
+                ),
             )
             return cur.rowcount
 
@@ -1350,11 +1462,15 @@ async def _finalize_group_if_complete(
 
     ids = [int(m["id"]) for m in members]
 
+    # Terminal for the whole group: the ladder is retired and ``render_dirty``
+    # cleared in the same transaction as the flip, because every member is
+    # re-rendered a few lines below.
     def _flip() -> int:
         placeholders = ",".join("?" * len(ids))
         with conn:
             cur = conn.execute(
-                f"UPDATE messages SET state='answered'"
+                f"UPDATE messages SET state='answered',"
+                f" next_nudge_at = NULL, render_dirty = 0"
                 f" WHERE id IN ({placeholders}) AND state='open'",
                 ids,
             )
@@ -1381,6 +1497,15 @@ async def _finalize_group_if_complete(
             )
         except Exception:  # noqa: BLE001
             logger.exception("group finalize edit failed for message %s", m["id"])
+        # One nudge spoke for the whole group (brd §5.3) and it hangs off
+        # whichever member owns it, so every member is checked. Best-effort.
+        await delete_nudge(
+            conn,
+            backend,
+            message_id=int(m["id"]),
+            chat_id=chat_id,
+            nudge_tg_message_id=m["nudge_tg_message_id"],
+        )
         waiters.notify(int(m["id"]))
     return True
 
@@ -2247,7 +2372,15 @@ async def _apply_text_answer(
     if group_id is not None:
         await _handle_grouped_reply(conn, backend, waiters, row, text)
     else:
-        await _record_answer(conn, waiters, int(row["id"]), {"text": text, "via": via})
+        # The caller owns the tag question (invariant 7): this row is the one
+        # that will need re-rendering iff it is carrying a tag right now.
+        await _record_answer(
+            conn,
+            waiters,
+            int(row["id"]),
+            {"text": text, "via": via},
+            render_dirty=awaits_human(_payload_for(row), row["state"]),
+        )
 
 
 async def _handle_callback_query(
@@ -2335,7 +2468,16 @@ async def _handle_callback_query(
         "via": "button",
     }
 
-    wrote = await _record_answer(conn, waiters, parsed.message_id, answer)
+    # Same as the plain-text path: the row is here, so the tag question is
+    # answered here (invariant 7). ``row`` may already be terminal — then
+    # ``awaits_human`` is False and ``_record_answer`` writes nothing anyway.
+    wrote = await _record_answer(
+        conn,
+        waiters,
+        parsed.message_id,
+        answer,
+        render_dirty=awaits_human(_payload_for(row), row["state"]),
+    )
 
     if cb_id:
         try:
