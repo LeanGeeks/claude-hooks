@@ -1180,6 +1180,37 @@ async def _load_message_by_tg_id(
     return await run_in_thread(_q)
 
 
+async def _load_message_by_nudge_tg_id(
+    conn: sqlite3.Connection, chat_id: int, nudge_tg_message_id: int
+) -> sqlite3.Row | None:
+    """Look up a message by its nudge's Telegram id in a specific chat.
+
+    No state filter — deliberate.  This function is called after the direct
+    ``telegram_message_id`` lookup (``_load_message_by_tg_id``) has already
+    missed, to resolve a reply aimed at a nudge back to the row the nudge
+    belongs to (brd §5.6).  Including non-open rows lets the caller detect
+    already-resolved targets and send an informative reply instead of silence.
+
+    **Lookup precedence** in ``_handle_update``:
+    1. ``telegram_message_id`` (open rows only) — ``_load_message_by_tg_id``
+    2. ``nudge_tg_message_id`` (all states) — this function
+
+    A collision between the two id spaces within the same chat is implausible
+    in practice, but the ordering is explicit rather than incidental so it
+    cannot become a surprise in the future.
+    """
+
+    def _q() -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM messages"
+            " WHERE telegram_chat_id = ? AND nudge_tg_message_id = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (chat_id, nudge_tg_message_id),
+        ).fetchone()
+
+    return await run_in_thread(_q)
+
+
 async def _load_open_in_chat(
     conn: sqlite3.Connection, chat_id: int
 ) -> list[sqlite3.Row]:
@@ -1967,11 +1998,43 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
         (msg.get("reply_to_message") or {}).get("message_id")
     )
     if reply_to is not None:
+        # Precedence 1: direct telegram_message_id lookup (open rows only).
         row = await _load_message_by_tg_id(conn, int(chat_id), int(reply_to))
         if row is not None:
             await _apply_text_answer(
                 conn, backend, waiters, row, msg.get("text", ""), "reply"
             )
+            return
+        # Precedence 2: nudge id lookup — a reply aimed at the nudge message
+        # resolves to the row the nudge belongs to (brd §5.6).  No state
+        # filter: we need to detect already-resolved targets so they receive
+        # an informative reply rather than silence.
+        nudge_row = await _load_message_by_nudge_tg_id(
+            conn, int(chat_id), int(reply_to)
+        )
+        if nudge_row is not None:
+            if nudge_row["state"] == "open":
+                await _apply_text_answer(
+                    conn,
+                    backend,
+                    waiters,
+                    nudge_row,
+                    msg.get("text", ""),
+                    "nudge_reply",
+                )
+            else:
+                # Target already resolved — do NOT fall through to the recency
+                # heuristic; prefer a short acknowledgement over silence so
+                # the operator learns the reply was received (brd §5.6).
+                try:
+                    await backend.send_text(
+                        chat_id=int(chat_id),
+                        text="That one's already been handled.",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("already-handled nudge reply hint send failed")
+        # Whether we resolved via nudge or found nothing: do NOT fall through
+        # to the recency heuristic — that path caused historical mis-routing.
         return
 
     # Ignore other slash-commands so /start, /help, etc. don't accidentally

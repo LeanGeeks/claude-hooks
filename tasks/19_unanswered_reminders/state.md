@@ -17,7 +17,7 @@ external unknown (hashtag search scope per client) was closed by the operator as
 | 19-02 | [Preference commands](./19-02-preference-commands.md) | done | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
 | 19-04 | [Nudge engine](./19-04-nudge-engine.md) | done | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
-| 19-05 | [Reply-to-nudge routing](./19-05-reply-routing.md) | todo | 19-04 | nudge ids resolve to their target; ambiguity counter ignores nudges |
+| 19-05 | [Reply-to-nudge routing](./19-05-reply-routing.md) | done | 19-04 | nudge ids resolve to their target; ambiguity counter ignores nudges |
 | 19-06 | [Diagnostics, docs, installer](./19-06-diagnostics-docs.md) | todo | 19-02, 19-05 | `claude-roles` column, `architecture.md`, `docs/availability.md`, task-05 reversal note |
 | 19-07 | [Live verification](./19-07-live-verification_human.md) | todo | 19-06 | **human** — needs a real chat, real clients and a window that actually closes overnight |
 
@@ -259,6 +259,35 @@ created message that awaits a human. Unavoidable — only that table knows wheth
 the chat has nudges on. It is a DB read, not a behaviour change; the stored row
 is byte-identical to today's when nudges are off, and an absent `recipients` row
 is a valid state that cannot error.
+
+**2026-08-17 — 19-05 done, in the same session as 19-04 as brd §5.6 requires.**
+Reviewed PASS with **zero issues at any severity**; committed. Relay tests
+241 → 247 (+6); root hooks 708 unchanged. There is a one-commit window
+(`447865a` alone) where nudges exist and a reply to one is swallowed — it never
+outlived the session and was never deployed, but do not deploy `447865a` without
+the 19-05 commit on top of it.
+
+**The ambiguity counter is provably unaffected, by construction rather than by
+luck:** `_distinct_open_targets` iterates the result of `SELECT … WHERE
+state='open'` on `messages`, and a nudge is a *column value on a row*, not a row —
+so it cannot increase that count. This is the payoff of invariant 6's "nudges are
+not `messages` rows": had 19-04 made them rows to simplify anything, one pending
+prompt plus its own nudge would now read as two targets and the relay would refuse
+plain replies with "multiple sessions are waiting" when only one is.
+
+Reply-target precedence is explicit: message rows by `telegram_message_id` first,
+then `nudge_tg_message_id` scoped to the same chat. The nudge lookup deliberately
+carries **no state filter**, so a nudge whose target already resolved is found and
+answered with "That one's already been handled." rather than silently ignored —
+and no path in the `reply_to` block falls through to the recency heuristic, which
+is what caused the historical mis-routing.
+
+`via="nudge_reply"` needs no client change: `relay_answer_to_decision` branches on
+`via` for `button_multi` and `button` only and falls through to free-text for
+anything else. Confirmed against the current `router.py`, not taken from the
+planning note. The free-text fallthrough test in
+`tests/test_unit_decision_mapper.py` (root suite) is the standing guard on that
+and must stay green.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace

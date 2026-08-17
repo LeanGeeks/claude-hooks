@@ -1185,3 +1185,361 @@ async def test_pref_nudge_off_echo_includes_status(
         kw in nudge_off_text.lower()
         for kw in ("active", "inactive", "never", "always")
     ), f"echo must include availability status; got: {nudge_off_text!r}"
+
+
+# ---- Reply-to-nudge routing (epic 19-05) -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reply_to_nudge_records_answer_via_nudge_reply(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Reply to a nudge → target message answered, waiter woken, via='nudge_reply'.
+
+    The nudge has no ``messages`` row of its own — it is only recorded as
+    ``messages.nudge_tg_message_id`` on the row it serves (brd §5.5, state.md
+    invariant 6).  Replying to the nudge's Telegram id must still land as a
+    full answer on the target row, with ``via="nudge_reply"`` so logs can show
+    whether nudges are actually being answered.
+    """
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+    nudge_tg_id = 5555
+
+    # Inject a nudge id onto the open row (simulating what the reaper does).
+    conn = connect(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = ? WHERE id = ?",
+            (nudge_tg_id, msg_id),
+        )
+    conn.close()
+
+    update = {
+        "update_id": 19050,
+        "message": {
+            "message_id": 19050100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "nudge answer",
+            "reply_to_message_id": nudge_tg_id,
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 200
+    body = ans.json()
+    assert body["answer"]["via"] == "nudge_reply"
+    assert body["answer"]["text"] == "nudge answer"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_nudge_of_already_answered_message_sends_hint(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Reply to a nudge whose target is already answered → no state change,
+    a clear 'already handled' reply, no fall-through to the recency heuristic.
+
+    The nudge may survive past the answer if the reaper's cleanup sweep has not
+    yet run (state.md invariant 10).  The handler must detect the terminal state
+    and inform the user instead of silently swallowing the reply.
+    """
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+    nudge_tg_id = 5666
+
+    # Answer the message via button tap so it transitions to 'answered'.
+    r = await post_callback_query(
+        app_client,
+        callback_data=encode_cb(msg_id, 0),
+        chat_id=int(seeded["chat_id"]),  # type: ignore[arg-type]
+        from_user_id=int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+    )
+    assert r.status_code == 200
+
+    # Inject a nudge id onto the now-answered row (mimicking a stale nudge the
+    # reaper has not yet deleted — the normal scenario between button tap and
+    # the reaper's next cleanup tick).
+    conn = connect(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = ? WHERE id = ?",
+            (nudge_tg_id, msg_id),
+        )
+    conn.close()
+
+    send_text_before = sum(1 for c in backend.calls if c.method == "send_text")
+
+    update = {
+        "update_id": 19051,
+        "message": {
+            "message_id": 19051100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "oh wait already handled",
+            "reply_to_message_id": nudge_tg_id,
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+
+    # Answer unchanged — original button tap is still the recorded answer.
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 200
+    assert ans.json()["answer"]["via"] == "button"
+
+    # An informative reply was sent (not silence).
+    send_text_after = sum(1 for c in backend.calls if c.method == "send_text")
+    assert send_text_after > send_text_before, (
+        "expected an 'already handled' hint but no send_text call was made"
+    )
+    new_texts = [
+        c.kwargs.get("text", "")
+        for c in backend.calls
+        if c.method == "send_text"
+    ][send_text_before:]
+    assert any("already" in t.lower() or "handled" in t.lower() for t in new_texts), (
+        f"hint text must mention 'already' or 'handled'; got: {new_texts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_open_prompt_with_nudge_loose_reply_still_unambiguous(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """One open prompt plus its nudge → loose reply still unambiguous and attributed.
+
+    Regression guard: ``_distinct_open_targets`` counts message *rows*, not
+    nudge ids.  A nudge stored in ``nudge_tg_message_id`` on a row must not
+    make that row count as two targets.  If it did, this chat — which has
+    exactly one open prompt — would be treated as ambiguous and the relay would
+    refuse plain replies with 'Multiple sessions are waiting'.
+    """
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+
+    # Inject a nudge id — a second prompt has NOT been created.
+    conn = connect(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = 6660 WHERE id = ?",
+            (msg_id,),
+        )
+    conn.close()
+
+    hint_calls_before = sum(1 for c in backend.calls if c.method == "send_text")
+
+    update = {
+        "update_id": 19052,
+        "message": {
+            "message_id": 19052100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "loose answer while nudge exists",
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+
+    # Not ambiguous — no "Multiple sessions" hint sent.
+    hint_calls_after = sum(1 for c in backend.calls if c.method == "send_text")
+    assert hint_calls_after == hint_calls_before, (
+        "a nudge on a single open prompt must not make loose replies ambiguous"
+    )
+
+    # The message was answered by the loose reply.
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 200
+    assert ans.json()["answer"]["via"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_two_open_prompts_each_with_nudge_loose_reply_still_ambiguous(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Two open prompts each with a nudge → loose reply still refused as ambiguous.
+
+    The regression guard from the other direction: two prompts are two targets
+    regardless of whether either has a nudge.  Adding a nudge to each must not
+    change the count or the refusal message.
+    """
+    token = seeded["token"]
+    msg_a = await _create_message(app_client, token)
+    msg_b = await _create_message(app_client, token)
+
+    conn = connect(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = 7771 WHERE id = ?", (msg_a,)
+        )
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = 7772 WHERE id = ?", (msg_b,)
+        )
+    conn.close()
+
+    update = {
+        "update_id": 19053,
+        "message": {
+            "message_id": 19053100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "which one?",
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+
+    # Neither message was answered.
+    for mid in (msg_a, msg_b):
+        ans = await app_client.get(
+            f"/v1/messages/{mid}/answer",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ans.status_code == 204, f"message {mid} should still be open"
+
+    # The "Multiple sessions" hint was sent.
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert texts, "expected an ambiguity hint but no send_text call was made"
+    assert any(
+        "multiple" in t.lower() or "sessions" in t.lower() for t in texts
+    ), f"hint must mention multiple sessions; got: {texts}"
+
+
+@pytest.mark.asyncio
+async def test_reply_to_unrelated_bot_message_is_ignored(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Reply to a bot message that is neither a relay prompt nor a nudge
+    (e.g. a /me status reply, a 'Nudges on' echo) must not fall through to the
+    recency heuristic — the open relay message stays unanswered.
+
+    This is the same invariant as the pre-existing
+    ``test_reply_to_unmatched_does_not_fall_through`` test, restated here with
+    the 19-05 nudge lookup path explicitly in scope.
+    """
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+
+    # reply_to points to an arbitrary bot message (id 999888) that is stored in
+    # neither telegram_message_id nor nudge_tg_message_id for any row.
+    update = {
+        "update_id": 19054,
+        "message": {
+            "message_id": 19054100,
+            "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+            "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+            "text": "thanks for the status",
+            "reply_to_message_id": 999888,
+        },
+    }
+    r = await _send_update(app_client, update)
+    assert r.status_code == 200
+
+    # The open relay message was NOT answered.
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_button_tap_on_original_with_nudge_answers_and_cleanup_deletes_nudge(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Button tap on the original while a nudge exists → answers; 19-04's
+    reaper cleanup sweep deletes the nudge on the next tick.
+
+    This verifies that the button-tap path (which goes through
+    ``_handle_callback_query`` → ``_record_answer``, brd §2.2's fifth path)
+    leaves the row in the state the reaper's cleanup sweep expects, and that
+    the sweep correctly deletes the nudge.  The button tap itself makes no
+    Telegram call for the nudge — that is the hole the reaper fills.
+    """
+    from relay_server.db import connect as _connect
+    from relay_server.reaper import reaper_tick
+    from relay_server.waiters import WaiterRegistry
+
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+    nudge_tg_id = 8888
+
+    # Inject a nudge id (simulating a live nudge sent by the reaper before the
+    # user answered).
+    conn = _connect(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE messages SET nudge_tg_message_id = ? WHERE id = ?",
+            (nudge_tg_id, msg_id),
+        )
+
+    # Tap the button on the original prompt (not the nudge).
+    r = await post_callback_query(
+        app_client,
+        callback_data=encode_cb(msg_id, 0),
+        chat_id=int(seeded["chat_id"]),  # type: ignore[arg-type]
+        from_user_id=int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+    )
+    assert r.status_code == 200
+
+    # Answer is recorded.
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 200
+    assert ans.json()["answer"]["via"] == "button"
+
+    # Before the reaper: nudge id is still set (the button tap makes no
+    # Telegram call for the nudge — that is brd §2.2's fifth-path hole).
+    row = conn.execute(
+        "SELECT nudge_tg_message_id, state FROM messages WHERE id = ?", (msg_id,)
+    ).fetchone()
+    assert row["state"] == "answered"
+    assert row["nudge_tg_message_id"] == nudge_tg_id
+
+    # Run the reaper cleanup sweep.
+    waiters = WaiterRegistry()
+    await reaper_tick(conn, backend, waiters, make_test_config(db_path))
+
+    # After the tick: nudge deleted from DB and from Telegram.
+    row = conn.execute(
+        "SELECT nudge_tg_message_id FROM messages WHERE id = ?", (msg_id,)
+    ).fetchone()
+    assert row["nudge_tg_message_id"] is None
+
+    delete_calls = [c for c in backend.calls if c.method == "delete_message"]
+    assert any(
+        c.kwargs.get("telegram_message_id") == nudge_tg_id for c in delete_calls
+    ), f"expected delete_message for nudge tg_id {nudge_tg_id}; calls: {delete_calls}"
+
+    conn.close()
