@@ -14,7 +14,7 @@ external unknown (hashtag search scope per client) was closed by the operator as
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
 | 19-01 | [Schema + availability engine](./19-01-availability-engine.md) | done | — | **The epic's whole migration** (`recipients` + the `messages` nudge columns + `render_dirty`), tz/windows parsing, `advance_active`. Touches no Telegram code. |
-| 19-02 | [Preference commands](./19-02-preference-commands.md) | todo | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
+| 19-02 | [Preference commands](./19-02-preference-commands.md) | done | 19-01 | `/tz`, `/hours`, `/nudge`, `/me` in the webhook; `/installations/me` fields; `relay-admin`; every chat-visible string |
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
 | 19-04 | [Nudge engine](./19-04-nudge-engine.md) | todo | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
 | 19-05 | [Reply-to-nudge routing](./19-05-reply-routing.md) | todo | 19-04 | nudge ids resolve to their target; ambiguity counter ignores nudges |
@@ -190,6 +190,35 @@ reader or writer exists yet, and no eager render-after-flip edit was added to
 was rebuilt from `requirements.txt` + `pip install -e .` to establish the
 baseline. It is gitignored. The relay suite is
 `cd relay-server && ./.venv/bin/python -m pytest tests -q`.
+
+**2026-08-17 — 19-02 done.** Implemented, reviewed PASS (1 MEDIUM + 3 LOW, all
+fixed), re-reviewed clean (0 issues at any severity), committed. Relay tests
+200 → 217; root hooks 708 unchanged.
+
+**Two contracts 19-04 inherits from 19-02 — read these before touching the
+reaper:**
+
+1. **`windows_json` holds a canonical *spec string*, not JSON**, despite the
+   column name. Every reader parses it with `availability.parse_windows`
+   (`app.py`, `admin_cli.py`, `/v1/installations/me`). Follow that pattern; do
+   not `json.loads` it.
+2. **The nudge knobs live in exactly one place:** `nudge_default_schedule =
+   "15m,45m,3h"` and `nudge_max = 3` on `RelayConfig` in `config.py`. 19-04 must
+   read them from `app.state.config` — **not** by constructing a fresh
+   `RelayConfig()`, and not by re-declaring the literals. (`admin_cli.py` was
+   corrected during review to use `load_config()` for the same reason.)
+
+19-02 also added duration/schedule helpers to `availability.py`, purely additive
+after the 19-01 functions; 19-01's five core functions are semantically
+untouched and the module is still clock-free and DB-free.
+
+**A guard worth not breaking:** the preference-command branch sits *above* both
+the `reply_to` and loose-reply answer paths in `_handle_update` and returns, so a
+`/tz` sent as a reply to an open prompt is never recorded as its answer. Two
+regression tests cover it. The `/nudge on` backfill is likewise guarded by an
+off → on transition — the resolved time is computed unconditionally for the echo,
+but the `next_nudge_at` write stays inside the transition check, so a repeat
+`/nudge on` cannot postpone open rows' nudges.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace

@@ -8,6 +8,7 @@ Covers:
 - Loose reply: attributed only when a single target is open; ambiguous (multiple
   idle sessions) is ignored with a nudge; a question group counts as one target.
 - Idle notifications are answerable but sent without a force_reply prompt.
+- Preference commands: /tz, /hours, /nudge, /me (epic 19-02).
 - /bind command is accepted and a no-op (Phase 3 territory).
 - update_id deduplication.
 - Unhandled handler exceptions still return 2xx (no infinite Telegram retry).
@@ -624,3 +625,563 @@ async def test_cancel_403_auto_unbinds(
     ).fetchone()
     conn.close()
     assert row["telegram_chat_id"] is None
+
+
+# ---- Preference commands (epic 19-02) ----------------------------------------
+
+
+async def _send_pref_command(
+    client: httpx.AsyncClient,
+    chat_id: int,
+    from_user_id: int,
+    text: str,
+    *,
+    update_id: int = 9900,
+) -> httpx.Response:
+    """Send a Telegram message update containing a preference command."""
+    return await _send_update(
+        client,
+        {
+            "update_id": update_id,
+            "message": {
+                "message_id": update_id + 1000,
+                "chat": {"id": chat_id},
+                "from": {"id": from_user_id},
+                "text": text,
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_tz_bound_user_writes_row_and_echoes(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Bound user sending /tz Europe/Berlin writes the recipient row and echoes."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/tz Europe/Berlin",
+        update_id=9901,
+    )
+    assert r.status_code == 200
+
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT tz FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row["tz"] == "Europe/Berlin"
+
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("Europe/Berlin" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_tz_non_bound_sender_writes_nothing(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Non-bound sender is silently ignored — no row written, no echo."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        99999,  # not bound_user_id
+        "/tz Europe/Berlin",
+        update_id=9902,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT tz FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert not texts
+
+
+@pytest.mark.asyncio
+async def test_pref_command_unbound_chat_prompts_bind(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """A preference command sent to an unbound chat replies with a /bind prompt
+    and creates no recipient row."""
+    unknown_chat_id = 99999
+    r = await _send_pref_command(
+        app_client,
+        unknown_chat_id,
+        7,
+        "/tz Europe/Berlin",
+        update_id=9903,
+    )
+    assert r.status_code == 200
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("/bind" in t for t in texts)
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT tz FROM recipients WHERE telegram_chat_id = ?",
+        (unknown_chat_id,),
+    ).fetchone()
+    conn.close()
+    assert row is None
+
+
+@pytest.mark.asyncio
+async def test_pref_command_while_message_open_does_not_record_answer(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """A preference command must NOT be attributed as an answer to an open
+    message — the regression this guard exists for."""
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/tz Europe/Berlin",
+        update_id=9904,
+    )
+    assert r.status_code == 200
+
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 204, (
+        f"message was answered by a preference command: {ans.json()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_tz_unknown_timezone_error_no_row(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Unknown timezone sends an error reply and writes no row."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/tz NotARealZone/XYZ",
+        update_id=9905,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT tz FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("Unknown timezone" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_hours_bound_user_writes_row_and_echoes(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Bound user /hours writes windows_json and echoes resolved status."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours mon-fri 09:00-19:00",
+        update_id=9906,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT windows_json FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert "09:00" in (row["windows_json"] or "")
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    # Echo includes canonical spec AND resolved status with a concrete time.
+    # Use case-insensitive check because describe_active_status result is .capitalize()d.
+    assert any(
+        "09:00" in t and ("active" in t.lower() or "inactive" in t.lower())
+        for t in texts
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_hours_bad_spec_no_row_no_partial(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """Bad window spec (unknown day): error text sent, no row written."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours notaday 09:00-17:00",
+        update_id=9908,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT windows_json FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("Bad window spec" in t or "bad" in t.lower() for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_hours_off_clears_windows(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """First set hours, then /hours off — windows_json becomes NULL."""
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours mon-fri 09:00-19:00",
+        update_id=9910,
+    )
+    conn = connect(db_path)
+    before = conn.execute(
+        "SELECT windows_json FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    assert before is not None and before["windows_json"] is not None
+
+    backend.calls.clear()
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours off",
+        update_id=9911,
+    )
+    after = conn.execute(
+        "SELECT windows_json FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert after is not None and after["windows_json"] is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("always available" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_me_reflects_hours_off(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """/me after /hours off reports always-available status."""
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours off",
+        update_id=9920,
+    )
+    backend.calls.clear()
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/me",
+        update_id=9921,
+    )
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert texts, "expected /me to send a reply"
+    assert any("always available" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_on_backfills_open_rows_only_this_chat(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """/nudge on backfills next_nudge_at on open rows in this chat only."""
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+
+    # Seed an open message in a different chat directly in the DB.
+    conn = connect(db_path)
+    conn.execute(
+        "INSERT INTO messages"
+        " (installation_id, telegram_chat_id, telegram_message_id,"
+        "  kind, payload_json, state, created_at, expires_at)"
+        " VALUES (?, 88888, 9999, 'question',"
+        "  '{\"kind\":\"question\",\"text\":\"?\",\"ttl_sec\":60}',"
+        "  'open', datetime('now'), datetime('now', '+1 hour'))",
+        (seeded["installation_id"],),
+    )
+    conn.commit()
+
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9930,
+    )
+    assert r.status_code == 200
+
+    this_msg = conn.execute(
+        "SELECT next_nudge_at FROM messages WHERE id = ?",
+        (msg_id,),
+    ).fetchone()
+    assert this_msg["next_nudge_at"] is not None, (
+        "expected next_nudge_at to be backfilled on the open message"
+    )
+
+    other_msg = conn.execute(
+        "SELECT next_nudge_at FROM messages WHERE telegram_chat_id = 88888"
+    ).fetchone()
+    assert other_msg is not None
+    assert other_msg["next_nudge_at"] is None, "backfill must not touch other chats"
+    conn.close()
+
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("Nudges on" in t for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_bad_schedule_no_row(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """An unparseable nudge schedule returns an error and writes no row."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge bad_schedule",
+        update_id=9940,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT nudge_enabled FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("Bad nudge schedule" in t or "bad" in t.lower() for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_too_many_entries_rejected(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """A schedule exceeding nudge_max is rejected, not truncated."""
+    # Default nudge_max is 3; use 4 entries.
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge 15m,30m,1h,2h",
+        update_id=9941,
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    row = conn.execute(
+        "SELECT nudge_enabled FROM recipients WHERE telegram_chat_id = ?",
+        (seeded["chat_id"],),
+    ).fetchone()
+    conn.close()
+    assert row is None
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    assert any("cap" in t.lower() or "entries" in t.lower() for t in texts)
+
+
+@pytest.mark.asyncio
+async def test_installations_me_returns_availability_fields(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """/v1/installations/me returns availability fields after configuring via
+    preference commands."""
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/tz Europe/London",
+        update_id=9950,
+    )
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/hours mon-fri 09:00-17:00",
+        update_id=9951,
+    )
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9952,
+    )
+
+    r = await app_client.get(
+        "/v1/installations/me",
+        headers={"Authorization": f"Bearer {seeded['token']}"},  # type: ignore[arg-type]
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tz"] == "Europe/London"
+    assert body["windows"] is not None
+    assert "09:00" in body["windows"]
+    assert isinstance(body["active_now"], bool)
+    assert body["nudge_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_installations_me_unconfigured_chat_returns_nulls(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+) -> None:
+    """A bound but unconfigured chat returns null tz/windows, bool active_now,
+    and nudge_enabled False — no error."""
+    r = await app_client.get(
+        "/v1/installations/me",
+        headers={"Authorization": f"Bearer {seeded['token']}"},  # type: ignore[arg-type]
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["chat_bound"] is True
+    assert body["tz"] is None
+    assert body["windows"] is None
+    assert isinstance(body["active_now"], bool)  # unconfigured = always active = True
+    assert body["nudge_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_pref_command_with_reply_to_does_not_answer_message(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+    db_path: str,
+) -> None:
+    """A preference command sent with reply_to_message_id must NOT be attributed
+    as an answer — it is caught before the reply path."""
+    token = seeded["token"]
+    msg_id = await _create_message(app_client, token)
+    # FakeTelegramBackend assigns telegram_message_id starting at 1000.
+    r = await _send_update(
+        app_client,
+        {
+            "update_id": 9960,
+            "message": {
+                "message_id": 9000,
+                "chat": {"id": int(seeded["chat_id"])},  # type: ignore[arg-type]
+                "from": {"id": int(seeded["bound_user_id"])},  # type: ignore[arg-type]
+                "text": "/tz UTC",
+                "reply_to_message_id": 1000,  # tg_id of the open message
+            },
+        },
+    )
+    assert r.status_code == 200
+
+    ans = await app_client.get(
+        f"/v1/messages/{msg_id}/answer",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert ans.status_code == 204, (
+        "/tz sent as a reply was treated as an answer — preference command guard broken"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_on_echo_includes_concrete_time(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """/nudge on echo must name a concrete resolved local time (done criterion)."""
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9970,
+    )
+    assert r.status_code == 200
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    nudge_on_text = next((t for t in texts if "Nudges on" in t), None)
+    assert nudge_on_text is not None, "expected a 'Nudges on' echo"
+    assert "First nudge:" in nudge_on_text, (
+        f"echo must include a concrete resolved time; got: {nudge_on_text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_pref_nudge_off_echo_includes_status(
+    app_client: httpx.AsyncClient,
+    seeded: dict[str, object],
+    backend: FakeTelegramBackend,
+) -> None:
+    """/nudge off echo must include resolved availability status (done criterion)."""
+    # First enable nudges so we can turn them off.
+    await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge on",
+        update_id=9971,
+    )
+    backend.calls.clear()
+    r = await _send_pref_command(
+        app_client,
+        int(seeded["chat_id"]),  # type: ignore[arg-type]
+        int(seeded["bound_user_id"]),  # type: ignore[arg-type]
+        "/nudge off",
+        update_id=9972,
+    )
+    assert r.status_code == 200
+    texts = [c.kwargs.get("text", "") for c in backend.calls if c.method == "send_text"]
+    nudge_off_text = next((t for t in texts if "Nudges off" in t), None)
+    assert nudge_off_text is not None, "expected a 'Nudges off' echo"
+    # describe_active_status produces "always available", "active now...",
+    # "inactive...", or "never active". Match case-insensitively.
+    assert any(
+        kw in nudge_off_text.lower()
+        for kw in ("active", "inactive", "never", "always")
+    ), f"echo must include availability status; got: {nudge_off_text!r}"

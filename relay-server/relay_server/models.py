@@ -59,6 +59,12 @@ class InstallationMeResponse(BaseModel):
     label: str
     chat_bound: bool
     last_seen_at: str | None
+    # Availability fields — null when the chat is unconfigured or not bound
+    # (both degrade to null so old clients ignore them).
+    tz: str | None = None
+    windows: str | None = None  # canonical window spec; None means always-available
+    active_now: bool | None = None
+    nudge_enabled: bool | None = None
 
 
 class BindingRequestResponse(BaseModel):

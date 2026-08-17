@@ -15,7 +15,7 @@ store a fixed UTC offset.
 
 from __future__ import annotations
 
-import json
+import difflib
 import re
 from datetime import datetime, timedelta
 from typing import NamedTuple
@@ -25,8 +25,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 __all__ = [
     "Window",
     "parse_tz",
+    "near_tz_matches",
     "parse_windows",
     "format_windows",
+    "parse_duration",
+    "parse_nudge_schedule",
+    "format_nudge_schedule",
+    "describe_active_status",
     "is_active",
     "next_active_start",
     "advance_active",
@@ -68,6 +73,26 @@ def parse_tz(name: str) -> str | None:
         return name
     except (ZoneInfoNotFoundError, KeyError, ValueError):
         return None
+
+
+def near_tz_matches(name: str, n: int = 3) -> list[str]:
+    """Return up to *n* timezone names that resemble *name*.
+
+    Uses difflib for fuzzy matching, then falls back to a case-insensitive
+    substring scan so that "Berlin" still finds "Europe/Berlin".
+    """
+    candidates = sorted(available_timezones())
+    matches: list[str] = list(
+        difflib.get_close_matches(name, candidates, n=n, cutoff=0.4)
+    )
+    if len(matches) < n:
+        lower = name.lower()
+        for c in candidates:
+            if lower in c.lower() and c not in matches:
+                matches.append(c)
+                if len(matches) >= n:
+                    break
+    return matches[:n]
 
 
 def _parse_minute(s: str) -> int:
@@ -412,3 +437,139 @@ def advance_active(
 
     # remaining reached zero — shouldn't happen (handled above), but guard.
     return cursor_utc
+
+
+# ---------------------------------------------------------------------------
+# Nudge schedule parsing (epic 19-02)
+# ---------------------------------------------------------------------------
+
+# Matches forms like "15m", "3h", "2h30m".  Both groups are optional but at
+# least one must be present (enforced by the caller).
+_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?$")
+
+
+def parse_duration(s: str) -> timedelta | None:
+    """Parse a duration like ``15m``, ``3h``, or ``2h30m`` into a timedelta.
+
+    Returns ``None`` if the string is empty, zero-length, or does not match
+    the expected form.
+    """
+    s = s.strip()
+    if not s:
+        return None
+    m = _DURATION_RE.fullmatch(s)
+    if not m or (m.group(1) is None and m.group(2) is None):
+        return None
+    hours = int(m.group(1) or 0)
+    minutes = int(m.group(2) or 0)
+    if hours == 0 and minutes == 0:
+        return None  # Zero-length is not a valid nudge interval.
+    return timedelta(hours=hours, minutes=minutes)
+
+
+def parse_nudge_schedule(spec: str, max_entries: int) -> list[timedelta]:
+    """Parse a nudge schedule like ``15m,45m,3h`` into a list of timedeltas.
+
+    Raises ``ValueError`` if any entry is unparseable or the list is longer
+    than *max_entries* (reject rather than truncate silently).
+    """
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty nudge schedule")
+    if len(parts) > max_entries:
+        raise ValueError(
+            f"nudge schedule has {len(parts)} entries; server cap is {max_entries}"
+        )
+    result: list[timedelta] = []
+    for p in parts:
+        td = parse_duration(p)
+        if td is None:
+            raise ValueError(
+                f"bad duration {p!r}; accepted forms: 15m, 3h, 2h30m"
+            )
+        result.append(td)
+    return result
+
+
+def format_nudge_schedule(schedule: list[timedelta]) -> str:
+    """Serialise a nudge schedule back to canonical string form (``15m,45m,3h``)."""
+    parts: list[str] = []
+    for td in schedule:
+        total_minutes = int(td.total_seconds() // 60)
+        h, m = divmod(total_minutes, 60)
+        if h and m:
+            parts.append(f"{h}h{m}m")
+        elif h:
+            parts.append(f"{h}h")
+        else:
+            parts.append(f"{m}m")
+    return ",".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Human-readable active-status description (epic 19-02)
+# ---------------------------------------------------------------------------
+
+
+def _current_window_end(
+    now_utc: datetime, tz_zone: ZoneInfo, windows: list[Window], now_local: datetime
+) -> datetime | None:
+    """Return the UTC end of the window that currently contains *now_utc*.
+
+    Returns ``None`` if *now_utc* is not inside any window (caller should check
+    :func:`is_active` first).
+    """
+    local_weekday = now_local.weekday()
+    best_end: datetime | None = None
+    for w in windows:
+        if w.weekday != local_weekday:
+            continue
+        start_utc, end_utc = _window_bounds_utc(now_local, w, tz_zone)
+        if start_utc <= now_utc < end_utc:
+            # Prefer the earliest-ending window if two overlap.
+            if best_end is None or end_utc < best_end:
+                best_end = end_utc
+    return best_end
+
+
+def describe_active_status(
+    now: datetime, tz: str | None, windows: list[Window] | None
+) -> str:
+    """Return a human-readable string describing current availability.
+
+    Examples:
+    - ``"always available"``
+    - ``"active now, until 19:00"``
+    - ``"active now, until Fri 00:00"``
+    - ``"inactive — next window Mon 09:00"``
+    - ``"inactive — next window today 14:00"``
+    - ``"inactive — next window tomorrow 09:00"``
+    - ``"never active"``
+    """
+    if windows is None:
+        return "always available"
+
+    tz_zone = ZoneInfo(tz) if tz else ZoneInfo("UTC")
+    now_local = _local_dt(now, tz_zone)
+    now_utc = now.astimezone(ZoneInfo("UTC"))
+
+    if is_active(now, tz, windows):
+        end_utc = _current_window_end(now_utc, tz_zone, windows, now_local)
+        if end_utc is None:
+            return "active now"
+        end_local = end_utc.astimezone(tz_zone)
+        if end_local.date() == now_local.date():
+            return f"active now, until {end_local.strftime('%H:%M')}"
+        return f"active now, until {end_local.strftime('%a %H:%M')}"
+
+    nxt = next_active_start(now, tz, windows)
+    if nxt is None:
+        return "never active"
+    nxt_local = nxt.astimezone(tz_zone)
+    today = now_local.date()
+    tomorrow = today + timedelta(days=1)
+    if nxt_local.date() == today:
+        return f"inactive — next window today {nxt_local.strftime('%H:%M')}"
+    if nxt_local.date() == tomorrow:
+        return f"inactive — next window tomorrow {nxt_local.strftime('%H:%M')}"
+    return f"inactive — next window {nxt_local.strftime('%a %H:%M')}"

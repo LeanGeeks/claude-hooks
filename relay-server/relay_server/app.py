@@ -15,14 +15,26 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from .availability import (
+    advance_active,
+    describe_active_status,
+    format_nudge_schedule,
+    format_windows,
+    is_active,
+    near_tz_matches,
+    parse_nudge_schedule,
+    parse_tz,
+    parse_windows,
+)
 from .binding_codes import generate_code, normalise_code
 from .callback_data import decode as decode_callback_data
 from .config import RelayConfig, load_config
-from .db import connect, init_schema, run_in_thread
+from .db import connect, init_schema, load_recipient, run_in_thread
 from .reaper import reaper_loop
 from .models import (
     AnswerResponse,
@@ -303,13 +315,34 @@ def create_app(
     # ---- Routes ------------------------------------------------------------
 
     @app.get("/v1/installations/me", response_model=InstallationMeResponse)
-    async def me(installation=Depends(require_installation)) -> InstallationMeResponse:
-        return InstallationMeResponse(
+    async def me(
+        request: Request,
+        installation=Depends(require_installation),
+    ) -> InstallationMeResponse:
+        conn: sqlite3.Connection = request.app.state.db
+        chat_id_raw = installation["telegram_chat_id"]
+        base = InstallationMeResponse(
             id=installation["id"],
             label=installation["label"],
-            chat_bound=installation["telegram_chat_id"] is not None,
+            chat_bound=chat_id_raw is not None,
             last_seen_at=installation["last_seen_at"],
         )
+        if chat_id_raw is not None:
+            chat_id = int(chat_id_raw)
+            recipient = await run_in_thread(load_recipient, conn, chat_id)
+            windows = (
+                parse_windows(recipient.windows_json)
+                if recipient.windows_json
+                else None
+            )
+            now = _utcnow()
+            base.tz = recipient.tz
+            base.windows = (
+                format_windows(windows) if windows is not None else None
+            )
+            base.active_now = is_active(now, recipient.tz, windows)
+            base.nudge_enabled = recipient.nudge_enabled
+        return base
 
     # ---- Binding routes -------------------------------------------------------
 
@@ -1352,6 +1385,409 @@ async def _finalize_group_if_complete(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Preference commands: /tz, /hours, /nudge, /me (epic 19-02)
+# ---------------------------------------------------------------------------
+
+# Commands that are handled as preference settings rather than answers.
+_PREF_COMMANDS = frozenset({"/tz", "/hours", "/nudge", "/me"})
+
+
+def _is_preference_command(text: str) -> bool:
+    """Return True if *text* starts with a known preference command."""
+    if not text.startswith("/"):
+        return False
+    # Strip "/cmd@botname" form.
+    cmd = text.split(None, 1)[0].lower()
+    if "@" in cmd:
+        cmd = cmd.split("@", 1)[0]
+    return cmd in _PREF_COMMANDS
+
+
+def _cmd_word(text: str) -> tuple[str, str]:
+    """Return (lowercased command, rest-of-line stripped) from a message text."""
+    parts = text.split(None, 1)
+    cmd = parts[0].lower()
+    if "@" in cmd:
+        cmd = cmd.split("@", 1)[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    return cmd, arg
+
+
+async def _handle_preference_command(
+    app: FastAPI, msg: dict[str, Any], chat_id: int
+) -> None:
+    """Handle /tz, /hours, /nudge, and /me preference commands.
+
+    Authorization: only the bound user of this chat may issue these.  An
+    unbound chat is told to /bind first.  Anyone else is silently ignored so
+    that a group chat with non-bound members does not spam error replies.
+
+    This function always returns without writing any answer to the messages
+    table — callers guarantee that by returning immediately after this call.
+    """
+    conn: sqlite3.Connection = app.state.db
+    backend: TelegramBackend = app.state.backend
+    cfg: RelayConfig = app.state.config
+
+    text = (msg.get("text") or "").strip()
+    sender_id = (msg.get("from") or {}).get("id")
+
+    install = await _load_installation_for_chat(conn, chat_id)
+    if install is None or install["bound_user_id"] is None:
+        try:
+            await backend.send_text(
+                chat_id=chat_id,
+                text=(
+                    "This chat is not yet linked to an installation. "
+                    "Send /bind <code> first."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("preference command send to unbound chat failed")
+        return
+
+    # Only the bound user may configure preference commands.
+    if sender_id is None or int(sender_id) != int(install["bound_user_id"]):
+        return  # silently ignore non-bound sender
+
+    now = _utcnow()
+    now_iso = now.isoformat()
+    cmd, arg = _cmd_word(text)
+
+    try:
+        if cmd == "/tz":
+            await _pref_tz(conn, backend, chat_id, arg, now, now_iso)
+        elif cmd == "/hours":
+            await _pref_hours(conn, backend, chat_id, arg, now, now_iso)
+        elif cmd == "/nudge":
+            await _pref_nudge(conn, backend, cfg, chat_id, arg, now, now_iso)
+        elif cmd == "/me":
+            await _pref_me(conn, backend, cfg, chat_id, now)
+    except Exception:  # noqa: BLE001
+        logger.exception("preference command %r in chat %s failed", cmd, chat_id)
+
+
+async def _pref_tz(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    chat_id: int,
+    arg: str,
+    now: datetime,
+    now_iso: str,
+) -> None:
+    if not arg:
+        await backend.send_text(
+            chat_id=chat_id,
+            text="Usage: /tz <IANA timezone>  (e.g. /tz Europe/Berlin)",
+        )
+        return
+
+    tz_name = parse_tz(arg)
+    if tz_name is None:
+        matches = near_tz_matches(arg)
+        if matches:
+            suggestions = ", ".join(matches)
+            reply = (
+                f"Unknown timezone {arg!r}. Did you mean: {suggestions}?"
+            )
+        else:
+            reply = (
+                f"Unknown timezone {arg!r}. "
+                "Use an IANA name like Europe/Berlin or America/New_York."
+            )
+        await backend.send_text(chat_id=chat_id, text=reply)
+        return
+
+    def _upsert() -> None:
+        with conn:
+            conn.execute(
+                "INSERT INTO recipients"
+                " (telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule, updated_at)"
+                " VALUES (?, ?, NULL, 0, NULL, ?)"
+                " ON CONFLICT(telegram_chat_id) DO UPDATE SET"
+                "   tz = excluded.tz,"
+                "   updated_at = excluded.updated_at",
+                (chat_id, tz_name, now_iso),
+            )
+
+    await run_in_thread(_upsert)
+
+    recipient = await run_in_thread(load_recipient, conn, chat_id)
+    windows = parse_windows(recipient.windows_json) if recipient.windows_json else None
+    status = describe_active_status(now, tz_name, windows)
+    await backend.send_text(
+        chat_id=chat_id,
+        text=f"Timezone set to {tz_name}. {status.capitalize()}.",
+    )
+
+
+async def _pref_hours(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    chat_id: int,
+    arg: str,
+    now: datetime,
+    now_iso: str,
+) -> None:
+    if not arg:
+        await backend.send_text(
+            chat_id=chat_id,
+            text=(
+                "Usage: /hours <spec>  "
+                "(e.g. /hours mon-fri 09:00-19:00, sat 11:00-15:00)\n"
+                "Use /hours off to clear (always available)."
+            ),
+        )
+        return
+
+    if arg.lower() == "off":
+        def _upsert_off() -> None:
+            with conn:
+                conn.execute(
+                    "INSERT INTO recipients"
+                    " (telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule, updated_at)"
+                    " VALUES (?, NULL, NULL, 0, NULL, ?)"
+                    " ON CONFLICT(telegram_chat_id) DO UPDATE SET"
+                    "   windows_json = NULL,"
+                    "   updated_at = excluded.updated_at",
+                    (chat_id, now_iso),
+                )
+
+        await run_in_thread(_upsert_off)
+        recipient = await run_in_thread(load_recipient, conn, chat_id)
+        status = describe_active_status(now, recipient.tz, None)
+        await backend.send_text(
+            chat_id=chat_id,
+            text=f"Hours cleared — always available. {status.capitalize()}.",
+        )
+        return
+
+    # Validate ALL clauses before writing anything (never partially apply).
+    try:
+        windows = parse_windows(arg)
+    except ValueError as exc:
+        await backend.send_text(
+            chat_id=chat_id,
+            text=(
+                f"Bad window spec: {exc}.\n"
+                "Example: /hours mon-fri 09:00-19:00, sat 11:00-15:00"
+            ),
+        )
+        return
+
+    if windows is None:
+        await backend.send_text(
+            chat_id=chat_id,
+            text=(
+                "Empty hours spec. Use /hours off to clear, "
+                "or e.g. /hours mon-fri 09:00-19:00."
+            ),
+        )
+        return
+
+    canonical = format_windows(windows)
+
+    def _upsert_hours() -> None:
+        with conn:
+            conn.execute(
+                "INSERT INTO recipients"
+                " (telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule, updated_at)"
+                " VALUES (?, NULL, ?, 0, NULL, ?)"
+                " ON CONFLICT(telegram_chat_id) DO UPDATE SET"
+                "   windows_json = excluded.windows_json,"
+                "   updated_at = excluded.updated_at",
+                (chat_id, canonical, now_iso),
+            )
+
+    await run_in_thread(_upsert_hours)
+    recipient = await run_in_thread(load_recipient, conn, chat_id)
+    status = describe_active_status(now, recipient.tz, windows)
+    await backend.send_text(
+        chat_id=chat_id,
+        text=f"Hours: {canonical}. {status.capitalize()}.",
+    )
+
+
+async def _pref_nudge(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    cfg: RelayConfig,
+    chat_id: int,
+    arg: str,
+    now: datetime,
+    now_iso: str,
+) -> None:
+    if not arg:
+        await backend.send_text(
+            chat_id=chat_id,
+            text=(
+                "Usage: /nudge on  — enable nudges\n"
+                "       /nudge off — disable nudges\n"
+                "       /nudge 15m,45m,3h — enable with custom schedule"
+            ),
+        )
+        return
+
+    arg_lower = arg.lower()
+
+    if arg_lower == "off":
+        def _disable() -> None:
+            with conn:
+                conn.execute(
+                    "INSERT INTO recipients"
+                    " (telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule, updated_at)"
+                    " VALUES (?, NULL, NULL, 0, NULL, ?)"
+                    " ON CONFLICT(telegram_chat_id) DO UPDATE SET"
+                    "   nudge_enabled = 0,"
+                    "   updated_at = excluded.updated_at",
+                    (chat_id, now_iso),
+                )
+                # Clear next_nudge_at on open rows so the reaper won't act.
+                conn.execute(
+                    "UPDATE messages SET next_nudge_at = NULL"
+                    " WHERE telegram_chat_id = ? AND state = 'open'",
+                    (chat_id,),
+                )
+
+        await run_in_thread(_disable)
+        recipient = await run_in_thread(load_recipient, conn, chat_id)
+        _off_windows = (
+            parse_windows(recipient.windows_json) if recipient.windows_json else None
+        )
+        status = describe_active_status(now, recipient.tz, _off_windows)
+        await backend.send_text(
+            chat_id=chat_id, text=f"Nudges off. {status.capitalize()}."
+        )
+        return
+
+    # Determine the schedule.
+    if arg_lower == "on":
+        schedule_str: str | None = None  # will use per-chat or default
+    else:
+        # Treat the argument as an explicit schedule.
+        try:
+            schedule_tds = parse_nudge_schedule(arg, cfg.nudge_max)
+        except ValueError as exc:
+            await backend.send_text(
+                chat_id=chat_id,
+                text=(
+                    f"Bad nudge schedule: {exc}.\n"
+                    "Example: /nudge 15m,45m,3h"
+                ),
+            )
+            return
+        schedule_str = format_nudge_schedule(schedule_tds)
+
+    # Load existing recipient to know whether nudges were off before (backfill
+    # only applies when transitioning from off → on).
+    recipient_before = await run_in_thread(load_recipient, conn, chat_id)
+    was_off = not recipient_before.nudge_enabled
+
+    # Determine effective schedule for the echo and for backfill.
+    effective_schedule_str = (
+        schedule_str
+        or recipient_before.nudge_schedule
+        or cfg.nudge_default_schedule
+    )
+    try:
+        effective_schedule_tds = parse_nudge_schedule(
+            effective_schedule_str, cfg.nudge_max
+        )
+    except ValueError:
+        effective_schedule_tds = parse_nudge_schedule(
+            cfg.nudge_default_schedule, cfg.nudge_max
+        )
+        effective_schedule_str = cfg.nudge_default_schedule
+
+    def _enable(new_sched: str | None) -> None:
+        with conn:
+            conn.execute(
+                "INSERT INTO recipients"
+                " (telegram_chat_id, tz, windows_json, nudge_enabled, nudge_schedule, updated_at)"
+                " VALUES (?, NULL, NULL, 1, ?, ?)"
+                " ON CONFLICT(telegram_chat_id) DO UPDATE SET"
+                "   nudge_enabled = 1,"
+                "   nudge_schedule = COALESCE(?, nudge_schedule),"
+                "   updated_at = excluded.updated_at",
+                (chat_id, new_sched, now_iso, new_sched),
+            )
+
+    await run_in_thread(_enable, schedule_str)
+
+    # Compute next nudge time (always, for the echo; also used for backfill).
+    recipient_after = await run_in_thread(load_recipient, conn, chat_id)
+    windows = (
+        parse_windows(recipient_after.windows_json)
+        if recipient_after.windows_json
+        else None
+    )
+    first_interval = effective_schedule_tds[0]
+    nudge_at = advance_active(now, first_interval, recipient_after.tz, windows)
+    nudge_at_iso = nudge_at.isoformat() if nudge_at else None
+
+    # Backfill open rows when transitioning off → on.
+    if was_off:
+        def _backfill() -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE messages SET next_nudge_at = ?"
+                    " WHERE telegram_chat_id = ? AND state = 'open'"
+                    " AND next_nudge_at IS NULL",
+                    (nudge_at_iso, chat_id),
+                )
+
+        await run_in_thread(_backfill)
+
+    canonical_sched = format_nudge_schedule(effective_schedule_tds)
+    if nudge_at is not None:
+        tz_zone = ZoneInfo(recipient_after.tz) if recipient_after.tz else ZoneInfo("UTC")
+        now_local = now.astimezone(tz_zone)
+        nudge_local = nudge_at.astimezone(tz_zone)
+        today = now_local.date()
+        tomorrow = today + timedelta(days=1)
+        if nudge_local.date() == today:
+            nudge_str = f"today {nudge_local.strftime('%H:%M')}"
+        elif nudge_local.date() == tomorrow:
+            nudge_str = f"tomorrow {nudge_local.strftime('%H:%M')}"
+        else:
+            nudge_str = nudge_local.strftime("%a %H:%M")
+        echo_text = f"Nudges on. Schedule: {canonical_sched}. First nudge: {nudge_str}."
+    else:
+        echo_text = f"Nudges on. Schedule: {canonical_sched}."
+    await backend.send_text(chat_id=chat_id, text=echo_text)
+
+
+async def _pref_me(
+    conn: sqlite3.Connection,
+    backend: TelegramBackend,
+    cfg: RelayConfig,
+    chat_id: int,
+    now: datetime,
+) -> None:
+    recipient = await run_in_thread(load_recipient, conn, chat_id)
+    windows = (
+        parse_windows(recipient.windows_json) if recipient.windows_json else None
+    )
+
+    tz_line = f"Timezone: {recipient.tz}" if recipient.tz else "Timezone: not set (UTC assumed)"
+    hours_line = (
+        f"Hours: {recipient.windows_json}"
+        if recipient.windows_json
+        else "Hours: always available (default)"
+    )
+    status = describe_active_status(now, recipient.tz, windows)
+
+    if recipient.nudge_enabled:
+        sched_str = recipient.nudge_schedule or cfg.nudge_default_schedule
+        nudge_line = f"Nudges: on  |  Schedule: {sched_str}"
+    else:
+        nudge_line = "Nudges: off (default)"
+
+    lines = [tz_line, hours_line, f"Status: {status}", nudge_line]
+    await backend.send_text(chat_id=chat_id, text="\n".join(lines))
+
+
 async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     """Route a single Telegram ``Update`` to the right handler.
 
@@ -1387,6 +1823,13 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
     if chat_id is None:
+        return
+
+    # Preference commands (/tz, /hours, /nudge, /me) are handled before any
+    # answer path so they can never be mistakenly attributed as answers — even
+    # if the message carries a reply_to_message_id.  They always return.
+    if _is_preference_command(text):
+        await _handle_preference_command(app, msg, int(chat_id))
         return
 
     # Free-text reply path: prefer explicit reply_to_message_id when present.

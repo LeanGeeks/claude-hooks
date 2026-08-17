@@ -33,6 +33,17 @@ class RelayConfig:
     # Interval in seconds between reaper ticks. Defaults to 30 s; tests may
     # set a shorter value to avoid slow test suites.
     reaper_interval: float = 30.0
+    # Nudge-engine defaults (epic 19, §6).  Defined here so that 19-02
+    # (preference commands) and 19-04 (reaper nudge pass) share one source of
+    # truth rather than each declaring a copy.
+    #
+    # nudge_default_schedule — comma-separated durations used when a chat has
+    #   nudges enabled but no per-chat schedule set.  Durations are measured in
+    #   *active* time (brd §3.4).  Default: 15 min, 45 min, 3 h.
+    # nudge_max — maximum number of entries allowed in a per-chat schedule.
+    #   A /nudge command with more entries is rejected, not truncated.
+    nudge_default_schedule: str = "15m,45m,3h"
+    nudge_max: int = 3
 
     extra: dict[str, Any] = field(default_factory=dict)
 
