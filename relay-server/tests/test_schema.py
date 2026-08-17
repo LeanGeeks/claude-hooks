@@ -344,3 +344,45 @@ def test_admin_rotate_warns_when_un_revoking(tmp_path: Path) -> None:
     r = runner.invoke(cli, ["--db", db, "rotate", "--id", str(inst_id)])
     assert r.exit_code == 0
     assert "was revoked" in r.stderr
+
+
+def test_recipients_list_round_trips_written_data(tmp_path: Path) -> None:
+    """relay-admin recipients set-* then list shows the written data (19-06)."""
+    db = str(tmp_path / "recip.db")
+    runner = CliRunner()
+
+    # Set timezone
+    r = runner.invoke(
+        cli, ["--db", db, "recipients", "set-tz", "42", "Europe/Berlin"]
+    )
+    assert r.exit_code == 0, r.output
+
+    # Set availability hours
+    r = runner.invoke(
+        cli, ["--db", db, "recipients", "set-hours", "42", "mon-fri 09:00-17:00"]
+    )
+    assert r.exit_code == 0, r.output
+
+    # Enable nudges
+    r = runner.invoke(
+        cli, ["--db", db, "recipients", "set-nudge", "42", "on"]
+    )
+    assert r.exit_code == 0, r.output
+
+    # List — the row must reflect everything written above.
+    r = runner.invoke(cli, ["--db", db, "recipients", "list"])
+    assert r.exit_code == 0, r.output
+    out = r.output
+    assert "chat_id=42" in out
+    assert "Europe/Berlin" in out
+    assert "mon-fri 09:00-17:00" in out
+    assert "nudge=on" in out
+
+
+def test_recipients_list_empty(tmp_path: Path) -> None:
+    """relay-admin recipients list on an empty DB prints the no-data message."""
+    db = str(tmp_path / "empty.db")
+    runner = CliRunner()
+    r = runner.invoke(cli, ["--db", db, "recipients", "list"])
+    assert r.exit_code == 0, r.output
+    assert "no recipient rows" in r.output

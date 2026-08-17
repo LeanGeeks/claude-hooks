@@ -148,3 +148,27 @@ When expired:
 - Testing and refinement: ~1-2 hours
 
 **Total: ~5-7 hours**
+
+---
+
+## 2026-08-17 — Option A reversed by epic 19-03
+
+This task chose **Option A** for expiry: strip only the keyboard, never edit the
+message text, explicitly to avoid the extra `editMessageText` call per expiry,
+which was judged unjustified rate-limit surface at the time.
+
+**Epic 19-03 reverses this decision.** Both the reaper's expiry pass and the
+cancel endpoint (`app.py:760`) now rewrite the message text in addition to
+stripping the keyboard.
+
+The justification that was missing at task 05's time is brd §4.3: an expired or
+cancelled message must lose its `#unanswered` tag, or Telegram's hashtag search —
+the pending-work index — lists work that nobody is waiting on. There is no other
+way to strip the tag without a text edit, because the tag exists only in the
+render layer (`render_body`) and is appended dynamically based on row state.
+
+A future reader finding `editMessageText` in the expiry path should read this
+note rather than reverting to keyboard-only to "reduce API calls". The extra call
+is the justification, and the justification is epic 19. See brd §4.3 for the full
+reasoning, and `reaper.py`'s module docstring for the implementation note.
+

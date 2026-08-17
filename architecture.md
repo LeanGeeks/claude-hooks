@@ -60,7 +60,9 @@ relay-server/
     models.py                    Pydantic request/response models; MessageKind/State literals
     db.py                        SQLite (WAL) schema + connection helpers
     waiters.py                   in-process long-poll waiter registry, keyed by message_id
-    reaper.py                    background task: expire stale messages, purge idem keys
+    reaper.py                    background task: expire stale messages, cleanup sweep, nudge pass, purge idem keys
+    render.py                    render_body + awaits_human: the single render function every send and edit uses
+    availability.py              pure active-time arithmetic: parse_tz, parse_windows, is_active, advance_active
     binding_codes.py             BIND-XXXX-XXXX code generation/validation
     callback_data.py             pack (message_id, option_idx) into Telegram's 64-byte cap
     tokens.py                    installation token generation + hashing
@@ -151,8 +153,133 @@ is no background drain — the waiting process is the actor.
 
 ### reaper.py
 
-A server background task expires stale messages (TTL) and purges old idempotency
-keys on an interval.
+A server background task that runs every 30 s. Each tick has five passes:
+
+1. **Expiry pass** — rows `state='open' AND expires_at < now`: transition to
+   `'expired'`, best-effort text re-render (to strip `#unanswered` — see below),
+   keyboard strip, delete any live nudge, wake waiters, evict waiter registry.
+2. **Cleanup sweep** (epic 19-04) — rows that have **left** `open` still carrying
+   a `render_dirty = 1` flag or a `nudge_tg_message_id IS NOT NULL`. This is the
+   backstop for `_record_answer` — the fifth terminal path (brd §2.2) — which
+   flips state in SQLite and performs **no Telegram call at all**, leaving the tag
+   and the nudge to the hook's subsequent PATCH. When the machine sleeps or the
+   hook dies between the flip and the PATCH, the cleanup sweep removes both within
+   one tick. **Why a sweep and not an eager edit at flip time:** adding
+   `editMessageText` to the hottest path in the system (every ungrouped button tap
+   and plain-text reply) costs two edits on a path that already has one (the
+   hook's PATCH lands milliseconds later with the baked `✅` text), only gains
+   anything in the failure case, and drags nudge deletion onto that hot path
+   unnecessarily. The reaper's answer — at most one tick of delay in the failure
+   case — is strictly better (state.md 2026-08-16, invariant 10).
+3. **Nudge pass** (epic 19-04) — rows `state='open' AND next_nudge_at IS NOT NULL
+   AND next_nudge_at < now`, coalesced to one nudge per group and one nudge per
+   chat per tick. `next_nudge_at NULL` (the default for unconfigured chats) is the
+   gate that keeps the pass a no-op for uninterested chats — no SELECT hits the
+   table unless at least one chat ran `/nudge on`.
+4. **Binding codes** — no action; the `GET /v1/bindings/{code}` endpoint already
+   returns HTTP 410 for expired codes.
+5. **Idempotency key purge** — rows older than 24 h are deleted.
+
+---
+
+## SQLite schema (v3)
+
+Three tables carry the relay's durable state. All queries use WAL mode.
+
+### `installations`
+
+Maps an installation token to a Telegram chat. One installation per machine;
+many installations can bind to the same `telegram_chat_id`.
+
+### `messages`
+
+One row per relayed message. Key columns:
+
+| Column | Purpose |
+|--------|---------|
+| `id` | Relay message id (not the Telegram message id) |
+| `telegram_chat_id` | Destination chat |
+| `telegram_message_id` | The message's id in Telegram (from the send response) |
+| `kind` | `question \| permission \| notification` |
+| `payload_json` | **Canonical, always-untagged body** — the source of truth for all renders. Every writer keeps it current; the PATCH endpoint writes the client's text back here so that the cancel and expiry renders never re-render from a stale payload (invariant 1 of epic 19). |
+| `state` | `open \| answered \| denied \| cancelled \| expired` |
+| `expires_at` | Wall-clock TTL deadline (not active-time) |
+| `nudge_count` | How many nudge-replies have been sent for this row |
+| `next_nudge_at` | When the next nudge is due (active-time arithmetic); `NULL` when nudges are off or the ladder is spent |
+| `nudge_tg_message_id` | The Telegram message id of the row's current live nudge; `NULL` when none |
+| `render_dirty` | `1` when `_record_answer` has flipped the state but the hook's PATCH has not yet re-rendered the text; the cleanup sweep uses this to remove the tag and the nudge asynchronously |
+
+Indexes: `messages_state_expiry (state, expires_at)` covers the expiry pass;
+`messages_nudge_due (state, next_nudge_at)` covers the nudge pass;
+`messages_render_dirty (render_dirty)` covers the cleanup sweep.
+
+### `recipients` (epic 19)
+
+Per-chat availability and nudge configuration. Keyed on `telegram_chat_id`
+(not `installations.id`) because many installations bind to the same chat —
+availability is a property of the human, not the machine (brd §2.1).
+
+| Column | Purpose |
+|--------|---------|
+| `telegram_chat_id` | Primary key |
+| `tz` | IANA timezone string (`Europe/Berlin`); `NULL` means UTC assumed |
+| `windows_json` | Canonical availability spec string (`mon-fri 09:00-19:00`); **not JSON** despite the column name — read with `availability.parse_windows`. `NULL` means always available |
+| `nudge_enabled` | `1`/`0`; `0` by default so `next_nudge_at` is never seeded on an unconfigured chat |
+| `nudge_schedule` | Comma-separated active-time intervals (`15m,45m,3h`); `NULL` means use the server default |
+
+An absent `recipients` row is valid and means: always available, nudges off —
+identical behaviour to before epic 19.
+
+---
+
+## `#unanswered` — relay-owned tag (epic 19)
+
+**`payload_json.text` is the canonical body and is always untagged.** A single
+`render_body` function (in `render.py`) is called by *every send and every edit*
+and appends a trailing `#unanswered` line iff the row is `state='open'` and
+`awaits_human` is true. No call site decides tagging for itself; the tag exists
+only in the render layer (brd §4.2, epic 19 invariant 2).
+
+**`awaits_human`** is true for a row whose `kind` is not `notification` and that
+has `reply_required`, a keyboard, or a `group_id`. Idle-session notifications are
+explicitly excluded — `#unanswered` means *an agent is blocked on you*, not "a
+session finished" (brd §4.1, invariant 7).
+
+**Why one function and not per-call-site decisions:** five terminal paths exist
+(brd §2.2), three of which do not currently edit the message text. Keeping the
+tag correct across all five without a single render chokepoint requires every path
+to know about and correctly handle the tag — a fragile invariant. One `render_body`
+called by every send and edit makes the invariant hold by construction and makes a
+retried PATCH idempotent (a client that appends `#unanswered` to its own text is
+stripped and re-rendered, not doubled).
+
+**Where to look in `app.py`:** the PATCH endpoint (`patch_message`, `app.py:735`) is the most
+important caller because it (a) writes the client's text back into `payload_json`
+and (b) calls `render_body` before the Telegram edit, so the tag round-trips
+correctly on every hook-side finalization.
+
+---
+
+## Relay-local commands (epic 19)
+
+`/tz`, `/hours`, `/nudge`, `/me` are handled directly in the webhook handler
+beside `/bind` (`app.py`). They read and write the `recipients` table and involve
+no queuing and no machine.
+
+**These are relay-local, not queue-backed.** Epic 16 plans a command queue (the
+`commands` table) for operations that must reach a specific machine — starting a
+session, injecting a reply. The availability commands are in a different
+category: they affect server-side state only and do not need to reach any
+machine. Confusing the two leads to over-engineering (the availability commands
+would need a listener on every machine) or under-engineering (queue-backed
+commands would not work when no machine is connected). The guard in `app.py` that
+ignores slash commands except `/bind` was extended additively to handle these
+four new ones above the existing guard, so they cannot be recorded as message
+answers.
+
+The operator equivalents are `relay-admin recipients` subcommands (`list`,
+`set-tz`, `clear-tz`, `set-hours`, `clear-hours`, `set-nudge`,
+`set-nudge-schedule`) which talk directly to the SQLite database.
 
 ---
 

@@ -49,6 +49,7 @@ TEST_MODULES = {
     "unit_profile_loader": "test_profile_loader",
     "unit_roles_config": "test_unit_roles_config",
     "unit_terminal_answers": "test_unit_terminal_answers",
+    "unit_claude_roles": "test_unit_claude_roles",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }

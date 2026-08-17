@@ -129,6 +129,15 @@ def _check_tokens(catalog, bindings) -> tuple[list[dict], bool]:
                     result["status"] = "bound"
                     result["label"] = data.get("label", "")
                     result["installation_id"] = data.get("id")
+                    # Availability fields — present only on relays running 19-02+.
+                    # A relay predating 19-02 omits them; the keys are absent and
+                    # .get() returns None, which the print loop treats as "blank".
+                    # active_now is resolved server-side in the recipient's timezone
+                    # and stored verbatim — never recomputed on the querying machine,
+                    # which may be in a different timezone (invariant 8, state.md).
+                    result["tz"] = data.get("tz")
+                    result["active_now"] = data.get("active_now")
+                    result["nudge_enabled"] = data.get("nudge_enabled")
                 else:
                     result["status"] = "not bound — run relay-client bind"
                     any_problem = True
@@ -216,7 +225,18 @@ def main() -> int:
                 status = r["status"]
                 if r.get("label"):
                     status += f" ({r['label']}, id={r['installation_id']})"
-                print(f"  {roles_str}: {status}")
+                # Availability column — blank when any field is absent (old relay
+                # or unbound chat).  active_now is the server's value verbatim;
+                # do not recompute from the local clock or timezone.
+                avail_parts: list[str] = []
+                if r.get("tz") is not None:
+                    avail_parts.append(f"tz={r['tz']}")
+                if r.get("active_now") is not None:
+                    avail_parts.append(f"active={'yes' if r['active_now'] else 'no'}")
+                if r.get("nudge_enabled") is not None:
+                    avail_parts.append(f"nudge={'on' if r['nudge_enabled'] else 'off'}")
+                avail_str = ("  " + "  ".join(avail_parts)) if avail_parts else ""
+                print(f"  {roles_str}: {status}{avail_str}")
 
     if report.get("has_errors"):
         return 1

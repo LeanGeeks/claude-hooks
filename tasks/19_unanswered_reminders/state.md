@@ -1,5 +1,13 @@
 # Epic 19 — State & orchestration
 
+> **Status 2026-08-17: all six engineering tasks are done and committed
+> (`3e19dda`, `69212cb`, `5a6f609`, `447865a`, `6f45a04`, plus 19-06). Nothing is
+> deployed.** The live relay still runs pre-19-01 code, so the schema v3 migration
+> has not been applied anywhere. 19-07 (human) is the remaining gate: it needs a
+> real chat, real clients and an availability window that actually closes
+> overnight. Test baseline at handoff: **716 root hooks / 249 relay**, both green.
+> Do not deploy `447865a` without `6f45a04` on top of it — see the 19-05 entry.
+
 **For the implementing orchestrator.** Read this first, then [brd.md](./brd.md).
 Each task file is written for a fresh-context agent and carries its own "read
 first" refs, done criteria and tests. This file owns **cross-task invariants**
@@ -18,8 +26,8 @@ external unknown (hashtag search scope per client) was closed by the operator as
 | 19-03 | [Render layer + `#unanswered`](./19-03-render-layer-tag.md) | done | — | `render_body`, payload canonicalization, PATCH write-back, cancel + expiry text edits. **Independently shippable.** |
 | 19-04 | [Nudge engine](./19-04-nudge-engine.md) | done | 19-01, 19-03 | backend reply-send, reaper pass, coalescing, ladder, cleanup, config knobs. **No migration — 19-01 owns it.** |
 | 19-05 | [Reply-to-nudge routing](./19-05-reply-routing.md) | done | 19-04 | nudge ids resolve to their target; ambiguity counter ignores nudges |
-| 19-06 | [Diagnostics, docs, installer](./19-06-diagnostics-docs.md) | todo | 19-02, 19-05 | `claude-roles` column, `architecture.md`, `docs/availability.md`, task-05 reversal note |
-| 19-07 | [Live verification](./19-07-live-verification_human.md) | todo | 19-06 | **human** — needs a real chat, real clients and a window that actually closes overnight |
+| 19-06 | [Diagnostics, docs, installer](./19-06-diagnostics-docs.md) | done | 19-02, 19-05 | `claude-roles` column, `architecture.md`, `docs/availability.md`, task-05 reversal note |
+| 19-07 | [Live verification](./19-07-live-verification_human.md) | blocked | 19-06 | **human** — needs a real chat, real clients and a window that actually closes overnight |
 
 ## Dependency graph
 
@@ -288,6 +296,46 @@ anything else. Confirmed against the current `router.py`, not taken from the
 planning note. The free-text fallthrough test in
 `tests/test_unit_decision_mapper.py` (root suite) is the standing guard on that
 and must stay green.
+
+**2026-08-17 — 19-06 done. All engineering tasks in the epic are complete;
+19-07 is the only one left and it is human.** Reviewed PASS (0 BLOCKER/HIGH,
+3 MEDIUM + 2 LOW), all five fixed, re-reviewed clean (0 issues), committed.
+Root hooks 708 → 716; relay 247 → 249.
+
+**Its own task file was out of date and was overridden deliberately:** it said
+"three new `messages` columns" (there are **four** — `render_dirty` postdates that
+sentence) and "the reaper's **second** pass" (there are **two** new passes — the
+nudge pass and the cleanup sweep). The docs describe the four and the two.
+
+**All three MEDIUMs were documentation that misstated the shipped code**, which is
+the failure mode this task exists to prevent, so they are recorded rather than
+just fixed:
+
+- The 18:50 worked example claimed "30 active minutes" remained to a 19:00 close.
+  It is 10. The 09:20 conclusion was right all along.
+- The 22:00 TTL example claimed it fires at 09:20 "plus 5-minute debt
+  carry-over". **The true value is 09:15** — no active time elapses before the
+  window opens, so there is no carry-over debt to credit. Three agents disagreed
+  about this instant; it was settled by calling the real `advance_active` twice,
+  independently, not by argument. If a future doc or comment claims carry-over
+  across a closed window, it is wrong.
+- `architecture.md` cited the PATCH endpoint at `app.py:695`, which is inside
+  `_do_create`'s rollback. Now `app.py:735` **with the symbol name**, because
+  every bare line number in this epic's planning docs went stale — `app.py` moved
+  under 19-02, 19-04 and 19-05. Prefer symbols over line numbers in docs.
+
+Both LOW findings were tests that could not have caught the bug they existed for:
+the timezone test never varied `TZ` (now runs under UTC and Pacific/Kiritimati,
+14 h apart, asserting the printed `active=` is identical in both — note its
+bug-catching power is inherently time-of-day dependent, roughly 19 h in 24), and
+the degradation test asserted an internal `any_problem` flag rather than the real
+exit code (now calls `main()` and asserts 0).
+
+**Invariant 8 held for the whole epic.** The only client-side change is
+`shell/claude-roles`' read-only availability column, which prints the server's
+`active_now` verbatim — no local clock, no timezone conversion, confirmed by
+review. `install-claude-config.sh` needs **no** change, confirmed in writing as
+the task required.
 
 **Still deferred, and correctly so:** brd §4.4's per-workspace companion tag. Not
 decidable today for a structural reason — the relay does not know the workspace
