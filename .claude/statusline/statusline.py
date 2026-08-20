@@ -536,6 +536,10 @@ def fetch_glm_quota(base_url: str, token: str, timeout_seconds: float = 2.0) -> 
     Fetch quota/limit from Z.ai monitor API.
     Auth header mirrors the official plugin: raw token, no 'Bearer' prefix.
     Raises urllib.error.HTTPError / urllib.error.URLError / socket.timeout on failure.
+
+    Note: Z.ai also signals failures (e.g. auth) inside an HTTP 200 body
+    ({"code": 1000, "success": false}) — callers must validate the payload
+    with _quota_payload_usable() before caching or rendering it.
     """
     url = f"{base_url}/api/monitor/usage/quota/limit"
     req = urllib.request.Request(
@@ -584,53 +588,123 @@ def _item_reset_epoch(item: dict) -> Optional[float]:
     return None
 
 
+# unit enum on quota limit entries (cross-checked against Z.ai community
+# tooling; undocumented officially): 5=minute, 3=hour, 1=day, 6=week.
+_ZAI_UNIT_MINUTES = {
+    5: 1,
+    3: 60,
+    1: 24 * 60,
+    6: 7 * 24 * 60,
+}
+_FIVE_HOUR_MAX_MINUTES = 6 * 60
+
+
+def _item_window_minutes(item: dict) -> Optional[float]:
+    """
+    Decode the unit/number window encoding into minutes; None when unknown.
+
+    Only meaningful for window-type limits (TOKENS_LIMIT / CREDIT_LIMIT).
+    TIME_LIMIT (monthly MCP) entries carry a bogus unit=5/number=1 marker.
+    """
+    unit = item.get("unit")
+    number = item.get("number")
+    multiplier = _ZAI_UNIT_MINUTES.get(unit) if isinstance(unit, int) else None
+    if multiplier is None or not isinstance(number, (int, float)) or number <= 0:
+        return None
+    return number * multiplier
+
+
+def _classify_window_items(items: list) -> tuple:
+    """
+    Return (five_hour_item, seven_day_item) — either may be None.
+
+    When every duration decodes, the shortest window <= 6h is the 5-hour
+    bucket and the longest is weekly; a single entry lands in whichever
+    bucket its duration matches. If any duration is undecodable, fall back
+    to nextResetTime ordering (soonest reset = 5-hour window) — that
+    heuristic mislabels only when the weekly window is in its final hours,
+    so decoding is preferred whenever available.
+    """
+    if not items:
+        return None, None
+
+    durations = [_item_window_minutes(it) for it in items]
+    if all(d is not None for d in durations):
+        ordered = sorted(zip(durations, items), key=lambda pair: pair[0])
+        if len(ordered) >= 2:
+            return ordered[0][1], ordered[-1][1]
+        minutes, sole = ordered[0]
+        if minutes <= _FIVE_HOUR_MAX_MINUTES:
+            return sole, None
+        return None, sole
+
+    ordered = sorted(items, key=lambda x: x.get("nextResetTime") or float("inf"))
+    if len(ordered) >= 2:
+        return ordered[0], ordered[-1]
+    return ordered[0], None
+
+
+def _quota_limits_list(payload) -> Optional[list]:
+    """Return the limits list from a quota payload, or None when absent."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if isinstance(data, dict):
+        limits = data.get("limits")
+    elif isinstance(data, list):
+        limits = data
+    else:
+        limits = None
+    return limits if isinstance(limits, list) else None
+
+
 def parse_glm_quota(payload: dict) -> QuotaSummary:
     """
     Parse raw quota API response into QuotaSummary.
 
-    Actual response shape (observed from Z.ai web API):
+    Token-era response (before the credit-system migration):
       { "data": { "limits": [
           { "type": "TOKENS_LIMIT", "percentage": 5,  "nextResetTime": <ms>, ... },  # 5h window
           { "type": "TOKENS_LIMIT", "percentage": 27, "nextResetTime": <ms>, ... },  # 7d window
           { "type": "TIME_LIMIT",   "percentage": 1,  "nextResetTime": <ms>, ... }   # monthly MCP
       ] } }
 
-    Multiple TOKENS_LIMIT entries are distinguished by nextResetTime:
-    the one that resets sooner is the 5-hour window.
-    """
-    data = payload.get("data") or {}
-    if isinstance(data, dict):
-        limits = data.get("limits") or []
-    elif isinstance(data, list):
-        limits = data
-    else:
-        limits = []
+    Credit-era response (observed 2026-08): same envelope, windows arrive as
+    CREDIT_LIMIT with a unit/number-encoded window and credit amounts:
+      { "data": { "limits": [
+          { "type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 12000,          # 5h credits
+            "currentValue": 208, "remaining": 11791, "percentage": 1,
+            "nextResetTime": <ms> },
+          { "type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 60000,          # weekly credits
+            "currentValue": 22027, "remaining": 37972, "percentage": 36,
+            "nextResetTime": <ms> } ], "level": "pro" } }
 
-    token_items = []
+    Window limits (TOKENS_LIMIT or CREDIT_LIMIT — same fields, same window
+    encoding) are classified by _classify_window_items; TIME_LIMIT stays the
+    monthly MCP bucket. `usage` is the window allowance, `currentValue` the
+    spent amount, `percentage` the used share.
+    """
+    limits = _quota_limits_list(payload) or []
+
+    window_items = []
     mcp_pct: Optional[float] = None
 
     for item in limits:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type", "")
-        if item_type == "TOKENS_LIMIT":
-            token_items.append(item)
+        if item_type in ("TOKENS_LIMIT", "CREDIT_LIMIT"):
+            window_items.append(item)
         elif item_type == "TIME_LIMIT":
             mcp_pct = _item_pct(item)
 
-    # Sort TOKENS_LIMIT by nextResetTime ascending: soonest reset = 5h window
-    token_items.sort(key=lambda x: x.get("nextResetTime") or float("inf"))
-
-    five_h_pct = _item_pct(token_items[0]) if len(token_items) >= 1 else None
-    five_h_reset = _item_reset_epoch(token_items[0]) if len(token_items) >= 1 else None
-    seven_d_pct = _item_pct(token_items[1]) if len(token_items) >= 2 else None
-    seven_d_reset = _item_reset_epoch(token_items[1]) if len(token_items) >= 2 else None
+    five_h_item, seven_d_item = _classify_window_items(window_items)
 
     return QuotaSummary(
-        five_hour_pct=five_h_pct,
-        five_hour_reset_at=five_h_reset,
-        seven_day_pct=seven_d_pct,
-        seven_day_reset_at=seven_d_reset,
+        five_hour_pct=_item_pct(five_h_item) if five_h_item else None,
+        five_hour_reset_at=_item_reset_epoch(five_h_item) if five_h_item else None,
+        seven_day_pct=_item_pct(seven_d_item) if seven_d_item else None,
+        seven_day_reset_at=_item_reset_epoch(seven_d_item) if seven_d_item else None,
         mcp_pct=mcp_pct,
     )
 
@@ -657,6 +731,28 @@ def format_glm_quota_segment(summary: QuotaSummary) -> list:
     return segments if segments else ["quota ?"]
 
 
+def _quota_payload_usable(payload) -> bool:
+    """
+    True when the payload carries real limit entries.
+
+    Z.ai reports some failures (e.g. expired tokens) as HTTP 200 bodies like
+    {"code": 1000, "msg": "Authentication Failed", "success": false}; those
+    must not be cached over previously good data.
+    """
+    limits = _quota_limits_list(payload)
+    return limits is not None and len(limits) > 0
+
+
+def _quota_auth_failure(payload) -> bool:
+    """Detect in-body auth failures (HTTP 200 + code 1000 / auth message)."""
+    if not isinstance(payload, dict) or payload.get("success") is not False:
+        return False
+    if payload.get("code") == 1000:
+        return True
+    msg = str(payload.get("msg") or "").lower()
+    return "auth" in msg or "token" in msg
+
+
 def format_glm_subscription_quota(env: StatusEnvironment) -> list:
     """
     Fetch and format GLM Coding Plan quota from Z.ai monitor API.
@@ -677,17 +773,25 @@ def format_glm_subscription_quota(env: StatusEnvironment) -> list:
 
     try:
         raw = fetch_glm_quota(usage_base, token, timeout_seconds=2.0)
-        write_glm_quota_cache(cache_path, raw)
-        return format_glm_quota_segment(parse_glm_quota(raw))
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             # Auth failure — stale data is equally untrustworthy
             return ["quota ?"]
         # 429 / 5xx — fall through to stale cache
+        raw = None
     except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError):
-        pass
+        raw = None
     except Exception:
-        pass
+        raw = None
+
+    if raw is not None:
+        if _quota_payload_usable(raw):
+            write_glm_quota_cache(cache_path, raw)
+            return format_glm_quota_segment(parse_glm_quota(raw))
+        if _quota_auth_failure(raw):
+            # In-body auth failure — same policy as HTTP 401/403
+            return ["quota ?"]
+        # Unusable body without auth signal — fall through to stale cache
 
     stale = _read_glm_quota_cache_any_age(cache_path)
     if stale is not None:

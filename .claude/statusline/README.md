@@ -24,7 +24,7 @@ The script requires Python 3 and uses only the standard library.
 |---|---|
 | Claude Max (with rate limits) | `Opus \| ctx 61% \| 5h 43% reset 1:12 \| 7d 18%` |
 | Claude (before first API call) | `Sonnet \| ctx ?` |
-| GLM Coding Plan (live quota) | `GLM-4.7 plan \| ctx 58% \| 5h 5% reset 3:29 \| 7d 27% \| MCP 1%` |
+| GLM Coding Plan (live quota, credit era) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset 3:29 \| 7d 36%` |
 | GLM Coding Plan (stale cache) | `GLM-5.1 plan \| ctx 72% \| 5h 81% reset 0:12 stale` |
 | GLM Coding Plan (no quota) | `GLM plan \| ctx 58% \| quota ?` |
 | DeepSeek API | `DeepSeek \| ctx 44% \| $0.10` |
@@ -75,15 +75,33 @@ GET {baseDomain}/api/monitor/usage/quota/limit
 Authorization: {ANTHROPIC_AUTH_TOKEN}
 ```
 
+The API has had two payload eras; both are supported:
+
+**Credit era** (since the 2026-08 credit-system migration) — windows arrive as `CREDIT_LIMIT` entries with a `unit`/`number`-encoded window and credit amounts (`usage` = window allowance, `currentValue` = spent, `percentage` = used share):
+
+```json
+{ "data": { "limits": [
+    { "type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 12000,
+      "currentValue": 208, "remaining": 11791, "percentage": 1,
+      "nextResetTime": 1787242384006 },
+    { "type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 60000,
+      "currentValue": 22027, "remaining": 37972, "percentage": 36,
+      "nextResetTime": 1787581390997 } ], "level": "pro" } }
+```
+
+**Token era** (legacy) — `TOKENS_LIMIT` entries (5h + weekly token quota) plus a `TIME_LIMIT` entry (monthly MCP/tool usage).
+
+The `unit` enum on window entries is undocumented officially; it is decoded as `5=minute, 3=hour, 1=day, 6=week` (cross-checked against multiple community quota monitors), so `unit=3, number=5` → 5-hour window and `unit=6, number=1` → weekly window.
+
 Fields displayed:
 
 | Field | Source |
 |---|---|
-| `5h N% reset H:MM` | `TOKENS_LIMIT` with the soonest `nextResetTime` (5-hour token quota) |
-| `7d N%` | `TOKENS_LIMIT` with the later `nextResetTime` (weekly token quota) |
-| `MCP N%` | `TIME_LIMIT` percentage (monthly MCP/tool usage) |
+| `5h N% reset H:MM` | Window limit with duration ≤ 6h (5-hour quota/credits) |
+| `7d N%` | Longest window limit (weekly quota/credits) |
+| `MCP N%` | `TIME_LIMIT` percentage (monthly MCP/tool usage), when present |
 
-When two `TOKENS_LIMIT` entries are present, they are distinguished by `nextResetTime`: the one that resets sooner is the 5-hour window. This avoids depending on the undocumented `unit` enum field.
+Window classification prefers the decoded duration: the shortest window ≤ 6h is the 5-hour bucket, the longest is weekly, and a single window lands in whichever bucket its duration matches. When no duration decodes (unknown `unit`), entries fall back to `nextResetTime` ordering — soonest reset = 5-hour window. That fallback mislabels only while the weekly window is in its final hours, which is why duration decoding takes priority.
 
 The raw auth token is never printed or persisted. The cache key is a short SHA-256 hash of the token.
 
@@ -97,8 +115,9 @@ Quota responses are cached at:
 
 - TTL: 60 seconds. Fresh cache is used as-is without a network call.
 - On TTL expiry: attempts a live fetch. On success, cache is updated atomically.
+- Only payloads that actually carry limit entries are cached. Z.ai signals failures (e.g. expired tokens) inside HTTP 200 bodies (`{"code": 1000, "msg": "Authentication Failed", "success": false}`); those are never written over previously good cache.
 - On network failure (URLError / timeout / 5xx): serves stale cache with `stale` marker.
-- On auth failure (HTTP 401/403): shows `quota ?`; stale data is not used.
+- On auth failure (HTTP 401/403, or in-body `code 1000`/auth message): shows `quota ?`; stale data is not used.
 - No cache and no network: shows `quota ?`.
 
 ### Validation without network
@@ -114,8 +133,10 @@ mkdir -p ~/.cache/claude-statusline
 python3 -c "
 import json, time
 print(json.dumps({'_cached_at': time.time(), 'data': {'limits': [
-  {'type': 'TOKENS_LIMIT', 'percentage': 37},
-  {'type': 'TIME_LIMIT', 'percentage': 12}
+  {'type': 'CREDIT_LIMIT', 'unit': 3, 'number': 5, 'usage': 12000,
+   'currentValue': 4440, 'percentage': 37, 'nextResetTime': (time.time()+11130)*1000},
+  {'type': 'CREDIT_LIMIT', 'unit': 6, 'number': 1, 'usage': 60000,
+   'currentValue': 15000, 'percentage': 25, 'nextResetTime': (time.time()+300000)*1000}
 ]}}))" > "$CACHE"
 
 echo '{"model":{"display_name":"GLM-4.7"},"context_window":{"used_percentage":58}}' | \
@@ -123,7 +144,7 @@ echo '{"model":{"display_name":"GLM-4.7"},"context_window":{"used_percentage":58
   ANTHROPIC_MODEL=glm-4.7 \
   ANTHROPIC_AUTH_TOKEN="$FAKE_TOKEN" \
   python3 $SCRIPT
-# Expected: GLM-4.7 plan | ctx 58% | 5h 37% | MCP 12%
+# Expected: GLM-4.7 plan | ctx 58% | 5h 37% reset 3:05 | 7d 25%
 ```
 
 ## Debug mode
@@ -269,6 +290,7 @@ python3 .claude/statusline/test_cost_engine.py -v          # generic engine
 python3 .claude/statusline/test_deepseek_pricing.py -v     # DeepSeek integration
 python3 .claude/statusline/test_additional_vendor_pricing.py -v  # Fireworks, MiniMax, Kimi
 python3 .claude/statusline/test_hardening.py -v            # review checks (06-03e)
+python3 .claude/statusline/test_glm_quota.py -v            # GLM quota parse/cache (credit + token eras)
 ```
 
 `test_hardening.py` covers: dedupe across renders, distinct `session_id` isolation, unknown-provider behavior, state-file content safety (no tokens / prompts / transcripts / commands), suppression for subscription and local billing, no-network guarantee for the cost path, runtime budget, and absence of git information in the rendered line.
