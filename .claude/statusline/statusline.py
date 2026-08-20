@@ -198,6 +198,30 @@ def _reset_countdown(epoch: Optional[float]) -> str:
     return f"{h}:{m:02d}"
 
 
+def _format_reset_tail(epoch: Optional[float]) -> str:
+    """
+    Reset tail for GLM quota segments.
+
+    past:          'reset now'
+    <= 24h out:    'reset at 20:13 (in 4:29)' — local wall clock + countdown
+    >= 24h out:    'resets in 3d' — whole days, floored (1.4 days -> 1d)
+
+    Wall-clock times are local; the Z.ai back office shows them in Beijing
+    time (UTC+8), so the two differ by the timezone offset only.
+    """
+    if not epoch:
+        return ""
+    remaining = epoch - time.time()
+    if remaining <= 0:
+        return "reset now"
+    if remaining >= 24 * 3600:
+        return f"resets in {int(remaining // 86400)}d"
+    h = int(remaining // 3600)
+    m = int((remaining % 3600) // 60)
+    wall = datetime.datetime.fromtimestamp(epoch).strftime("%H:%M")
+    return f"reset at {wall} (in {h}:{m:02d})"
+
+
 def format_claude_rate_limits(status_input: dict) -> list:
     """Rate-limit segments from built-in Claude Code fields (subscription only)."""
     rl = status_input.get("rate_limits") or {}
@@ -714,15 +738,18 @@ def format_glm_quota_segment(summary: QuotaSummary) -> list:
 
     if summary.five_hour_pct is not None:
         seg = f"5h {int(summary.five_hour_pct)}%"
-        cd = _reset_countdown(summary.five_hour_reset_at)
-        if cd:
-            seg += f" reset {cd}"
+        tail = _format_reset_tail(summary.five_hour_reset_at)
+        if tail:
+            seg += f" {tail}"
         if summary.stale:
             seg += " stale"
         segments.append(seg)
 
     if summary.seven_day_pct is not None:
         seg = f"7d {int(summary.seven_day_pct)}%"
+        tail = _format_reset_tail(summary.seven_day_reset_at)
+        if tail:
+            seg += f" {tail}"
         segments.append(seg)
 
     if summary.mcp_pct is not None:

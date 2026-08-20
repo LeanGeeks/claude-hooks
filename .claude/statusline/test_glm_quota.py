@@ -14,6 +14,7 @@ Run: python3 .claude/statusline/test_glm_quota.py -v
 """
 
 import hashlib
+import datetime
 import importlib.util
 import io
 import json
@@ -74,8 +75,8 @@ class ParseCreditEraTest(unittest.TestCase):
         self.assertIsNotNone(summary.seven_day_reset_at)
         segments = statusline.format_glm_quota_segment(summary)
         self.assertEqual(len(segments), 2)
-        self.assertTrue(segments[0].startswith("5h 1% reset "))
-        self.assertEqual(segments[1], "7d 36%")
+        self.assertTrue(segments[0].startswith("5h 1% reset at "))
+        self.assertTrue(segments[1].startswith("7d 36% resets in 4d"))
 
     def test_classification_beats_reset_order(self):
         """Weekly window in its final hours resets sooner than the 5h one —
@@ -227,7 +228,7 @@ class OrchestrationTest(unittest.TestCase):
         with mock.patch.object(statusline, "fetch_glm_quota", return_value=payload):
             segments = statusline.format_glm_subscription_quota(self.status_env)
         self.assertTrue(segments[0].startswith("5h 7%"))
-        self.assertIn("7d 44%", segments)
+        self.assertTrue(any(s.startswith("7d 44%") for s in segments))
         # Payload was cached with limits intact
         cached = json.loads(self.read_cache_raw())
         self.assertEqual(len(cached["data"]["limits"]), 2)
@@ -287,6 +288,52 @@ def email_headers():
     return email.message.Message()
 
 
+class ResetFormatTest(unittest.TestCase):
+    """Reset rendering: wall clock + countdown inside 24h, floored days beyond."""
+
+    def tail(self, offset_s):
+        return statusline._format_reset_tail(time.time() + offset_s)
+
+    def test_no_epoch_is_empty(self):
+        self.assertEqual(statusline._format_reset_tail(None), "")
+        self.assertEqual(statusline._format_reset_tail(0), "")
+
+    def test_past_reset(self):
+        self.assertEqual(self.tail(-10), "reset now")
+
+    def test_inside_24h_wall_clock_and_countdown(self):
+        epoch = time.time() + 4 * 3600 + 29 * 60 + 30
+        wall = datetime.datetime.fromtimestamp(epoch).strftime("%H:%M")
+        self.assertEqual(
+            statusline._format_reset_tail(epoch),
+            f"reset at {wall} (in 4:29)")
+
+    def test_beyond_24h_whole_days_floored(self):
+        self.assertEqual(self.tail(3.4 * 86400), "resets in 3d")
+        self.assertEqual(self.tail(1.4 * 86400), "resets in 1d")
+        # just past the 24h boundary (exact-24h would race below it)
+        self.assertEqual(self.tail(24 * 3600 + 30), "resets in 1d")
+
+    def test_just_under_24h_uses_clock(self):
+        epoch = time.time() + 24 * 3600 - 90
+        wall = datetime.datetime.fromtimestamp(epoch).strftime("%H:%M")
+        self.assertEqual(
+            statusline._format_reset_tail(epoch),
+            f"reset at {wall} (in 23:58)")
+
+    def test_segments_render_full_format(self):
+        now = time.time()
+        summary = statusline.QuotaSummary(
+            five_hour_pct=7, five_hour_reset_at=now + 4 * 3600 + 29 * 60 + 30,
+            seven_day_pct=37, seven_day_reset_at=now + 99 * 3600,
+            mcp_pct=None)
+        segments = statusline.format_glm_quota_segment(summary)
+        wall = datetime.datetime.fromtimestamp(
+            summary.five_hour_reset_at).strftime("%H:%M")
+        self.assertEqual(segments[0], f"5h 7% reset at {wall} (in 4:29)")
+        self.assertEqual(segments[1], "7d 37% resets in 4d")
+
+
 class EndToEndTest(unittest.TestCase):
     """Subprocess runs with a pre-seeded cache (no network)."""
 
@@ -329,9 +376,10 @@ class EndToEndTest(unittest.TestCase):
         self.seed_cache(age_seconds=0)
         out = self.run_script("https://api.z.ai/api/anthropic")
         self.assertTrue(
-            out.startswith("GLM-4.7 plan | ctx 58% | 5h 1% reset "),
+            out.startswith("GLM-4.7 plan | ctx 58% | 5h 1% reset at "),
             msg=f"unexpected output: {out!r}")
-        self.assertIn("7d 36%", out)
+        self.assertIn("(in 2:05)", out)
+        self.assertIn("7d 36% resets in 4d", out)
         self.assertNotIn("stale", out)
         self.assertNotIn("quota ?", out)
 

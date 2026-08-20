@@ -24,8 +24,9 @@ The script requires Python 3 and uses only the standard library.
 |---|---|
 | Claude Max (with rate limits) | `Opus \| ctx 61% \| 5h 43% reset 1:12 \| 7d 18%` |
 | Claude (before first API call) | `Sonnet \| ctx ?` |
-| GLM Coding Plan (live quota, credit era) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset 3:29 \| 7d 36%` |
-| GLM Coding Plan (stale cache) | `GLM-5.1 plan \| ctx 72% \| 5h 81% reset 0:12 stale` |
+| GLM Coding Plan (live quota, credit era) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset at 20:13 (in 3:29) \| 7d 36% resets in 4d` |
+| GLM Coding Plan (weekly inside 24h) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset at 20:13 (in 3:29) \| 7d 36% reset at 19:40 (in 23:26)` |
+| GLM Coding Plan (stale cache) | `GLM-5.1 plan \| ctx 72% \| 5h 81% reset at 21:40 (in 0:12) stale` |
 | GLM Coding Plan (no quota) | `GLM plan \| ctx 58% \| quota ?` |
 | DeepSeek API | `DeepSeek \| ctx 44% \| $0.10` |
 | Fireworks GLM-5.1 | `Fireworks GLM-5.1 \| ctx 51% \| $0.15` |
@@ -97,9 +98,11 @@ Fields displayed:
 
 | Field | Source |
 |---|---|
-| `5h N% reset H:MM` | Window limit with duration ≤ 6h (5-hour quota/credits) |
-| `7d N%` | Longest window limit (weekly quota/credits) |
+| `5h N% reset at HH:MM (in H:MM)` | Window limit with duration ≤ 6h (5-hour quota/credits) |
+| `7d N% resets in Nd` / `7d N% reset at HH:MM (in H:MM)` | Longest window (weekly quota/credits); floored whole days beyond 24h, wall clock + countdown inside the final 24h |
 | `MCP N%` | `TIME_LIMIT` percentage (monthly MCP/tool usage), when present |
+
+Reset times render in the local timezone: `reset at 20:13 (in 4:29)` means the window refreshes at 20:13 local, 4h29m from now. The Z.ai back office shows the same moment in Beijing time (UTC+8) — a back-office `00:13` is the statusline's `20:13` at UTC+4, and the `(in …)` part is the countdown back offices omit.
 
 Window classification prefers the decoded duration: the shortest window ≤ 6h is the 5-hour bucket, the longest is weekly, and a single window lands in whichever bucket its duration matches. When no duration decodes (unknown `unit`), entries fall back to `nextResetTime` ordering — soonest reset = 5-hour window. That fallback mislabels only while the weekly window is in its final hours, which is why duration decoding takes priority.
 
@@ -144,7 +147,7 @@ echo '{"model":{"display_name":"GLM-4.7"},"context_window":{"used_percentage":58
   ANTHROPIC_MODEL=glm-4.7 \
   ANTHROPIC_AUTH_TOKEN="$FAKE_TOKEN" \
   python3 $SCRIPT
-# Expected: GLM-4.7 plan | ctx 58% | 5h 37% reset 3:05 | 7d 25%
+# Expected: GLM-4.7 plan | ctx 58% | 5h 37% reset at <local HH:MM> (in 3:05) | 7d 25% resets in 3d
 ```
 
 ## Debug mode
