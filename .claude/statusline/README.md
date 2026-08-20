@@ -26,6 +26,8 @@ The script requires Python 3 and uses only the standard library.
 | Claude (before first API call) | `Sonnet \| ctx ?` |
 | GLM Coding Plan (live quota, credit era) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset at 20:13 (in 3:29) \| 7d 36% resets in 4d` |
 | GLM Coding Plan (weekly inside 24h) | `GLM-4.7 plan \| ctx 58% \| 5h 1% reset at 20:13 (in 3:29) \| 7d 36% reset at 19:40 (in 23:26)` |
+| GLM Coding Plan (during peak hours) | `🔥 PEAK HOURS \| GLM-5.3 plan \| ctx 18% \| 5h 14% reset at 13:13 (in 3:50) \| 7d 39% resets in 4d \| Peak hours end at 14:00 (in 3:25)` |
+| GLM Coding Plan (peak < 1h away) | `GLM-5.3 plan \| ctx 18% \| 5h 14% reset at 13:13 (in 3:50) \| 7d 39% resets in 4d \| ⚠️ Peak hours start at 10:00 (in 13:25)` |
 | GLM Coding Plan (stale cache) | `GLM-5.1 plan \| ctx 72% \| 5h 81% reset at 21:40 (in 0:12) stale` |
 | GLM Coding Plan (no quota) | `GLM plan \| ctx 58% \| quota ?` |
 | DeepSeek API | `DeepSeek \| ctx 44% \| $0.10` |
@@ -107,6 +109,23 @@ Reset times render in the local timezone: `reset at 20:13 (in 4:29)` means the w
 Window classification prefers the decoded duration: the shortest window ≤ 6h is the 5-hour bucket, the longest is weekly, and a single window lands in whichever bucket its duration matches. When no duration decodes (unknown `unit`), entries fall back to `nextResetTime` ordering — soonest reset = 5-hour window. That fallback mislabels only while the weekly window is in its final hours, which is why duration decoding takes priority.
 
 The raw auth token is never printed or persisted. The cache key is a short SHA-256 hash of the token.
+
+### Peak hours
+
+Credit plans charge off-peak model usage at **50% of the standard credit rate** (legacy plans charged 3× during peak), so it pays to know the window:
+
+- **Peak = Mon–Fri 14:00–18:00 UTC+8** (06:00–10:00 UTC); weekends are off-peak all day
+- Source: Z.ai's Plan Update Announcement (docs.z.ai/devpack/notice/usage-revision.md) and devpack overview; the window is purely clock-derived — no Z.ai endpoint exposes it
+
+Rendering (zai subscription only):
+
+| State | Display |
+|---|---|
+| during peak | `🔥 PEAK HOURS` as the leading segment, plus trailing `Peak hours end at HH:MM (in H:MM)` |
+| < 1h before peak | trailing `⚠️ Peak hours start at HH:MM (in M:SS)` |
+| otherwise | nothing |
+
+Countdowns inside the final hour switch to M:SS (e.g. `13:25` = 13 min 25 s). Wall-clock times are local, like the quota resets.
 
 ### Cache
 

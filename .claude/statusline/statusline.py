@@ -830,16 +830,116 @@ def format_glm_subscription_quota(env: StatusEnvironment) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Z.ai peak hours (credit-rate windows)
+# ---------------------------------------------------------------------------
+
+# Peak = Mon-Fri 14:00-18:00 UTC+8 (06:00-10:00 UTC); weekends are off-peak
+# all day. Off-peak model usage is charged at 50% of the standard credit rate
+# (docs.z.ai/devpack/overview; legacy plans charged 3x peak / 1x off-peak per
+# /devpack/notice/usage-revision). Purely clock-derived — no Z.ai endpoint
+# exposes the window.
+_ZAI_PEAK_START_UTC_HOUR = 6
+_ZAI_PEAK_END_UTC_HOUR = 10
+_ZAI_PEAK_WARN_SECONDS = 3600  # show "peak starting" within 1h of the window
+
+
+def zai_peak_state(now_epoch: Optional[float] = None) -> dict:
+    """
+    Clock-derived peak-hours state.
+
+    Returns {'is_peak': bool, 'boundary': epoch seconds of the next
+    transition (None if undecodable), 'kind': 'end' when inside the peak
+    window, else 'start'}.
+    """
+    dt = datetime.datetime.fromtimestamp(
+        now_epoch if now_epoch is not None else time.time(),
+        datetime.timezone.utc,
+    )
+    is_peak = (
+        dt.weekday() < 5
+        and _ZAI_PEAK_START_UTC_HOUR <= dt.hour < _ZAI_PEAK_END_UTC_HOUR
+    )
+    if is_peak:
+        boundary = dt.replace(
+            hour=_ZAI_PEAK_END_UTC_HOUR, minute=0, second=0, microsecond=0
+        )
+        return {"is_peak": True, "boundary": boundary.timestamp(), "kind": "end"}
+
+    day = dt.date()
+    for offset in range(8):
+        candidate_date = day + datetime.timedelta(days=offset)
+        if candidate_date.weekday() >= 5:
+            continue
+        start = datetime.datetime.combine(
+            candidate_date,
+            datetime.time(_ZAI_PEAK_START_UTC_HOUR, 0),
+            tzinfo=datetime.timezone.utc,
+        )
+        if start > dt:
+            return {"is_peak": False, "boundary": start.timestamp(), "kind": "start"}
+    return {"is_peak": False, "boundary": None, "kind": "start"}
+
+
+def _format_countdown_short(seconds: float) -> str:
+    """H:MM at an hour or more, M:SS inside the final hour."""
+    if seconds >= 3600:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}:{m:02d}"
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    return f"{m}:{s:02d}"
+
+
+def format_zai_peak_segments(env: StatusEnvironment,
+                             now_epoch: Optional[float] = None) -> tuple:
+    """
+    Prefix/suffix segments for the peak-hours note (zai subscription only):
+
+      during peak:  prefix '🔥 PEAK HOURS', suffix
+                    'Peak hours end at 20:00 (in 3:50)'
+      <1h before:   suffix '⚠️ Peak hours start at 16:00 (in 13:25)'
+      otherwise:    nothing
+
+    Wall-clock times are local, matching the quota reset rendering.
+    """
+    if env.provider != "zai" or env.billing != "subscription":
+        return [], []
+
+    now = now_epoch if now_epoch is not None else time.time()
+    state = zai_peak_state(now)
+    boundary = state.get("boundary")
+    if boundary is None:
+        return [], []
+    remaining = boundary - now
+    wall = datetime.datetime.fromtimestamp(boundary).strftime("%H:%M")
+
+    if state["kind"] == "end":
+        return (
+            ["🔥 PEAK HOURS"],
+            [f"Peak hours end at {wall} (in {_format_countdown_short(remaining)})"],
+        )
+    if 0 < remaining <= _ZAI_PEAK_WARN_SECONDS:
+        return (
+            [],
+            [f"⚠️ Peak hours start at {wall} (in {_format_countdown_short(remaining)})"],
+        )
+    return [], []
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
 def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
+    peak_prefix, peak_suffix = format_zai_peak_segments(env)
+
     # First segment: model + billing hint for plan/subscription providers
     model_label = env.model
     if env.provider == "zai" and env.billing == "subscription":
         model_label = f"{model_label} plan"
 
-    parts = [model_label, format_context_segment(status_input)]
+    parts = [*peak_prefix, model_label, format_context_segment(status_input)]
 
     if env.billing == "subscription":
         if env.provider == "claude":
@@ -850,6 +950,7 @@ def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
         parts.extend(compute_api_cost(status_input, env))
     # local: no extras
 
+    parts.extend(peak_suffix)
     return " | ".join(parts)
 
 

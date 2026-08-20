@@ -334,6 +334,116 @@ class ResetFormatTest(unittest.TestCase):
         self.assertEqual(segments[1], "7d 37% resets in 4d")
 
 
+class PeakHoursTest(unittest.TestCase):
+    """
+    Peak hours = Mon-Fri 14:00-18:00 UTC+8 (06:00-10:00 UTC), weekends
+    off-peak all day. 2026-08-19 is a Wednesday; 2026-08-21 Friday;
+    2026-08-22 Saturday; 2026-08-24 the next Monday.
+    """
+
+    def utc(self, y, mo, d, h, mi=0, s=0):
+        return datetime.datetime(y, mo, d, h, mi, s,
+                                  tzinfo=datetime.timezone.utc).timestamp()
+
+    def env(self, provider="zai", billing="subscription"):
+        return statusline.StatusEnvironment(
+            provider=provider, billing=billing, profile="glm-plan",
+            model="GLM-5.3", pricing_key="glm-5.3",
+        )
+
+    # --- clock state ------------------------------------------------------
+
+    def test_state_during_peak(self):
+        state = statusline.zai_peak_state(self.utc(2026, 8, 19, 7, 30))
+        self.assertTrue(state["is_peak"])
+        self.assertEqual(state["kind"], "end")
+        self.assertEqual(state["boundary"], self.utc(2026, 8, 19, 10))
+
+    def test_state_just_inside_end_boundary(self):
+        state = statusline.zai_peak_state(self.utc(2026, 8, 19, 9, 59, 59))
+        self.assertTrue(state["is_peak"])
+        self.assertEqual(state["boundary"], self.utc(2026, 8, 19, 10))
+
+    def test_state_before_peak_same_day(self):
+        state = statusline.zai_peak_state(self.utc(2026, 8, 19, 4))
+        self.assertFalse(state["is_peak"])
+        self.assertEqual(state["kind"], "start")
+        self.assertEqual(state["boundary"], self.utc(2026, 8, 19, 6))
+
+    def test_state_after_peak_next_day(self):
+        state = statusline.zai_peak_state(self.utc(2026, 8, 19, 11))
+        self.assertEqual(state["boundary"], self.utc(2026, 8, 20, 6))
+
+    def test_state_friday_after_peak_skips_weekend(self):
+        state = statusline.zai_peak_state(self.utc(2026, 8, 21, 11))
+        self.assertEqual(state["boundary"], self.utc(2026, 8, 24, 6))
+
+    def test_state_weekend_off_peak(self):
+        for hour in (3, 8, 15):
+            state = statusline.zai_peak_state(self.utc(2026, 8, 22, hour))
+            self.assertFalse(state["is_peak"], msg=f"Sat {hour}:00 UTC")
+            self.assertEqual(state["boundary"], self.utc(2026, 8, 24, 6))
+
+    # --- segment rendering ------------------------------------------------
+
+    def test_segments_during_peak(self):
+        now = self.utc(2026, 8, 19, 7, 30)
+        prefix, suffix = statusline.format_zai_peak_segments(self.env(), now)
+        wall = datetime.datetime.fromtimestamp(
+            self.utc(2026, 8, 19, 10)).strftime("%H:%M")
+        self.assertEqual(prefix, ["🔥 PEAK HOURS"])
+        self.assertEqual(suffix, [f"Peak hours end at {wall} (in 2:30)"])
+
+    def test_segments_approaching_within_1h(self):
+        start = self.utc(2026, 8, 19, 6)
+        now = start - (13 * 60 + 25)
+        prefix, suffix = statusline.format_zai_peak_segments(self.env(), now)
+        wall = datetime.datetime.fromtimestamp(start).strftime("%H:%M")
+        self.assertEqual(prefix, [])
+        self.assertEqual(suffix, [f"⚠️ Peak hours start at {wall} (in 13:25)"])
+
+    def test_segments_more_than_1h_out_hidden(self):
+        # Wednesday 20:00 UTC — next start is Thursday 06:00, 10h away
+        prefix, suffix = statusline.format_zai_peak_segments(
+            self.env(), self.utc(2026, 8, 19, 20))
+        self.assertEqual((prefix, suffix), ([], []))
+
+    def test_segments_hidden_for_other_providers(self):
+        now = self.utc(2026, 8, 19, 7, 30)  # mid-peak
+        self.assertEqual(statusline.format_zai_peak_segments(
+            self.env(provider="claude"), now), ([], []))
+        self.assertEqual(statusline.format_zai_peak_segments(
+            self.env(billing="api"), now), ([], []))
+
+    def test_countdown_short_format(self):
+        fmt = statusline._format_countdown_short
+        self.assertEqual(fmt(3 * 3600 + 50 * 60), "3:50")
+        self.assertEqual(fmt(3600), "1:00")
+        self.assertEqual(fmt(13 * 60 + 25), "13:25")
+        self.assertEqual(fmt(45), "0:45")
+
+    # --- render wiring ----------------------------------------------------
+
+    def test_render_places_marker_first_and_note_last(self):
+        now = time.time()
+        with mock.patch.object(statusline, "zai_peak_state",
+                               return_value={"is_peak": True,
+                                             "boundary": now + 2.5 * 3600 + 30,
+                                             "kind": "end"}), \
+             mock.patch.object(statusline, "format_glm_subscription_quota",
+                               return_value=["5h 1% reset at 20:13 (in 4:08)",
+                                             "7d 37% resets in 4d"]):
+            line = statusline.render_status_line(
+                {"context_window": {"used_percentage": 18}}, self.env())
+        parts = line.split(" | ")
+        self.assertEqual(parts[0], "🔥 PEAK HOURS")
+        self.assertEqual(parts[1], "GLM-5.3 plan")
+        self.assertEqual(parts[2], "ctx 18%")
+        self.assertTrue(parts[-1].startswith("Peak hours end at "),
+                        msg=f"last segment: {parts[-1]!r}")
+        self.assertIn("(in 2:30)", parts[-1])
+
+
 class EndToEndTest(unittest.TestCase):
     """Subprocess runs with a pre-seeded cache (no network)."""
 
