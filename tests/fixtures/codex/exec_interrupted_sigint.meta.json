@@ -1,0 +1,26 @@
+{
+  "fixture": "exec_interrupted_sigint.jsonl",
+  "description": "SIGINT mid-turn. Stream stops after turn.started; no completion event and no result file.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "timeout",
+    "--preserve-status",
+    "-s",
+    "INT",
+    "3",
+    "codex",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/int_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 1,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": null,
+  "notes": [
+    "codex exits 1 on SIGINT (it installs a handler; the shell does not see 130)"
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "fixture": "exec_turn_failed.jsonl",
+  "description": "Deliberate turn failure (unsupported model). Emits item.completed(type=error), a bare {\"type\":\"error\"} event and turn.failed.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-m",
+    "gpt-nonexistent-model-zzz",
+    "--skip-git-repo-check",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/fail_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 1,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": null,
+  "notes": [
+    "no output-last-message file is created on turn.failed",
+    "turn.failed.error.message is a JSON string containing a nested JSON error document"
+  ]
+}

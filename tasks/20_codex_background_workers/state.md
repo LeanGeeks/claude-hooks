@@ -22,7 +22,7 @@ and event-shape uncertainties before production implementation.
 
 | # | Task | Status | Depends on | Notes |
 |---|---|---|---|---|
-| 20-01 | [Provider-neutral handle and event reducer](./20-01-handle-event-reducer.md) | todo | amux 01-01 | Schema migration, fixtures, pure Codex JSONL reducer; no launch changes |
+| 20-01 | [Provider-neutral handle and event reducer](./20-01-handle-event-reducer.md) | done | amux 01-01 | Schema migration, fixtures, pure Codex JSONL reducer; no launch changes |
 | 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | todo | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | todo | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | todo | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
@@ -74,3 +74,26 @@ amux 01-01 ─────► 20-01
 Every engineering task runs its focused tests plus the existing amux-spawn,
 producer, reads, supervise, and remove suites. The final engineering task runs
 the full repository suite and the sibling amux suite at the pinned revision.
+
+## Log
+
+- **2026-08-21 — amux 01-01 done** (amux `819807e`). Lifecycle contract locked
+  against codex-cli `0.149.0`; 17 redacted fixtures committed. Three findings
+  changed this epic's contract and are recorded in `architecture.md` §5: exit
+  code is not a success signal, `codex exec resume` rejects `-C/--cd`,
+  `-p/--profile` and `-s/--sandbox`, and a non-UUID resume id silently starts a
+  new thread and exits `0` (so 20-04 must validate the thread ID *and* compare
+  `thread.started.thread_id` against the requested one — Codex will not fail
+  closed for us).
+- **2026-08-21 — 20-01 done.** Handle schema 14 -> 20 fields with
+  `transcript_path` retained; legacy no-provider handles resolve to `claude`.
+  New pure-stdlib `.claude/hooks/codex_event_reducer.py` implements the
+  completion-evidence-beats-exit-code rule. Codex fixtures vendored into
+  `tests/fixtures/codex/` from amux `819807e` (see `SOURCE.txt`); refresh them
+  from that path if the amux fixtures change.
+- **Test baseline:** this repo's suite is now **762 passed / 0 failed / 1
+  pre-existing skip** (was 716 before 20-01). The sibling amux suite baseline is
+  **184 passed / 1 failed**, that failure pre-existing and unrelated.
+- **Not yet live:** 20-01 changed no runtime behavior, so
+  `install-claude-config.sh` has NOT been re-run. It must be re-run before 20-06
+  live verification.

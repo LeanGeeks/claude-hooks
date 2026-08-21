@@ -152,6 +152,35 @@ class TestHandle(unittest.TestCase):
         self.assertIsNone(h["mtime_at_stop"])
         self.assertEqual(h["background_tasks"], [])
         self.assertFalse(h["permission_pending"])
+        # Epic-20 (20-01) migration: provider defaults to claude, the activity
+        # clock mirrors the transcript, and the Codex lifecycle fields start empty.
+        self.assertEqual(h["provider"], lib.PROVIDER_CLAUDE)
+        self.assertEqual(h["activity_path"], "/t.jsonl")
+        self.assertEqual(h["transcript_path"], "/t.jsonl")
+        self.assertIsNone(h["result_path"])
+        self.assertIsNone(h["process_pid"])
+        self.assertIsNone(h["exit_code"])
+        self.assertIsNone(h["failure"])
+
+    def test_codex_handle_atomic_write_read_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            with _redirect_amux_home(Path(d)):
+                lib.ensure_dirs()
+                h = lib.new_handle(
+                    name="review-123",
+                    session_id="01a00000-0000-7000-8000-000000000001",
+                    run_id="rid", abs_dir="/abs", transcript_path="",
+                    stuck_after_s=600, provider=lib.PROVIDER_CODEX,
+                    activity_path="/abs/review-123.events.jsonl",
+                    result_path="/abs/review-123.last.md",
+                    process_pid=4242,
+                )
+                self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+                lib.write_handle("review-123", h)
+                back = lib.read_handle("review-123")
+                self.assertEqual(back, h)
+                self.assertTrue(lib.is_codex_handle(back))
+                self.assertEqual(list(lib.SPAWN_DIR.glob(".review-123.*.tmp")), [])
 
     def test_atomic_write_read_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:

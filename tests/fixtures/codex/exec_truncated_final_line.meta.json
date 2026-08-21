@@ -1,0 +1,23 @@
+{
+  "fixture": "exec_truncated_final_line.jsonl",
+  "description": "SYNTHESIZED. exec_success with its final line cut mid-JSON, modelling a reader that samples the artifact while the process is still writing.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": true,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/success_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": null,
+  "stderr": "",
+  "output_last_message": null,
+  "notes": [
+    "DELIBERATELY NOT valid line-delimited JSON: the last line is a partial object",
+    "derived verbatim from exec_success.jsonl; readers must tolerate and skip an unparsable final line while the process is live"
+  ]
+}

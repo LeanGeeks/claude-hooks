@@ -1,0 +1,23 @@
+{
+  "fixture": "exec_success.jsonl",
+  "description": "Smallest successful bounded turn. thread.started -> turn.started -> item.completed(agent_message) -> turn.completed.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/success_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 0,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": "OK",
+  "notes": [
+    "output-last-message file is written WITHOUT a trailing newline",
+    "stderr carries the cosmetic line \"Reading additional input from stdin...\" whenever stdin is a pipe or /dev/null"
+  ]
+}

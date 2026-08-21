@@ -1,0 +1,26 @@
+{
+  "fixture": "exec_terminated_sigterm.jsonl",
+  "description": "SIGTERM mid-turn. Stream stops after turn.started but the process exits 0.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "timeout",
+    "--preserve-status",
+    "-s",
+    "TERM",
+    "3",
+    "codex",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/term_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 0,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": null,
+  "notes": [
+    "CRITICAL: exit code 0 does NOT imply success. turn.completed in the JSONL is the only completion evidence."
+  ]
+}

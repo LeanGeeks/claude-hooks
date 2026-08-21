@@ -1,0 +1,30 @@
+{
+  "fixture": "exec_killed_sigkill.jsonl",
+  "description": "SIGKILL to the `codex exec` PARENT pid mid-turn. `codex exec` forks a child `codex` process; the child SURVIVES the parent's SIGKILL, finishes the turn, and keeps appending to the inherited stdout fd and to the -o result file. The first two lines were written before the kill; item.completed and turn.completed were written ~10s AFTER the parent was dead.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "timeout",
+    "--preserve-status",
+    "-s",
+    "KILL",
+    "3",
+    "codex",
+    "exec",
+    "--json",
+    "--skip-git-repo-check",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/kill_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 137,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": "OK",
+  "notes": [
+    "parent exit is 137 (128+9) as seen by the shell",
+    "VERIFIED separately: `ps --ppid <codex pid>` shows one child `codex`; after parent SIGKILL the artifact grew from 2 to 4 lines and the -o file appeared",
+    "SIGINT and SIGTERM DO stop the child (see exec_interrupted_sigint / exec_terminated_sigterm: both stop at 2 lines, no result file)",
+    "to stop a worker, signal the process group / use `tmux kill-session` (see exec_tmux_kill_session.jsonl), never a bare kill -9 on the pid",
+    "IMPORTANT: the -o result file and a turn.completed event can therefore appear for a process the caller already reaped as killed"
+  ]
+}

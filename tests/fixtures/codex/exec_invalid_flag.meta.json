@@ -1,0 +1,16 @@
+{
+  "fixture": "exec_invalid_flag.jsonl",
+  "description": "Unknown flag: clap usage error, exit 2, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "--no-such-flag",
+    "hi"
+  ],
+  "exit_code": 2,
+  "stderr": "error: unexpected argument '--no-such-flag' found\n\n  tip: to pass '--no-such-flag' as a value, use '-- --no-such-flag'\n\nUsage: codex exec [OPTIONS] [PROMPT]\n       codex exec [OPTIONS] <COMMAND> [ARGS]\n\nFor more information, try '--help'.\n",
+  "output_last_message": null
+}

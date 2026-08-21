@@ -434,15 +434,33 @@ def pick_free_name(prefix: str, suffix: str | None = None) -> str:
         n += 1
 
 
-# ── Handle registry (architecture s6.0 schema) ───────────────────────────────
+# ── Handle registry (architecture s6.0 schema + epic-20 s3 migration) ────────
 
-# Authoritative field list (architecture s6.0). Used for schema sanity only.
+# Provider vocabulary (epic 20 architecture s3 / cross-task invariants 1-2).
+PROVIDER_CLAUDE = "claude"
+PROVIDER_CODEX = "codex"
+PROVIDERS = (PROVIDER_CLAUDE, PROVIDER_CODEX)
+
+# Authoritative field list (architecture s6.0, extended by epic-20 s3). Used for
+# schema sanity only.
+#
+# Epic-20 additions: ``provider``, ``activity_path``, ``result_path``,
+# ``process_pid``, ``exit_code``, ``failure``. ``session_id`` predates the
+# migration and now carries the Claude UUID *or* the captured Codex thread id.
+# ``transcript_path`` is deliberately KEPT during the migration so installed
+# Claude hooks and older readers keep working (architecture s3).
 HANDLE_FIELDS = (
     "name",
+    "provider",
     "session_id",
     "run_id",
     "dir",
     "transcript_path",
+    "activity_path",
+    "result_path",
+    "process_pid",
+    "exit_code",
+    "failure",
     "stuck_after_s",
     "state",
     "last_state",
@@ -453,6 +471,81 @@ HANDLE_FIELDS = (
     "created_at",
     "updated_at",
 )
+
+# Fields added by the epic-20 migration. A legacy handle has none of them; the
+# accessors below supply the documented defaults instead of rewriting the file.
+HANDLE_FIELDS_ADDED_20_01 = (
+    "provider",
+    "activity_path",
+    "result_path",
+    "process_pid",
+    "exit_code",
+    "failure",
+)
+
+
+def handle_provider(handle: dict[str, Any] | None) -> str:
+    """Return a handle's provider, defaulting to ``claude``.
+
+    Cross-task invariant 2: **a handle with no ``provider`` key is a Claude
+    handle.** Same for an empty / non-string value (a corrupted field must not
+    make a legacy Claude session unreadable). Any other non-empty string is
+    returned verbatim (lower-cased) so an unknown future provider is never
+    mistaken for Claude by :func:`is_claude_handle`.
+    """
+    if not isinstance(handle, dict):
+        return PROVIDER_CLAUDE
+    raw = handle.get("provider")
+    if not isinstance(raw, str) or not raw.strip():
+        return PROVIDER_CLAUDE
+    return raw.strip().lower()
+
+
+def is_claude_handle(handle: dict[str, Any] | None) -> bool:
+    """True iff *handle* is a Claude handle (legacy no-provider handles included)."""
+    return handle_provider(handle) == PROVIDER_CLAUDE
+
+
+def is_codex_handle(handle: dict[str, Any] | None) -> bool:
+    """True iff *handle* is a Codex handle."""
+    return handle_provider(handle) == PROVIDER_CODEX
+
+
+def handle_activity_path(handle: dict[str, Any] | None) -> str | None:
+    """The path whose mtime is this handle's activity clock.
+
+    Claude: the transcript. Codex: the ``codex exec --json`` event artifact.
+    Legacy Claude handles have no ``activity_path``, so ``transcript_path`` is
+    the fallback — that is what makes legacy and migrated Claude handles derive
+    identical results.
+    """
+    if not isinstance(handle, dict):
+        return None
+    for key in ("activity_path", "transcript_path"):
+        value = handle.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def upgrade_handle(handle: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *handle* with every :data:`HANDLE_FIELDS` key present.
+
+    Pure (the input is not mutated) and non-destructive: it only fills in the
+    epic-20 defaults for a legacy handle — ``provider="claude"``,
+    ``activity_path=transcript_path``, everything else ``None``. Unknown extra
+    keys are preserved so a newer writer's fields survive an older reader.
+
+    This is a read-side normalizer; nothing rewrites handle files on disk just
+    to migrate them.
+    """
+    upgraded = dict(handle)
+    upgraded["provider"] = handle_provider(handle)
+    if not upgraded.get("activity_path"):
+        upgraded["activity_path"] = handle_activity_path(handle)
+    for key in ("result_path", "process_pid", "exit_code", "failure"):
+        upgraded.setdefault(key, None)
+    return upgraded
 
 
 def handle_path(name: str) -> Path:
@@ -527,20 +620,36 @@ def new_handle(
     abs_dir: str,
     transcript_path: str,
     stuck_after_s: int,
+    provider: str = PROVIDER_CLAUDE,
+    activity_path: str | None = None,
+    result_path: str | None = None,
+    process_pid: int | None = None,
 ) -> dict[str, Any]:
-    """Build a fresh handle in state ``spawning`` (architecture s6.0).
+    """Build a fresh handle in state ``spawning`` (architecture s6.0 + s3).
 
     10-01 creates the handle in ``spawning`` with ``stuck_after_s`` persisted so
     10-03 can read it. ``mtime_at_stop`` is None until the first ``Stop``
     (10-02); its absence keeps the session ``active`` until then (s6.1 step 2).
+
+    Epic 20: ``provider`` defaults to ``claude`` (cross-task invariant 1) and
+    ``activity_path`` defaults to ``transcript_path`` — so a Claude handle
+    written by this constructor derives exactly like a legacy one.
+    ``exit_code``/``failure`` start as ``None``: they are only known once a
+    bounded Codex process has finished.
     """
     now = iso_now()
     return {
         "name": name,
+        "provider": provider,
         "session_id": session_id,
         "run_id": run_id,
         "dir": abs_dir,
         "transcript_path": transcript_path,
+        "activity_path": activity_path or transcript_path or None,
+        "result_path": result_path,
+        "process_pid": process_pid,
+        "exit_code": None,
+        "failure": None,
         "stuck_after_s": stuck_after_s,
         "state": "spawning",
         "last_state": None,

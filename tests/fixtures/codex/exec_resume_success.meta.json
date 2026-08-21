@@ -1,0 +1,24 @@
+{
+  "fixture": "exec_resume_success.jsonl",
+  "description": "Second turn on the same thread via `codex exec resume`. Same thread_id as exec_success; context was retained.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "resume",
+    "--json",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/resume_last.md",
+    "01a00000-0000-7000-8000-000000000001",
+    "what single word did you just reply? answer with only that word"
+  ],
+  "exit_code": 0,
+  "stderr": "",
+  "output_last_message": "OK",
+  "notes": [
+    "`codex exec resume` has NO -C/--cd, -p/--profile or -s/--sandbox: the working directory must come from the process cwd",
+    "item ids restart at item_0 in every process; they are not unique across segments",
+    "thread_id in thread.started equals the requested id \u2014 callers MUST compare them"
+  ]
+}

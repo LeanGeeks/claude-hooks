@@ -1,0 +1,22 @@
+{
+  "fixture": "exec_resume_name_miss_new_thread.jsonl",
+  "description": "HAZARD: a non-UUID resume id is treated as a thread NAME; when no such name exists codex silently starts a BRAND NEW thread and exits 0.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "resume",
+    "--json",
+    "--skip-git-repo-check",
+    "not-a-uuid-zzz",
+    "hi"
+  ],
+  "exit_code": 0,
+  "stderr": "",
+  "output_last_message": null,
+  "notes": [
+    "amux MUST validate that the stored thread id parses as a UUID before invoking resume",
+    "amux MUST compare thread.started.thread_id with the requested id and fail the launch if they differ"
+  ]
+}

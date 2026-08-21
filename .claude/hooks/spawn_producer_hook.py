@@ -27,7 +27,13 @@ One executable handles all four events, dispatched by ``--event``:
 Every event is **handle-gated**: it no-ops fast for sessions without a handle
 (plain/human sessions, other repos' sessions). Resolution uses
 ``amux_spawn_lib.resolve_amux_session`` (the current pane's ``amux-<name>`` tmux
-session name) and then checks the handle file exists.
+session name) and then checks the handle file exists. It is additionally
+**provider-gated** (epic 20): only ``provider == "claude"`` handles are written,
+which includes legacy handles that have no ``provider`` key at all.
+
+Handle writes are read-modify-write, so the epic-20 fields this hook does not
+own (``provider``, ``activity_path``, ``result_path``, ``process_pid``,
+``exit_code``, ``failure``) are preserved verbatim.
 
 Fail-OPEN: any error exits 0 so the session is never disrupted; but a handle is
 never silently corrupted (writes are atomic tmp+rename via the shared lib, and we
@@ -81,6 +87,18 @@ def _resolve_tracked_handle() -> tuple[str, dict] | None:
     handle = lib.read_handle(amux_name)
     if handle is None:
         debug_log(f"No handle for amux:{amux_name}; plain/untracked session, no-op")
+        return None
+    # Provider gate (epic 20, task 20-01): this producer is driven by *Claude
+    # Code* lifecycle events, so it owns Claude handles only. A Codex worker's
+    # state is reduced from its event artifact (codex_event_reducer) and must
+    # never be overwritten from a Claude hook that happens to fire in the same
+    # pane. A legacy handle with no ``provider`` key IS a Claude handle
+    # (cross-task invariant 2), so it still passes this gate.
+    if not lib.is_claude_handle(handle):
+        debug_log(
+            f"Handle amux:{amux_name} has provider="
+            f"{lib.handle_provider(handle)!r}; not a Claude handle, no-op"
+        )
         return None
     return amux_name, handle
 

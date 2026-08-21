@@ -663,7 +663,12 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
         except (TypeError, ValueError):
             stuck_after = lib.DEFAULT_STUCK_AFTER_S
 
-    transcript_path = handle.get("transcript_path")
+    # Activity clock. Epic 20 (20-01) made this provider-neutral: ``activity_path``
+    # with ``transcript_path`` as the fallback, so a legacy handle (no
+    # ``activity_path`` key at all) and a migrated Claude handle derive
+    # identically. Codex-specific derivation lands in 20-03; today every handle
+    # this function sees is a Claude handle.
+    transcript_path = lib.handle_activity_path(handle)
 
     # 1) terminated: tmux gone, OR producer already recorded terminated (SessionEnd).
     alive = lib.tmux_has_session(name) if name else False
@@ -671,6 +676,7 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
         last_state = handle.get("last_state")
         return {
             "name": name,
+            "provider": lib.handle_provider(handle),
             "state": "terminated",
             "last_state": last_state,
             "stuck_after_s": stuck_after,
@@ -725,6 +731,7 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
 
     result: dict[str, Any] = {
         "name": name,
+        "provider": lib.handle_provider(handle),
         "state": state,
         "stored_state": stored_state,
         "active": active,

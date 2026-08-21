@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a00000-0000-7000-8000-000000000001"}
+{"type":"turn.started"}
+{"type":"thread.future_event_type_v2","payload":{"note":"unknown to this reader"}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}
+{"type":"item.completed","item":{"id":"item_9","type":"future_item_kind","text":"unknown item"}}
+{"type":"turn.completed","usage":{"input_tokens":18692,"cached_input_tokens":11008,"cache_write_input_tokens":0,"output_tokens":5,"reasoning_output_tokens":0}}

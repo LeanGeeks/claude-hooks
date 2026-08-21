@@ -1,0 +1,20 @@
+{
+  "fixture": "exec_invalid_config.jsonl",
+  "description": "Invalid -c config override with --strict-config: exit 1 before any API call, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "--strict-config",
+    "-c",
+    "nonexistent_key_zzz=1",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "hi"
+  ],
+  "exit_code": 1,
+  "stderr": "Error loading config.toml: unknown configuration field `nonexistent_key_zzz` in -c/--config override\n",
+  "output_last_message": null
+}

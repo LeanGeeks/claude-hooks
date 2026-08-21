@@ -1,0 +1,18 @@
+{
+  "fixture": "exec_resume_unknown_thread.jsonl",
+  "description": "Resume with a well-formed but unknown thread UUID: fails closed, exit 1, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "resume",
+    "--json",
+    "--skip-git-repo-check",
+    "00000000-0000-4000-8000-000000000000",
+    "hi"
+  ],
+  "exit_code": 1,
+  "stderr": "Error: thread/resume: thread/resume failed: no rollout found for thread id 00000000-0000-4000-8000-000000000000 (code -32600)\n",
+  "output_last_message": null
+}

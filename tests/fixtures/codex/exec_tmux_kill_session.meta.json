@@ -1,0 +1,20 @@
+{
+  "fixture": "exec_tmux_kill_session.jsonl",
+  "description": "`tmux kill-session` on the pane running a bounded codex exec. The whole process tree dies: the stream stops after turn.started, no result file, and the exit-code wrapper never runs.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "tmux",
+    "kill-session",
+    "-t",
+    "<session>",
+    "# pane ran: codex exec --json --skip-git-repo-check -o RESULT 'reply with the single word OK' </dev/null >EVENTS 2>ERR; printf %s $? > RC"
+  ],
+  "exit_code": null,
+  "stderr": "",
+  "output_last_message": null,
+  "notes": [
+    "no RC file is produced, so a consumer sees: tmux gone + no turn.completed + no rc => terminated",
+    "contrast with exec_killed_sigkill.jsonl, where SIGKILL to the parent pid only leaves an orphan behind"
+  ]
+}

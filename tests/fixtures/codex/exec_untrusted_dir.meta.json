@@ -1,0 +1,17 @@
+{
+  "fixture": "exec_untrusted_dir.jsonl",
+  "description": "Non-git / untrusted working directory without --skip-git-repo-check: exit 1, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/nogit",
+    "hi"
+  ],
+  "exit_code": 1,
+  "stderr": "Reading additional input from stdin...\nNot inside a trusted directory and --skip-git-repo-check was not specified.\n",
+  "output_last_message": null
+}

@@ -395,6 +395,96 @@ class TestHandleGating(unittest.TestCase):
                 self.assertIsNone(lib.read_handle("other-9"))
 
 
+class TestProviderGate(unittest.TestCase):
+    """Epic 20 (20-01): this Claude producer owns Claude handles only."""
+
+    def test_legacy_handle_without_provider_key_is_still_written(self):
+        """Cross-task invariant 2 — a no-provider handle IS a Claude handle."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                mtime = _write_transcript(tpath)
+                legacy = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                # Strip every epic-20 field: this is exactly an epic-10 handle.
+                for field in lib.HANDLE_FIELDS_ADDED_20_01:
+                    legacy.pop(field, None)
+                lib.write_handle("proj-2", legacy)
+                self.assertNotIn("provider", lib.read_handle("proj-2"))
+
+                code = _run("Stop",
+                            {"last_assistant_message": "done",
+                             "background_tasks": [],
+                             "transcript_path": str(tpath)},
+                            amux_name="proj-2")
+                self.assertEqual(code, 0)
+                h = lib.read_handle("proj-2")
+                self.assertEqual(h["state"], "idle")
+                self.assertEqual(h["last_message"], "done")
+                self.assertEqual(h["mtime_at_stop"], mtime)
+                # The producer does not invent the new fields on a legacy handle.
+                self.assertNotIn("provider", h)
+
+    def test_codex_handle_is_never_written_by_the_claude_producer(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                events = tmp / "review.events.jsonl"
+                events.parent.mkdir(parents=True, exist_ok=True)
+                events.write_text('{"type":"turn.started"}\n')
+                codex = lib.new_handle(
+                    name="review-123",
+                    session_id="01a00000-0000-7000-8000-000000000001",
+                    run_id="rid", abs_dir="/ws/proj", transcript_path="",
+                    stuck_after_s=600, provider=lib.PROVIDER_CODEX,
+                    activity_path=str(events),
+                    result_path=str(tmp / "review.last.md"),
+                )
+                lib.write_handle("review-123", codex)
+
+                for event, payload in (
+                    ("Stop", {"last_assistant_message": "claude text",
+                              "background_tasks": []}),
+                    ("SubagentStop", {"background_tasks": []}),
+                    ("Notification", {"notification_type": "permission_prompt"}),
+                    ("SessionEnd", {"reason": "clear"}),
+                ):
+                    code = _run(event, payload, amux_name="review-123")
+                    self.assertEqual(code, 0)
+                    self.assertEqual(
+                        lib.read_handle("review-123"), codex,
+                        f"{event} mutated a Codex handle",
+                    )
+
+    def test_claude_handle_stop_preserves_the_epic20_fields(self):
+        """Read-modify-write must not drop fields this hook does not own."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                h0["process_pid"] = 4242
+                h0["result_path"] = "/some/result.md"
+                lib.write_handle("proj-2", h0)
+
+                _run("Stop",
+                     {"last_assistant_message": "done", "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+                h = lib.read_handle("proj-2")
+                self.assertEqual(h["provider"], lib.PROVIDER_CLAUDE)
+                self.assertEqual(h["activity_path"], str(tpath))
+                self.assertEqual(h["process_pid"], 4242)
+                self.assertEqual(h["result_path"], "/some/result.md")
+                self.assertIsNone(h["exit_code"])
+                self.assertIsNone(h["failure"])
+                self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+
+
 class TestFailOpen(unittest.TestCase):
     def test_unknown_event_no_ops(self):
         with tempfile.TemporaryDirectory() as d:

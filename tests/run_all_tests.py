@@ -42,6 +42,7 @@ TEST_MODULES = {
     "unit_reply_injector": "test_unit_reply_injector",
     "unit_amux_spawn": "test_unit_amux_spawn",
     "unit_spawn_producer": "test_unit_spawn_producer",
+    "unit_codex_reducer": "test_unit_codex_reducer",
     "unit_amux_reads": "test_unit_amux_reads",
     "unit_amux_supervise": "test_unit_amux_supervise",
     "unit_amux_ergonomics": "test_unit_amux_ergonomics",

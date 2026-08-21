@@ -1,0 +1,23 @@
+{
+  "fixture": "exec_unknown_event.jsonl",
+  "description": "SYNTHESIZED. exec_success with two forward-compatibility events injected (an unknown top-level type and an unknown item type).",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": true,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/success_last.md",
+    "reply with the single word OK"
+  ],
+  "exit_code": 0,
+  "stderr": "",
+  "output_last_message": "OK",
+  "notes": [
+    "derived verbatim from exec_success.jsonl plus two hand-written events",
+    "readers must ignore unknown types and still reduce to a completed turn"
+  ]
+}

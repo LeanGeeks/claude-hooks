@@ -1,0 +1,25 @@
+Codex lifecycle fixtures — vendored copy
+========================================
+
+Source repository : ../amux  (sibling checkout, https://github.com/ path per your remote)
+Source path       : tests/fixtures/codex/
+Source revision   : 819807e ("feat(codex): lock Codex lifecycle contract with captured fixtures")
+Full revision     : 819807e0f30914a0e479aa0c8b573064652d121c
+Captured with     : codex-cli 0.149.0 (amux task 01-01 lifecycle spike)
+Vendored on       : 2026-08-21 by claude-hooks task 20-01
+
+Why vendored: the sibling repository is an unpinned checkout at a path that is
+not guaranteed to exist on any machine that runs this suite. Copying keeps
+tests/test_unit_codex_reducer.py hermetic. Files are byte-for-byte identical to
+the source revision.
+
+To refresh:
+
+    cp ../amux/tests/fixtures/codex/*.jsonl     tests/fixtures/codex/
+    cp ../amux/tests/fixtures/codex/*.meta.json tests/fixtures/codex/
+
+then update the revision recorded above.
+
+Each <name>.jsonl has a <name>.meta.json sidecar recording the scenario,
+argv, exit code, stderr and final-message content of that run. Two fixtures
+(exec_truncated_final_line, exec_unknown_event) are marked "synthesized": true.

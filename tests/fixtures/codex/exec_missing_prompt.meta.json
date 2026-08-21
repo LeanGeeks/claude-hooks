@@ -1,0 +1,17 @@
+{
+  "fixture": "exec_missing_prompt.jsonl",
+  "description": "No prompt argument and empty stdin: exit 1, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "--skip-git-repo-check"
+  ],
+  "exit_code": 1,
+  "stderr": "Reading prompt from stdin...\nNo prompt provided via stdin.\n",
+  "output_last_message": null
+}

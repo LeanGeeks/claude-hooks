@@ -1,0 +1,26 @@
+{
+  "fixture": "exec_yolo_command_execution.jsonl",
+  "description": "Bounded YOLO turn launched inside a private tmux server with a multiline prompt; shows item.started/item.completed for command_execution.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "-C",
+    "/tmp/amux-codex-workspace/ws",
+    "--skip-git-repo-check",
+    "-o",
+    "/tmp/amux-codex-workspace/cap/tmux_yolo_last.md",
+    "<multiline prompt>"
+  ],
+  "exit_code": 0,
+  "stderr": "Reading additional input from stdin...\n",
+  "output_last_message": "DONE",
+  "notes": [
+    "command_execution items carry command, aggregated_output, exit_code (null while in_progress) and status",
+    "launched via: tmux new-session -d -s NAME -c DIR \"<shlex-quoted argv> </dev/null >EVENTS 2>ERR; printf %s $? > RC\"",
+    "the tmux session ends by itself when codex exec exits"
+  ]
+}

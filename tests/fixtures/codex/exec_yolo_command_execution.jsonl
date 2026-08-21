@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"01a00000-0000-7000-8000-000000000006"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’m running the exact command now."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"echo \\\"yolo-probe 'ok'\\\" > yolo_probe.txt\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc \"echo \\\"yolo-probe 'ok'\\\" > yolo_probe.txt\"","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"DONE"}}
+{"type":"turn.completed","usage":{"input_tokens":34888,"cached_input_tokens":28160,"cache_write_input_tokens":0,"output_tokens":90,"reasoning_output_tokens":0}}

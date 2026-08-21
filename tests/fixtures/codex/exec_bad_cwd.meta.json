@@ -1,0 +1,17 @@
+{
+  "fixture": "exec_bad_cwd.jsonl",
+  "description": "Nonexistent --cd directory: exit 1 with an OS error, empty JSONL stream.",
+  "codex_version": "codex-cli 0.149.0",
+  "synthesized": false,
+  "argv": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/tmp/amux-codex-workspace/nope",
+    "hi"
+  ],
+  "exit_code": 1,
+  "stderr": "Error: No such file or directory (os error 2)\n",
+  "output_last_message": null
+}
