@@ -17,6 +17,10 @@ and event-shape uncertainties before production implementation.
    epic branch is cut, and this epic pins that branch rather than `main`.
 3. **Codex toolchain.** Verification uses the locally installed `codex-cli`
    `0.149.0` with the existing `~/.codex/auth.json` credentials.
+4. **Pinned amux revision.** This epic builds against amux
+   `11a8426a014e8b9ca30134758e66e3912628b647` on branch `feat/epic-10-amux-extensions` (sibling epic 01
+   complete, suite 398 passed / 0 failed). Tasks 20-02 onward must verify
+   against this revision; task 20-05 records it in the installer/docs.
 
 ## Tasks
 
