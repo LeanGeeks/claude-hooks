@@ -62,6 +62,15 @@ for _cand in (_HERE, _HERE.parent / "hooks", Path.home() / ".claude" / "hooks"):
 
 import amux_spawn_lib as lib  # noqa: E402
 
+# The pure Codex reducer (task 20-01) lives alongside the lib, so the sys.path
+# candidates above already cover it (repo and installed layouts are parallel).
+# Import fail-soft: a missing reducer must never break the Claude surface — the
+# Codex derivation then degrades to liveness-only (fail-open convention).
+try:
+    import codex_event_reducer as codex_reducer  # noqa: E402
+except Exception:  # noqa: BLE001
+    codex_reducer = None
+
 
 def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -237,13 +246,6 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
                 "--provider codex.\n"
                 "  Pass Codex's own model/profile flags through instead "
                 "(e.g. --model gpt-5.5), or configure ~/.codex/config.toml."
-            )
-            return 1
-        if getattr(args, "wait", False) or getattr(args, "notify", False):
-            _eprint(
-                "amux-spawn: error: --wait/--notify are not supported for "
-                "--provider codex yet (task 20-03 derives Codex status).\n"
-                "  Spawn detached and read the run's artifacts from the handle."
             )
             return 1
         for flag in CLAUDE_ONLY_PERMISSION_FLAGS:
@@ -473,6 +475,9 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
         _eprint(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
         if session_id:
             _eprint(f"  session_id: {session_id}")
+            _eprint(f"  run_id:     {run_id}")
+        elif codex:
+            _eprint("  provider:   codex (bounded exec)")
             _eprint(f"  run_id:     {run_id}")
     else:
         print(f"amux-spawn: spawned {kind} session '{chosen_name}' in {abs_dir}")
@@ -722,11 +727,22 @@ def _wait_for_idle(
       outcome == "timeout" -> payload == None
       outcome == "error"   -> payload == error description (str)
 
-    False-idle guard: requires seeing at least one non-idle state (running or
-    stuck) before accepting idle. A session still in spawning / with no Stop yet
-    will read "running" (active, no_stop_yet) so the first iteration is never
-    mistakenly "idle" — but we enforce this explicitly as a belt-and-suspenders
-    guard (architecture §6 step 2 / FR5).
+    False-idle guard (Claude): requires seeing at least one non-idle state
+    (running or stuck) before accepting idle. A session still in spawning / with
+    no Stop yet will read "running" (active, no_stop_yet) so the first iteration
+    is never mistakenly "idle" — but we enforce this explicitly as a
+    belt-and-suspenders guard (architecture §6 step 2 / FR5).
+
+    Codex (task 20-03): completion evidence (``turn.completed``) is itself proof
+    the seeded turn ran, so the false-idle gate does not apply — a bounded turn
+    can legitimately finish between two polls. The idle payload is the
+    final-message artifact, not a hook-written ``last_message``. And
+    ``terminated`` is never latched on first observation: the 01-01 spike
+    showed the forked codex child appending ``turn.completed`` up to ~10 s
+    after the tmux session died (exit 137 + completion coexist), so the
+    artifact is re-checked for :data:`CODEX_ORPHAN_GRACE_S` before the wait
+    gives up (the caller's deadline still wins — expiry mid-grace is a
+    timeout, exit 3, not an error).
     """
     deadline: float | None = (time.time() + timeout_s) if timeout_s is not None else None
 
@@ -735,13 +751,17 @@ def _wait_for_idle(
     # seeded turn has started.
     seen_non_idle = False
 
+    # Codex orphan re-check: when the derived state first reads "terminated".
+    terminated_since: float | None = None
+
     while True:
         # Check timeout BEFORE polling so a zero-timeout returns immediately.
         if deadline is not None and time.time() >= deadline:
             return "timeout", None
 
         # Re-read the handle fresh on every poll (the producer hook overwrites it
-        # on every Stop — this is what carries state/last_message/mtime_at_stop).
+        # on every Stop — this is what carries state/last_message/mtime_at_stop;
+        # for Codex it stays as-written and the artifacts carry the lifecycle).
         handle = lib.read_handle(name)
         if handle is None:
             return "error", f"handle for session '{name}' disappeared during wait"
@@ -752,18 +772,35 @@ def _wait_for_idle(
             return "error", f"_derive_status raised: {exc}"
 
         state = result.get("state", "unknown")
+        codex = lib.is_codex_handle(handle)
 
         if state == "terminated":
-            return "error", f"session '{name}' terminated before reaching idle"
+            if not codex:
+                return "error", f"session '{name}' terminated before reaching idle"
+            # Re-check the artifact instead of latching the first "gone"
+            # observation: the orphan child may still be completing the turn.
+            now = time.time()
+            if terminated_since is None:
+                terminated_since = now
+            if now - terminated_since >= CODEX_ORPHAN_GRACE_S:
+                summary = _codex_failure_summary(result)
+                message = f"session '{name}' terminated before reaching idle"
+                return "error", f"{message} ({summary})" if summary else message
+            # Inside the grace window — fall through and poll again.
+        else:
+            terminated_since = None
+            if state in ("running", "stuck"):
+                seen_non_idle = True
 
-        if state in ("running", "stuck"):
-            seen_non_idle = True
-
-        if state == "idle" and seen_non_idle:
-            # True idle: a Stop with empty background_tasks, after the seeded
-            # turn ran (seen_non_idle gate).
-            last_message = handle.get("last_message") or ""
-            return "idle", last_message
+            if state == "idle" and (codex or seen_non_idle):
+                if codex:
+                    # True idle: turn.completed in the event artifact. The
+                    # payload is the bounded final-message text.
+                    return "idle", _codex_result_text(handle) or ""
+                # True idle: a Stop with empty background_tasks, after the seeded
+                # turn ran (seen_non_idle gate).
+                last_message = handle.get("last_message") or ""
+                return "idle", last_message
 
         # Not yet idle (or idle but haven't seen a non-idle intermediate) — keep
         # waiting.
@@ -905,13 +942,209 @@ def _reason_context(handle: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Codex state derivation (task 20-03) ───────────────────────────────────────
+#
+# Epic-20 architecture §5 is the binding precedence, implemented directly:
+#
+#   turn.completed (last-wins, no turn.failed) -> idle   — REGARDLESS of exit
+#     code; a SIGKILLed parent (exit 137) whose orphan child finished the turn
+#     is a completed run, and exit 0 without turn.completed (the SIGTERM trap)
+#     is NOT.
+#   turn.failed (last-wins)                   -> terminated — regardless of exit
+#     code.
+#   tmux alive, activity too old               -> stuck     (never persisted).
+#   tmux alive                                 -> running (or spawning before
+#     the first thread.started event).
+#   process gone, no completion evidence and no explicit failure -> terminated,
+#     with the exit code carried as REASON CONTEXT only.
+#
+# Liveness is the tmux session (amux owns the pane; ``process_pid`` stays a
+# best-effort nullable field nobody populates today). Activity is the event
+# artifact's mtime, falling back to handle ``created_at``. No signal ever comes
+# from terminal-pane text (epic invariant 5 / BRD §4.2).
+
+# 01-01 spike evidence: ``codex exec`` forks a child that survives a bare
+# ``kill -9`` on the parent and can append ``turn.completed`` (and write the
+# result file) up to ~10 s AFTER the tmux session is gone. ``--wait`` must
+# therefore re-check the artifact for this long before latching "terminated".
+CODEX_ORPHAN_GRACE_S = 10.0
+
+# Normalized Codex failure reasons (task 20-03 work item 6). The terminated
+# ones come straight out of the reducer; the two below are derived here.
+CODEX_REASON_STALE_ACTIVITY = "stale_activity"          # alive but silent
+CODEX_REASON_MALFORMED_COMPLETION = "malformed_completion"  # completed, no readable result
+
+
+def _codex_reduce(handle: dict[str, Any], *, process_gone: bool,
+                  read_result: bool = False) -> dict[str, Any]:
+    """Reduce a Codex handle's artifacts, fail-open on any error."""
+    if codex_reducer is None:
+        return {"activity_mtime": None, "thread_id": None, "thread_started": False,
+                "turn_started": False, "turn_completed": False, "turn_failed": False,
+                "segments": 0, "exit_code": None, "exit_code_present": False,
+                "result_available": False, "result_text": None, "outcome": None,
+                "state_hint": None, "failure": None, "result_path": None,
+                "refused_path": False}
+    try:
+        return codex_reducer.reduce_handle(
+            handle, process_gone=process_gone, read_result=read_result
+        )
+    except Exception:  # noqa: BLE001
+        return codex_reducer.empty_reduction()
+
+
+def _codex_result_text(handle: dict[str, Any]) -> str | None:
+    """The bounded final-message artifact's text (or None), size-limited."""
+    if codex_reducer is None:
+        return None
+    try:
+        return codex_reducer.read_result_text(handle.get("result_path"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _codex_failure_summary(result: dict[str, Any]) -> str | None:
+    """One-line normalized failure summary out of a derivation result."""
+    failure = result.get("failure")
+    if not isinstance(failure, dict):
+        return None
+    bits = [str(failure.get("reason") or "unknown")]
+    if failure.get("exit_code") is not None:
+        bits.append(f"exit {failure['exit_code']}")
+    message = failure.get("message")
+    if isinstance(message, str) and message.strip():
+        bits.append(message.strip())
+    return ": ".join(bits)
+
+
+def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
+    """Derive a bounded Codex worker's state (architecture §5 precedence)."""
+    name = str(handle.get("name", ""))
+
+    stuck_after = stuck_after_override
+    if stuck_after is None:
+        try:
+            stuck_after = int(handle.get("stuck_after_s") or lib.DEFAULT_STUCK_AFTER_S)
+        except (TypeError, ValueError):
+            stuck_after = lib.DEFAULT_STUCK_AFTER_S
+
+    alive = lib.tmux_has_session(name) if name else False
+    reduction = _codex_reduce(handle, process_gone=not alive)
+
+    result: dict[str, Any] = {
+        "name": name,
+        "provider": lib.PROVIDER_CODEX,
+        "stored_state": handle.get("state"),
+        "active": alive,
+        "stuck_after_s": stuck_after,
+        "thread_id": reduction.get("thread_id") or handle.get("session_id"),
+        "attempt": reduction.get("segments") or 0,
+        "exit_code": reduction.get("exit_code"),
+        "result_path": handle.get("result_path"),
+        "signals": {
+            "tmux_alive": alive,
+            "thread_started": bool(reduction.get("thread_started")),
+            "turn_started": bool(reduction.get("turn_started")),
+            "turn_completed": bool(reduction.get("turn_completed")),
+            "turn_failed": bool(reduction.get("turn_failed")),
+            "exit_code_present": bool(reduction.get("exit_code_present")),
+            "result_available": bool(reduction.get("result_available")),
+            "refused_path": bool(reduction.get("refused_path")),
+        },
+    }
+
+    # §5 precedence, in order. The reducer already resolved last-wins turn
+    # outcomes across appended resume segments, so its state_hint IS the
+    # authoritative verdict for the first two rows.
+    state_hint = reduction.get("state_hint")
+
+    if state_hint == "idle":
+        # turn.completed is the completion evidence; the exit code is not
+        # consulted (exit 137 + turn.completed is the SIGKILL-orphan idle).
+        result["state"] = "idle"
+        result["failure"] = None
+        result["activity_age_s"] = _age_s(reduction.get("activity_mtime"), handle)
+        if not reduction.get("result_available"):
+            # Completed turn, but the final-message artifact is missing/empty —
+            # still idle (evidence beats the artifact), with reason context.
+            result["reason_context"] = {
+                "codex": {
+                    "reason": CODEX_REASON_MALFORMED_COMPLETION,
+                    "message": "turn.completed present but the final-message "
+                               "artifact is missing or empty",
+                    "result_path": handle.get("result_path"),
+                    "exit_code": reduction.get("exit_code"),
+                }
+            }
+        return result
+
+    if state_hint == "terminated":
+        # turn.failed — or a process gone with neither completion evidence nor
+        # an explicit failure. The exit code rides as reason context only.
+        result["state"] = "terminated"
+        result["failure"] = reduction.get("failure") or {
+            "reason": "no_evidence", "message": None, "exit_code": reduction.get("exit_code"),
+        }
+        result["activity_age_s"] = _age_s(reduction.get("activity_mtime"), handle)
+        return result
+
+    # No authoritative event yet (launch begun): liveness + activity age decide.
+    age = _age_s(reduction.get("activity_mtime"), handle)
+    result["activity_age_s"] = age
+    if alive and age is not None and age > stuck_after:
+        result["state"] = "stuck"
+        result["failure"] = None
+        result["reason_context"] = {
+            "codex": {
+                "reason": CODEX_REASON_STALE_ACTIVITY,
+                "message": f"no event activity for {round(age)}s "
+                           f"(threshold {stuck_after}s)",
+                "activity_age_s": round(age, 1) if age is not None else None,
+                "exit_code": reduction.get("exit_code"),
+            }
+        }
+        return result
+
+    if alive:
+        # spawning until the first thread.started proves Codex itself is up.
+        result["state"] = "spawning" if handle.get("state") == "spawning" and \
+            not reduction.get("thread_started") else "running"
+        result["failure"] = None
+        return result
+
+    # Defensive: process gone with no verdict (only reachable when the reducer
+    # is unavailable — the reducer itself maps this to terminated above).
+    result["state"] = "terminated"
+    result["failure"] = {
+        "reason": "no_evidence", "message": None,
+        "exit_code": reduction.get("exit_code"),
+    }
+    return result
+
+
+def _age_s(activity_mtime: float | None, handle: dict[str, Any]) -> float | None:
+    """Seconds since the activity clock ticked (artifact mtime -> created_at)."""
+    mtime = activity_mtime
+    if mtime is None:
+        mtime = _created_at_epoch(handle)
+    if mtime is None:
+        return None
+    return round(max(0.0, time.time() - mtime), 1)
+
+
 def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
     """Derive a tracked session's state (architecture §6 derivation rules).
 
-    Precedence: terminated -> stuck -> running -> idle. Returns a dict suitable for
-    JSON output (see _status_json_schema in the report). ``stuck`` is derived here
-    and NEVER persisted back to the handle.
+    Provider dispatch (task 20-03): a Codex handle derives through
+    :func:`_derive_codex_status` (architecture §5 — reducer evidence, event
+    mtime, tmux liveness, exit metadata). Everything below is the Claude path,
+    unchanged: hooks + transcript mtime, precedence terminated -> stuck ->
+    running -> idle. ``stuck`` is derived here and NEVER persisted back to the
+    handle.
     """
+    if lib.is_codex_handle(handle):
+        return _derive_codex_status(handle, stuck_after_override)
+
     name = str(handle.get("name", ""))
     stored_state = handle.get("state")
 
@@ -926,8 +1159,8 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
     # Activity clock. Epic 20 (20-01) made this provider-neutral: ``activity_path``
     # with ``transcript_path`` as the fallback, so a legacy handle (no
     # ``activity_path`` key at all) and a migrated Claude handle derive
-    # identically. Codex-specific derivation lands in 20-03; today every handle
-    # this function sees is a Claude handle.
+    # identically. (Codex handles never reach this point — they dispatch to
+    # _derive_codex_status above.)
     transcript_path = lib.handle_activity_path(handle)
 
     # 1) terminated: tmux gone, OR producer already recorded terminated (SessionEnd).
@@ -1040,6 +1273,11 @@ def _human_status_line(result: dict[str, Any]) -> str:
         ls = result.get("last_state")
         if ls:
             bits.append(f"(last_state={ls})")
+        # Codex terminated: the normalized failure reason is the headline
+        # (architecture §6). Claude results carry no "failure" key.
+        summary = _codex_failure_summary(result)
+        if summary:
+            bits.append(f"({summary})")
     else:
         age = result.get("activity_age_s")
         if age is not None:
@@ -1084,7 +1322,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_last(args: argparse.Namespace) -> int:
-    """``last <handle>`` — print the handle's last_message."""
+    """``last <handle>`` — print the handle's last message.
+
+    Claude: the producer hook's ``last_message``. Codex: the explicit
+    final-message artifact (``--output-last-message``), read through the
+    reducer's bounded reader — never Codex's internal transcript format (BRD
+    §4.2 / invariant 5). The bound is the reducer's ``MAX_RESULT_BYTES``
+    (256 KiB); a larger artifact is truncated, not rejected.
+    """
     if not getattr(args, "handle", None):
         _eprint("amux-spawn last: missing <handle>")
         return 2
@@ -1095,6 +1340,24 @@ def cmd_last(args: argparse.Namespace) -> int:
         else:
             _eprint(f"amux-spawn last: no tracked handle found for {name}")
         return 1
+    if lib.is_codex_handle(handle):
+        last_message = _codex_result_text(handle)
+        if args.json:
+            print(json.dumps({
+                "name": name,
+                "provider": lib.PROVIDER_CODEX,
+                "last_message": last_message,
+                "result_path": handle.get("result_path"),
+            }))
+        else:
+            if last_message is None:
+                _eprint(
+                    f"amux-spawn last: {name} has no final-message artifact yet "
+                    f"({handle.get('result_path')})"
+                )
+                return 1
+            print(last_message)
+        return 0
     last_message = handle.get("last_message")
     if args.json:
         print(json.dumps({"name": name, "last_message": last_message}))
@@ -1138,10 +1401,21 @@ def cmd_ls(args: argparse.Namespace) -> int:
             continue
         name = str(handle.get("name", ""))
         alive = lib.tmux_has_session(name) if name else False
+        if lib.is_codex_handle(handle):
+            # A dead tmux session is NOT termination for a bounded Codex run
+            # (architecture §5): the row state must come from the same
+            # derivation as ``status``. Fail-soft on any derivation error.
+            try:
+                state = _derive_status(handle, None).get("state", handle.get("state"))
+            except Exception:  # noqa: BLE001
+                state = handle.get("state")
+        else:
+            state = "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state")
         rows.append({
             "name": name,
+            "provider": lib.handle_provider(handle),
             "alive": alive,
-            "state": "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state"),
+            "state": state,
             "run_id": handle.get("run_id"),
             "dir": hdir,
         })
@@ -1275,6 +1549,8 @@ def cmd_rm(args: argparse.Namespace) -> int:
          delete ``<name>.meta.json``.  Tolerates any amux failure (unknown
          session, amux unavailable, etc.).
       2. Deletes ``~/.amux/spawn/<name>.json`` from the registry.
+      3. Codex only: deletes the exact event/result artifacts the handle
+         names (plus their ``.err``/``.rc`` siblings) — no broad glob.
 
     Output: a human one-liner by default; ``--json`` emits
     ``{name, state_at_rm, killed}`` where ``killed`` is true iff the session
@@ -1291,8 +1567,10 @@ def cmd_rm(args: argparse.Namespace) -> int:
 
     force = bool(getattr(args, "force", False))
 
-    # Guard: a live session is a kill — the caller must mean it.
-    if state in ("running", "stuck") and not force:
+    # Guard: a live session is a kill — the caller must mean it. ``spawning``
+    # only ever derives for a just-launched Codex worker (a Claude handle maps
+    # spawning to running/stuck), so including it changes nothing for Claude.
+    if state in ("running", "stuck", "spawning") and not force:
         _eprint(
             f"amux-spawn rm: session '{name}' is {state} — refusing to reap "
             f"without --force"
@@ -1300,14 +1578,25 @@ def cmd_rm(args: argparse.Namespace) -> int:
         _eprint("  (use --force to kill and remove the session)")
         return 1
 
-    killed = state in ("running", "stuck")
+    killed = state in ("running", "stuck", "spawning")
 
     # 1) Ask amux to stop the tmux session + remove its registration +
-    #    delete meta.json.  Tolerate any failure.
+    #    delete meta.json.  Tolerate any failure.  amux stops the pane via
+    #    ``tmux kill-session`` (never a bare kill -9 — the 01-01 orphan
+    #    evidence), which is exactly what a bounded worker needs.
     _amux_rm(name)
 
     # 2) Remove the spawn registry handle.
     lib.delete_handle(name)
+
+    # 3) Codex: reap THIS handle's bounded-run artifacts — exactly the event
+    #    log + its amux-owned ``.err``/``.rc`` siblings + the result file the
+    #    handle names, never a glob (architecture §9). Nothing else in the
+    #    registry dir is touched.
+    if lib.is_codex_handle(handle):
+        lib.remove_codex_artifacts(
+            handle.get("activity_path"), handle.get("result_path")
+        )
 
     # Output.
     if args.json:

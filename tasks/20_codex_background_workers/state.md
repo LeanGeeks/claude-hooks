@@ -28,7 +28,7 @@ and event-shape uncertainties before production implementation.
 |---|---|---|---|---|
 | 20-01 | [Provider-neutral handle and event reducer](./20-01-handle-event-reducer.md) | done | amux 01-01 | Schema migration, fixtures, pure Codex JSONL reducer; no launch changes |
 | 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | done | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
-| 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | todo | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
+| 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | done | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | todo | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
 | 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | todo | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
 | 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | todo | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
@@ -116,3 +116,26 @@ the full repository suite and the sibling amux suite at the pinned revision.
   - The 20-02 implementer run was interrupted by a process restart and resumed;
     review included an explicit restart-seam audit (no duplicated/orphaned code
     found).
+- **2026-08-23 — 20-03 done.** `status`/`last`/`ls`/`wait`/`rm` are
+  provider-dispatched; Codex derivation follows architecture §5 exactly
+  (completion evidence authoritative regardless of exit code; absent `.rc` ->
+  terminated; bounded artifact-based orphan grace window, no sleep on the read
+  path). Suite **847 ran / 0 failed / 1 pre-existing skip** — which now includes
+  `test_unit_amux_codex_reads` (41 tests) and the previously unregistered
+  `test_logging_verification` (9 tests), both added to `run_all_tests.py`.
+  - **Incident (recorded honestly):** the first review's mutation testing
+    reverted its edits with `git checkout`, destroying the entire uncommitted
+    CLI implementation. Detection: the fixer's post-edit runner count DROPPED
+    (838 -> 806) — an unexplained count decrease is a data-loss alarm, not
+    flakiness. The implementer restored the code from its own context; a fresh
+    full review then PASSED (0 blocker/high) with mutation spot-checks re-run
+    under a cp-backup protocol and a final git-status gate. See memory
+    `reviewer-mutation-git-checkout-destroys-work`.
+  - Final review's 2 LOW + 1 INFO findings were all dispositioned by direct
+    inspection without code changes: the `except OSError` widening was rejected
+    (dead breadth on a correct fail-open idiom), the "duplicated" constant is
+    already documented by its adjacent comment, and the "missing" `_age_s`
+    docstring exists.
+  - `test_unit_amux_spawn.py`'s codex refusal test updated to reflect that
+    `--wait`/`--notify` are now supported for codex (`--profile` refusal
+    retained) — tracks the real behavior added here, confirmed by review.

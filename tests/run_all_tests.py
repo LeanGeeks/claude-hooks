@@ -43,6 +43,7 @@ TEST_MODULES = {
     "unit_amux_spawn": "test_unit_amux_spawn",
     "unit_spawn_producer": "test_unit_spawn_producer",
     "unit_codex_reducer": "test_unit_codex_reducer",
+    "unit_amux_codex_reads": "test_unit_amux_codex_reads",
     "unit_amux_reads": "test_unit_amux_reads",
     "unit_amux_supervise": "test_unit_amux_supervise",
     "unit_amux_ergonomics": "test_unit_amux_ergonomics",
@@ -51,6 +52,7 @@ TEST_MODULES = {
     "unit_roles_config": "test_unit_roles_config",
     "unit_terminal_answers": "test_unit_terminal_answers",
     "unit_claude_roles": "test_unit_claude_roles",
+    "unit_logging": "test_logging_verification",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
 }

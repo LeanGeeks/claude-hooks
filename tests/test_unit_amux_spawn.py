@@ -947,13 +947,16 @@ class TestProviderValidation(unittest.TestCase):
             tmp = Path(d)
             ws = tmp / "myproj"
             ws.mkdir()
-            for extra in (["--profile", "glm"], ["--wait"], ["--notify"]):
-                rc, calls, _h, _ = _spawn_capturing_argv(
-                    tmp, ["spawn", "--provider", "codex", "--dir", str(ws)]
-                    + extra + ["--", "go"]
-                )
-                self.assertEqual(rc, 1, extra)
-                self.assertEqual(calls, [], extra)
+            # --profile remains refused (a Claude model profile means nothing
+            # to Codex). --wait/--notify became SUPPORTED for Codex in task
+            # 20-03 (exit-code contract pinned in test_unit_amux_codex_reads),
+            # so they are no longer part of this refusal set.
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--profile", "glm", "--", "go"]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(calls, [])
 
     def test_codex_refuses_claude_permission_flag(self):
         """Architecture §8: Claude's permission flag must never reach Codex."""
