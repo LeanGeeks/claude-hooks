@@ -31,7 +31,7 @@ and event-shape uncertainties before production implementation.
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | done | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | done | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
 | 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | done | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
-| 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | todo | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
+| 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | blocked | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
 
 `amux NN-NN` refers to tasks in
 [`../../../amux/tasks/01_codex_cli_provider/state.md`](../../../amux/tasks/01_codex_cli_provider/state.md).
@@ -216,3 +216,12 @@ the full repository suite and the sibling amux suite at the pinned revision.
     `./install-amux.sh` (pin `11a8426…`, branch `feat/epic-10-amux-extensions`;
     requires sudo, writes to `/usr/local/bin`). The installer's stale-detection
     diagnostic now emits this guidance itself.
+- **2026-08-23 — 20-06 blocked, awaiting human evidence.** All engineering
+  tasks (amux 01-01..01-05, claude-hooks 20-01..20-05) are complete, reviewed,
+  and committed. The live gate requires the operator:
+  1. refresh the stale pre-Codex `/usr/local/bin/amux` via `./install-amux.sh`
+     (pin `11a8426…`; requires sudo, writes to `/usr/local/bin`), and
+  2. run the seven-step live procedure in
+     [20-06-live-verification_human.md](./20-06-live-verification_human.md),
+     recording the sign-off evidence listed there.
+  Mark `done` only when that evidence is recorded.
