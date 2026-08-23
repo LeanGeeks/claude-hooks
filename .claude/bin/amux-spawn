@@ -4,7 +4,8 @@
 This is the CLI: the ``spawn`` subcommand (task 10-01), the read subcommands
 ``status`` / ``last`` / ``ls`` (task 10-03), the supervise flag
 ``--wait`` / ``--notify`` (task 10-04), attach / quick-switch ``a|attach``
-(task 10-05), and the end-of-life ``rm`` subcommand (task 10-06).
+(task 10-05), the end-of-life ``rm`` subcommand (task 10-06), and the Codex
+second-turn ``resume`` subcommand (epic 20, task 20-04).
 
 State is DERIVED at read time (architecture §6); ``stuck`` is never persisted.
 Precedence: terminated -> stuck -> running -> idle. ``status`` bundles
@@ -244,8 +245,10 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
                 "amux-spawn: error: --profile is a Claude model profile "
                 "(~/.claude/profiles.toml) and cannot be used with "
                 "--provider codex.\n"
-                "  Pass Codex's own model/profile flags through instead "
-                "(e.g. --model gpt-5.5), or configure ~/.codex/config.toml."
+                "  Pass Codex's own model flag through instead using the "
+                "--model=<name> form (the space form's value is eaten by the "
+                "optional <suffix> positional), or configure "
+                "~/.codex/config.toml."
             )
             return 1
         for flag in CLAUDE_ONLY_PERMISSION_FLAGS:
@@ -498,29 +501,40 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
 
     # --wait / --notify: block until the seeded turn reaches true idle.
     if wait_mode:
-        timeout_s = parse_stuck_after(getattr(args, "timeout", None)) \
-            if getattr(args, "timeout", None) else None
-        _eprint(f"amux-spawn: waiting for session '{chosen_name}' to reach idle"
-                + (f" (timeout {timeout_s}s)" if timeout_s else "") + " …")
-        outcome, payload = _wait_for_idle(chosen_name, timeout_s)
-        if outcome == "idle":
-            # Stdout = the result payload the orchestrator captures.
-            print(payload or "")
-            return 0
-        elif outcome == "timeout":
-            # Machine-readable timeout marker on stdout; distinct exit code 3.
-            print(WAIT_TIMEOUT_MARKER)
-            _eprint(
-                f"amux-spawn: --wait timed out after {timeout_s}s "
-                f"(session '{chosen_name}' did not reach idle)"
-            )
-            return 3
-        else:
-            # Error: detail on stderr, nothing on stdout.
-            _eprint(f"amux-spawn: --wait error: {payload}")
-            return 1
+        return _wait_and_report(chosen_name, getattr(args, "timeout", None))
 
     return 0
+
+
+def _wait_and_report(name: str, timeout_raw: str | None) -> int:
+    """The shared ``--wait`` / ``--notify`` phase (tasks 10-04 + 20-04).
+
+    Blocks until session *name* reaches true idle, then applies the documented
+    exit-code/stdout contract: 0 + last_message on success, 3 +
+    ``AMUX_WAIT_TIMEOUT`` on caller timeout, 1 + stderr-only detail on error.
+    Used verbatim by ``spawn`` and by ``resume`` — the supervision itself is
+    provider-dispatched inside :func:`_wait_for_idle`.
+    """
+    timeout_s = parse_stuck_after(timeout_raw) if timeout_raw else None
+    _eprint(f"amux-spawn: waiting for session '{name}' to reach idle"
+            + (f" (timeout {timeout_s}s)" if timeout_s else "") + " …")
+    outcome, payload = _wait_for_idle(name, timeout_s)
+    if outcome == "idle":
+        # Stdout = the result payload the orchestrator captures.
+        print(payload or "")
+        return 0
+    elif outcome == "timeout":
+        # Machine-readable timeout marker on stdout; distinct exit code 3.
+        print(WAIT_TIMEOUT_MARKER)
+        _eprint(
+            f"amux-spawn: --wait timed out after {timeout_s}s "
+            f"(session '{name}' did not reach idle)"
+        )
+        return 3
+    else:
+        # Error: detail on stderr, nothing on stdout.
+        _eprint(f"amux-spawn: --wait error: {payload}")
+        return 1
 
 
 def _amux_create_detached(
@@ -661,6 +675,325 @@ def _rollback_launch(
         lib.delete_handle(name)
     _amux_rm(name)
     lib.remove_codex_artifacts(event_log, result_path)
+
+
+# ── Resume: the next bounded Codex turn (task 20-04) ──────────────────────────
+#
+# Architecture §7's coordinated order, mapped onto the amux contract at the
+# pinned revision:
+#
+#   1. acquire the normal spawn/session lock (the SAME one spawn/remove take,
+#      so resume is serialized against both);
+#   2. require provider=codex, an idle/terminated process, and a valid
+#      captured thread id (amux's meta.json — never minted here);
+#   3. the "next event artifact segment" is amux's own: `amux start --resume`
+#      re-reads the persisted --event-log and APPENDS the new segment to it
+#      (docs/codex-provider.md §4: "appended, never truncated"). Nothing is
+#      rotated or truncated on this side, so prior evidence survives by
+#      construction;
+#   4. ask amux to launch `codex exec resume <thread-id> <prompt>` (it builds
+#      the argv, validates the id as a UUID, and quarantines a foreign
+#      thread.started to `.err` with `.rc` = 66);
+#   5. update the handle attempt ATOMICALLY, only after the launch succeeds.
+#
+# A failed launch preserves the previous result and evidence: the handle is
+# never written, the event log was never truncated, and amux's pre-launch
+# exit-status removal is undone from a snapshot.
+
+# Options codex-cli 0.149.0 rejects on `codex exec resume` (spike evidence,
+# docs/codex-provider.md §3). amux dies with guidance for the full list; these
+# are the ones amux-spawn refuses up front with its own actionable message so
+# the caller never reaches a doomed launch. Never silently dropped.
+CODEX_RESUME_REJECTED_FLAGS = ("-p", "--profile", "-C", "--cd", "-s", "--sandbox")
+
+
+def _amux_start_resume(
+    name: str,
+    forward_flags: list[str],
+    prompt: str,
+) -> tuple[int, str | None]:
+    """Launch the next bounded turn through amux's PUBLIC resume contract.
+
+    ``amux start <name> --resume --no-attach [flags…] -- <prompt>`` —
+    ``--resume`` must be amux's FIRST option after the session name. amux
+    re-reads provider/mode/artifact paths from the session's persisted env
+    (they cannot be re-set on start), validates the stored thread id as a
+    UUID before launching, appends the new segment to the SAME event log and
+    arms its fail-closed ``--expect-thread`` comparison. No provider argv is
+    constructed here (cross-task invariant 3).
+
+    Returns ``(returncode, captured_output_or_none)``.
+    """
+    cmd = ["amux", "start", name, "--resume", "--no-attach"]
+    cmd += list(forward_flags)
+    cmd += ["--", prompt]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return 1, f"amux invocation failed: {exc}"
+    out = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, out.strip() or None
+
+
+def _snapshot_rc(event_log: str | None) -> bytes | None:
+    """Bytes of ``<event_log>.rc`` if present — amux removes it at launch."""
+    if not event_log:
+        return None
+    try:
+        with open(f"{event_log}.rc", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _restore_rc(event_log: str | None, snapshot: bytes | None) -> None:
+    """Restore a snapshotted exit-status file after a failed resume launch.
+
+    amux deletes ``.rc`` at launch so its absence always refers to the current
+    attempt (docs/codex-provider.md §4); a launch that never started a turn
+    must not leave that hole in the previous attempt's readable state. An
+    absent snapshot stays absent — a ``.rc`` written by the failed launch
+    itself is evidence of it, not noise. Fail-soft.
+    """
+    if not event_log or snapshot is None:
+        return
+    try:
+        with open(f"{event_log}.rc", "wb") as f:
+            f.write(snapshot)
+    except OSError:
+        pass
+
+
+def cmd_resume(args: argparse.Namespace, forward_flags: list[str], prompt: str | None) -> int:
+    """``resume <handle> -- "prompt"`` — start the next bounded Codex turn.
+
+    The resumed run continues the EXACT captured Codex thread: the id comes
+    from amux's authoritative ``meta.json`` (cross-checked against the event
+    artifact and the handle), must parse as a UUID, and is never minted,
+    guessed or defaulted — a missing or malformed id is a hard error and no
+    process is started (BRD §4.3: it must never start a fresh, unrelated
+    conversation under the old handle).
+    """
+    name = (getattr(args, "handle", "") or "").strip()
+    if not name:
+        _eprint("amux-spawn resume: missing <handle>")
+        return 2
+    if prompt is None:
+        _eprint(
+            "amux-spawn: error: resume needs a prompt: a resumed bounded run "
+            "is one more seeded turn.\n"
+            "  amux-spawn resume <handle> -- \"address the remaining issue\""
+        )
+        return 1
+
+    # Refusals BEFORE anything is locked, read or launched. A flag that
+    # cannot ride a resume errors with guidance — it is never silently
+    # dropped and never forwarded to a doomed launch.
+    for flag in CLAUDE_ONLY_PERMISSION_FLAGS:
+        if _flag_present(forward_flags, flag):
+            _eprint(
+                f"amux-spawn: error: {flag} is a Claude flag and must never "
+                f"reach Codex.\n"
+                "  Use --yolo at spawn time: amux expands it per provider."
+            )
+            return 1
+    if getattr(args, "yolo", False) or _flag_present(forward_flags, "--yolo"):
+        _eprint(
+            "amux-spawn: error: --yolo cannot be set on resume. It is a "
+            "registration-time choice, persisted with the session and "
+            "inherited by every resumed run; forwarding it here would hand "
+            "Codex a flag it does not know.\n"
+            "  Spawn a new worker with (or without) --yolo to change it."
+        )
+        return 1
+    if getattr(args, "profile", None):
+        _eprint(
+            "amux-spawn: error: --profile cannot ride a resume.\n"
+            "  amux-spawn's --profile is a Claude ~/.claude/profiles.toml "
+            "concept, and Codex's own -p/--profile is rejected by "
+            "`codex exec resume` (codex-cli 0.149.0).\n"
+            "  Configure ~/.codex/config.toml for Codex defaults, or pass an "
+            "explicit --model=<name> (resume accepts -m/--model)."
+        )
+        return 1
+    for bad in CODEX_RESUME_REJECTED_FLAGS:
+        if _flag_present(forward_flags, bad):
+            _eprint(
+                f"amux-spawn: error: {bad} cannot ride a resume — "
+                f"`codex exec resume` rejects it (codex-cli 0.149.0) and a "
+                f"resumed run keeps the session's workspace.\n"
+                "  Re-spawn a fresh worker to change the working directory or "
+                "sandbox; see amux resume guidance for details."
+            )
+            return 1
+    if getattr(args, "dir", None):
+        _eprint(
+            "amux-spawn: error: --dir cannot be changed on resume: the "
+            "resumed run keeps the workspace the session was spawned with "
+            "(its dir is persisted by amux)."
+        )
+        return 1
+
+    wait_mode = bool(getattr(args, "wait", False) or getattr(args, "notify", False))
+    json_out = bool(getattr(args, "json", False))
+
+    event_log: str | None = None
+    thread_id: str | None = None
+    new_attempt = 0
+    with SpawnLock():
+        handle = lib.read_handle(name)
+        if handle is None:
+            _eprint(f"amux-spawn resume: no tracked handle found for '{name}'")
+            return 1
+        if not lib.is_codex_handle(handle):
+            _eprint(
+                f"amux-spawn: error: resume is a Codex-thread operation; "
+                f"handle '{name}' is provider="
+                f"{lib.handle_provider(handle)!r}.\n"
+                "  Claude sessions continue interactively "
+                "(amux-spawn a|attach <suffix>) or via a new spawn; there is "
+                "no bounded-turn resume for them."
+            )
+            return 1
+
+        # §7 step 2: an idle/terminated process only. A live attempt —
+        # running, stuck, or a resume whose handle bump has not been followed
+        # by its first event yet (spawning) — is refused. Holding the spawn
+        # lock across this check is what rejects a concurrent second resume
+        # of the same handle (and serializes against spawn/remove).
+        try:
+            state = _derive_status(handle, None).get("state", "unknown")
+        except Exception:  # noqa: BLE001
+            state = "unknown"
+        if state not in ("idle", "terminated"):
+            _eprint(
+                f"amux-spawn: error: session '{name}' is {state} — refusing "
+                f"to resume a live attempt. Wait for the current turn "
+                f"(amux-spawn status {name}) or reap it first "
+                f"(amux-spawn rm {name} --force)."
+            )
+            return 1
+
+        # Thread-id authority (BRD §4.3 / amux docs §5): amux's captured id,
+        # validated as a UUID here — belt-and-suspenders alongside amux's own
+        # pre-launch guard. Missing or malformed => hard error, no launch.
+        thread_id = lib.read_codex_thread_id(name)
+        if not thread_id:
+            _eprint(
+                f"amux-spawn: error: no captured Codex thread id for session "
+                f"'{name}' (amux's {lib.meta_path(name)}, key "
+                f"'{lib.CODEX_THREAD_KEY}'). The first bounded turn captures "
+                f"it — run one before resuming. A missing id NEVER falls "
+                f"back to a fresh thread."
+            )
+            return 1
+        if not lib.is_uuid_string(thread_id):
+            _eprint(
+                f"amux-spawn: error: malformed Codex thread id for session "
+                f"'{name}': {thread_id!r}. Codex would treat a non-UUID id "
+                f"as a thread NAME and silently start an unrelated new "
+                f"conversation — refusing to resume. Fix or clear the id in "
+                f"{lib.meta_path(name)}."
+            )
+            return 1
+
+        # Cross-check the authoritative id against the captured evidence: a
+        # disagreement means corrupted state, and resuming would target a
+        # thread these artifacts do not describe. Fail closed.
+        reduction = _codex_reduce(handle, process_gone=not lib.tmux_has_session(name))
+        artifact_id = reduction.get("thread_id")
+        stored_id = handle.get("session_id")
+        for source, value in (("event artifact", artifact_id), ("handle", stored_id)):
+            if isinstance(value, str) and value and value != thread_id:
+                _eprint(
+                    f"amux-spawn: error: corrupted thread identity for "
+                    f"'{name}': amux meta.json says {thread_id!r} but the "
+                    f"{source} says {value!r}. Refusing to resume a thread "
+                    f"the evidence does not describe — inspect "
+                    f"{lib.meta_path(name)} and the event artifact."
+                )
+                return 1
+
+        # Prior readable state to preserve if the launch fails (work item 4):
+        # amux removes `.rc` at launch; snapshot it for restore. The event
+        # log is append-only and the result file is only written by Codex on
+        # success, so those need no snapshot.
+        event_log = handle.get("activity_path")
+        base_attempt = max(_handle_attempt(handle), int(reduction.get("segments") or 0))
+        rc_snapshot = _snapshot_rc(event_log)
+
+        rc, detail = _amux_start_resume(name, forward_flags, prompt)
+        if rc != 0:
+            _eprint(f"amux-spawn: error: amux failed to resume session {name}")
+            if detail:
+                _eprint(detail)
+            _restore_rc(event_log, rc_snapshot)
+            return 1
+        if not _launch_confirmed(name, lib.PROVIDER_CODEX, event_log):
+            _eprint(
+                f"amux-spawn: error: session {name} did not come up after "
+                f"resume (no live tmux session, exit status or new events)."
+            )
+            _restore_rc(event_log, rc_snapshot)
+            return 1
+
+        # §7 step 5: the ONLY handle write, atomically, after a successful
+        # launch. The attempt bump is the cross-segment key readers use; the
+        # state flip keeps the in-flight attempt from false-reading idle off
+        # the previous attempt's completion.
+        new_attempt = base_attempt + 1
+        handle["attempt"] = new_attempt
+        handle["session_id"] = thread_id
+        handle["state"] = "spawning"
+        handle["updated_at"] = lib.iso_now()
+        try:
+            lib.write_handle(name, handle)
+        except Exception as exc:  # noqa: BLE001
+            _eprint(
+                f"amux-spawn: error: could not update the handle for "
+                f"{name}: {exc}\n"
+                f"  the resumed worker is running and its evidence is intact; "
+                f"the attempt counter was not bumped."
+            )
+            return 1
+    # ── lock released ──
+
+    if json_out:
+        payload = json.dumps({
+            "name": name,
+            "provider": lib.PROVIDER_CODEX,
+            "state": "spawning",
+            "attempt": new_attempt,
+            "thread_id": thread_id,
+            "events": event_log,
+            "result": handle.get("result_path"),
+        })
+        if wait_mode:
+            _eprint(payload)
+        else:
+            print(payload)
+    else:
+        banner = (
+            f"amux-spawn: resumed session '{name}' (attempt {new_attempt}) "
+            f"on thread {thread_id}"
+        )
+        detail = f"  events:     {event_log}\n  result:     {handle.get('result_path')}"
+        if wait_mode:
+            # Stdout stays clean for the orchestrator's result payload.
+            _eprint(banner)
+            _eprint(detail)
+        else:
+            print(banner)
+            print(detail)
+
+    if wait_mode:
+        return _wait_and_report(name, getattr(args, "timeout", None))
+    return 0
 
 
 def _amux_attach(name: str) -> None:
@@ -970,9 +1303,16 @@ def _reason_context(handle: dict[str, Any]) -> dict[str, Any]:
 CODEX_ORPHAN_GRACE_S = 10.0
 
 # Normalized Codex failure reasons (task 20-03 work item 6). The terminated
-# ones come straight out of the reducer; the two below are derived here.
+# ones come straight out of the reducer; the three below are derived here.
 CODEX_REASON_STALE_ACTIVITY = "stale_activity"          # alive but silent
 CODEX_REASON_MALFORMED_COMPLETION = "malformed_completion"  # completed, no readable result
+CODEX_REASON_THREAD_MISMATCH = "thread_mismatch"        # amux's fail-closed quarantine
+
+# amux's documented exit status when a resumed run's first ``thread.started``
+# id did NOT echo the requested one: the foreign output is quarantined to
+# ``<event-log>.err`` and the child is SIGINTed (docs/codex-provider.md §5).
+# Surfaced here as a normalized failure reason — never re-derived here.
+CODEX_EXIT_THREAD_MISMATCH = 66
 
 
 def _codex_reduce(handle: dict[str, Any], *, process_gone: bool,
@@ -1017,8 +1357,31 @@ def _codex_failure_summary(result: dict[str, Any]) -> str | None:
     return ": ".join(bits)
 
 
+def _handle_attempt(handle: dict[str, Any]) -> int:
+    """The handle's launch-attempt counter, defaulting to 1 (>= 1 always).
+
+    Legacy Codex handles (pre-20-04) have no ``attempt`` key; callers combine
+    this with the reducer's segment count via max().
+    """
+    try:
+        value = int(handle.get("attempt") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, value)
+
+
 def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
-    """Derive a bounded Codex worker's state (architecture §5 precedence)."""
+    """Derive a bounded Codex worker's state (architecture §5 precedence).
+
+    Attempt semantics (task 20-04): the handle's ``attempt`` counts launches;
+    the artifact's ``thread.started`` count (``segments``) counts turns whose
+    evidence has started arriving. The reported attempt is the max of the two.
+    While ``attempt > segments`` an attempt is IN FLIGHT whose segment has not
+    started — the artifact's last turn outcome then belongs to an OLDER
+    attempt and must not mask the live/dead question for the newest one (a
+    freshly resumed worker would otherwise false-read ``idle`` off the previous
+    attempt's ``turn.completed`` until the new segment's first event lands).
+    """
     name = str(handle.get("name", ""))
 
     stuck_after = stuck_after_override
@@ -1031,6 +1394,16 @@ def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | Non
     alive = lib.tmux_has_session(name) if name else False
     reduction = _codex_reduce(handle, process_gone=not alive)
 
+    segments = int(reduction.get("segments") or 0)
+    handle_attempt = _handle_attempt(handle)
+    attempt = max(handle_attempt, segments)
+    # An attempt was launched (handle bumped under the resume lock) but its
+    # segment has not started: no Nth thread.started in the artifact yet.
+    # The gate matters only when an OLDER segment exists to mask it — a fresh
+    # spawn (attempt 1, empty artifact) has no prior turn.completed that could
+    # false-read idle, and keeps the plain §5 liveness/age derivation.
+    attempt_pending = handle_attempt > segments and segments > 0
+
     result: dict[str, Any] = {
         "name": name,
         "provider": lib.PROVIDER_CODEX,
@@ -1038,7 +1411,7 @@ def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | Non
         "active": alive,
         "stuck_after_s": stuck_after,
         "thread_id": reduction.get("thread_id") or handle.get("session_id"),
-        "attempt": reduction.get("segments") or 0,
+        "attempt": attempt,
         "exit_code": reduction.get("exit_code"),
         "result_path": handle.get("result_path"),
         "signals": {
@@ -1050,8 +1423,16 @@ def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | Non
             "exit_code_present": bool(reduction.get("exit_code_present")),
             "result_available": bool(reduction.get("result_available")),
             "refused_path": bool(reduction.get("refused_path")),
+            "attempt_pending": attempt_pending,
         },
     }
+
+    if attempt_pending:
+        # The newest attempt owns the state; the artifact's last-wins outcome
+        # is stale (older attempt). Its activity clock is the resume launch
+        # time (handle updated_at), NOT the artifact mtime — which the new
+        # attempt has not touched yet.
+        return _derive_pending_attempt(result, reduction, handle, alive, attempt)
 
     # §5 precedence, in order. The reducer already resolved last-wins turn
     # outcomes across appended resume segments, so its state_hint IS the
@@ -1119,6 +1500,85 @@ def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | Non
         "reason": "no_evidence", "message": None,
         "exit_code": reduction.get("exit_code"),
     }
+    return result
+
+
+def _derive_pending_attempt(
+    result: dict[str, Any],
+    reduction: dict[str, Any],
+    handle: dict[str, Any],
+    alive: bool,
+    attempt: int,
+) -> dict[str, Any]:
+    """Finish a derivation for an attempt whose segment has not started.
+
+    Reached only when ``handle.attempt > segments``: a resume launched, but no
+    ``thread.started`` for the newest attempt is in the event artifact yet.
+    Liveness decides; the exit status rides as reason context exactly like the
+    reducer's ``incomplete`` branch (§5). amux's rc-66 thread-mismatch
+    quarantine (foreign output to ``.err``, SIGINT, no event append) lands
+    here too and is surfaced as ``thread_mismatch`` — amux's outcome, not a
+    re-implementation of its comparison.
+    """
+    # The new attempt has not touched the event artifact, so its activity
+    # clock starts at the resume launch (updated_at), falling back to
+    # created_at for a hand-written handle.
+    launched_at = _iso_epoch(handle, "updated_at") or _iso_epoch(handle, "created_at")
+    age = round(max(0.0, time.time() - launched_at), 1) if launched_at else None
+    result["activity_age_s"] = age
+
+    exit_code = reduction.get("exit_code")
+    exit_present = bool(reduction.get("exit_code_present"))
+
+    if alive:
+        stuck_after = result["stuck_after_s"]
+        if age is not None and age > stuck_after:
+            result["state"] = "stuck"
+            result["failure"] = None
+            result["reason_context"] = {
+                "codex": {
+                    "reason": CODEX_REASON_STALE_ACTIVITY,
+                    "message": f"attempt {attempt} launched but no event "
+                               f"activity for {round(age)}s "
+                               f"(threshold {stuck_after}s)",
+                    "activity_age_s": age,
+                    "exit_code": exit_code,
+                }
+            }
+        else:
+            result["state"] = "running"
+            result["failure"] = None
+        return result
+
+    # Pane gone before the newest attempt's segment started. Exit code is the
+    # only direct evidence, and it is context — the mismatch code is amux's.
+    result["state"] = "terminated"
+    if exit_present and exit_code == CODEX_EXIT_THREAD_MISMATCH:
+        result["failure"] = {
+            "reason": CODEX_REASON_THREAD_MISMATCH,
+            "message": "amux quarantined the resumed run: the new segment's "
+                       "thread id did not match the requested one "
+                       f"(see {handle.get('activity_path')}.err)",
+            "exit_code": exit_code,
+        }
+    elif exit_present:
+        result["failure"] = {
+            "reason": "nonzero_exit" if exit_code else "no_completion_event",
+            "message": f"attempt {attempt} ended before its turn started",
+            "exit_code": exit_code,
+        }
+    elif reduction.get("thread_started"):
+        result["failure"] = {
+            "reason": "no_exit_status",
+            "message": f"attempt {attempt} left no exit status (killed launch)",
+            "exit_code": None,
+        }
+    else:
+        result["failure"] = {
+            "reason": "no_evidence",
+            "message": None,
+            "exit_code": None,
+        }
     return result
 
 
@@ -1242,9 +1702,9 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
     return result
 
 
-def _created_at_epoch(handle: dict[str, Any]) -> float | None:
-    """Parse ``created_at`` (ISO-8601) into an epoch float, or None."""
-    raw = handle.get("created_at")
+def _iso_epoch(handle: dict[str, Any], key: str) -> float | None:
+    """Parse a handle's ISO-8601 timestamp field (e.g. ``created_at``) or None."""
+    raw = handle.get(key)
     if not isinstance(raw, str) or not raw:
         return None
     try:
@@ -1252,6 +1712,11 @@ def _created_at_epoch(handle: dict[str, Any]) -> float | None:
         return datetime.fromisoformat(raw).timestamp()
     except (ValueError, TypeError):
         return None
+
+
+def _created_at_epoch(handle: dict[str, Any]) -> float | None:
+    """Parse ``created_at`` (ISO-8601) into an epoch float, or None."""
+    return _iso_epoch(handle, "created_at")
 
 
 def _resolve_handle(handle_arg: str) -> tuple[str, dict[str, Any] | None]:
@@ -1401,24 +1866,32 @@ def cmd_ls(args: argparse.Namespace) -> int:
             continue
         name = str(handle.get("name", ""))
         alive = lib.tmux_has_session(name) if name else False
+        attempt: int | None = None
         if lib.is_codex_handle(handle):
             # A dead tmux session is NOT termination for a bounded Codex run
             # (architecture §5): the row state must come from the same
             # derivation as ``status``. Fail-soft on any derivation error.
+            # Task 20-04: the derivation also carries the attempt counter —
+            # inspectable history for resumed workers (architecture §6).
             try:
-                state = _derive_status(handle, None).get("state", handle.get("state"))
+                derived = _derive_status(handle, None)
+                state = derived.get("state", handle.get("state"))
+                attempt = derived.get("attempt")
             except Exception:  # noqa: BLE001
                 state = handle.get("state")
         else:
             state = "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state")
-        rows.append({
+        row = {
             "name": name,
             "provider": lib.handle_provider(handle),
             "alive": alive,
             "state": state,
             "run_id": handle.get("run_id"),
             "dir": hdir,
-        })
+        }
+        if lib.is_codex_handle(handle):
+            row["attempt"] = attempt
+        rows.append(row)
 
     rows.sort(key=lambda r: r["name"])
     if args.json:
@@ -1685,7 +2158,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="subcommand")
 
-    sp = sub.add_parser("spawn", help="create + seed a new amux session", add_help=True)
+    sp = sub.add_parser(
+        "spawn", help="create + seed a new amux session", add_help=True,
+        epilog=(
+            "value-taking pass-through flags: prefer the --flag=value form. "
+            "The space form's value (e.g. the model in `--model gpt-5.5`) can "
+            "be captured by the optional <suffix> positional — pre-existing "
+            "behavior, identical for both providers; `--model=gpt-5.5` "
+            "round-trips verbatim. Codex model selection is never implicit: "
+            "with no explicit --model=<name>, Codex's own config "
+            "(~/.codex/config.toml) decides. --profile is Claude's "
+            "~/.claude/profiles.toml concept and is refused for codex."
+        ),
+    )
     sp.add_argument("suffix", nargs="?", default=None,
                     help="optional memorable name suffix (else auto-increment)")
     sp.add_argument("--detach", action="store_true",
@@ -1716,6 +2201,41 @@ def build_parser() -> argparse.ArgumentParser:
 
     prof = sub.add_parser("profiles", help="list available model profiles from profiles.toml")
     prof.add_argument("--json", action="store_true", help="machine-readable JSON output")
+
+    rs = sub.add_parser(
+        "resume", help="start the next bounded turn on a captured Codex thread",
+        epilog=(
+            "resumes the EXACT thread captured by the first turn (amux's "
+            "meta.json); a missing or malformed thread id is refused, never "
+            "silently restarted on a fresh thread. -m/--model may pass through "
+            "(both `--model X` and `--model=X` work here — resume has no "
+            "suffix positional); -p/--profile, -C/--cd and -s/--sandbox are "
+            "refused because `codex exec resume` rejects them; --yolo and the "
+            "workspace are fixed at spawn time and inherited."
+        ),
+    )
+    rs.add_argument("handle", help="amux session name (handle key); must be a codex worker")
+    rs.add_argument("--json", action="store_true",
+                    help="machine-readable JSON outcome")
+    rs.add_argument("--wait", action="store_true",
+                    help="block until the resumed turn reaches idle; print the "
+                         "final message to stdout")
+    rs.add_argument("--notify", action="store_true",
+                    help="alias for --wait; intended for run_in_background orchestrator pattern")
+    rs.add_argument("--timeout", default=None,
+                    help="--wait patience limit (e.g. 30s, 5m); on expiry print "
+                         f"'{WAIT_TIMEOUT_MARKER}' to stdout and exit 3")
+    # Defined so each gets its own actionable refusal message instead of
+    # riding the pass-through flags into a doomed launch.
+    rs.add_argument("--yolo", action="store_true",
+                    help="REFUSED on resume: YOLO is fixed at spawn time and "
+                         "inherited by resumed runs")
+    rs.add_argument("--profile", default=None,
+                    help="REFUSED on resume: Claude profiles are a spawn-time "
+                         "concept and codex exec resume rejects -p/--profile")
+    rs.add_argument("--dir", default=None,
+                    help="REFUSED on resume: the resumed run keeps the "
+                         "session's spawned workspace")
 
     st = sub.add_parser("status", help="report a tracked session's derived state")
     st.add_argument("handle", help="amux session name (handle key)")
@@ -1783,6 +2303,17 @@ def main(argv: list[str] | None = None) -> int:
         # --append-system-prompt) through to forward_flags untouched.
         ns, claude_flags = parser.parse_known_args(["spawn"] + before)
         return cmd_spawn(ns, claude_flags, prompt)
+
+    if subcommand == "resume":
+        # Same shape as spawn: the prompt after the first `--` is split off,
+        # and unknown value-taking flags (e.g. --model) ride the pass-through
+        # list. resume has no optional suffix positional, so BOTH the
+        # `--model X` and `--model=X` spellings reach amux intact.
+        rest = argv[1:]
+        before, prompt = _split_prompt(rest)
+        parser = build_parser()
+        ns, pass_through = parser.parse_known_args(["resume"] + before)
+        return cmd_resume(ns, pass_through, prompt)
 
     if subcommand == "profiles":
         ns = build_parser().parse_args(argv)

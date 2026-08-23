@@ -449,6 +449,12 @@ PROVIDERS = (PROVIDER_CLAUDE, PROVIDER_CODEX)
 # migration and now carries the Claude UUID *or* the captured Codex thread id.
 # ``transcript_path`` is deliberately KEPT during the migration so installed
 # Claude hooks and older readers keep working (architecture s3).
+#
+# Task 20-04 added ``attempt`` (architecture s6/§7: the resume-attempt counter
+# that keys cross-segment history — ``item.completed`` ids restart per process,
+# so they are unique per segment only). It counts LAUNCH attempts: a handle at
+# ``attempt == N`` with fewer than N ``thread.started`` segments in its event
+# artifact has an attempt in flight whose evidence has not started arriving.
 HANDLE_FIELDS = (
     "name",
     "provider",
@@ -461,6 +467,7 @@ HANDLE_FIELDS = (
     "process_pid",
     "exit_code",
     "failure",
+    "attempt",
     "stuck_after_s",
     "state",
     "last_state",
@@ -545,6 +552,7 @@ def upgrade_handle(handle: dict[str, Any]) -> dict[str, Any]:
         upgraded["activity_path"] = handle_activity_path(handle)
     for key in ("result_path", "process_pid", "exit_code", "failure"):
         upgraded.setdefault(key, None)
+    upgraded.setdefault("attempt", 1)
     return upgraded
 
 
@@ -624,6 +632,7 @@ def new_handle(
     activity_path: str | None = None,
     result_path: str | None = None,
     process_pid: int | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     """Build a fresh handle in state ``spawning`` (architecture s6.0 + s3).
 
@@ -641,7 +650,9 @@ def new_handle(
     at launch time there is no Codex thread id yet (it arrives in the first
     ``thread.started`` event, captured by amux into ``<name>.meta.json``) and
     there is no Claude transcript to guess at. Inventing either would create a
-    fake identity, so both stay ``None`` until real evidence exists.
+    fake identity, so both stay ``None`` until real evidence exists. Task 20-04's
+    resume path is the one writer that later fills ``session_id`` with the
+    captured id (validated against ``meta.json``) and bumps ``attempt``.
     """
     now = iso_now()
     return {
@@ -656,6 +667,7 @@ def new_handle(
         "process_pid": process_pid,
         "exit_code": None,
         "failure": None,
+        "attempt": attempt,
         "stuck_after_s": stuck_after_s,
         "state": "spawning",
         "last_state": None,
@@ -783,6 +795,60 @@ def remove_codex_artifacts(event_path: str | None, result_path: str | None) -> N
             os.unlink(path)
         except OSError:
             pass
+
+
+# ── Codex thread identity (epic-20 task 20-04) ───────────────────────────────
+#
+# The authoritative Codex thread id of a session lives in amux's
+# ``~/.amux/sessions/<name>.meta.json`` under ``codex_session_id``: amux's launch
+# wrapper captures it from the first ``thread.started`` event as it arrives and
+# merges it there (``docs/codex-provider.md`` §5). Resume MUST use exactly that
+# captured id — never a minted, guessed or placeholder one — and refuses to
+# launch without it (BRD §4.3: a missing/malformed id never falls back to a
+# fresh, unrelated thread; Codex itself would silently start one and exit 0).
+
+#: The meta.json key amux (and its dashboard) use for the captured thread id.
+CODEX_THREAD_KEY = "codex_session_id"
+
+
+def meta_path(name: str) -> Path:
+    """Path to amux's ``<name>.meta.json`` session metadata file."""
+    return AMUX_SESSIONS_DIR / f"{name}.meta.json"
+
+
+def read_codex_thread_id(name: str) -> str | None:
+    """The captured Codex thread id from amux's ``<name>.meta.json``, or None.
+
+    Fail-soft like every reader here: a missing, unreadable or malformed meta
+    file, or a missing/empty/non-string key, all return None. Callers treat
+    None as "no captured id" and fail closed.
+    """
+    try:
+        with open(meta_path(name)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(CODEX_THREAD_KEY)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+# Same shape amux's ``_is_uuid`` enforces pre-launch: a non-UUID resume id is
+# treated by Codex as a thread NAME and silently starts a brand-new thread.
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def is_uuid_string(value: str | None) -> bool:
+    """True iff *value* is a canonical UUID string (the amux resume guard)."""
+    if not isinstance(value, str):
+        return False
+    return _UUID_RE.match(value.strip()) is not None
 
 
 # ── Fork-bomb cap ─────────────────────────────────────────────────────────────

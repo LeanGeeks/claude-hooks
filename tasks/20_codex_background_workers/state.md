@@ -29,7 +29,7 @@ and event-shape uncertainties before production implementation.
 | 20-01 | [Provider-neutral handle and event reducer](./20-01-handle-event-reducer.md) | done | amux 01-01 | Schema migration, fixtures, pure Codex JSONL reducer; no launch changes |
 | 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | done | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | done | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
-| 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | todo | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
+| 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | done | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
 | 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | todo | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
 | 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | todo | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
 
@@ -139,3 +139,21 @@ the full repository suite and the sibling amux suite at the pinned revision.
   - `test_unit_amux_spawn.py`'s codex refusal test updated to reflect that
     `--wait`/`--notify` are now supported for codex (`--profile` refusal
     retained) — tracks the real behavior added here, confirmed by review.
+- **2026-08-23 — 20-04 done.** `amux-spawn resume <name> -- "prompt"` launches
+  a second bounded turn on the same Codex thread: lock-serialized §7
+  coordination (gates -> segment -> amux resume argv -> atomic attempt update
+  only after launch success), thread-ID authority from amux meta.json with
+  fail-closed missing/malformed/mismatch errors, amux's rc-66 quarantine
+  surfaced as `thread_mismatch` without clobbering prior result or evidence.
+  Attempt counter gates in-flight reads (no stale idle while attempt 2 runs);
+  `last` returns the newest successful result. Reviewed PASS with zero findings
+  (first clean-sheet review in the epic). Suite **889 ran / 0 failed / 1
+  pre-existing skip**; 42 resume tests in `test_unit_amux_resume.py`,
+  registered in the runner.
+  - **`--model` space-form decision (closed):** `--model=X` / `--profile=X` are
+    documented as the unambiguous spawn forms in the CLI epilogs; the parser is
+    unchanged and the Claude path byte-identical. Resume accepts both forms
+    naturally (no suffix positional). `--profile` on resume errors with
+    guidance because `codex exec resume` rejects `-p`.
+  - No Codex model is injected when the caller omits one; explicit choices pass
+    through to amux's contract on both spawn and resume.

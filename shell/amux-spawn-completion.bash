@@ -8,7 +8,8 @@
 #   amux-spawn a|attach <TAB>   → session SUFFIXES from live `amux ls`, preferring
 #                                   the current workspace's sessions first.
 #   amux-spawn <TAB>            → subcommands.
-#   amux-spawn status|last <TAB>→ tracked session names (from ~/.amux/spawn/*.json).
+#   amux-spawn status|last|resume <TAB>
+#                               → tracked session names (from ~/.amux/spawn/*.json).
 #   amux-spawn spawn <TAB>      → (no suffix completion; too context-sensitive)
 #   amux-spawn ls <TAB>         → flags.
 #
@@ -30,7 +31,7 @@ _amux_spawn_completions() {
 
     # ── Top-level subcommand completion ──────────────────────────────────────
     if [[ $cword -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "spawn a attach status last ls profiles" -- "$cur"))
+        COMPREPLY=($(compgen -W "spawn a attach status last ls rm resume profiles" -- "$cur"))
         return
     fi
 
@@ -40,8 +41,8 @@ _amux_spawn_completions() {
         return
     fi
 
-    # ── status / last: complete the <handle> from the spawn registry ──────────
-    if [[ "$subcommand" == "status" || "$subcommand" == "last" ]] && [[ $cword -eq 2 ]]; then
+    # ── status / last / resume: complete the <handle> from the spawn registry ──
+    if [[ "$subcommand" == "status" || "$subcommand" == "last" || "$subcommand" == "resume" ]] && [[ $cword -eq 2 ]]; then
         local spawn_dir="${HOME}/.amux/spawn"
         if [[ -d "$spawn_dir" ]]; then
             local names=()
