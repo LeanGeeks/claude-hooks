@@ -56,6 +56,9 @@ TEST_MODULES = {
     "unit_logging": "test_logging_verification",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",
+    "amux_pin": "test_amux_pin",
+    "integration_codex_cli": "test_integration_codex_cli",
+    "integration_codex_tmux": "test_integration_codex_tmux",
 }
 
 

@@ -30,7 +30,7 @@ and event-shape uncertainties before production implementation.
 | 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | done | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | done | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | done | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
-| 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | todo | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
+| 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | done | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
 | 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | todo | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
 
 `amux NN-NN` refers to tasks in
@@ -157,3 +157,62 @@ the full repository suite and the sibling amux suite at the pinned revision.
     guidance because `codex exec resume` rejects `-p`.
   - No Codex model is injected when the caller omits one; explicit choices pass
     through to amux's contract on both spawn and resume.
+- **2026-08-23 — 20-05 done.** Packaging, regression, and docs shipped:
+  - **Installer:** the epic's new modules were already allowlisted
+    (`codex_event_reducer.py` joined REQUIRED_HOOKS in 20-01); a full audit
+    confirmed the CLI's every local import (`amux_spawn_lib`,
+    `codex_event_reducer`, lazy `permission_state_store`) ships, and the only
+    unshipped hooks file is the legacy stray `test_task03.py` (imported by
+    nothing). Diagnostics now import the reducer from the deployed location
+    (Step-3 sanity + the final hook test) and probe the PATH-resolved `amux`
+    for the Codex provider surface (warn-only: Claude spawning must not fail
+    on it). `install-claude-config.sh` was RUN for real and verified: the
+    deployed `~/.local/bin/amux-spawn` completed a full fake-amux worker
+    cycle (spawn → idle → last → rm) importing both modules from
+    `~/.claude/hooks/`. **Finding:** the installed `/usr/local/bin/amux`
+    predates the pin (no `__codex-run`); the installer's probe now reports
+    this as STALE. Run `./install-amux.sh` (pin updated to `11a8426…`, Codex
+    fork markers added) before 20-06 live verification.
+  - **Drift check:** `tests/test_amux_pin.py` verifies pin containment
+    (`git merge-base --is-ancestor`) against the sibling checkout when it
+    exists, skips cleanly when absent, fails with checkout/merge-or-move-the-
+    pin instructions on drift, and pins the revision consistently across
+    tests, `install-amux.sh`, the operator doc, and Phase 0 above.
+  - **Integration:** `tests/test_integration_codex_cli.py` (13 tests) runs
+    the REAL CLI end to end through PATH-shimmed fake `amux` + fake `codex`
+    (fixture-shaped JSONL, wrapper artifacts) and a state-file fake tmux:
+    launch, JSONL flow, result capture, failure, timeout, resume (incl. the
+    rc-66 thread-mismatch quarantine), cleanup, argv boundaries, --yolo
+    translation. `tests/test_integration_codex_tmux.py` runs one worker in a
+    REAL tmux pane on a private `-L` socket with a stubbed provider,
+    proving the pane/argv path and evidence-over-liveness end to end.
+    No credentials anywhere; teardown asserts zero live sessions/pids.
+  - **Docs:** `docs/amux-spawn-codex-workers.md` — operator examples for
+    detached spawn, wait, status/last, resume, model (`--model=X` form), rm;
+    YOLO trusted-host implications stated plainly; Codex workers have NO
+    Telegram permission prompts by design (blocked/HALT result; the
+    foreground Claude workflow owns human interaction) — never presented as a
+    prerequisite.
+  - Suite **908 ran / 0 failed / 1 pre-existing skip** (was 889); amux suite
+    at HEAD `db7e29d` (contains the pin): **398 passed / 0 failed**.
+- **2026-08-23 — 20-05 done. All engineering tasks complete.** Installer
+  allowlists and diagnostics ship `codex_event_reducer.py` and the
+  Codex-capable launcher; `install-claude-config.sh` was run for real and the
+  DEPLOYED copies verified importable, with a full fake-environment worker
+  cycle (spawn -> idle -> last -> rm) executed from the installed paths.
+  Drift check: ancestor-containment against the `11a8426` pin with
+  skip-when-absent and an actionable fix-or-move-the-pin message; the pin is
+  recorded in the tests, `install-amux.sh`, and
+  `docs/amux-spawn-codex-workers.md`. 19 integration tests (fake amux + fake
+  codex through PATH shims driving the real CLI, plus one private-tmux test).
+  YOLO docs state the full host filesystem/network/Docker access plainly and
+  present the absence of Telegram prompts as an explicit design decision.
+  Reviewed PASS (3 LOW doc/comment fixes applied in place). Final verification:
+  this repo **908 ran / 0 failed / 1 pre-existing skip**; sibling amux at the
+  pinned lineage **398 passed / 0 failed**.
+  - **OPERATOR ACTION REQUIRED before 20-06:** the installed
+    `/usr/local/bin/amux` is STALE (dated 2026-06-22, pre-Codex, lacks the
+    `__codex-run` marker). Live verification must first refresh it:
+    `./install-amux.sh` (pin `11a8426…`, branch `feat/epic-10-amux-extensions`;
+    requires sudo, writes to `/usr/local/bin`). The installer's stale-detection
+    diagnostic now emits this guidance itself.

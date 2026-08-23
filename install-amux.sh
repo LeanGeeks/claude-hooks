@@ -24,7 +24,12 @@ PARENT_DIR="$(dirname "$SCRIPT_DIR")"
 # Defaults (overridable by flag or environment)
 AMUX_DIR="${AMUX_DIR:-$PARENT_DIR/amux}"
 AMUX_BRANCH="${AMUX_BRANCH:-feat/epic-10-amux-extensions}"
-AMUX_PIN="${AMUX_PIN:-9b05d10}"          # commit amux-spawn is validated against
+# Epic 20 pin (full sha): sibling epic 01 (Codex provider) complete, amux
+# suite 398 passed / 0 failed at this revision. Recorded together with
+# tests/test_amux_pin.py, docs/amux-spawn-codex-workers.md and epic-20
+# state.md Phase 0 — move all four together. Contains the epic-10 pin
+# 9b05d10, so it serves both the spawn chain and the Codex worker path.
+AMUX_PIN="${AMUX_PIN:-11a8426a014e8b9ca30134758e66e3912628b647}"
 INSTALL_DIR="${AMUX_INSTALL_DIR:-/usr/local/bin}"
 AMUX_REPO_SSH="git@github.com:aDorofeev/amux.git"
 AMUX_REPO_HTTPS="https://github.com/aDorofeev/amux.git"
@@ -84,13 +89,16 @@ BACKUP="$INSTALL_DIR/amux.pre-epic10.bak"
 
 # Fork markers: the fork does NOT bump CC_VERSION (still 0.3.0), so `amux
 # --version` cannot tell fork from upstream. These strings are the E1-E5
-# extensions; all are absent from upstream 0.3.0.
+# extensions plus the epic-01 Codex provider surface; all are absent from
+# upstream 0.3.0.
 FORK_MARKERS=(
     "--no-default-model"   # E2 — suppress the injected `--model sonnet`
     "--no-attach"          # E5 — detached create
     "switch-client"        # E3 — nested-tmux attach
     "claude_session_id"    # E4 — session id in <name>.meta.json, not CC_FLAGS
     "update-environment"   # E1 — env propagation allowlist
+    "--agent-mode"         # epic 01 — Codex bounded/interactive provider mode
+    "__codex-run"          # epic 01 — bounded-run launch wrapper (artifacts, .rc)
 )
 
 if ! command -v git &> /dev/null; then

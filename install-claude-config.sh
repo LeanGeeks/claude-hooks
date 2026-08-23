@@ -299,6 +299,7 @@ fi
 log_step "Step 3/5: Installing amux-spawn launcher"
 
 AMUX_SPAWN_INSTALLED=false
+AMUX_CODEX_STATUS="not probed"
 USER_BIN_DIR="$HOME/.local/bin"
 if [[ ! -f "$PROJECT_BIN_DIR/amux-spawn" ]]; then
     log_warn "amux-spawn not found at $PROJECT_BIN_DIR/amux-spawn — skipping launcher install"
@@ -309,15 +310,37 @@ else
     log_info "Installed: amux-spawn → $USER_BIN_DIR/amux-spawn"
     AMUX_SPAWN_INSTALLED=true
 
-    # Sanity: it must import its shared lib (copied to ~/.claude/hooks/ in Step 1).
+    # Sanity: it must import its shared lib and the Codex reducer (both are
+    # copied to ~/.claude/hooks/ in Step 1; the launcher sys.path-inserts that
+    # dir at runtime). A missing reducer degrades Codex reads to
+    # liveness-only, so verify it here rather than at first spawn.
     if [[ "$HOOKS_INSTALLED" == true ]]; then
-        if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); import amux_spawn_lib" 2>/dev/null; then
-            log_info "  amux_spawn_lib importable from $GLOBAL_HOOKS_DIR"
+        if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); import amux_spawn_lib, codex_event_reducer" 2>/dev/null; then
+            log_info "  amux_spawn_lib + codex_event_reducer importable from $GLOBAL_HOOKS_DIR"
         else
-            log_warn "  amux_spawn_lib not importable — amux-spawn will fail until Step 1 succeeds"
+            log_warn "  amux_spawn_lib / codex_event_reducer not importable from $GLOBAL_HOOKS_DIR — amux-spawn (and its Codex path) will fail until Step 1 succeeds"
         fi
     else
         log_warn "  Hooks not installed, so amux_spawn_lib.py is not in $GLOBAL_HOOKS_DIR — amux-spawn will not run"
+    fi
+
+    # Codex provider probe (epic 20): a bounded Codex worker needs the fork's
+    # provider surface (epic-01: --agent-mode exec / the __codex-run wrapper).
+    # An amux older than the pinned revision silently lacks it — Claude
+    # spawning still works, so this is a WARN with the fix, never a failure.
+    AMUX_RESOLVED="$(command -v amux 2>/dev/null || true)"
+    AMUX_CODEX_STATUS="unknown (amux not on PATH)"
+    if [[ -n "$AMUX_RESOLVED" ]]; then
+        if grep -q -- "__codex-run" "$AMUX_RESOLVED" 2>/dev/null; then
+            log_info "  amux at $AMUX_RESOLVED carries the Codex provider surface (epic 20)"
+            AMUX_CODEX_STATUS="capable ($AMUX_RESOLVED)"
+        else
+            log_warn "  amux at $AMUX_RESOLVED predates the Codex provider (epic 20)."
+            log_warn "    Codex workers (\`amux-spawn spawn --provider codex\`) will fail until amux is updated:"
+            log_warn "    ./install-amux.sh   # pin 11a8426…, branch feat/epic-10-amux-extensions (requires sudo; writes to /usr/local/bin)"
+            log_warn "    (see docs/amux-spawn-codex-workers.md for the pinned-revision contract)"
+            AMUX_CODEX_STATUS="STALE ($AMUX_RESOLVED lacks the Codex provider)"
+        fi
     fi
 
     case ":$PATH:" in
@@ -818,6 +841,7 @@ fi
 # Show amux-spawn status
 if [[ "$AMUX_SPAWN_INSTALLED" == true ]]; then
     echo "  - amux-spawn: installed ($USER_BIN_DIR/amux-spawn)"
+    echo "    - amux Codex provider: $AMUX_CODEX_STATUS"
 else
     echo "  - amux-spawn: not installed"
 fi
@@ -887,7 +911,7 @@ log_info "To restore: cp \"$BACKUP_FILE\" \"$GLOBAL_CONFIG\""
 if [[ "$HOOKS_INSTALLED" == true ]]; then
     echo ""
     log_info "Testing hook installation..."
-    if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); from bash_command_parser import BashCommandParser; print('Hook modules loaded successfully')" 2>/dev/null; then
+    if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); from bash_command_parser import BashCommandParser; import amux_spawn_lib, codex_event_reducer; print('Hook modules loaded successfully')" 2>/dev/null; then
         log_info "Hook modules are working correctly!"
     else
         log_warn "Hook modules test failed (this may be okay if dependencies are missing)"
