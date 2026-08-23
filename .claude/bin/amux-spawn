@@ -1076,6 +1076,17 @@ def _wait_for_idle(
     artifact is re-checked for :data:`CODEX_ORPHAN_GRACE_S` before the wait
     gives up (the caller's deadline still wins — expiry mid-grace is a
     timeout, exit 3, not an error).
+
+    Codex idle acceptance additionally requires the run's file writes to be
+    FINAL (sign-off finding F1): ``turn.completed`` is flushed to the event log
+    before codex writes the final-message artifact, and amux's wrapper writes
+    the ``.rc`` sibling only after codex exits — so a poll can observe true
+    idle while the result file is still empty (first attempt) or still holds
+    the previous attempt's text (after a resume). An idle with no ``.rc`` yet
+    is re-polled for :data:`CODEX_RESULT_GRACE_S` and then accepted fail-open:
+    completion evidence beats the artifact (architecture §5), and the stdout
+    contract already documents "or an empty string if none". The payload itself
+    is derived by :func:`_final_message` — the SAME read path ``last`` uses.
     """
     deadline: float | None = (time.time() + timeout_s) if timeout_s is not None else None
 
@@ -1086,6 +1097,10 @@ def _wait_for_idle(
 
     # Codex orphan re-check: when the derived state first reads "terminated".
     terminated_since: float | None = None
+
+    # Codex result-lag re-check: when idle is first seen without the run's
+    # writes being final (no ``.rc`` sibling yet).
+    result_lag_since: float | None = None
 
     while True:
         # Check timeout BEFORE polling so a zero-timeout returns immediately.
@@ -1108,6 +1123,7 @@ def _wait_for_idle(
         codex = lib.is_codex_handle(handle)
 
         if state == "terminated":
+            result_lag_since = None
             if not codex:
                 return "error", f"session '{name}' terminated before reaching idle"
             # Re-check the artifact instead of latching the first "gone"
@@ -1126,14 +1142,30 @@ def _wait_for_idle(
                 seen_non_idle = True
 
             if state == "idle" and (codex or seen_non_idle):
-                if codex:
-                    # True idle: turn.completed in the event artifact. The
-                    # payload is the bounded final-message text.
-                    return "idle", _codex_result_text(handle) or ""
-                # True idle: a Stop with empty background_tasks, after the seeded
-                # turn ran (seen_non_idle gate).
-                last_message = handle.get("last_message") or ""
-                return "idle", last_message
+                if not codex:
+                    # True idle: a Stop with empty background_tasks, after the
+                    # seeded turn ran (seen_non_idle gate). Claude's payload is
+                    # the producer hook's last_message — byte-identical to the
+                    # pre-F1 behavior, via the shared derivation.
+                    return "idle", _final_message(handle) or ""
+                # Codex true idle: the NEWEST segment's turn.completed is in the
+                # event artifact. Accept only once the run's writes are final —
+                # a present .rc sibling means codex exited, and codex writes
+                # the final-message artifact before exiting (F1).
+                signals = result.get("signals") or {}
+                if signals.get("exit_code_present"):
+                    return "idle", _final_message(handle) or ""
+                now = time.time()
+                if result_lag_since is None:
+                    result_lag_since = now
+                elif now - result_lag_since >= CODEX_RESULT_GRACE_S:
+                    # Fail-open: completion evidence beats the artifact (§5).
+                    # Print whatever the shared reader gives — possibly "" per
+                    # the documented stdout contract.
+                    return "idle", _final_message(handle) or ""
+                # Writes still in flight — fall through and poll again.
+            else:
+                result_lag_since = None
 
         # Not yet idle (or idle but haven't seen a non-idle intermediate) — keep
         # waiting.
@@ -1302,6 +1334,15 @@ def _reason_context(handle: dict[str, Any]) -> dict[str, Any]:
 # therefore re-check the artifact for this long before latching "terminated".
 CODEX_ORPHAN_GRACE_S = 10.0
 
+# Same evidence family, other direction: ``turn.completed`` is flushed to the
+# event log BEFORE codex writes the ``--output-last-message`` file (written at
+# exec end), and amux's wrapper writes the ``.rc`` sibling only after codex
+# exits — so ``--wait`` can observe true idle while the final-message artifact
+# is still in flight (empty on a first attempt, the previous attempt's text
+# after a resume — sign-off finding F1). Re-poll for this long for the run's
+# writes to become final before printing; after that, fail open.
+CODEX_RESULT_GRACE_S = 10.0
+
 # Normalized Codex failure reasons (task 20-03 work item 6). The terminated
 # ones come straight out of the reducer; the three below are derived here.
 CODEX_REASON_STALE_ACTIVITY = "stale_activity"          # alive but silent
@@ -1341,6 +1382,20 @@ def _codex_result_text(handle: dict[str, Any]) -> str | None:
         return codex_reducer.read_result_text(handle.get("result_path"))
     except Exception:  # noqa: BLE001
         return None
+
+
+def _final_message(handle: dict[str, Any]) -> str | None:
+    """The message ``last`` prints for this handle — ONE derivation, two callers.
+
+    Codex: the bounded final-message artifact via the reducer's reader (the
+    newest successful turn's text). Claude: the producer hook's
+    ``last_message`` handle field. ``cmd_last`` and the ``--wait`` completion
+    print both go through here so the two surfaces can never diverge again
+    (sign-off finding F1 shipped exactly such a divergence).
+    """
+    if lib.is_codex_handle(handle):
+        return _codex_result_text(handle)
+    return handle.get("last_message")
 
 
 def _codex_failure_summary(result: dict[str, Any]) -> str | None:
@@ -1789,11 +1844,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_last(args: argparse.Namespace) -> int:
     """``last <handle>`` — print the handle's last message.
 
-    Claude: the producer hook's ``last_message``. Codex: the explicit
-    final-message artifact (``--output-last-message``), read through the
-    reducer's bounded reader — never Codex's internal transcript format (BRD
-    §4.2 / invariant 5). The bound is the reducer's ``MAX_RESULT_BYTES``
-    (256 KiB); a larger artifact is truncated, not rejected.
+    The derivation is :func:`_final_message` — the SAME read path the
+    ``--wait`` completion print uses, so the two surfaces cannot diverge
+    (sign-off finding F1). Claude: the producer hook's ``last_message``.
+    Codex: the explicit final-message artifact (``--output-last-message``),
+    read through the reducer's bounded reader — never Codex's internal
+    transcript format (BRD §4.2 / invariant 5). The bound is the reducer's
+    ``MAX_RESULT_BYTES`` (256 KiB); a larger artifact is truncated, not
+    rejected.
     """
     if not getattr(args, "handle", None):
         _eprint("amux-spawn last: missing <handle>")
@@ -1806,7 +1864,7 @@ def cmd_last(args: argparse.Namespace) -> int:
             _eprint(f"amux-spawn last: no tracked handle found for {name}")
         return 1
     if lib.is_codex_handle(handle):
-        last_message = _codex_result_text(handle)
+        last_message = _final_message(handle)
         if args.json:
             print(json.dumps({
                 "name": name,
@@ -1823,7 +1881,7 @@ def cmd_last(args: argparse.Namespace) -> int:
                 return 1
             print(last_message)
         return 0
-    last_message = handle.get("last_message")
+    last_message = _final_message(handle)
     if args.json:
         print(json.dumps({"name": name, "last_message": last_message}))
     else:

@@ -47,6 +47,7 @@ TEST_MODULES = {
     "unit_amux_resume": "test_unit_amux_resume",
     "unit_amux_reads": "test_unit_amux_reads",
     "unit_amux_supervise": "test_unit_amux_supervise",
+    "unit_amux_wait_print": "test_unit_amux_wait_print",
     "unit_amux_ergonomics": "test_unit_amux_ergonomics",
     "unit_amux_rm": "test_unit_amux_rm",
     "unit_profile_loader": "test_profile_loader",

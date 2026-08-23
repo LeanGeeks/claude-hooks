@@ -371,8 +371,9 @@ def reduce_events(
     unknown_events: list[str] = []
     unknown_items: list[str] = []
     last_index = len(lines) - 1
-    # Index of the last authoritative turn boundary seen, so appended resume
-    # segments are resolved last-wins (see ``outcome`` below).
+    # The last authoritative turn boundary seen **within the newest segment**,
+    # so appended resume segments are resolved last-wins per segment (see
+    # ``outcome`` below and EVENT_THREAD_STARTED in the loop).
     last_turn_event: str | None = None
     failure_message: str | None = None
 
@@ -406,6 +407,17 @@ def reduce_events(
             tid = event.get("thread_id")
             if isinstance(tid, str) and tid and tid not in out["thread_ids"]:
                 out["thread_ids"].append(tid)
+            # A new segment began: any turn outcome already seen belongs to an
+            # OLDER attempt and must stop governing (amux appends resume
+            # segments to the same log; architecture §5 — "the next attempt
+            # temporarily returns to spawning/running"). Until this segment
+            # emits its own turn terminal event there is no authoritative
+            # outcome, exactly like a first segment mid-turn. Without this
+            # reset a resumed worker mid-turn false-read idle off the previous
+            # attempt's turn.completed once the new segment's first event
+            # landed (epic-20 sign-off finding F1).
+            last_turn_event = None
+            failure_message = None
         elif etype == EVENT_TURN_STARTED:
             out["turn_started"] = True
         elif etype == EVENT_TURN_COMPLETED:
@@ -435,11 +447,14 @@ def reduce_events(
     # ── outcome (architecture s5 priority rule) ──
     #
     # Completion evidence is authoritative; the exit code is never consulted
-    # here. ``last_turn_event`` is last-wins so that an appended resume segment
-    # governs: a single segment can only carry one of the two events, so this
-    # reduces exactly to s5 for the non-resume case, while a successful resume
-    # after a failed attempt is not permanently poisoned by the old failure
-    # (s7: "a failed resume preserves the previous result and evidence").
+    # here. ``last_turn_event`` is last-wins *within the newest segment* (a
+    # ``thread.started`` resets it, see the loop), so an appended resume
+    # segment governs: a single segment can only carry one of the two events,
+    # so this reduces exactly to s5 for the non-resume case, while a successful
+    # resume after a failed attempt is not permanently poisoned by the old
+    # failure (s7: "a failed resume preserves the previous result and
+    # evidence") and an IN-FLIGHT resumed segment inherits no verdict at all
+    # from the older one.
     if last_turn_event == EVENT_TURN_FAILED:
         out["outcome"] = OUTCOME_FAILED
         out["state_hint"] = STATE_TERMINATED

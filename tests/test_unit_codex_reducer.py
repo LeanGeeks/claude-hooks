@@ -740,6 +740,34 @@ class TestOutcomeOrdering(unittest.TestCase):
             self.assertEqual(out["state_hint"], reducer.STATE_TERMINATED)
             self.assertEqual(out["failure"]["reason"], "turn_failed")
 
+    def test_incomplete_resume_segment_inherits_no_verdict(self):
+        """A resumed segment that has STARTED but not finished must not
+        inherit the previous segment's outcome: ``thread.started`` opens a new
+        segment and resets the governing turn event. Mid-turn used to read
+        idle off the previous attempt's turn.completed (sign-off finding F1 —
+        ``--wait`` then printed the stale result)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            path = tmp / "segments.jsonl"
+            path.write_bytes(
+                _fixture("exec_success").read_bytes()
+                + b'{"type":"thread.started","thread_id":"'
+                + b"01a00000-0000-7000-8000-000000000001"
+                + b'"}\n{"type":"turn.started"}\n'
+            )
+            # No .rc: the resumed run is still live — no verdict may govern.
+            out = reducer.reduce_events(path)
+            self.assertEqual(out["segments"], 2)
+            self.assertTrue(out["turn_completed"])  # file-wide signal kept
+            self.assertEqual(out["outcome"], reducer.OUTCOME_INCOMPLETE)
+            self.assertIsNone(out["state_hint"],
+                              "a mid-turn resumed segment must not read idle")
+            # Once the newest segment completes, IT governs.
+            with open(path, "a") as f:
+                f.write('{"type":"turn.completed","usage":{}}\n')
+            out2 = reducer.reduce_events(path)
+            self.assertEqual(out2["state_hint"], reducer.STATE_IDLE)
+
 
 class TestSmallReaders(unittest.TestCase):
     def test_read_exit_code_strips_and_parses(self):

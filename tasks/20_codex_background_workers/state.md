@@ -239,3 +239,14 @@ the full repository suite and the sibling amux suite at the pinned revision.
     in the Codex read-back); F2 without `--dir` the Codex worker's cwd is the
     amux workspace root, not the invoking shell's cwd — docs should say so
     loudly; F3 `status`/`last`/`ls` lookups are workspace-scoped by cwd.
+- **2026-08-23 — follow-up F1 fixed** (post-rebase onto the epic-21 tip,
+  `34560c2`). The live-stale `--wait` print for codex workers was NOT the
+  handle-`last_message` hypothesis — the wait already read the artifact. Real
+  cause: the reducer resolved turn outcome last-wins across resume segments
+  (mid-resume false idle), and codex writes the result file after flushing
+  `turn.completed` (empty first print). Fixed via reducer segment-scoping
+  plus a `.rc`-finality conditional re-check in `_wait_for_idle`, both
+  surfaces unified through one `_final_message` helper reusing the `last`
+  derivation. Claude output byte-pinned; exit codes untouched. Reviewed PASS,
+  zero findings; both halves mutation-verified. Suite **923 ran / 0 failed /
+  1 pre-existing skip**. F2/F3 remain doc follow-ups.

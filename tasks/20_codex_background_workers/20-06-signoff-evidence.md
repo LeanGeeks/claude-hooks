@@ -124,3 +124,21 @@ immediately — see F2).
       with no workflow files edited (fixtures patterned after Flightclaim's
       review tasks and Hyppie Flow's `docs/workflow.md` verdict contract;
       neither repo touched).
+
+## Postscript — F1 root cause corrected and fixed (2026-08-23, post-rebase)
+
+The F1 note above attributed the stale print to the handle `last_message`
+field. Investigation during the fix disproved that hypothesis: the wait path
+already read the result artifact. The confirmed root cause was two defects:
+
+1. the reducer resolved turn outcome last-wins across appended resume
+   segments, so a mid-resume worker falsely read idle via attempt-1's
+   `turn.completed` (the stale print after resume), and
+2. codex writes the result file after flushing `turn.completed`, so an
+   immediate read printed empty content (the empty first print) — gated now
+   by a `.rc`-finality conditional re-check (not a fixed delay).
+
+Both surfaces route through one `_final_message` helper reusing the `last`
+derivation; Claude output byte-pinned; exit codes and `AMUX_WAIT_TIMEOUT`
+untouched. Reviewed PASS with zero findings; 7 new tests; suite 923 / 0 / 1.
+F1 is CLOSED. (F2/F3 remain documentation follow-ups.)
