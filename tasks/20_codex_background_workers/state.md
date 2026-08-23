@@ -31,7 +31,7 @@ and event-shape uncertainties before production implementation.
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | done | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | done | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
 | 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | done | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
-| 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | blocked | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
+| 20-06 | [Live cross-project verification](./20-06-live-verification_human.md) | done | 20-05 | Real Claude→Codex workers; disposable YOLO/network/Docker checks |
 
 `amux NN-NN` refers to tasks in
 [`../../../amux/tasks/01_codex_cli_provider/state.md`](../../../amux/tasks/01_codex_cli_provider/state.md).
@@ -225,3 +225,17 @@ the full repository suite and the sibling amux suite at the pinned revision.
      [20-06-live-verification_human.md](./20-06-live-verification_human.md),
      recording the sign-off evidence listed there.
   Mark `done` only when that evidence is recorded.
+- **2026-08-23 — 20-06 done. Epic 20 complete.** The operator authorized the
+  manager session to execute the live procedure; all seven steps passed with
+  evidence recorded in
+  [20-06-signoff-evidence.md](./20-06-signoff-evidence.md) and the operator
+  accepted the sign-off. Installed chain verified live: deployed
+  `amux-spawn` + `/usr/local/bin/amux` (`db7e29d`, zero production-code delta
+  vs pin `11a8426`) + `codex-cli 0.149.0`. Every BRD §6 success criterion
+  checked. Cleanup verified: no tmux sessions, handles, or containers left.
+  - **Follow-ups recorded in the evidence doc (knowledge work, not blockers):**
+    F1 `spawn --wait` prints a stale/empty final message for Codex workers
+    (`last`/result artifact correct; Claude path prints correctly — defect is
+    in the Codex read-back); F2 without `--dir` the Codex worker's cwd is the
+    amux workspace root, not the invoking shell's cwd — docs should say so
+    loudly; F3 `status`/`last`/`ls` lookups are workspace-scoped by cwd.
