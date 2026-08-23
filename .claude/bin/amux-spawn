@@ -209,6 +209,31 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
     if inh_model:
         forward_flags += ["--model", inh_model]
 
+    # Automated spawns must not read the harness default (epic 21). The non-TTY
+    # path IS the agent path, so warn there — never refuse (brd §2.2), never
+    # raise (brd §3 H1).
+    #
+    # Placement is after the inherited-model block above so that a chained
+    # opus→opus spawn (which just added --model via inh_model) is correctly seen
+    # as pinned and does not cry wolf.
+    if not is_tty:
+        model_pinned = (lib.extract_model_flag(forward_flags) is not None
+                        or bool(os.environ.get("ANTHROPIC_MODEL")))
+        # CLAUDE_CODE_EFFORT_LEVEL is deliberately NOT counted as a pin.
+        # Two independent reasons: (1) amux's AMUX_ENV_ALLOWLIST does not carry
+        # it, so it cannot reach the child at all (brd §1 finding 5); (2) even
+        # if it could, it overrides --effort rather than backing it up (brd §1
+        # finding 6), so counting it would silence the warning about the one
+        # input that can silently un-pin every per-spawn --effort flag.
+        effort_pinned = lib.extract_flag_value(forward_flags, "--effort") is not None
+        if not model_pinned:
+            _eprint("amux-spawn: warning: non-TTY (agent) spawn pins no model — "
+                    "the child reads the harness default, which floats between "
+                    "sessions; pass --model <alias>")
+        if not effort_pinned:
+            _eprint("amux-spawn: warning: non-TTY (agent) spawn pins no effort — "
+                    "the child reads the harness default; pass --effort <level>")
+
     stuck_after_s = parse_stuck_after(args.stuck_after)
 
     # Build the amux exec base command (E2: --no-default-model so ANTHROPIC_MODEL

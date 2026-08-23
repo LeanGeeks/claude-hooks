@@ -16,7 +16,9 @@ Two layers:
    real session) — so the default suite stays hermetic.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -503,6 +505,297 @@ class TestLivenessCheckFailure(unittest.TestCase):
             spawn_dir = tmp / "spawn"
             handles = list(spawn_dir.glob("*.json")) if spawn_dir.exists() else []
             self.assertEqual(handles, [])
+
+
+class TestSpawnPinWarnings(unittest.TestCase):
+    """Warn on an unpinned model or effort on the non-TTY path (epic 21, 21-01).
+
+    Cases 1–7 drive ``cmd_spawn`` end-to-end (amux/tmux mocked).
+    Case 8 is a unit test of ``extract_flag_value``.
+    """
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _run_nontty(self, tmp: Path, ws: Path, extra_argv=None,
+                    parent_name=None, parent_flags=None, anthropic_model=None):
+        """Drive a non-TTY spawn via ``cli.main`` and return
+        ``(rc, stderr_text, forward_flags)``.
+
+        ``anthropic_model``: when not None, sets ANTHROPIC_MODEL in the env.
+        When None, removes ANTHROPIC_MODEL so each test is isolated.
+
+        Does NOT change the 3-tuple arity of
+        ``TestSpawnDispatch._run_spawn_nontty``; use a sibling helper instead
+        of modifying that method.
+
+        Limitation: ``parse_known_args`` inside ``cli.main`` consumes a bare
+        token following an unknown flag (e.g. ``--model opus``) as the
+        positional ``suffix`` rather than as the flag's value. Use
+        ``--model=opus`` (equals form) for model/effort pins in ``extra_argv``
+        to avoid this. For space-form tests use ``_run_cmd_spawn_direct``.
+        """
+        created: dict = {}
+        live_names: set[str] = set()
+
+        def fake_create(*, name, abs_dir, forward_flags, session_id, prompt):
+            created["name"] = name
+            created["forward_flags"] = forward_flags
+            live_names.add(name)
+            return 0, None
+
+        argv = ["spawn", "--dir", str(ws)] + (extra_argv or []) + ["--", "go"]
+        stderr_buf = io.StringIO()
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_redirect_amux_home(tmp))
+            stack.enter_context(
+                patch.object(cli.lib, "resolve_amux_session", return_value=parent_name)
+            )
+            stack.enter_context(
+                patch.object(cli.lib, "list_amux_names", return_value=set())
+            )
+            stack.enter_context(
+                patch.object(cli.lib, "tmux_has_session",
+                             side_effect=lambda n: n in live_names)
+            )
+            stack.enter_context(
+                patch.object(cli, "_amux_create_detached", side_effect=fake_create)
+            )
+            mock_stdin = stack.enter_context(patch("sys.stdin"))
+            mock_stdout = stack.enter_context(patch("sys.stdout"))
+            mock_stdin.isatty.return_value = False
+            mock_stdout.isatty.return_value = False
+
+            if parent_flags is not None:
+                stack.enter_context(
+                    patch.object(cli.lib, "parent_cc_flags", return_value=parent_flags)
+                )
+
+            # Isolate ANTHROPIC_MODEL: set it or ensure it is absent.
+            if anthropic_model is not None:
+                stack.enter_context(
+                    patch.dict(os.environ, {"ANTHROPIC_MODEL": anthropic_model}, clear=False)
+                )
+            else:
+                stack.enter_context(patch.dict(os.environ, {}, clear=False))
+                os.environ.pop("ANTHROPIC_MODEL", None)
+
+            stack.enter_context(contextlib.redirect_stderr(stderr_buf))
+            rc = cli.main(argv)
+
+        return rc, stderr_buf.getvalue(), created.get("forward_flags", [])
+
+    def _run_cmd_spawn_direct(self, tmp: Path, ws: Path, claude_flags=None,
+                              anthropic_model=None):
+        """Drive ``cmd_spawn`` directly with pre-built ``claude_flags``.
+
+        This bypasses ``parse_known_args`` so the exact tokens in
+        ``claude_flags`` (including space-form ``["--effort", "high"]`` or
+        ``["--model", "opus"]``) end up verbatim in ``forward_flags``, which
+        is what the warning block inspects. Returns ``(rc, stderr_text)``.
+        """
+        live_names: set[str] = set()
+
+        def fake_create(*, name, abs_dir, forward_flags, session_id, prompt):
+            live_names.add(name)
+            return 0, None
+
+        stderr_buf = io.StringIO()
+
+        # Build a Namespace with spawn defaults so cmd_spawn gets everything
+        # it expects, then override just the dir.
+        parser = cli.build_parser()
+        ns, _ = parser.parse_known_args(["spawn", "--dir", str(ws)])
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(_redirect_amux_home(tmp))
+            stack.enter_context(
+                patch.object(cli.lib, "resolve_amux_session", return_value=None)
+            )
+            stack.enter_context(
+                patch.object(cli.lib, "list_amux_names", return_value=set())
+            )
+            stack.enter_context(
+                patch.object(cli.lib, "tmux_has_session",
+                             side_effect=lambda n: n in live_names)
+            )
+            stack.enter_context(
+                patch.object(cli, "_amux_create_detached", side_effect=fake_create)
+            )
+            mock_stdin = stack.enter_context(patch("sys.stdin"))
+            mock_stdout = stack.enter_context(patch("sys.stdout"))
+            mock_stdin.isatty.return_value = False
+            mock_stdout.isatty.return_value = False
+
+            if anthropic_model is not None:
+                stack.enter_context(
+                    patch.dict(os.environ, {"ANTHROPIC_MODEL": anthropic_model}, clear=False)
+                )
+            else:
+                stack.enter_context(patch.dict(os.environ, {}, clear=False))
+                os.environ.pop("ANTHROPIC_MODEL", None)
+
+            stack.enter_context(contextlib.redirect_stderr(stderr_buf))
+            rc = cli.cmd_spawn(ns, list(claude_flags or []), "go")
+
+        return rc, stderr_buf.getvalue()
+
+    # ── cases ─────────────────────────────────────────────────────────────────
+
+    def test_case1_nontty_no_flags_both_warnings(self):
+        """Case 1: non-TTY, no flags → both model and effort warnings."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr, _ = self._run_nontty(tmp, ws)
+        self.assertEqual(rc, 0)
+        self.assertIn("pins no model", stderr)
+        self.assertIn("pins no effort", stderr)
+
+    def test_case2_nontty_model_flag_only_effort_warning(self):
+        """Case 2: non-TTY, forward_flags carries ["--model", "opus"] (space form).
+
+        Uses _run_cmd_spawn_direct so the space-form tokens reach forward_flags
+        verbatim — parse_known_args would otherwise consume "opus" as ns.suffix.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr = self._run_cmd_spawn_direct(
+                tmp, ws, claude_flags=["--model", "opus"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("pins no model", stderr)
+        self.assertIn("pins no effort", stderr)
+
+    def test_case3_nontty_both_flags_no_warnings(self):
+        """Case 3: non-TTY, --model=opus --effort=high → neither warning."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr, _ = self._run_nontty(
+                tmp, ws, extra_argv=["--model=opus", "--effort=high"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertNotIn("pins no model", stderr)
+        self.assertNotIn("pins no effort", stderr)
+
+    def test_case4_nontty_effort_spaceform_model_warning_only(self):
+        """Case 4: non-TTY, forward_flags carries ["--effort", "high"] (space form).
+
+        Uses _run_cmd_spawn_direct so the space-form tokens reach forward_flags
+        verbatim — parse_known_args would otherwise consume "high" as ns.suffix.
+        Verifies that extract_flag_value correctly detects the space-form pin.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr = self._run_cmd_spawn_direct(
+                tmp, ws, claude_flags=["--effort", "high"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("pins no model", stderr)
+        self.assertNotIn("pins no effort", stderr)
+
+    def test_case5_tty_no_flags_no_warnings(self):
+        """Case 5: TTY (both isatty True), no flags → neither warning.
+
+        Must mock _amux_attach to prevent os.execvp from replacing the
+        interpreter (amux is installed; the exec would succeed and the test
+        process would vanish — the suite would never return).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+
+            live_names: set[str] = set()
+            stderr_buf = io.StringIO()
+
+            def fake_create(*, name, abs_dir, forward_flags, session_id, prompt):
+                live_names.add(name)
+                return 0, None
+
+            argv = ["spawn", "--dir", str(ws), "--", "go"]
+
+            with _redirect_amux_home(tmp), \
+                    patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                    patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                    patch.object(cli.lib, "tmux_has_session",
+                                 side_effect=lambda n: n in live_names), \
+                    patch.object(cli, "_amux_create_detached", side_effect=fake_create), \
+                    patch.object(cli, "_amux_attach"), \
+                    patch("sys.stdin") as mock_stdin, \
+                    patch("sys.stdout") as mock_stdout, \
+                    patch.dict(os.environ, {}, clear=False), \
+                    contextlib.redirect_stderr(stderr_buf):
+                os.environ.pop("ANTHROPIC_MODEL", None)
+                mock_stdin.isatty.return_value = True
+                mock_stdout.isatty.return_value = True
+                rc = cli.main(argv)
+
+        self.assertEqual(rc, 0)
+        self.assertNotIn("pins no model", stderr_buf.getvalue())
+        self.assertNotIn("pins no effort", stderr_buf.getvalue())
+
+    def test_case6_nontty_inherited_model_effort_warning_only(self):
+        """Case 6: non-TTY, no --model, parent CC_FLAGS carries --model opus.
+
+        Regression guard for placement: the check runs AFTER the inherited-model
+        block, so the inherited --model is in forward_flags and model_pinned is
+        True. If the block were placed BEFORE inheritance, this test would fail
+        (model warning would fire incorrectly).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr, fwd_flags = self._run_nontty(
+                tmp, ws,
+                parent_name="parent-x",
+                parent_flags=["--model", "opus"],
+            )
+        self.assertEqual(rc, 0)
+        # Inherited --model was found in forward_flags — no model warning.
+        self.assertNotIn("pins no model", stderr)
+        self.assertIn("pins no effort", stderr)
+        # Confirm inheritance actually added --model to forward_flags.
+        self.assertIn("--model", fwd_flags)
+        self.assertIn("opus", fwd_flags)
+
+    def test_case7_nontty_anthropic_model_env_effort_warning_only(self):
+        """Case 7: non-TTY, no --model, ANTHROPIC_MODEL=glm-4.7 in env.
+
+        ANTHROPIC_MODEL counts as a model pin even though it is an env var, not
+        a flag. Effort is still unpinned, so the effort warning fires.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "proj"
+            ws.mkdir()
+            rc, stderr, _ = self._run_nontty(tmp, ws, anthropic_model="glm-4.7")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("pins no model", stderr)
+        self.assertIn("pins no effort", stderr)
+
+    def test_case8_extract_flag_value_units(self):
+        """Case 8: extract_flag_value — all four sub-cases."""
+        # Space form.
+        self.assertEqual(
+            lib.extract_flag_value(["--effort", "high"], "--effort"), "high"
+        )
+        # Equals form.
+        self.assertEqual(
+            lib.extract_flag_value(["--effort=high"], "--effort"), "high"
+        )
+        # Absent flag → None.
+        self.assertIsNone(lib.extract_flag_value(["--model", "opus"], "--effort"))
+        # Trailing bare flag at end of list → None (not IndexError).
+        self.assertIsNone(lib.extract_flag_value(["--effort"], "--effort"))
 
 
 @unittest.skipUnless(

@@ -203,14 +203,24 @@ def parent_cc_flags(parent_name: str) -> list[str]:
     return flags.split()
 
 
-def extract_model_flag(flags: list[str]) -> str | None:
-    """Return the value of ``--model`` within a flag token list, else None."""
+def extract_flag_value(flags: list[str], flag: str) -> str | None:
+    """Return the value of ``flag`` within a flag token list, else None.
+
+    Handles both ``--flag value`` (space form) and ``--flag=value`` (equals
+    form). A bare ``flag`` at the end of the list (no following value) returns
+    None rather than raising IndexError.
+    """
     for i, tok in enumerate(flags):
-        if tok == "--model" and i + 1 < len(flags):
+        if tok == flag and i + 1 < len(flags):
             return flags[i + 1]
-        if tok.startswith("--model="):
+        if tok.startswith(flag + "="):
             return tok.split("=", 1)[1]
     return None
+
+
+def extract_model_flag(flags: list[str]) -> str | None:
+    """Return the value of ``--model`` within a flag token list, else None."""
+    return extract_flag_value(flags, "--model")
 
 
 # ── Naming ────────────────────────────────────────────────────────────────────

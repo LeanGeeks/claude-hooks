@@ -32,9 +32,9 @@ brd §3 H4. Only 21-01 needs an install at all, and it is the user-owned one
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 21-01 | [amux-spawn pin warning](./21-01-spawn-pin-warning_sonnet.md) | todo | — | The load-bearing half. Three files, eight tests, no policy. **Independently shippable**, no sudo. |
-| — | fork `02-01` (guard the omission) | todo | — | Lives in `~/.bin/amux`. A comment + a regression test; independent of 21-01, runnable in parallel by an agent in that checkout. |
-| 21-02 | [Allowlist decision](./21-02-allowlist-decision_human.md) | todo | fork `02-01` | **human** — closes the downstream proposal as refuted (or overturns the refutation with fresh measurement). No install unless it overturns. |
+| 21-01 | [amux-spawn pin warning](./21-01-spawn-pin-warning_sonnet.md) | done | — | The load-bearing half. Three files, eight tests, no policy. **Independently shippable**, no sudo. |
+| — | fork `02-01` (guard the omission) | done | — | Lives in `~/.bin/amux`. A comment + a regression test; independent of 21-01, runnable in parallel by an agent in that checkout. |
+| 21-02 | [Allowlist decision](./21-02-allowlist-decision_human.md) | done | fork `02-01` | **human** — closes the downstream proposal as refuted (or overturns the refutation with fresh measurement). No install unless it overturns. |
 | 21-03 | [Effort inheritance by flag](./21-03-effort-inheritance-by-flag_sonnet.md) | todo · **optional** | 21-01 | The safe shape of what DW-68 item 2 wanted. **Ask before running** — its question 2 is a policy call. |
 
 ## Dependency graph
@@ -94,3 +94,42 @@ an `amux` install.
   omission, 21-02 records the reversal, and 21-03 carries the safe shape of the
   capability. **No code was written in either repo during this sitting** —
   operator's instruction was specs only.
+- **2026-08-23 — fork `02-01` done** (`aDorofeev/amux` `66ebd54`, log `db7e29d`). A comment at
+  `AMUX_ENV_ALLOWLIST` giving the reason for the omission, plus a negative assertion in the existing
+  propagation test. 398 tests green before and after — no behaviour change, the same 15 vars
+  propagate. The guard was proven to bite by a reviewer independent of the implementer: added the
+  var, saw red, reverted, confirmed green with an unchanged tree. Nothing installed, per brd §3 H4.
+- **2026-08-23 — 21-01 done.** `extract_flag_value()` added to `amux_spawn_lib.py` with
+  `extract_model_flag()` refactored to delegate to it (signature and behaviour unchanged); a warning
+  block in `cmd_spawn` after the `inh_model` block, guarded by `not is_tty`; 8 cases in a new
+  `TestSpawnPinWarnings`. Suite **724 passed** (baseline 716, +8), 1 pre-existing skip.
+  Acceptance §4.1/§4.2 demonstrated against the repo copy: an unpinned non-TTY spawn printed one
+  warning per unpinned knob **and still started the session**; the same spawn with `--model` and
+  `--effort` printed neither. Invariant 3 holds in the code — `CLAUDE_CODE_EFFORT_LEVEL` is
+  deliberately not consulted, with brd §1 finding 6 cited at the line. Note the deliberate asymmetry
+  that a reader may mistake for a bug: `ANTHROPIC_MODEL` **does** count as a model pin (epic 12
+  verified alt-model selection riding on it end-to-end) while the effort env var does **not** count
+  as an effort pin — invariant 3 is about effort specifically, and the two vars are not symmetric.
+  Review PASS with two LOW findings, neither fixed and both deliberately: one flags this file as a
+  fourth changed path, which is the manager's bookkeeping rather than the implementer exceeding
+  done criterion 5; the other observes that 3 of 8 cases survive neutering because they are negative
+  (`assertNotIn`) or bare-helper tests. The neutering experiment is the load-bearing one and it
+  passed — 5 of 8 went red with the block stubbed out, all green on revert.
+- **2026-08-23 — 21-02 decided: DW-68 item 2 is REFUTED. `CLAUDE_CODE_EFFORT_LEVEL` stays off
+  `AMUX_ENV_ALLOWLIST`.** This is a decision, not a preference: the operator declined to accept the
+  recorded finding on its own and asked for it to be re-measured first. It was, independently, on
+  CLI **2.1.231** — env `high` + `--effort low` → served **high**; env `low` + `--effort high` →
+  served **low**; both single-channel controls confirmed each channel works in isolation; served
+  effort read from each child's transcript, never self-reported. Both polarities were needed, since
+  one arm cannot tell *"env wins"* from *"the higher tier wins"*. Evidence:
+  [21-02_remeasurement_report.md](../../agents_output/21-02_remeasurement_report.md). brd §1
+  finding 6 therefore stands **re-confirmed, not merely cited**. Because the recommendation was
+  accepted, no pin bump and no root-owned install follow (21-02 §"If the decision goes the other
+  way" is moot); H3, the fresh-server asymmetry, remains **unverified** and is untouched by this.
+  Downstream told: `hyppie-flow` `docs/backlog.md`, DW-68 entry, "ITEM 2 CLOSED" — worded so the
+  entry is not re-opened from its original phrasing (21-02 done criterion 3).
+- **2026-08-23 — 21-03 declined for now, and left `todo · optional` rather than closed.** Its
+  question 2 is the operator's, and the operator answered it by deferring the whole task: ship
+  21-01's warning and live with it before adding an inheritance whose wrong default is expensive in
+  the `max`-flows-downhill direction. Nothing in 21-01 forecloses it — `extract_flag_value`, the
+  generalization 21-03 depends on, lands with 21-01.
