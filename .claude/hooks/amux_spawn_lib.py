@@ -615,10 +615,10 @@ def write_handle(name: str, handle: dict[str, Any]) -> None:
 def new_handle(
     *,
     name: str,
-    session_id: str,
+    session_id: str | None,
     run_id: str,
     abs_dir: str,
-    transcript_path: str,
+    transcript_path: str | None,
     stuck_after_s: int,
     provider: str = PROVIDER_CLAUDE,
     activity_path: str | None = None,
@@ -636,6 +636,12 @@ def new_handle(
     written by this constructor derives exactly like a legacy one.
     ``exit_code``/``failure`` start as ``None``: they are only known once a
     bounded Codex process has finished.
+
+    A **Codex** handle passes ``session_id=None`` and ``transcript_path=None``:
+    at launch time there is no Codex thread id yet (it arrives in the first
+    ``thread.started`` event, captured by amux into ``<name>.meta.json``) and
+    there is no Claude transcript to guess at. Inventing either would create a
+    fake identity, so both stay ``None`` until real evidence exists.
     """
     now = iso_now()
     return {
@@ -660,6 +666,123 @@ def new_handle(
         "created_at": now,
         "updated_at": now,
     }
+
+
+# ── Codex bounded-run artifacts (epic-20 architecture s3) ────────────────────
+#
+# A bounded Codex worker publishes its evidence to files, not to a terminal:
+# the ``codex exec --json`` event stream and the ``--output-last-message``
+# result. amux owns writing them (plus the sibling ``.err`` / ``.rc``); this
+# repository owns *where* they live and *who* may read them:
+#
+#   ~/.amux/spawn/<name>.events.jsonl        JSONL event stream (append-only)
+#   ~/.amux/spawn/<name>.events.jsonl.err    codex stderr        (amux)
+#   ~/.amux/spawn/<name>.events.jsonl.rc     exit status         (amux)
+#   ~/.amux/spawn/<name>.result.md           final assistant message
+#
+# They sit in the existing spawn registry keyed by the session name (never a
+# separate registry), and they are created here — before the pane exists — with
+# mode 0600, so the mode never depends on amux's or the pane's umask. The
+# ``.jsonl`` / ``.md`` extensions cannot collide with the ``*.json`` handle glob
+# used by :func:`live_tracked_count` / :func:`list_handles`.
+
+CODEX_EVENT_SUFFIX = ".events.jsonl"
+CODEX_RESULT_SUFFIX = ".result.md"
+
+# Mode for every artifact this repository allocates (architecture s3).
+ARTIFACT_MODE = 0o600
+
+# How many name variants ``allocate_codex_artifacts`` will try before giving up.
+MAX_ARTIFACT_ALLOC_TRIES = 100
+
+
+def codex_artifact_paths(name: str, seq: int = 1) -> tuple[str, str]:
+    """The ``(event_log, result)`` pair for *name* at collision sequence *seq*.
+
+    ``seq <= 1`` is the primary, session-name-keyed pair; higher sequences are
+    the collision escape hatch (see :func:`allocate_codex_artifacts`).
+    """
+    stem = name if seq <= 1 else f"{name}.{seq}"
+    return (
+        str(SPAWN_DIR / f"{stem}{CODEX_EVENT_SUFFIX}"),
+        str(SPAWN_DIR / f"{stem}{CODEX_RESULT_SUFFIX}"),
+    )
+
+
+def codex_artifact_siblings(event_path: str, result_path: str | None) -> tuple[str, ...]:
+    """Every file a bounded run owns for one ``(event_log, result)`` pair."""
+    paths = [event_path, f"{event_path}.err", f"{event_path}.rc"]
+    if result_path:
+        paths.append(result_path)
+    return tuple(paths)
+
+
+def allocate_codex_artifacts(name: str) -> tuple[str, str]:
+    """Create a fresh, collision-free ``(event_log, result)`` pair, mode 0600.
+
+    Called under the spawn lock. Collision-safety is two-layered:
+
+    1. the whole four-file set for a candidate stem must be absent — amux
+       *appends* to the event log and the ``.err`` sibling, so reusing a stem
+       left behind by an earlier session would silently mix two runs' evidence
+       into one artifact;
+    2. the two files this function owns are created with ``O_CREAT | O_EXCL``,
+       so two processes racing on the same stem cannot both win.
+
+    On a collision the next sequence (``<name>.2.…``) is tried. The handle
+    records whichever pair was actually allocated, so callers never recompute
+    the path from the name.
+
+    ``os.open``'s mode argument is masked by the process umask, so the mode is
+    re-asserted with ``chmod``: 0600 is a requirement, not a default.
+
+    Raises ``OSError`` if no free pair can be allocated.
+    """
+    SPAWN_DIR.mkdir(parents=True, exist_ok=True)
+    for seq in range(1, MAX_ARTIFACT_ALLOC_TRIES + 1):
+        event_path, result_path = codex_artifact_paths(name, seq)
+        if any(os.path.lexists(p)
+               for p in codex_artifact_siblings(event_path, result_path)):
+            continue
+        created: list[str] = []
+        try:
+            for path in (event_path, result_path):
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, ARTIFACT_MODE)
+                os.close(fd)
+                created.append(path)
+                os.chmod(path, ARTIFACT_MODE)
+        except FileExistsError:
+            for path in created:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            continue
+        return event_path, result_path
+    raise OSError(
+        f"could not allocate a free Codex artifact pair for '{name}' in "
+        f"{SPAWN_DIR} after {MAX_ARTIFACT_ALLOC_TRIES} attempts"
+    )
+
+
+def remove_codex_artifacts(event_path: str | None, result_path: str | None) -> None:
+    """Delete a bounded run's artifacts and every amux-owned sibling (fail-soft).
+
+    Used by the launcher's rollback path: an artifact set whose session never
+    started must not linger and shadow the next spawn under the same name.
+    """
+    if not event_path:
+        if result_path:
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
+        return
+    for path in codex_artifact_siblings(event_path, result_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 # ── Fork-bomb cap ─────────────────────────────────────────────────────────────

@@ -826,6 +826,742 @@ class TestSpawnPinWarnings(unittest.TestCase):
         # Trailing bare flag at end of list → None (not IndexError).
         self.assertIsNone(lib.extract_flag_value(["--effort"], "--effort"))
 
+# ══ Task 20-02: provider-aware launcher ═══════════════════════════════════════
+#
+# Everything below is hermetic: ``lib``'s amux paths point at a tmp dir, tmux is
+# mocked, and ``cli.subprocess.run`` is replaced by a recorder — so the argv the
+# launcher WOULD hand to amux is asserted as a real argv list, never as a
+# rendered string, and no ``amux`` / ``tmux`` / ``codex`` process is ever run.
+# No live Codex turn happens anywhere in this file (no API credits, and
+# --dangerously-bypass-approvals-and-sandbox is never spelled, let alone run).
+
+import importlib.machinery  # noqa: E402  (already used by _load_cli above)
+
+_reducer_spec = importlib.util.spec_from_file_location(
+    "codex_event_reducer_t2002", _HOOKS / "codex_event_reducer.py"
+)
+reducer = importlib.util.module_from_spec(_reducer_spec)
+_reducer_spec.loader.exec_module(reducer)
+
+# A prompt with every metacharacter class the contract names: spaces, both quote
+# kinds, $VAR, $(...) and backticks, a glob, a `;`, and a newline.
+ADVERSARIAL_PROMPT = (
+    "review 'this' \"thing\" $HOME $(touch {sentinel}) `id` *.py ; echo pwned\n"
+    "second line\twith a tab"
+)
+
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _spawn_capturing_argv(tmp: Path, argv: list[str], *, tty=False,
+                          amux_rc=0, live=True):
+    """Drive ``cli.main`` with amux replaced by an argv recorder.
+
+    Returns ``(rc, calls, handle_files, attach_called)`` where ``calls`` is the
+    list of real
+    argv lists passed to ``subprocess.run`` inside the CLI.
+    """
+    calls: list[list[str]] = []
+    live_names: set[str] = set()
+
+    def fake_run(cmd, *_a, **_kw):
+        calls.append(list(cmd))
+        if cmd[:2] == ["amux", "exec"] and amux_rc == 0 and live:
+            live_names.add(cmd[2])
+        if cmd[:2] == ["amux", "rm"]:
+            live_names.discard(cmd[2])
+            return _FakeCompleted(0)
+        return _FakeCompleted(amux_rc, stderr="" if amux_rc == 0 else "boom")
+
+    with _redirect_amux_home(tmp), \
+            patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+            patch.object(cli.lib, "list_amux_names", return_value=set()), \
+            patch.object(cli.lib, "tmux_has_session",
+                         side_effect=lambda n: n in live_names), \
+            patch.object(cli.subprocess, "run", side_effect=fake_run), \
+            patch.object(cli, "_amux_attach") as attach, \
+            patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+            patch("sys.stderr"):
+        stdin.isatty.return_value = tty
+        stdout.isatty.return_value = tty
+        rc = cli.main(argv)
+        handles = sorted(p.name for p in (tmp / "spawn").glob("*.json")) \
+            if (tmp / "spawn").is_dir() else []
+        attached = attach.called
+    return rc, calls, handles, attached
+
+
+def _amux_exec_call(calls):
+    for c in calls:
+        if c[:2] == ["amux", "exec"]:
+            return c
+    return None
+
+
+class TestProviderValidation(unittest.TestCase):
+    """Work item 1: validated ``--provider claude|codex``, default claude."""
+
+    def test_default_is_claude(self):
+        self.assertEqual(cli.resolve_provider(None), lib.PROVIDER_CLAUDE)
+        self.assertEqual(cli.resolve_provider(""), lib.PROVIDER_CLAUDE)
+
+    def test_case_and_whitespace_normalized(self):
+        self.assertEqual(cli.resolve_provider("  CODEX "), lib.PROVIDER_CODEX)
+
+    def test_unknown_provider_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            cli.resolve_provider("gemini")
+        self.assertIn("claude, codex", str(ctx.exception))
+
+    def test_cli_refuses_unknown_provider_without_creating_anything(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "gemini", "--dir", str(ws), "--", "go"]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(calls, [])
+            self.assertEqual(handles, [])
+
+    def test_codex_without_prompt_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws)]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(calls, [])
+            self.assertEqual(handles, [])
+
+    def test_codex_refuses_claude_profile_and_wait(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            for extra in (["--profile", "glm"], ["--wait"], ["--notify"]):
+                rc, calls, _h, _ = _spawn_capturing_argv(
+                    tmp, ["spawn", "--provider", "codex", "--dir", str(ws)]
+                    + extra + ["--", "go"]
+                )
+                self.assertEqual(rc, 1, extra)
+                self.assertEqual(calls, [], extra)
+
+    def test_codex_refuses_claude_permission_flag(self):
+        """Architecture §8: Claude's permission flag must never reach Codex."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--dangerously-skip-permissions", "--", "go"]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(calls, [])
+
+
+class TestAmuxArgvBothProviders(unittest.TestCase):
+    """Work item 2 / Done-when 1: the EXACT amux argv, for both providers.
+
+    The Codex form uses only amux's public options, documented in the pinned
+    revision's ``docs/codex-provider.md`` §§2–3: ``--provider``,
+    ``--agent-mode``, ``--event-log``, ``--output-last-message``. No ``codex``
+    argv is built here (invariant 3).
+    """
+
+    def test_claude_argv_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--dir", str(ws), "--", "hello world"]
+            )
+            self.assertEqual(rc, 0)
+            call = _amux_exec_call(calls)
+            handle = None
+            with _redirect_amux_home(tmp):
+                handle = lib.read_handle("myproj")
+            sid = handle["session_id"]
+            self.assertEqual(call, [
+                "amux", "exec", "myproj", "--no-attach", "--no-default-model",
+                "--dir", str(ws), "--session-id", sid, "hello world",
+            ])
+            # No Codex option leaks onto the Claude path.
+            for leaked in ("--provider", "--agent-mode", "--event-log",
+                           "--output-last-message"):
+                self.assertNotIn(leaked, call)
+
+    def test_claude_yolo_argv_forwards_the_neutral_alias(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--yolo", "--dir", str(ws), "--", "go"]
+            )
+            self.assertEqual(rc, 0)
+            call = _amux_exec_call(calls)
+            self.assertIn("--yolo", call)
+            self.assertNotIn("--dangerously-skip-permissions", call)
+
+    def test_codex_argv_uses_only_public_amux_options(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--yolo",
+                      "--dir", str(ws), "--", "review the diff"]
+            )
+            self.assertEqual(rc, 0)
+            events = str(tmp / "spawn" / "myproj.events.jsonl")
+            result = str(tmp / "spawn" / "myproj.result.md")
+            self.assertEqual(_amux_exec_call(calls), [
+                "amux", "exec", "myproj", "--no-attach",
+                "--provider", "codex", "--agent-mode", "exec",
+                "--dir", str(ws),
+                "--event-log", events,
+                "--output-last-message", result,
+                "--yolo",
+                "--", "review the diff",
+            ])
+
+    def test_codex_argv_never_contains_a_provider_command_or_yolo_expansion(self):
+        """Ownership boundary: amux-spawn builds no `codex …` argv at all.
+
+        The only command constructed is ``amux`` itself. "codex"/"exec" appear
+        ONLY as the values of amux's own ``--provider``/``--agent-mode`` options
+        (checked positionally); no Codex subcommand, contract option or YOLO
+        expansion is ever spelled here.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            _rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--yolo",
+                      "--dir", str(ws), "--", "go"]
+            )
+            call = _amux_exec_call(calls)
+            # The one and only executable is amux; everything else is options.
+            self.assertEqual(call[0], "amux")
+            self.assertEqual(call[1], "exec")      # amux's own subcommand
+            self.assertEqual(call[2], "myproj")
+            # "codex"/"exec" only as VALUES of amux's public provider options
+            # (amux's own subcommand "exec" at index 1 aside).
+            codex_positions = [i for i, tok in enumerate(call) if tok == "codex"]
+            self.assertEqual(codex_positions, [call.index("--provider") + 1])
+            exec_positions = [i for i, tok in enumerate(call[2:], start=2)
+                              if tok == "exec"]
+            self.assertEqual(exec_positions, [call.index("--agent-mode") + 1])
+            # No Codex contract option, YOLO expansion, or Claude-only option.
+            for forbidden in ("--json", "-o", "-C", "resume", "--cd",
+                              "--dangerously-bypass-approvals-and-sandbox",
+                              "--dangerously-skip-permissions",
+                              "--no-default-model", "--session-id"):
+                self.assertNotIn(forbidden, call[3:], forbidden)
+
+    def test_codex_forwards_explicit_model_but_inherits_none(self):
+        """BRD §3: no hardcoded model; a Claude parent's tier is not inherited."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                (lib.AMUX_SESSIONS_DIR / "parent.env").write_text(
+                    f'CC_NAME="parent"\nCC_DIR="{ws}"\nCC_FLAGS="--model opus"\n'
+                )
+            calls_seen = {}
+            live_names: set[str] = set()
+
+            def fake_run(cmd, *_a, **_kw):
+                calls_seen.setdefault("cmd", list(cmd))
+                if cmd[:2] == ["amux", "exec"]:
+                    live_names.add(cmd[2])
+                return _FakeCompleted(0)
+
+            with _redirect_amux_home(tmp), \
+                    patch.object(cli.lib, "resolve_amux_session", return_value="parent"), \
+                    patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                    patch.object(cli.lib, "tmux_has_session",
+                                 side_effect=lambda n: n in live_names), \
+                    patch.object(cli.subprocess, "run", side_effect=fake_run), \
+                    patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                    patch("sys.stderr"):
+                stdin.isatty.return_value = False
+                stdout.isatty.return_value = False
+                rc = cli.main(["spawn", "--provider", "codex", "--", "go"])
+            self.assertEqual(rc, 0)
+            self.assertNotIn("--model", calls_seen["cmd"])
+            self.assertNotIn("opus", calls_seen["cmd"])
+
+    def test_explicit_codex_model_is_forwarded_verbatim(self):
+        """An explicit model rides along untouched (BRD §3: none is injected).
+
+        Value-taking provider flags must use the ``--flag=value`` form: the
+        space form is eaten by this CLI's optional positional ``suffix``
+        (pre-existing epic-10 behavior, identical on the Claude path — the bare
+        flag amux then receives makes amux die with a usage error).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            _rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--model=gpt-5.5", "--", "go"]
+            )
+            call = _amux_exec_call(calls)
+            self.assertIn("--model=gpt-5.5", call)   # one argv element, verbatim
+            i = call.index("--")
+            self.assertEqual(call[i + 1], "go")      # the prompt is still last
+
+    def test_space_form_model_keeps_the_pre_existing_cli_behavior(self):
+        """The ``--model X`` space form behaves exactly as it does for Claude
+        today: argparse eats the value as the suffix positional and amux (not
+        amux-spawn) rejects the bare flag. Nothing is orphaned."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--model", "gpt-5.5", "--", "go"], amux_rc=1
+            )
+            self.assertEqual(rc, 1)
+            call = _amux_exec_call(calls)
+            self.assertEqual(call[2], "myproj-gpt-5.5")   # eaten as the suffix
+            self.assertIn("--model", call)
+            self.assertNotIn("gpt-5.5", call)
+            self.assertEqual(handles, [])                 # rolled back
+
+
+class TestMultilinePromptBoundary(unittest.TestCase):
+    """Work item 6 / verification: one argv element, nothing executed."""
+
+    def _assert_prompt_intact(self, provider_argv, tmp, ws, expect_separator):
+        sentinel = tmp / "PWNED"
+        prompt = ADVERSARIAL_PROMPT.format(sentinel=sentinel)
+        rc, calls, _h, _ = _spawn_capturing_argv(
+            tmp, ["spawn", *provider_argv, "--dir", str(ws), "--", prompt]
+        )
+        self.assertEqual(rc, 0)
+        call = _amux_exec_call(calls)
+        # The prompt is ONE real argv element (asserted on the argv list, not on
+        # any rendered string), and it is the last one.
+        self.assertEqual(call[-1], prompt)
+        self.assertEqual(call.count(prompt), 1)
+        if expect_separator:
+            self.assertEqual(call[-2], "--")
+        # Nothing in the prompt was evaluated by any shell.
+        self.assertFalse(sentinel.exists(), "command substitution executed!")
+        self.assertIn("\n", call[-1])
+        self.assertIn("$HOME", call[-1])
+        self.assertIn("`id`", call[-1])
+
+    def test_claude_prompt_survives(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            self._assert_prompt_intact([], tmp, ws, expect_separator=False)
+
+    def test_codex_prompt_survives_behind_the_separator(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            self._assert_prompt_intact(
+                ["--provider", "codex"], tmp, ws, expect_separator=True
+            )
+
+    def test_split_prompt_preserves_a_newline(self):
+        before, prompt = cli._split_prompt(["--", "a\nb"])
+        self.assertEqual(before, [])
+        self.assertEqual(prompt, "a\nb")
+
+
+class TestCodexArtifactAllocation(unittest.TestCase):
+    """Work item 3: collision-safe, mode-0600 artifacts under ~/.amux/spawn."""
+
+    def test_paths_are_keyed_by_session_name_and_created_0600(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                ev, res = lib.allocate_codex_artifacts("proj-2")
+                self.assertEqual(Path(ev).parent, tmp / "spawn")
+                self.assertEqual(Path(ev).name, "proj-2.events.jsonl")
+                self.assertEqual(Path(res).name, "proj-2.result.md")
+                for p in (ev, res):
+                    self.assertTrue(os.path.exists(p))
+                    self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_umask_cannot_loosen_the_mode(self):
+        old = os.umask(0)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                with _redirect_amux_home(tmp):
+                    lib.ensure_dirs()
+                    ev, res = lib.allocate_codex_artifacts("wide")
+                    for p in (ev, res):
+                        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+        finally:
+            os.umask(old)
+
+    def test_allocation_is_exclusive_and_never_reuses_a_stem(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                first_ev, first_res = lib.allocate_codex_artifacts("p")
+                second_ev, second_res = lib.allocate_codex_artifacts("p")
+                self.assertNotEqual(first_ev, second_ev)
+                self.assertNotEqual(first_res, second_res)
+                self.assertEqual(Path(second_ev).name, "p.2.events.jsonl")
+
+    def test_a_stale_amux_sibling_also_forces_a_new_stem(self):
+        """amux APPENDS to the event log — mixing two runs must be impossible."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                # Only the .rc sibling survives from an earlier reaped run.
+                (tmp / "spawn" / "p.events.jsonl.rc").write_text("0")
+                ev, _res = lib.allocate_codex_artifacts("p")
+                self.assertEqual(Path(ev).name, "p.2.events.jsonl")
+
+    def test_artifacts_do_not_collide_with_the_handle_glob(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                lib.allocate_codex_artifacts("p")
+                self.assertEqual(list((tmp / "spawn").glob("*.json")), [])
+
+    def test_remove_reaps_every_amux_owned_sibling(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                ev, res = lib.allocate_codex_artifacts("p")
+                Path(ev + ".err").write_text("stderr")
+                Path(ev + ".rc").write_text("0")
+                lib.remove_codex_artifacts(ev, res)
+                self.assertEqual(sorted(p.name for p in (tmp / "spawn").iterdir()
+                                        if p.name != ".lock"), [])
+
+
+class TestCodexHandle(unittest.TestCase):
+    """Work item 4 + Done-when 3/4: the provider-aware handle, no fake identity."""
+
+    def _spawn_codex(self, tmp: Path, ws: Path, extra=()):
+        rc, calls, _h, attached = _spawn_capturing_argv(
+            tmp, ["spawn", "--provider", "codex", "--dir", str(ws), *extra,
+                  "--", "do the thing"]
+        )
+        with _redirect_amux_home(tmp):
+            handle = lib.read_handle("myproj")
+        return rc, calls, handle, attached
+
+    def test_handle_records_provider_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, h, _ = self._spawn_codex(tmp, ws)
+            self.assertEqual(rc, 0)
+            self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+            self.assertEqual(h["provider"], "codex")
+            self.assertTrue(lib.is_codex_handle(h))
+            self.assertEqual(h["activity_path"],
+                             str(tmp / "spawn" / "myproj.events.jsonl"))
+            self.assertEqual(h["result_path"],
+                             str(tmp / "spawn" / "myproj.result.md"))
+            self.assertEqual(h["state"], "spawning")
+            self.assertEqual(h["exit_code"], None)
+            self.assertEqual(h["failure"], None)
+            self.assertEqual(lib.handle_activity_path(h), h["activity_path"])
+
+    def test_no_transcript_guess_and_no_minted_thread_id(self):
+        """Done-when 3: no Claude transcript guess, no fake Codex UUID."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, h, _ = self._spawn_codex(tmp, ws)
+            self.assertEqual(rc, 0)
+            self.assertIsNone(h["session_id"])
+            self.assertIsNone(h["transcript_path"])
+            self.assertNotIn("--session-id", _amux_exec_call(calls))
+            # run_id is still minted: it is OUR workflow id, not an agent identity.
+            self.assertEqual(str(uuid.UUID(h["run_id"])), h["run_id"])
+
+    def test_codex_is_always_tracked_and_detached_even_at_a_tty(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, handles, attached = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws), "--", "go"],
+                tty=True,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(handles, ["myproj.json"])
+            self.assertFalse(attached, "a bounded codex run has no TUI to attach")
+
+    def test_a_finished_bounded_run_is_not_a_failed_launch(self):
+        """Architecture §5: completion evidence beats liveness at confirm time."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+
+            def fake_run(cmd, *_a, **_kw):
+                # amux "starts" the run, which finishes (and drops its tmux
+                # session) before the launcher's confirmation check.
+                if cmd[:2] == ["amux", "exec"]:
+                    i = cmd.index("--event-log")
+                    Path(cmd[i + 1] + ".rc").write_text("0")
+                return _FakeCompleted(0)
+
+            with _redirect_amux_home(tmp), \
+                    patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                    patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                    patch.object(cli.lib, "tmux_has_session", return_value=False), \
+                    patch.object(cli.subprocess, "run", side_effect=fake_run), \
+                    patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                    patch("sys.stderr"):
+                stdin.isatty.return_value = False
+                stdout.isatty.return_value = False
+                rc = cli.main(["spawn", "--provider", "codex", "--dir", str(ws),
+                               "--", "go"])
+                handle = lib.read_handle("myproj")
+            self.assertEqual(rc, 0)
+            self.assertIsNotNone(handle)
+
+    def test_claude_liveness_failure_behavior_is_unchanged(self):
+        """A dead Claude session is still a failed launch (epic-10 behavior)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, handles, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--dir", str(ws), "--", "go"], live=False
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(handles, [])
+
+    def test_stub_event_stream_populates_the_thread_id_after_launch(self):
+        """Done-when 4: the thread id arrives from the stream, not from us."""
+        thread = "01a00000-0000-7000-8000-0000000000ff"
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, h, _ = self._spawn_codex(tmp, ws)
+            self.assertEqual(rc, 0)
+            self.assertIsNone(h["session_id"])
+
+            # A stub `codex exec --json` segment lands in the artifact the
+            # launcher allocated (this is what amux's pane wrapper writes).
+            with open(h["activity_path"], "a") as f:
+                for event in (
+                    {"type": "thread.started", "thread_id": thread},
+                    {"type": "turn.started"},
+                    {"type": "item.completed",
+                     "item": {"id": "item_0", "type": "agent_message",
+                              "text": "done"}},
+                    {"type": "turn.completed", "usage": {"input_tokens": 1}},
+                ):
+                    f.write(json.dumps(event) + "\n")
+            Path(h["result_path"]).write_text("done")
+
+            reduction = reducer.reduce_handle(h, read_result=True)
+            self.assertEqual(reduction["thread_id"], thread)
+            self.assertTrue(reduction["turn_completed"])
+            self.assertEqual(reduction["state_hint"], reducer.STATE_IDLE)
+            self.assertEqual(reduction["result_text"], "done")
+
+
+class TestCodexLaunchRollback(unittest.TestCase):
+    """Work item 7: a partial launch leaves no handle, artifact, or session."""
+
+    def _failing_spawn(self, tmp: Path, ws: Path, *, amux_rc=0, live=True):
+        rm_calls: list[str] = []
+        live_names: set[str] = set()
+
+        def fake_run(cmd, *_a, **_kw):
+            if cmd[:2] == ["amux", "exec"] and amux_rc == 0 and live:
+                live_names.add(cmd[2])
+            return _FakeCompleted(amux_rc, stderr="boom" if amux_rc else "")
+
+        def fake_rm(name):
+            rm_calls.append(name)
+            live_names.discard(name)
+
+        with _redirect_amux_home(tmp), \
+                patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                patch.object(cli.lib, "tmux_has_session",
+                             side_effect=lambda n: n in live_names), \
+                patch.object(cli.subprocess, "run", side_effect=fake_run), \
+                patch.object(cli, "_amux_rm", side_effect=fake_rm), \
+                patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                patch("sys.stderr"):
+            stdin.isatty.return_value = False
+            stdout.isatty.return_value = False
+            rc = cli.main(["spawn", "--provider", "codex", "--dir", str(ws),
+                           "--", "go"])
+            leftovers = sorted(p.name for p in (tmp / "spawn").iterdir()
+                               if p.name != ".lock")
+        return rc, rm_calls, leftovers, live_names
+
+    def test_amux_create_failure_rolls_everything_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, rm_calls, leftovers, live = self._failing_spawn(
+                tmp, ws, amux_rc=1
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(rm_calls, ["myproj"])   # session torn down
+            self.assertEqual(leftovers, [])          # no handle, no artifacts
+            self.assertEqual(live, set())
+
+    def test_launch_not_confirmed_rolls_everything_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, rm_calls, leftovers, live = self._failing_spawn(
+                tmp, ws, amux_rc=0, live=False
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(rm_calls, ["myproj"])
+            self.assertEqual(leftovers, [])
+            self.assertEqual(live, set())
+
+    def test_handle_write_failure_rolls_everything_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rm_calls: list[str] = []
+            live_names: set[str] = set()
+
+            def fake_run(cmd, *_a, **_kw):
+                if cmd[:2] == ["amux", "exec"]:
+                    live_names.add(cmd[2])
+                return _FakeCompleted(0)
+
+            def fake_rm(name):
+                rm_calls.append(name)
+                live_names.discard(name)
+
+            with _redirect_amux_home(tmp), \
+                    patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                    patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                    patch.object(cli.lib, "tmux_has_session",
+                                 side_effect=lambda n: n in live_names), \
+                    patch.object(cli.subprocess, "run", side_effect=fake_run), \
+                    patch.object(cli, "_amux_rm", side_effect=fake_rm), \
+                    patch.object(cli.lib, "write_handle",
+                                 side_effect=OSError("disk full")), \
+                    patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                    patch("sys.stderr"):
+                stdin.isatty.return_value = False
+                stdout.isatty.return_value = False
+                rc = cli.main(["spawn", "--provider", "codex", "--dir", str(ws),
+                               "--", "go"])
+                leftovers = sorted(p.name for p in (tmp / "spawn").iterdir()
+                                   if p.name != ".lock")
+            self.assertEqual(rc, 1)
+            self.assertEqual(rm_calls, ["myproj"])
+            self.assertEqual(leftovers, [])
+            self.assertEqual(live_names, set())
+
+    def test_rollback_never_touches_a_claude_launch(self):
+        """Backward compatibility: the Claude failure path is byte-for-byte."""
+        rm_calls: list[str] = []
+        with patch.object(cli, "_amux_rm", side_effect=rm_calls.append):
+            cli._rollback_launch(name="x", provider=lib.PROVIDER_CLAUDE,
+                                 event_log=None, result_path=None,
+                                 handle_written=True)
+        self.assertEqual(rm_calls, [])
+
+
+class TestCodexCapAndNaming(unittest.TestCase):
+    """Done-when 5: naming + cap stay green with a provider in the mix."""
+
+    def test_codex_spawn_counts_against_the_workspace_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            with patch.dict(os.environ, {"AMUX_SPAWN_MAX_SESSIONS": "1"}):
+                with _redirect_amux_home(tmp):
+                    lib.ensure_dirs()
+                    lib.write_handle("x", lib.new_handle(
+                        name="x", session_id="s", run_id="r", abs_dir=str(ws),
+                        transcript_path="/t", stuck_after_s=1,
+                    ))
+                with _redirect_amux_home(tmp), \
+                        patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                        patch.object(cli.lib, "tmux_has_session", return_value=True), \
+                        patch.object(cli.subprocess, "run") as run, \
+                        patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                        patch("sys.stderr"):
+                    stdin.isatty.return_value = False
+                    stdout.isatty.return_value = False
+                    rc = cli.main(["spawn", "--provider", "codex",
+                                   "--dir", str(ws), "--", "go"])
+                    self.assertEqual(rc, 1)
+                    run.assert_not_called()
+                    # The cap refusal allocated no artifacts.
+                    self.assertEqual(
+                        sorted(p.name for p in (tmp / "spawn").glob("*.events.jsonl")),
+                        [])
+
+    def test_second_codex_spawn_gets_its_own_name_and_artifacts(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            names = []
+            for i in range(2):
+                rc, calls, _h, _ = _spawn_capturing_argv(
+                    tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                          "--", "go"]
+                )
+                self.assertEqual(rc, 0)
+                names.append(_amux_exec_call(calls)[2])
+                # Real `amux exec` registers the session: <name>.env now exists,
+                # so the next pick_free_name must move on to <name>-2.
+                with _redirect_amux_home(tmp):
+                    (lib.AMUX_SESSIONS_DIR / names[-1]).with_suffix(
+                        ".env"
+                    ).write_text(f'CC_NAME="{names[-1]}"\n')
+            self.assertEqual(names, ["myproj", "myproj-2"])
+            with _redirect_amux_home(tmp):
+                a = lib.read_handle("myproj")
+                b = lib.read_handle("myproj-2")
+            self.assertNotEqual(a["activity_path"], b["activity_path"])
+            self.assertNotEqual(a["result_path"], b["result_path"])
+
 
 @unittest.skipUnless(
     os.environ.get("AMUX_SPAWN_LIVE_TEST") == "1",

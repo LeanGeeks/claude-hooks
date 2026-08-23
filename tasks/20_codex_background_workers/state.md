@@ -27,7 +27,7 @@ and event-shape uncertainties before production implementation.
 | # | Task | Status | Depends on | Notes |
 |---|---|---|---|---|
 | 20-01 | [Provider-neutral handle and event reducer](./20-01-handle-event-reducer.md) | done | amux 01-01 | Schema migration, fixtures, pure Codex JSONL reducer; no launch changes |
-| 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | todo | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
+| 20-02 | [Provider-aware launcher](./20-02-provider-aware-launcher.md) | done | 20-01, amux 01-03 | `--provider codex`, YOLO delegation, artifacts, multiline prompt |
 | 20-03 | [Codex reads and supervision](./20-03-codex-reads-supervision.md) | todo | 20-01, 20-02, amux 01-04 | `status`, `last`, `wait`, failure and stuck behavior |
 | 20-04 | [Resume and Codex model/profile ergonomics](./20-04-resume-profiles.md) | todo | 20-02, 20-03, amux 01-04 | Resume lock/attempts; no hardcoded model |
 | 20-05 | [Installer, integration tests, and docs](./20-05-integration-docs.md) | todo | 20-03, 20-04, amux 01-05 | Packaging, regression suite, operator docs |
@@ -101,3 +101,18 @@ the full repository suite and the sibling amux suite at the pinned revision.
 - **Not yet live:** 20-01 changed no runtime behavior, so
   `install-claude-config.sh` has NOT been re-run. It must be re-run before 20-06
   live verification.
+- **2026-08-23 — 20-02 done.** `amux-spawn spawn --provider codex` launches a
+  bounded Codex worker through amux's public CLI at the pinned revision; no
+  Codex argv is constructed in this repo and YOLO translation is delegated to
+  amux (grep-audited by review). Collision-safe mode-0600 artifacts, handle
+  created under the existing spawn lock, forced-failure rollback verified clean.
+  Reviewed PASS (0 blocker/high; 2 LOW report-number corrections applied
+  in place). Suite **805 passed / 0 failed / 1 pre-existing skip**.
+  - Note for 20-04: the space form `--model X` is consumed by the CLI's
+    optional `suffix` positional — pre-existing epic-10 behavior on the Claude
+    path, preserved for byte-for-byte compatibility. `--model=X` round-trips
+    verbatim for both providers. Task 20-04 (model/profile ergonomics) owns the
+    decision whether to document or fix the space form.
+  - The 20-02 implementer run was interrupted by a process restart and resumed;
+    review included an explicit restart-seam audit (no duplicated/orphaned code
+    found).

@@ -67,6 +67,43 @@ def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+# ── Provider selection (epic 20 task 20-02) ───────────────────────────────────
+#
+# Ownership boundary (epic-20 architecture §1): amux-spawn selects the provider,
+# names the session, enforces the cap, allocates the artifacts and writes the
+# tracked handle. **amux is the only component that constructs provider
+# executable argv** (cross-task invariant 3) — nothing below ever spells a
+# `codex …` command line, and `--yolo` is forwarded verbatim so amux can expand
+# it AFTER it has resolved the persisted provider (architecture §8).
+
+# Claude-only permission flags. Forwarding one of these to a Codex session would
+# be exactly the mistake architecture §8 forbids; amux would reject it too, but
+# the caller deserves the actionable message here, before anything is created.
+CLAUDE_ONLY_PERMISSION_FLAGS = (
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+)
+
+
+def _flag_present(flags: list[str], flag: str) -> bool:
+    """True if *flag* appears in *flags*, either bare or as ``--flag=value``."""
+    return any(f == flag or f.startswith(f"{flag}=") for f in flags)
+
+
+def resolve_provider(raw: str | None) -> str:
+    """Validate ``--provider`` and return the canonical provider name.
+
+    Cross-task invariant 1: the default is ``claude``. Raises ``ValueError``
+    with an actionable message for anything outside the supported set.
+    """
+    value = (raw or lib.PROVIDER_CLAUDE).strip().lower()
+    if value not in lib.PROVIDERS:
+        raise ValueError(
+            f"--provider must be one of: {', '.join(lib.PROVIDERS)} (got {raw!r})"
+        )
+    return value
+
+
 # ── flock context ─────────────────────────────────────────────────────────────
 
 class SpawnLock:
@@ -165,9 +202,60 @@ def inherited_model_flag(caller_flags: list[str], parent_name: str | None) -> st
 def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | None) -> int:
     """Create + seed a new amux session (task 10-01).
 
-    ``claude_flags`` are the pass-through Claude flags (everything amux-spawn did
-    not consume). ``prompt`` is the seeded prompt (from after ``--``), or None.
+    ``claude_flags`` are the pass-through provider flags (everything amux-spawn
+    did not consume). ``prompt`` is the seeded prompt (from after ``--``), or
+    None.
+
+    Provider (task 20-02): ``--provider claude`` (the default) is the unchanged
+    epic-10 path. ``--provider codex`` launches a **bounded** ``codex exec``
+    worker through amux's public options — ``--provider`` / ``--agent-mode`` /
+    ``--event-log`` / ``--output-last-message`` — and records the artifacts in
+    the handle. It mints no session id and guesses no transcript: a Codex thread
+    id only exists once Codex emits it.
     """
+    try:
+        provider = resolve_provider(getattr(args, "provider", None))
+    except ValueError as exc:
+        _eprint(f"amux-spawn: error: {exc}")
+        return 1
+    codex = provider == lib.PROVIDER_CODEX
+
+    # Provider/flag combinations refused with an actionable error (BRD §4.1),
+    # BEFORE anything is resolved, exported, locked or created.
+    if codex:
+        if prompt is None:
+            _eprint(
+                "amux-spawn: error: --provider codex needs a prompt: a bounded "
+                "codex exec run is one seeded turn.\n"
+                "  amux-spawn spawn <suffix> --provider codex -- \"do the thing\""
+            )
+            return 1
+        if getattr(args, "profile", None):
+            _eprint(
+                "amux-spawn: error: --profile is a Claude model profile "
+                "(~/.claude/profiles.toml) and cannot be used with "
+                "--provider codex.\n"
+                "  Pass Codex's own model/profile flags through instead "
+                "(e.g. --model gpt-5.5), or configure ~/.codex/config.toml."
+            )
+            return 1
+        if getattr(args, "wait", False) or getattr(args, "notify", False):
+            _eprint(
+                "amux-spawn: error: --wait/--notify are not supported for "
+                "--provider codex yet (task 20-03 derives Codex status).\n"
+                "  Spawn detached and read the run's artifacts from the handle."
+            )
+            return 1
+        for flag in CLAUDE_ONLY_PERMISSION_FLAGS:
+            if _flag_present(claude_flags, flag):
+                _eprint(
+                    f"amux-spawn: error: {flag} is a Claude flag and must never "
+                    f"reach Codex.\n"
+                    "  Use --yolo: amux expands it per provider "
+                    "(Codex: --dangerously-bypass-approvals-and-sandbox)."
+                )
+                return 1
+
     # Resolve model profile and export its env vars BEFORE the lock so the
     # spawner's live environment (which amux E1 snapshots via update-environment)
     # already carries the profile vars when the session is created.
@@ -190,6 +278,13 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
     # --wait/--notify => tracked. A seeded prompt at a non-TTY is the agent path.
     tracked = (not is_tty) or wait_mode
 
+    # A bounded Codex worker has no TUI to attach to and its evidence lives in
+    # files, so it is ALWAYS tracked and detached — including at a TTY. (amux
+    # itself never attaches an exec-mode session either.)
+    if codex:
+        tracked = True
+        detach = True
+
     abs_dir, parent_name, warning = resolve_dir(args.dir, is_tty)
     if warning:
         _eprint(f"amux-spawn: warning: {warning}")
@@ -199,13 +294,22 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
 
     prefix = lib.workspace_prefix(abs_dir)
 
-    # Assemble the Claude flags to forward to amux. Start from the caller's
+    # Assemble the provider flags to forward to amux. Start from the caller's
     # pass-through flags; add inherited --model when the caller gave none.
+    #
+    # --yolo is forwarded AS ``--yolo`` for both providers: amux expands it once
+    # it has resolved the persisted provider (architecture §8 / invariant 3).
+    # amux-spawn never spells --dangerously-skip-permissions nor Codex's
+    # --dangerously-bypass-approvals-and-sandbox itself.
     forward_flags = list(claude_flags)
     if args.yolo and "--yolo" not in forward_flags and \
             "--dangerously-skip-permissions" not in forward_flags:
         forward_flags.append("--yolo")
-    inh_model = inherited_model_flag(forward_flags, parent_name)
+    # Model tiers are provider-specific vocabularies: a Claude parent's
+    # "--model opus" means nothing to Codex, and BRD §3 requires that a Codex
+    # worker with no explicit model falls through to Codex's own config. So the
+    # standard --model inheritance is a same-provider (Claude) rule only.
+    inh_model = None if codex else inherited_model_flag(forward_flags, parent_name)
     if inh_model:
         forward_flags += ["--model", inh_model]
 
@@ -240,12 +344,19 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
     # governs; E5: --no-attach so every spawn is created detached under the lock).
     # The minted --session-id (tracked only) is a valid UUID; amux routes it to
     # meta.json (E4-floor), NOT CC_FLAGS — never re-pass it on restart.
-    session_id = lib.mint_uuid() if tracked else None
+    #
+    # Codex mints NOTHING here: --session-id is Claude-only (amux rejects it for
+    # other providers), and a fake Codex thread id would be a lie the resume
+    # path could act on. The real id arrives in the first ``thread.started``
+    # event and amux captures it into <name>.meta.json.
+    session_id = lib.mint_uuid() if (tracked and not codex) else None
     run_id = resolve_run_id(args.run_id, parent_name) if tracked else None
 
     # ── Critical section: one global lock held across cap-check -> name pick ->
     #    create detached -> (tracked) write handle. Released before any attach.
     chosen_name: str
+    event_log: str | None = None
+    result_path: str | None = None
     with SpawnLock():
         if tracked:
             count = lib.live_tracked_count(abs_dir)
@@ -267,33 +378,66 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
             )
             return 1
 
+        # Codex artifacts are allocated under the SAME lock as the name, so the
+        # (name, event log, result) triple is claimed atomically against any
+        # concurrent spawn. Nothing has been created outside this repo yet, so a
+        # failure here needs no session teardown.
+        if codex:
+            try:
+                event_log, result_path = lib.allocate_codex_artifacts(chosen_name)
+            except OSError as exc:
+                _eprint(f"amux-spawn: error: {exc}")
+                return 1
+
+        # The provider/artifact keywords are supplied ONLY for Codex, so a
+        # Claude spawn calls _amux_create_detached with exactly the epic-10
+        # keyword set (and the defaults reproduce the epic-10 argv verbatim).
+        create_kwargs: dict[str, Any] = {}
+        if codex:
+            create_kwargs = {
+                "provider": provider,
+                "event_log": event_log,
+                "result_path": result_path,
+            }
         rc, detail = _amux_create_detached(
             name=chosen_name,
             abs_dir=abs_dir,
             forward_flags=forward_flags,
             session_id=session_id,
             prompt=prompt,
+            **create_kwargs,
         )
         if rc != 0:
             _eprint(f"amux-spawn: error: amux failed to create session {chosen_name}")
             if detail:
                 _eprint(detail)
+            _rollback_launch(
+                name=chosen_name, provider=provider,
+                event_log=event_log, result_path=result_path,
+                handle_written=False,
+            )
             return 1
 
         # amux runs under `set -e`; don't trust its exit code alone. Confirm the
-        # tmux session is actually live before reporting success.
-        if not lib.tmux_has_session(chosen_name):
+        # session actually came up before reporting success.
+        if not _launch_confirmed(chosen_name, provider, event_log):
             _eprint(
                 f"amux-spawn: error: session {chosen_name} did not come up "
                 f"(no live tmux session after create)."
             )
+            _rollback_launch(
+                name=chosen_name, provider=provider,
+                event_log=event_log, result_path=result_path,
+                handle_written=False,
+            )
             return 1
 
         if tracked:
-            if session_id is None or run_id is None:
+            if run_id is None or (session_id is None and not codex):
                 _eprint("amux-spawn: internal error: missing session_id or run_id for tracked spawn")
                 return 1
-            transcript = lib.transcript_path_for(abs_dir, session_id)
+            # No Claude transcript is guessed for Codex — there is none.
+            transcript = None if codex else lib.transcript_path_for(abs_dir, session_id)
             handle = lib.new_handle(
                 name=chosen_name,
                 session_id=session_id,
@@ -301,8 +445,25 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
                 abs_dir=abs_dir,
                 transcript_path=transcript,
                 stuck_after_s=stuck_after_s,
+                provider=provider,
+                activity_path=event_log if codex else None,
+                result_path=result_path,
             )
-            lib.write_handle(chosen_name, handle)
+            try:
+                lib.write_handle(chosen_name, handle)
+            except Exception as exc:  # noqa: BLE001
+                _eprint(
+                    f"amux-spawn: error: could not write the handle for "
+                    f"{chosen_name}: {exc}"
+                )
+                # delete_handle is idempotent, so claiming the handle exists is
+                # the safe assumption even though write_handle is atomic.
+                _rollback_launch(
+                    name=chosen_name, provider=provider,
+                    event_log=event_log, result_path=result_path,
+                    handle_written=True,
+                )
+                return 1
     # ── lock released ──
 
     # Report the resolved name (to stderr in wait_mode so stdout stays clean for
@@ -318,6 +479,12 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
         if tracked and session_id:
             print(f"  session_id: {session_id}")
             print(f"  run_id:     {run_id}")
+        elif tracked and codex:
+            # No session_id line: the Codex thread id does not exist yet.
+            print("  provider:   codex (bounded exec)")
+            print(f"  run_id:     {run_id}")
+            print(f"  events:     {event_log}")
+            print(f"  result:     {result_path}")
 
     # TTY path: attach / switch-client (separate step, outside the lock). Skipped
     # for --detach / --wait / --notify / non-TTY.
@@ -358,30 +525,69 @@ def _amux_create_detached(
     forward_flags: list[str],
     session_id: str | None,
     prompt: str | None,
+    provider: str = lib.PROVIDER_CLAUDE,
+    event_log: str | None = None,
+    result_path: str | None = None,
 ) -> tuple[int, str | None]:
-    """Run ``amux exec <name> --no-attach --no-default-model [flags] [-- prompt]``.
+    """Create the session detached, through amux's PUBLIC option contract.
 
-    The prompt is forwarded as a trailing **positional** arg (amux funnels every
-    non-flag token to claude as the prompt, which auto-submits). The minted
-    ``--session-id`` goes through amux's flag parser, which routes it to
-    meta.json (E4-floor). No secret is inlined — env rides update-environment.
+    Claude (unchanged epic-10 argv)::
+
+        amux exec <name> --no-attach --no-default-model --dir <dir>
+             [--session-id <uuid>] [flags…] [prompt]
+
+    Codex bounded worker (amux `docs/codex-provider.md` §§2–3)::
+
+        amux exec <name> --no-attach --provider codex --agent-mode exec
+             --dir <dir> --event-log <E> --output-last-message <R>
+             [flags…] -- <prompt>
+
+    ``--provider`` / ``--agent-mode`` / ``--event-log`` /
+    ``--output-last-message`` are amux's provider-neutral options: amux persists
+    them to ``<name>.env`` (``CC_PROVIDER`` / ``CC_AGENT_MODE`` /
+    ``CC_EVENT_LOG`` / ``CC_LAST_MESSAGE``) and builds ``codex exec --json -C
+    <dir> -o <R> …`` itself. This function constructs **no** provider argv and
+    injects no model, sandbox or approval flag; ``--yolo`` rides along untouched
+    for amux to expand after provider resolution (invariant 3).
+
+    ``--no-default-model`` and ``--session-id`` are Claude-only (amux refuses
+    them for any other provider), so the Codex form carries neither.
+
+    The prompt is one argv element on both paths. For the bounded path it is
+    preceded by amux's documented ``--`` separator (``amux start w -- "…"``),
+    which ``cmd_start`` strips before handing the prompt to Codex — so the
+    prompt keeps its argv boundary and nothing in it is expanded or executed.
 
     Returns ``(returncode, captured_output_or_none)``.
     """
-    cmd: list[str] = [
-        "amux", "exec", name,
-        "--no-attach",          # E5: create detached
-        "--no-default-model",   # E2: let ANTHROPIC_MODEL / our --model govern
-        "--dir", abs_dir,
-    ]
-    if session_id is not None:
-        cmd += ["--session-id", session_id]
-    cmd += forward_flags
-    if prompt is not None:
-        # Trailing positional => claude prompt (auto-submits). amux's flag parser
-        # sends unrecognized tokens to CC_EXTRA_ARGS == the prompt. Pass it as a
-        # single argv element so multi-word/multi-line prompts stay intact.
-        cmd.append(prompt)
+    cmd: list[str] = ["amux", "exec", name, "--no-attach"]  # E5: create detached
+    if provider == lib.PROVIDER_CODEX:
+        cmd += [
+            "--provider", lib.PROVIDER_CODEX,
+            "--agent-mode", "exec",
+            "--dir", abs_dir,
+        ]
+        if event_log is not None:
+            cmd += ["--event-log", event_log]
+        if result_path is not None:
+            cmd += ["--output-last-message", result_path]
+        cmd += forward_flags
+        if prompt is not None:
+            cmd += ["--", prompt]
+    else:
+        cmd += [
+            "--no-default-model",   # E2: let ANTHROPIC_MODEL / our --model govern
+            "--dir", abs_dir,
+        ]
+        if session_id is not None:
+            cmd += ["--session-id", session_id]
+        cmd += forward_flags
+        if prompt is not None:
+            # Trailing positional => claude prompt (auto-submits). amux's flag
+            # parser sends unrecognized tokens to CC_EXTRA_ARGS == the prompt.
+            # Pass it as a single argv element so multi-word/multi-line prompts
+            # stay intact.
+            cmd.append(prompt)
 
     try:
         result = subprocess.run(
@@ -396,6 +602,60 @@ def _amux_create_detached(
         return 1, f"amux invocation failed: {exc}"
     out = (result.stdout or "") + (result.stderr or "")
     return result.returncode, out.strip() or None
+
+
+def _launch_confirmed(name: str, provider: str, event_log: str | None) -> bool:
+    """Did the session actually come up? (amux runs under ``set -e``.)
+
+    Claude: unchanged — a live tmux session is the signal.
+
+    Codex bounded: liveness is NOT the signal. A bounded ``codex exec`` run is
+    expected to exit on its own, and a trivial turn can be over before this
+    check runs — so completion evidence beats liveness (architecture §5). The
+    ``.rc`` sibling (written by amux's launch wrapper when the run finishes) or
+    any event byte proves the pane really started.
+    """
+    if lib.tmux_has_session(name):
+        return True
+    if provider != lib.PROVIDER_CODEX or not event_log:
+        return False
+    try:
+        if os.path.exists(f"{event_log}.rc"):
+            return True
+        return os.path.getsize(event_log) > 0
+    except OSError:
+        return False
+
+
+def _rollback_launch(
+    *,
+    name: str,
+    provider: str,
+    event_log: str | None,
+    result_path: str | None,
+    handle_written: bool,
+) -> None:
+    """Undo a partially completed Codex launch (task 20-02 work item 7).
+
+    Order matters, and it is the reverse of creation:
+
+      1. the handle first — while it exists, a reader can see a tracked session
+         pointing at something that is about to be destroyed;
+      2. then ``amux rm``, which stops tmux (``kill-session``, never SIGKILL —
+         01-01 evidence) and removes the registration + ``<name>.meta.json``;
+      3. then the artifacts, once nothing can still be writing to them.
+
+    Claude launches keep their epic-10 failure behavior byte-for-byte: this is a
+    no-op for them (a Claude session left behind by a failed create is
+    pre-existing behavior and out of this task's scope). Everything here is
+    fail-soft — rollback never turns one failure into two.
+    """
+    if provider != lib.PROVIDER_CODEX:
+        return
+    if handle_written:
+        lib.delete_handle(name)
+    _amux_rm(name)
+    lib.remove_codex_artifacts(event_log, result_path)
 
 
 def _amux_attach(name: str) -> None:
@@ -1149,8 +1409,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="--wait patience limit (e.g. 30s, 5m); on expiry print "
                          f"'{WAIT_TIMEOUT_MARKER}' to stdout and exit 3")
     sp.add_argument("--dir", default=None, help="explicit workspace dir override")
+    sp.add_argument("--provider", default=lib.PROVIDER_CLAUDE,
+                    help="agent CLI to launch: "
+                         f"{'|'.join(lib.PROVIDERS)} (default: {lib.PROVIDER_CLAUDE}). "
+                         "'codex' launches a bounded `codex exec` worker: always "
+                         "tracked and detached, and it needs a prompt after --")
     sp.add_argument("--yolo", action="store_true",
-                    help="pass --dangerously-skip-permissions to claude (gate still governs)")
+                    help="forward amux's provider-neutral --yolo; amux expands it "
+                         "per provider (claude: --dangerously-skip-permissions, "
+                         "codex: --dangerously-bypass-approvals-and-sandbox)")
     sp.add_argument("--run-id", default=None, help="override the inherited/minted run_id")
     sp.add_argument("--stuck-after", default=None,
                     help="stuck threshold (e.g. 10m, 600, 2h); persisted in the handle")
