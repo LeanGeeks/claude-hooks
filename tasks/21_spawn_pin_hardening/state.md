@@ -115,6 +115,18 @@ an `amux` install.
   done criterion 5; the other observes that 3 of 8 cases survive neutering because they are negative
   (`assertNotIn`) or bare-helper tests. The neutering experiment is the load-bearing one and it
   passed — 5 of 8 went red with the block stubbed out, all green on revert.
+- **2026-08-23 — 21-01 is LIVE on this machine.** `install-claude-config.sh` was re-run (the
+  user-owned half, no sudo; settings backed up to
+  `~/.claude/backups/settings.json.20260823_140446.bak`, and `model`/`effortLevel` among the keys it
+  preserved). `~/.local/bin/amux-spawn` is now byte-identical to `.claude/bin/amux-spawn`. Naming
+  the install is invariant 4's requirement, and this is the claim it licenses — acceptance §4.1/§4.2
+  re-run against the **installed** binary on `PATH`, not the repo copy:
+  - unpinned non-TTY spawn → both warnings printed, session still spawned, **exit 0**;
+  - `--model=sonnet --effort=medium` → **neither** warning, session spawned.
+
+  All three probe sessions (`tmp`, `tmp-2`, `tmp-3`) were killed and removed; `tmux ls` shows none
+  left. `install-amux.sh` was **not** run and needs no running — nothing in this epic requires it
+  (brd §3 H4), so the fork's six unrelated commits stay unshipped.
 - **2026-08-23 — 21-02 decided: DW-68 item 2 is REFUTED. `CLAUDE_CODE_EFFORT_LEVEL` stays off
   `AMUX_ENV_ALLOWLIST`.** This is a decision, not a preference: the operator declined to accept the
   recorded finding on its own and asked for it to be re-measured first. It was, independently, on
