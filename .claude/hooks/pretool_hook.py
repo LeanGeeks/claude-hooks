@@ -171,11 +171,11 @@ SCAFFOLDING_KEYWORDS = {
 # sub-command. Whatever follows the builtin is data (a name, assignment, option,
 # numeric status, job spec, or path), never a command to validate.
 #
-# Deliberately EXCLUDED because they CAN execute an arbitrary command (and so
-# must stay on the normal allow/deny path): `eval`, `source`/`.`, `trap` (its
-# handler string is run later, unvalidated), `alias` (can shadow a real command),
-# `mapfile`/`readarray` (their `-C` callback runs per line), and `kill` (signals
-# arbitrary processes). `command`/`exec`/`builtin` are handled as wrappers above.
+# NOT in this set (deliberately): `eval` (executes arbitrary strings), `exec`
+# (handled as a wrapper above; replaces the process image), `trap` and `source`
+# (handled via SAFE_BUILTINS below — they are allowed but not "runs nothing"):
+# `alias` (can shadow a real command), `mapfile`/`readarray` (their `-C` callback
+# runs per line), and `kill` (signals arbitrary processes).
 NOOP_BUILTINS = {
     ':', 'true', 'false',  # pure no-ops
     'exit', 'return',      # terminate shell/function (numeric status only)
@@ -186,10 +186,61 @@ NOOP_BUILTINS = {
     # Loop-control builtins — only affect iteration of the current shell loop.
     'break', 'continue',
     # Shell-state / positional-parameter builtins — mutate the current shell only.
-    'set', 'shopt', 'shift', 'let', 'read', 'getopts', 'umask', 'wait',
+    'set', 'shopt', 'shift', 'let', 'read', 'getopts', 'umask', 'ulimit', 'wait',
     'hash', 'times',
     # Directory-stack builtins — change cwd / the dir stack (path operands only).
     'cd', 'pushd', 'popd', 'dirs',
+}
+
+# Curated set of shell builtins that are safe to auto-allow by head-token match,
+# without requiring a pattern entry in settings.json. A sub-command whose HEAD
+# TOKEN (the bare command word after stripping leading KEY=VALUE env prefixes) is
+# in this set is approved immediately, before the pattern lookup.
+#
+# Selection criteria: the builtin must NOT be able to execute an arbitrary
+# command string or replace the current process image. All entries only inspect
+# or mutate the current shell's own state (variables, resource limits, signal
+# dispositions, positional parameters, shell options) or perform a fixed
+# structural operation with no code-execution side effects.
+#
+# DELIBERATELY EXCLUDED — and must remain excluded — even if they appear
+# superficially safe:
+#   eval  — executes an arbitrary string as shell code; the canonical "exec
+#            anything" builtin. Adding it would make SAFE_BUILTINS a bypass for
+#            the entire permission system.
+#   exec  — replaces the process image; handled as a wrapper in WRAPPER_PREFIXES
+#            so the command it runs is validated on its own merits. Listing exec
+#            here would auto-allow arbitrary process replacement without checking
+#            the target command.
+# Do not add either without a full security review and explicit operator sign-off.
+#
+# NOTE on SETTINGS.JSON REDUNDANCY: several of these builtins already appear as
+# individual Bash(<name>:*) pattern entries in .claude/settings.json (e.g.
+# Bash(set:*), Bash(export:*), Bash(source:*), Bash(read:*), Bash(for:*),
+# Bash(done:*), Bash(fi:*), Bash(break:*), Bash(wait:*)). Those entries are now
+# redundant with SAFE_BUILTINS and can be pruned from settings.json in a future
+# cleanup pass. They are intentionally left in place for the transition period
+# (removing them would change live gate behaviour for a second reason in the same
+# change, and .claude/settings.json is merged into ~/.claude/settings.json by the
+# installer, so a repo deletion does not cleanly retract them).
+SAFE_BUILTINS = {
+    # Already in NOOP_BUILTINS / SCAFFOLDING_KEYWORDS — listed here for the
+    # complete canonical reference; the NOOP path fires first for these.
+    'set', 'export', 'read', 'for', 'done', 'fi', 'break',
+    'shift', 'local', 'wait', 'umask', 'ulimit', 'getopts',
+    'return', 'continue', 'unset', 'readonly',
+    # Not in NOOP_BUILTINS — SAFE_BUILTINS is the only auto-allow path for these:
+    #   source — executes a file, but only a file named by a literal path that
+    #            is already on disk; no code-generation surface (unlike eval).
+    #   trap   — registers a handler string for later delivery; the handler runs
+    #            when the signal/event fires, not at trap-call time. The parser
+    #            validates any $(…) command substitution within the handler string
+    #            as a separate sub-command, but a literal handler string (e.g.,
+    #            single-quoted, as in `trap 'rm -rf /' EXIT`) is NOT extracted or
+    #            validated at trap-registration time — it runs when the signal fires.
+    #            trap is allowed on its head token alone; the handler content is
+    #            not inspected by the hook.
+    'source', 'trap',
 }
 
 # A leading function-definition header: `name() {`, `name ()`, `function name {`,
@@ -1152,6 +1203,27 @@ class BashPermissionValidator:
                 'matched_ask_patterns': []
             }
         cmd = effective
+
+        # SAFE_BUILTINS: if the effective head token (the command word after env
+        # prefix stripping by _reduce_to_effective_command) is a known-safe shell
+        # builtin, allow immediately without a pattern lookup. The head-token check
+        # is precise: we split on whitespace and take the first token, then require
+        # it has no '/' (so /bin/trap is not mistaken for the bare builtin trap).
+        # This handles:
+        #   VAR=x trap ...  → _reduce_to_effective_command peels VAR=x → head=trap ✓
+        #   /bin/trap ...   → head='/bin/trap' → '/' present → not matched ✓
+        _effective_head = cmd.split()[0] if cmd.split() else ''
+        if _effective_head and '/' not in _effective_head and _effective_head in SAFE_BUILTINS:
+            debug_log(f"Command {cmd!r} head token {_effective_head!r} in SAFE_BUILTINS - auto-allowing")
+            return {
+                'command': cmd,
+                'allowed': True,
+                'denied': False,
+                'asked': False,
+                'matched_allow_patterns': ['safe_builtin'],
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': []
+            }
 
         # A call to a function defined EARLIER in this same compound command runs
         # only its (separately validated) body, so it is a no-op here. This also

