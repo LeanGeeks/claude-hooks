@@ -18,6 +18,9 @@ Behaviour notes:
 - The message is fire-and-forget: no buttons, no reply expected (the
   Notification hook can't inject a reply back into the running session — making
   it answerable is a future iteration).
+- Idle notifications are suppressed for sessions started programmatically
+  (``amux-spawn`` tracked sessions) — those report to their parent, not to the
+  operator. Sessions you start by hand always send. See ``should_notify_idle()``.
 - Idle notifications are suppressed while async background agents are still
   running, since a parent session looks "idle" while it waits on child Tasks.
 
@@ -54,6 +57,9 @@ from telegram_permission_router import (
     load_telegram_config,
     send_idle_notification,
 )
+
+sys.path.insert(0, str(Path(__file__).parent))
+import amux_spawn_lib as lib  # noqa: E402
 
 # Configuration
 CLAUDE_DIR = Path.home() / ".claude"
@@ -564,6 +570,40 @@ def resolve_amux_session() -> str | None:
     return amux_name or None
 
 
+def session_started_by_agent(amux_name: str | None, session_id: str) -> bool:
+    """Return True if THIS session was started programmatically (tracked handle).
+
+    "Programmatically" means ``amux-spawn`` classified it as a tracked session:
+    an agent's Bash tool called ``amux-spawn spawn``, or a cron script did so
+    from a non-TTY context.  Hand-started sessions produce no handle and return
+    False — so every failure mode of this predicate lands on "notify" (fail-open).
+
+    The identity check (``handle["session_id"] == session_id``) is load-bearing:
+    amux names are reused but handles are reaped only by ``amux-spawn rm``.  A
+    plain ``amux rm`` leaves an orphaned handle; without the id comparison a
+    later human session that inherits the name would go silent.  See §3.1.
+    """
+    if not amux_name:
+        return False
+    handle = lib.read_handle(amux_name)
+    if handle is None:
+        return False
+    # Require the handle to name THIS exact session, not merely share its amux
+    # name.  A None session_id in the handle (Codex-shaped) never matches a
+    # real UUID, so Codex workers are correctly treated as operator-started.
+    return handle.get("session_id") == session_id
+
+
+def should_notify_idle(amux_name: str | None, session_id: str) -> bool:
+    """Policy: may this session raise an idle notification?
+
+    Returns True (notify) for operator-started sessions; False (stay silent) for
+    programmatically-started ones.  This is the single seam the later settings
+    epic will replace — all callers go through here.
+    """
+    return not session_started_by_agent(amux_name, session_id)
+
+
 def spawn_reply_injector(message_id: int, amux_name: str) -> None:
     """Detach a ``reply_injector.py`` process for this idle notification.
 
@@ -624,6 +664,23 @@ def main():
             debug_log(f"Skipping notification type: {notification_type}")
             sys.exit(0)
 
+        # Resolve the amux session name early: used both for the origin gate
+        # below and for reply-injector routing later.  One tmux round-trip is
+        # far cheaper than a transcript replay, and for tracked sessions the
+        # background-agent check is irrelevant.
+        amux_name = resolve_amux_session()
+
+        # Origin gate: programmatically-started sessions (amux-spawn tracked
+        # handles) report to their parent — the Telegram card would be noise.
+        # Operator-started sessions always pass.  Fails open on every error:
+        # no handle, corrupt handle, id mismatch → notify.
+        if not should_notify_idle(amux_name, session_id):
+            debug_log(
+                f"Skipping idle notification: session started by agent "
+                f"(amux:{amux_name})"
+            )
+            sys.exit(0)
+
         # Suppress idle notifications while async background agents are running.
         # Parent sessions can be "idle" while they wait for child Task completions.
         if has_active_background_agents(transcript_path):
@@ -651,7 +708,7 @@ def main():
         # An amux-hosted session can receive a reply back (task 09): we send the
         # notification as a force-reply so the user can answer in-thread, then
         # arm a detached injector. A non-amux session stays notify-only.
-        amux_name = resolve_amux_session()
+        # amux_name was resolved above at the origin gate.
         reply_enabled = amux_name is not None
 
         # Derive the dedupe key from the composed message itself: an idle prompt

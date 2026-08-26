@@ -115,7 +115,9 @@ Claude Code uses a hook system for command validation and permission handling. U
    - Returns final decision based on user input
 
 3. **Notification**: Triggered for idle notification events
-   - `idle_prompt`: When Claude is waiting for input
+   - `idle_prompt`: When Claude is waiting for input — forwarded to Telegram for
+     operator-started sessions only; sessions started by agents (`amux-spawn`
+     tracked handles) are silently skipped.
    - Permission prompts are handled by `PermissionRequest` and forwarded to Telegram
 
 ### Decision Flow

@@ -991,7 +991,7 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
     echo "    - PreToolUse: Bash command interception"
     echo "    - PermissionRequest: Telegram-gated permission approval"
     echo "    - PostToolUse: Telegram message cleanup on terminal response"
-    echo "    - Notification: idle_prompt → Telegram (forwards agent's last message)"
+    echo "    - Notification: idle_prompt → Telegram (operator-started sessions only; forwards agent's last message)"
     echo "    - Stop/SubagentStop/Notification(permission_prompt)/SessionEnd → amux-spawn producer (tracked-session state)"
 else
     echo "  - hooks: not installed (missing files)"

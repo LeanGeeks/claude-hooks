@@ -150,6 +150,86 @@ class TestResolveAmuxSession(unittest.TestCase):
             self.assertIsNone(nh.resolve_amux_session())
 
 
+class TestSessionOrigin(unittest.TestCase):
+    """Unit tests for session_started_by_agent() and should_notify_idle().
+
+    Cases 1-7 from §8.  Drive the real lib.read_handle against a temp directory
+    so they break if the handle layout moves (no stubbing of the read logic).
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.mkdtemp()
+        # Point lib.SPAWN_DIR at the temp directory for the duration of each test.
+        self._orig_spawn_dir = nh.lib.SPAWN_DIR
+        nh.lib.SPAWN_DIR = Path(self._tmpdir)
+
+    def tearDown(self):
+        nh.lib.SPAWN_DIR = self._orig_spawn_dir
+        import shutil as _shutil
+        _shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _write_handle(self, name: str, data: dict) -> None:
+        import json as _json
+        path = Path(self._tmpdir) / f"{name}.json"
+        path.write_text(_json.dumps(data))
+
+    # Case 1: handle present, session_id matches → agent-started
+    def test_matching_handle_is_agent_started(self):
+        self._write_handle("my-worker", {"session_id": "aabbccdd-1234-5678-abcd-000000000001"})
+        self.assertTrue(
+            nh.session_started_by_agent("my-worker", "aabbccdd-1234-5678-abcd-000000000001")
+        )
+        self.assertFalse(
+            nh.should_notify_idle("my-worker", "aabbccdd-1234-5678-abcd-000000000001")
+        )
+
+    # Case 2: no handle file for the name → operator-started (hand-started case)
+    def test_no_handle_is_operator_started(self):
+        self.assertFalse(nh.session_started_by_agent("my-session", "any-session-id"))
+        self.assertTrue(nh.should_notify_idle("my-session", "any-session-id"))
+
+    # Case 3: amux_name is None → not an amux session → operator-started
+    def test_none_amux_name_is_operator_started(self):
+        self.assertFalse(nh.session_started_by_agent(None, "any-session-id"))
+        self.assertTrue(nh.should_notify_idle(None, "any-session-id"))
+
+    # Case 4: handle file contains invalid JSON → fail open (notify)
+    def test_corrupt_handle_fails_open(self):
+        path = Path(self._tmpdir) / "broken.json"
+        path.write_text("{not json")
+        self.assertFalse(nh.session_started_by_agent("broken", "any-session-id"))
+        self.assertTrue(nh.should_notify_idle("broken", "any-session-id"))
+
+    # Case 5: handle has a different UUID → §3.1 orphan-handle guard → fails open
+    def test_different_session_id_fails_open(self):
+        self._write_handle("reused-name", {"session_id": "aabbccdd-0000-0000-0000-000000000001"})
+        # A later operator session on the same name has a different id.
+        self.assertFalse(
+            nh.session_started_by_agent("reused-name", "ffffffff-0000-0000-0000-000000000002")
+        )
+        self.assertTrue(
+            nh.should_notify_idle("reused-name", "ffffffff-0000-0000-0000-000000000002")
+        )
+
+    # Case 6: handle carries session_id: None (Codex-shaped) → fails open
+    def test_codex_shaped_handle_fails_open(self):
+        self._write_handle("codex-worker", {"session_id": None})
+        # Payload carries a real UUID — the None never matches.
+        self.assertFalse(
+            nh.session_started_by_agent("codex-worker", "aabbccdd-0000-0000-0000-000000000001")
+        )
+        self.assertTrue(
+            nh.should_notify_idle("codex-worker", "aabbccdd-0000-0000-0000-000000000001")
+        )
+
+    # Case 7: payload session_id is empty string, handle carries a real UUID → fails open
+    def test_empty_payload_session_id_fails_open(self):
+        self._write_handle("my-worker", {"session_id": "aabbccdd-0000-0000-0000-000000000001"})
+        self.assertFalse(nh.session_started_by_agent("my-worker", ""))
+        self.assertTrue(nh.should_notify_idle("my-worker", ""))
+
+
 class TestMainRouting(unittest.TestCase):
     """main() routing. We patch resolve_amux_session + spawn_reply_injector so
     these never depend on the host being amux or spawn real injector processes;
@@ -162,12 +242,18 @@ class TestMainRouting(unittest.TestCase):
         self._spawn = patch.object(
             nh, "spawn_reply_injector", lambda mid, name: self.spawned.append((mid, name))
         )
+        # Default: no handle for any name → operator-started (untracked).
+        # Without this, tests that pass a real amux_name reach the developer's
+        # live ~/.amux/spawn/ registry and may flip depending on disk state.
+        self._read_handle = patch.object(nh.lib, "read_handle", lambda name: None)
         self._resolve.start()
         self._spawn.start()
+        self._read_handle.start()
 
     def tearDown(self):
         self._resolve.stop()
         self._spawn.stop()
+        self._read_handle.stop()
 
     def _run_main(self, payload):
         with patch("sys.stdin", io.StringIO(json.dumps(payload))):
@@ -333,6 +419,85 @@ class TestMainRouting(unittest.TestCase):
              patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
             self._run_main(payload)
         self.assertEqual(called, [])
+
+    def test_tracked_session_suppressed(self):
+        """Case 8: matching tracked handle → exit 0, send never called, no injector."""
+        t = _write_transcript([_assistant("work done")])
+        session_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": session_uuid,
+            "cwd": "/tmp/x",
+            "transcript_path": t,
+        }
+        called = []
+        with patch.object(nh, "resolve_amux_session", lambda: "my-agent"), \
+             patch.object(nh.lib, "read_handle",
+                          lambda name: {"session_id": session_uuid}), \
+             patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", lambda *a, **k: called.append(1)):
+            code = self._run_main(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(called, [], "send_idle_notification must not be called for tracked sessions")
+        self.assertEqual(self.spawned, [], "reply injector must not be armed for tracked sessions")
+
+    def test_tracked_gate_precedes_transcript_replay(self):
+        """Case 9: gate fires before has_active_background_agents; transcript never replayed."""
+        # Point transcript_path at a file that does not exist — if the gate
+        # correctly exits before has_active_background_agents(), no file read
+        # happens and the test passes.  Patch has_active_background_agents to
+        # record calls so we can assert it was never reached.
+        session_uuid = "11111111-2222-3333-4444-555555555555"
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": session_uuid,
+            "cwd": "/tmp/x",
+            "transcript_path": "/nonexistent/path/transcript.jsonl",
+        }
+        replay_calls = []
+        with patch.object(nh, "resolve_amux_session", lambda: "my-agent"), \
+             patch.object(nh.lib, "read_handle",
+                          lambda name: {"session_id": session_uuid}), \
+             patch.object(nh, "has_active_background_agents",
+                          lambda path: replay_calls.append(path) or False), \
+             patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", lambda *a, **k: None):
+            code = self._run_main(payload)
+        self.assertEqual(code, 0)
+        self.assertEqual(replay_calls, [],
+                         "has_active_background_agents must not be called when origin gate fires")
+
+    def test_untracked_amux_session_sends_and_arms_injector(self):
+        """Case 10: amux session with no handle → notifies with force-reply + injector."""
+        t = _write_transcript([_assistant("awaiting decision")])
+        session_uuid = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+        payload = {
+            "notification_type": "idle_prompt",
+            "session_id": session_uuid,
+            "cwd": "/tmp/myrepo",
+            "transcript_path": t,
+        }
+        captured = {}
+
+        def fake_send(text, dedupe_key, *, reply_required=False):
+            captured["reply_required"] = reply_required
+            return 99
+
+        # resolve_amux_session returns a name, but read_handle (patched in setUp)
+        # returns None → plain/operator-started session → should notify.
+        with patch.object(nh, "resolve_amux_session", lambda: "hyppie-flow"), \
+             patch.object(nh, "load_telegram_config", lambda: None), \
+             patch.object(tr, "TELEGRAM_ENABLED", True), \
+             patch.object(nh, "send_idle_notification", fake_send):
+            code = self._run_main(payload)
+
+        self.assertEqual(code, 0)
+        self.assertTrue(captured.get("reply_required"),
+                        "untracked amux session must use force-reply")
+        self.assertEqual(self.spawned, [(99, "hyppie-flow")],
+                         "reply injector must be armed with (message_id, amux_name)")
 
 
 def _tool_result(tool_use_id, text="done", tool_use_result=None, is_error=False):

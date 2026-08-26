@@ -112,7 +112,7 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 | `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. All allowed → allow; otherwise let Claude Code surface a `PermissionRequest`. |
 | `PermissionRequest` | `*` | `permission_request_hook.py` | Send the request to Telegram via the relay, long-poll for the answer, map it to an allow/deny/stop/whitelist/reply decision. Also handles `AskUserQuestion`. timeout 43200s. |
 | `PostToolUse` | `*` | `posttool_hook.py` | If the request was resolved in the terminal instead, cancel the relay message (strip buttons) so the Telegram prompt goes dead. |
-| `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification (see below). |
+| `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification — conditional on the session being operator-started (see below). |
 
 ### permission_state_store.py — cross-hook coordination
 
@@ -364,6 +364,9 @@ resolved destination and escalation for each role in the current workspace.
 
 ```
 Session goes idle ──► Notification(idle_prompt): notification_hook
+   origin gate: session_started_by_agent(amux_name, session_id)?
+     yes (tracked amux-spawn handle matches this session) → silent
+     no  (no handle, or handle belongs to a different session) → continue
    suppressed while async background agents still run
    extract last MAIN-agent text from the transcript (skip sidechain/tool-only/thinking)
    HTML-escape + tail-truncate to ~3800 chars
