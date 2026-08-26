@@ -21,8 +21,8 @@ one-line changes if they prove wrong in practice:
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
 | 22-01 | [Validator: deny denies, ask asks](./22-01-validator-deny-and-ask.md) | done | — | Independently shippable; changes live behavior on install. Watch H1 (no more human-rescue for deny false positives). |
-| 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | in_progress | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
-| 22-03 | [Permissions MCP: read + decide](./22-03-permissions-mcp.md) | todo | 22-01, 22-02 | The server, registration, D5 guard, D3 tier. 22-01 defines the tier vocabulary; 22-02 makes decide effective. |
+| 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | done | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
+| 22-03 | [Permissions MCP: read + decide](./22-03-permissions-mcp.md) | in_progress | 22-01, 22-02 | The server, registration, D5 guard, D3 tier. 22-01 defines the tier vocabulary; 22-02 makes decide effective. |
 | 22-04 | [Allowlist writers + queue](./22-04-allowlist-writes-and-queue.md) | todo | 22-03 | `resolve_project_key`, queue format, versioned-settings writer, `allowlist_add` + `report_parser_issue` tools. |
 | 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | todo | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
 | 22-06 | [Live verification](./22-06-live-verification_human.md) | todo | all | **human** — walks brd §5 end to end with real sessions and a real Telegram chat. |
@@ -112,3 +112,11 @@ one-line changes if they prove wrong in practice:
   `install-claude-config.sh` has not been re-run, so `~/.claude/hooks/` still
   carries the old mapping and user-scope `ask` patterns do not yet exist
   (invariant 8, H6). Run the installer before 22-06.
+- **2026-08-26 — 22-02 done.** Store carries `actor_agent` and
+  `RESOLUTION_SOURCE_AGENT`; the relay-path wait loop adopts an external
+  decision only when the row is agent-sourced *and* in `{ALLOW, DENY, STOP}`
+  (both halves of the gate now isolated by tests); `_finalize_agent_decision`
+  patches the Telegram message with 🤖 attribution then cancels, best-effort.
+  Tests 931 → 942. Review PASS; one MEDIUM (source gate untested in isolation)
+  and two LOW findings fixed and re-reviewed PASS. Inert until 22-03 writes
+  decisions. Decision-dict contract for 22-03: `{"action": "allow"|"deny"|"stop"}`.

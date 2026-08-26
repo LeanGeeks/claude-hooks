@@ -469,6 +469,146 @@ class TestSessionQueries(unittest.TestCase):
         self.assertIsNone(pending)
 
 
+class TestActorAgentField(unittest.TestCase):
+    """``PermissionRequest.actor_agent`` and the ``agent`` resolution source
+    (epic 22): every agent-written decision must be attributable after the
+    fact — on the row and in the audit log."""
+
+    def test_agent_decision_persists_actor_and_source(self):
+        from permission_state_store import RESOLUTION_SOURCE_AGENT
+
+        request = create_request(
+            session_id="test-actor-agent",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        self.assertIsNone(request.actor_agent)
+
+        updated = update_request_state(
+            request.request_id,
+            RequestState.ALLOW,
+            decision={"action": "allow"},
+            resolution_source=RESOLUTION_SOURCE_AGENT,
+            actor_agent="abc123def456 @ claude-hooks",
+        )
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.actor_agent, "abc123def456 @ claude-hooks")
+        self.assertEqual(updated.resolution_source, RESOLUTION_SOURCE_AGENT)
+
+        loaded = get_request(request.request_id)
+        self.assertEqual(loaded.actor_agent, "abc123def456 @ claude-hooks")
+        self.assertEqual(loaded.resolution_source, "agent")
+        self.assertEqual(loaded.decision, {"action": "allow"})
+
+    def test_audit_entry_carries_actor_agent(self):
+        from permission_state_store import RESOLUTION_SOURCE_AGENT
+
+        request = create_request(
+            session_id="test-actor-agent-audit",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        update_request_state(
+            request.request_id,
+            RequestState.DENY,
+            decision={"action": "deny"},
+            resolution_source=RESOLUTION_SOURCE_AGENT,
+            actor_agent="sess-9f8e @ worktree",
+        )
+
+        entries = []
+        with open(AUDIT_LOG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                if entry.get("request_id") == request.request_id:
+                    entries.append(entry)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["actor_agent"], "sess-9f8e @ worktree")
+        self.assertEqual(entries[0]["new_state"], "deny")
+        self.assertIsNone(entries[0]["actor_user_id"])
+
+    def test_human_write_leaves_actor_agent_untouched(self):
+        """The guarded write (like ``actor_user_id``): a later human/timeout
+        write that passes no ``actor_agent`` must not blank an existing one, and
+        must not invent one."""
+        from permission_state_store import RESOLUTION_SOURCE_TELEGRAM
+
+        request = create_request(
+            session_id="test-actor-agent-guard",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        updated = update_request_state(
+            request.request_id,
+            RequestState.ALLOW,
+            decision={"action": "allow"},
+            actor_user_id=42,
+            resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+        )
+        self.assertIsNone(updated.actor_agent)
+        self.assertEqual(get_request(request.request_id).actor_agent, None)
+
+    def test_row_written_before_this_change_loads_with_actor_agent_none(self):
+        """Old-format rows (no ``actor_agent`` key) must deserialize unchanged."""
+        legacy = {
+            "request_id": "legacy-row-no-actor-agent",
+            "session_id": "legacy-session",
+            "cwd": "/test",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "permission_suggestions": [],
+            "state": "pending",
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "expires_at": _expires_at(600),
+            "telegram_message_id": None,
+            "decision": None,
+            "reply_text": None,
+            "actor_user_id": None,
+            "resolution_source": None,
+            "resolved_at": None,
+            "expired_notified_at": None,
+            "agent_id": None,
+            "role": None,
+        }
+        self.assertNotIn("actor_agent", legacy)
+        self.assertIsNone(PermissionRequest.from_dict(legacy).actor_agent)
+
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, "a") as f:
+            f.write(json.dumps(legacy) + "\n")
+
+        loaded = get_request("legacy-row-no-actor-agent")
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.actor_agent)
+        self.assertEqual(loaded.tool_name, "Bash")
+
+        # …and a new agent write onto that old row still attributes.
+        from permission_state_store import RESOLUTION_SOURCE_AGENT
+
+        updated = update_request_state(
+            "legacy-row-no-actor-agent",
+            RequestState.ALLOW,
+            decision={"action": "allow"},
+            resolution_source=RESOLUTION_SOURCE_AGENT,
+            actor_agent="legacy-writer @ test",
+        )
+        self.assertEqual(updated.actor_agent, "legacy-writer @ test")
+
+
 class TestRoleField(unittest.TestCase):
     """``PermissionRequest.role`` — the resolved role id a request was routed
     to. Only the id is persisted; the installation token never is."""

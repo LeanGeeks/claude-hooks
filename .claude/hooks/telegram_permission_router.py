@@ -469,15 +469,19 @@ def _send_relay(
     return handle.message_id
 
 
-def send_permission_message(
+def render_permission_body(
     request: PermissionRequest,
     workspace_name: str,
     session_name: Optional[str] = None,
-) -> Optional[int]:
-    """Send a permission-request prompt with allow/deny/stop/whitelist buttons.
+) -> str:
+    """Build the HTML body of a permission-request message.
 
-    Returns the relay message id (stored as ``telegram_message_id`` on the
-    state-store row for legacy reasons).
+    Pure function — no network, no state-store writes (it does re-run the
+    validator via ``_unallowlisted_bash_parts``, which reads settings files).
+    ``send_permission_message`` calls it to compose the text it sends, and
+    callers that later need to PATCH that message — the agent-decision
+    finalization in ``permission_request_hook`` — call it again to reconstruct
+    the exact body that was sent.
     """
     import html as _html
 
@@ -519,7 +523,20 @@ def send_permission_message(
         lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in unknown]
 
     lines += ["", "Approve this command?"]
-    text = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def send_permission_message(
+    request: PermissionRequest,
+    workspace_name: str,
+    session_name: Optional[str] = None,
+) -> Optional[int]:
+    """Send a permission-request prompt with allow/deny/stop/whitelist buttons.
+
+    Returns the relay message id (stored as ``telegram_message_id`` on the
+    state-store row for legacy reasons).
+    """
+    text = render_permission_body(request, workspace_name, session_name)
 
     message_id = _send_relay(
         text=text,

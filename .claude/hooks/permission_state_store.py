@@ -71,6 +71,10 @@ TERMINAL_STATES = {
 RESOLUTION_SOURCE_TELEGRAM = "telegram"
 RESOLUTION_SOURCE_TERMINAL = "terminal"
 RESOLUTION_SOURCE_TIMEOUT = "timeout"
+# An AI agent decided the request (epic 22): the permissions MCP writes it, and
+# the relay-path wait loop adopts a terminal state only when it carries this
+# source. Callers pass it explicitly — see update_request_state's inference note.
+RESOLUTION_SOURCE_AGENT = "agent"
 
 
 @dataclass
@@ -90,7 +94,11 @@ class PermissionRequest:
     decision: Optional[Dict[str, Any]] = None
     reply_text: Optional[str] = None
     actor_user_id: Optional[int] = None
-    resolution_source: Optional[str] = None  # "telegram" | "terminal" | "timeout"
+    # Human-readable actor string for an agent-written decision, e.g.
+    # "abc123def456 @ claude-hooks" (session id prefix @ cwd basename). None for
+    # every human/timeout resolution. Composed by the caller, never here.
+    actor_agent: Optional[str] = None
+    resolution_source: Optional[str] = None  # "telegram" | "terminal" | "timeout" | "agent"
     resolved_at: Optional[str] = None  # ISO timestamp when resolved
     expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
     agent_id: Optional[str] = None  # subagent id (None for parent session)
@@ -123,6 +131,7 @@ class AuditEntry:
     previous_state: str
     new_state: str
     details: Optional[Dict[str, Any]] = None
+    actor_agent: Optional[str] = None  # set when an agent, not a human, decided
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -343,6 +352,7 @@ def update_request_state(
     actor_user_id: Optional[int] = None,
     resolution_source: Optional[str] = None,
     terminal_answers: Optional[str] = None,
+    actor_agent: Optional[str] = None,
 ) -> Optional[PermissionRequest]:
     """
     Update the state of a request.
@@ -356,10 +366,14 @@ def update_request_state(
         decision: Optional decision data (for whitelist actions)
         reply_text: Optional reply text (for reply actions)
         actor_user_id: Optional Telegram user ID who performed the action
-        resolution_source: Optional source of resolution ("telegram" | "terminal" | "timeout")
+        resolution_source: Optional source of resolution
+            ("telegram" | "terminal" | "timeout" | "agent")
         terminal_answers: Optional reduced JSON of the terminal's answers.
             Written only when a value is passed, so a later sweep over sibling
             rows cannot blank out what PostToolUse recorded a moment earlier.
+        actor_agent: Optional human-readable actor string for an agent-written
+            decision. Written only when a value is passed (same guarded shape as
+            actor_user_id), so a later write cannot blank out the attribution.
 
     Returns:
         Updated PermissionRequest if successful, None if request not found
@@ -373,7 +387,13 @@ def update_request_state(
     previous_state = None
     now = _utc_now()
 
-    # Determine resolution source based on state if not provided
+    # Determine resolution source based on state if not provided.
+    #
+    # This inference must never claim an agent decision: an agent writer
+    # (RESOLUTION_SOURCE_AGENT) always passes ``resolution_source`` explicitly,
+    # because the relay-path wait loop gates on that exact value. A write that
+    # let itself be inferred here would be labelled "telegram" and silently lose
+    # its attribution (epic 22, invariant 5).
     if resolution_source is None and new_state in TERMINAL_STATES:
         if new_state == RequestState.RESOLVED_TERMINAL:
             resolution_source = RESOLUTION_SOURCE_TERMINAL
@@ -428,6 +448,8 @@ def update_request_state(
                             data['reply_text'] = reply_text
                         if actor_user_id is not None:
                             data['actor_user_id'] = actor_user_id
+                        if actor_agent is not None:
+                            data['actor_agent'] = actor_agent
                         if terminal_answers is not None:
                             data['terminal_answers'] = terminal_answers
                         if resolution_source is not None:
@@ -466,6 +488,7 @@ def update_request_state(
             previous_state=previous_state or 'unknown',
             new_state=new_state.value,
             details={'decision': decision} if decision else None,
+            actor_agent=actor_agent,
         )
         _append_audit_log(audit_entry)
 

@@ -51,6 +51,7 @@ from permission_state_store import (
     resolve_via_terminal,
     update_request_state,
     cleanup_expired_requests,
+    RESOLUTION_SOURCE_AGENT,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
     RESOLUTION_SOURCE_TIMEOUT,
@@ -58,6 +59,7 @@ from permission_state_store import (
 from telegram_permission_router import (
     load_telegram_config,
     finalize_message,
+    render_permission_body,
     send_permission_message,
     send_question_message,
     wait_for_relay_answer,
@@ -324,6 +326,50 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
     return None
 
 
+# Terminal states an *external* writer (the epic-22 permissions MCP) may use to
+# resolve a parked request, as raw state values.
+#
+# Deliberately not REPLY or WHITELIST: reply carries injection semantics, and
+# whitelist has its own writer path (22-04 goes through settings files instead).
+# ``decide`` only ever writes allow/deny/stop. The source gate at the call site
+# is what keeps this from adopting an EXPIRED row (source ``timeout``) or a row
+# a later compaction pass rewrote.
+_EXTERNALLY_DECIDABLE_STATES = {
+    RequestState.ALLOW.value,
+    RequestState.DENY.value,
+    RequestState.STOP.value,
+}
+
+
+def _finalize_agent_decision(message_id: int, row: PermissionRequest) -> None:
+    """Bake an agent's decision into the live Telegram message, then cancel it.
+
+    The human never tapped anything here, so the chat would otherwise keep an
+    open keyboard and collect ``#unanswered`` nudges until the reaper expires
+    it. We PATCH the original body plus ``🤖 <action> by agent <actor_agent>``
+    and strip the keyboard — ``finalize_message`` does both, patch *then*
+    cancel. The relay re-renders the PATCH through ``render_body``, which drops
+    the ``#unanswered`` tag and kills any live nudge.
+
+    Best-effort and non-fatal: a dead chat, a failed reconstruction or an
+    unreachable relay must never cost the caller its decision (the reaper's
+    cleanup sweep is the backstop, as on every other finalization path).
+    """
+    try:
+        body = render_permission_body(
+            row,
+            get_workspace_name(row.cwd),
+            get_session_name(row.session_id, row.cwd),
+        )
+        action = (row.decision or {}).get("action", "decided")
+        actor = row.actor_agent or "unknown"
+        finalize_message(
+            message_id, body, f"{action} by agent {actor}", prefix="🤖 "
+        )
+    except Exception as e:  # noqa: BLE001 — never disrupt the decision path.
+        debug_log(f"Failed to finalize agent-decided message {message_id}: {e}")
+
+
 def wait_for_response(
     request_id: str,
     message_id: Optional[int],
@@ -339,6 +385,11 @@ def wait_for_response(
     * The user resolves the request through the terminal prompt. The
       PostToolUse hook writes ``resolved_terminal`` to the local state store;
       between long-poll chunks we check for that and bail out.
+
+    A third wakeup joined them in epic 22: an **agent** may write a terminal
+    decision straight into the store (the permissions MCP). Between long-poll
+    chunks we adopt such a row — but only when it carries
+    ``resolution_source == "agent"`` (see ``_EXTERNALLY_DECIDABLE_STATES``).
 
     Returns a decision dict for Telegram answers, ``None`` if the request was
     resolved via terminal, the message expired/cancelled, or the overall TTL
@@ -357,6 +408,15 @@ def wait_for_response(
             debug_log(f"Request {request_id} resolved via terminal, cancelling relay msg")
             remove_inline_buttons(message_id)
             return None
+        if (current and current.decision
+                and current.resolution_source == RESOLUTION_SOURCE_AGENT
+                and current.state in _EXTERNALLY_DECIDABLE_STATES):
+            debug_log(
+                f"Request {request_id} decided externally by agent "
+                f"{current.actor_agent}: {current.decision}"
+            )
+            _finalize_agent_decision(message_id, current)
+            return current.decision
         chunk = min(25, max(1, int(deadline - time.time())))
         answer = wait_for_relay_answer(message_id, timeout=chunk, long_poll_chunk=chunk)
         if answer is None:
@@ -850,6 +910,12 @@ def _wait_for_group_answers(
     Daemon threads are never joined: when the hook exits, threads still parked
     in a long-poll die with the process. ``stop`` only spares a doomed thread
     one more relay round trip.
+
+    **No external-decision check here, deliberately** (epic 22, brd §3.2, task
+    22-02 §4): AskUserQuestion rows carry reply semantics, not allow/deny, so
+    the permissions MCP refuses them and nothing ever writes an agent decision
+    onto a question row. The agent-decision adoption lives in
+    ``wait_for_response`` only.
     """
     results: "queue.Queue" = queue.Queue()
     stop = threading.Event()
