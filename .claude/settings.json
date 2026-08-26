@@ -280,7 +280,8 @@
       "Bash(id:*)",
       "Bash(mktemp:*)",
       "Bash(ffmpeg:*)",
-      "Bash(agent-browser:*)"
+      "Bash(agent-browser:*)",
+      "Bash(crontab -l:*)"
     ],
     "deny": [
       "Bash(shred:*)",
