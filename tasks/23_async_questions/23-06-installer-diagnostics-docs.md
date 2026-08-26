@@ -101,3 +101,61 @@ repo who has never read this epic.
 Tests: `--check` against a conforming fixture (exit 0), against the deliberately
 non-conforming fixture from 23-03 (exit non-zero, every category reported), and
 against a workspace with no `[questions]` section (clean no-op, exit 0).
+
+## Obligations inherited from 23-05's review (added 2026-08-27)
+
+### `claude-questions --reindex` — closes the one hole in "never lose a decision"
+
+23-05's review found the epic's only remaining gap in its central guarantee, and
+it is real though narrow:
+
+1. `ask` writes the entry, sends to Telegram, then writes the routing index.
+2. If that index write fails after its retries, `ask` returns
+   `index_routing_failed: True` — entry and message both exist, no index record
+   does.
+3. The listener resolves answers by `message_id → index`. An unknown id is
+   skipped (correctly — the feed carries *every* answered message of the
+   installation, including permission approvals, so pending them all would make
+   `pending_answers` meaningless).
+4. So that human's answer is **never applied**, with no pending entry and no
+   sidecar. It is the one outcome brd D10 forbids.
+
+**The data to recover it already exists.** `mark_dispatched` runs at step 7
+*unconditionally* — it does not return early when the index write fails — so the
+queue entry carries `**Dispatched:** <timestamp> · relay #<message_id>`. The
+mapping `message_id → qid` is therefore durable **in the queue file itself**, and
+the index is fully reconstructible.
+
+Add `claude-questions --reindex`:
+
+- scan the workspace's configured queue set for `**Dispatched:** … relay #N`
+  markers;
+- for every `N` with no index record, rebuild the `IndexEntry` from the entry's
+  own location (`workspace_id`, anchor, root, `rel_path`, `qid`, role);
+- never overwrite an existing record, never move a watermark, never touch a
+  queue file — it is a repair for the index only;
+- report how many records were rebuilt, and print the ids so an operator can see
+  what was recovered.
+
+Recovery is then: run `--reindex`, and the listener picks the answers up on its
+next poll (or via an `after=0` replay, which is safe because applies are
+idempotent on relay message id). Document this in `docs/async-questions.md` as
+*the* answer to "a question was answered and nothing happened".
+
+### Install `questions_listen_lib.py` and `questions-mcp` together
+
+23-05's review raised two transition-window LOWs. Between 23-05 landing and the
+installer running, the **installed** `questions_listen_lib.py` is still 23-04's
+version, which does not know the fields 23-05 added:
+
+- `Index.to_dict` drops `watermarks` → the listener replays from `after=0`
+  (idempotent, just slow);
+- `PendingApply.to_dict` drops `answered_at`, `last_attempt_at` and `token_fp` →
+  a retry fires immediately, and an empty `token_fp` makes `_finalize` skip the
+  Telegram PATCH, so the answer still reaches the queue file but the message is
+  never ticked.
+
+Neither loses an answer, and both close the moment the installer runs. The
+requirement: **install the hook library and the MCP server in the same pass**,
+and do not ship a state where one is new and the other old. Note it in the
+installer so a future partial install does not reintroduce the window.

@@ -36,7 +36,7 @@ lossless edits across 290 entries**. Because adopters do this themselves,
 | 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | done | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | done | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | done | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
-| 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | todo | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
+| 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | done | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
 | 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | todo | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
 | 23-07 | [Live verification](./23-07-live-verification_human.md) | todo | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
 
@@ -302,3 +302,45 @@ parses it, everyone else imports. Neither task hand-parses the JSON.
   - The `questions-mcp` installer block is deliberately **not** written — 23-06
     owns installation. The server mirrors `permissions-mcp` exactly so 23-06 can
     copy that block and substitute the name.
+
+- **2026-08-27 — 23-05 done.** Implemented (opus) → reviewed (PASS, 0 blocker /
+  0 high / 1 medium / 3 low) → fixed → verified. Suite `Ran 1222, skipped=1`
+  (still only the pre-existing `test_headless_spawn`); relay untouched at 315.
+  - **The epic's design missed something and the implementation caught it: the
+    answer feed is installation-scoped, and a machine can hold several tokens.**
+    `[roles] hpl = "rly_…"` binds a role to its own installation, so an `ask`
+    routed there is sent with *that* token and its answer appears only on *that*
+    feed. Polling the default token alone would have silently stranded every
+    answer given to a role-bound human — invisible to every test in the epic's
+    plan, and visible in production only as "they answered and nothing
+    happened". The reviewer confirmed the premise against the relay's own SQL
+    (`GET /v1/answers` filters by `installation_id`).
+    **Deviation from architecture §5, accepted:** `Index.watermarks`
+    (fingerprint → position) is the truth per feed; the top-level `watermark`
+    mirrors the primary so the documented shape and `--status` stay honest.
+    The loop stays single-threaded and splits the 25 s budget `max(1, 25 // N)`.
+  - The six-step crash walk was independently verified. Steps 1–5 write nothing;
+    step 6 is one `flock`-ed read-modify-write recording the terminal outcome
+    *and* advancing the watermark — so there is no window where the watermark
+    has moved past an answer nothing is tracking (invariant 2). Crash tests
+    inject `BaseException` so the loop's own `except Exception` cannot swallow
+    them, then run a **fresh** listener and assert exactly-once application.
+  - **A missing index record is skipped and the watermark advances** — correct,
+    not a leak: the feed carries *every* answered message of the installation,
+    including permission approvals and blocking answers, so pending them would
+    fill the backlog with rows that can never apply and make `pending_answers`
+    meaningless.
+  - **The one hole in "never lose a decision", and why it is closeable.** If
+    23-04's index write fails after retries, that answer is skipped forever.
+    But `mark_dispatched` runs *unconditionally*, so the entry carries
+    `**Dispatched:** … relay #<message_id>` — the mapping is durable **in the
+    queue file**, and the index is reconstructible. `--reindex` is specified in
+    23-06 to recover it; replay is safe because applies are idempotent.
+  - Existing installations no longer replay from zero: the primary fingerprint
+    is seeded once from the legacy top-level `watermark`. Role-bound
+    fingerprints correctly stay at 0 — they have genuinely never been polled,
+    and seeding them would skip answers.
+  - **23-06 must install `questions_listen_lib.py` and `questions-mcp` in the
+    same pass.** Until it does, the installed 23-04 library drops `watermarks`
+    and `token_fp` on write; nothing is lost, but the listener replays and skips
+    the Telegram tick. Recorded in 23-06's task file.
