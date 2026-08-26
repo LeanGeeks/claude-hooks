@@ -37,7 +37,7 @@ lossless edits across 290 entries**. Because adopters do this themselves,
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | done | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | done | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
 | 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | done | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
-| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | done | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
+| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | done | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check-contract`, distinct from the relay probe `--check`), `--reindex` recovery and `docs/questions-contract.md`** — see the task file. |
 | 23-07 | [Live verification](./23-07-live-verification_human.md) | blocked | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
 
 ## Dependency graph
