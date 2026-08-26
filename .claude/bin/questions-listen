@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""``questions-listen`` — the async-question answer listener (epic 23, 23-05).
+
+**Process lifecycle only.**  Every decision — config, the long-poll, applying an
+answer to a queue file, the pending retries and the sidecar fallback — lives in
+``.claude/hooks/questions_listen_lib.py``, which is installed through
+``REQUIRED_HOOKS``, importable and testable.  This file resolves that module,
+takes the single-instance lock, and runs or reports.  It is the epic-10/16
+layout (``amux-spawn`` + ``amux_spawn_lib``).
+
+Usage::
+
+    questions-listen              # run the loop (systemd --user ExecStart)
+    questions-listen --once       # one poll cycle, then exit (diagnostics)
+    questions-listen --status     # print state without holding the lock
+    questions-listen --config P   # use P instead of the default config.toml
+
+Exit codes are deliberately forgiving: **0** for "disabled", "another listener
+is already running" and a clean shutdown alike.  A unit that restarts forever
+because the feature is switched off would be worse than useless.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+from pathlib import Path
+from types import FrameType
+
+# The shared library lands in ``~/.claude/hooks/`` when installed and lives in
+# ``.claude/hooks/`` in the checkout.  Try both, plus this file's own directory,
+# so the binary runs from ``~/.local/bin`` or straight out of the repo.
+_HERE = Path(__file__).resolve().parent
+for _cand in (_HERE, _HERE.parent / "hooks", Path.home() / ".claude" / "hooks"):
+    if (_cand / "questions_listen_lib.py").exists():
+        sys.path.insert(0, str(_cand))
+        break
+
+import questions_listen_lib as lib  # noqa: E402
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="questions-listen",
+        description="Apply Telegram answers to workspace question queues.",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="print connection state, watermark, last applied answer and pending applies",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="run a single poll cycle and exit (diagnostics)",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="path to config.toml (default: ~/.config/claude-tg-relay/config.toml)",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="log at DEBUG instead of INFO",
+    )
+    return parser
+
+
+def _configure_logging(debug: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+
+def cmd_status(config: "lib.ListenConfig") -> int:
+    """Print the truth about the listener without holding its lock."""
+    status = lib.read_status()
+    index = lib.read_index()
+    running = lib.listener_running()
+    print(lib.format_status(status, index, running=running, config=config))
+    return 0
+
+
+def cmd_run(config: "lib.ListenConfig", *, once: bool) -> int:
+    """Take the lock and run the loop (or exactly one cycle)."""
+    handle = lib.acquire_single_instance()
+    if handle is None:
+        # A second copy exits cleanly rather than double-applying answers.
+        print(
+            "questions-listen: another instance holds "
+            f"{lib.LISTEN_LOCK_PATH}; exiting",
+            file=sys.stderr,
+        )
+        return 0
+
+    listener = lib.Listener(config)
+    stopping = {"flag": False}
+
+    def _stop(signum: int, _frame: FrameType | None) -> None:
+        stopping["flag"] = True
+        logging.getLogger("questions_listen").info(
+            "signal %s received; finishing the current cycle", signum
+        )
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _stop)
+        except (ValueError, OSError):  # not the main thread / unsupported
+            pass
+
+    try:
+        if once:
+            listener.run_cycle()
+        else:
+            listener.run_forever(stop=lambda: stopping["flag"])
+    finally:
+        listener.write_status()
+        handle.close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    _configure_logging(args.debug)
+
+    config_path = Path(args.config).expanduser() if args.config else None
+    config = lib.load_listen_config(config_path)
+
+    if args.status:
+        # ``--status`` must answer even when the feature is off — "disabled" is
+        # the most common answer to "why didn't my answer arrive?".
+        return cmd_status(config)
+
+    if not config.enabled:
+        # Absent or false, the binary exits 0 immediately so the systemd unit
+        # can be installed without being active (task §2).
+        logging.getLogger("questions_listen").info(
+            "[questions_listen] not enabled in %s; exiting",
+            config.config_path or lib.RELAY_CONFIG_PATH,
+        )
+        return 0
+
+    if not config.tokens:
+        logging.getLogger("questions_listen").error(
+            "no installation token in %s; nothing to poll",
+            config.config_path or lib.RELAY_CONFIG_PATH,
+        )
+        return 1
+    if not config.server_url:
+        logging.getLogger("questions_listen").error(
+            "server_url not configured in %s; nothing to poll",
+            config.config_path or lib.RELAY_CONFIG_PATH,
+        )
+        return 1
+
+    return cmd_run(config, once=args.once)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
