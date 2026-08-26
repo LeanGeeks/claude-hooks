@@ -24,8 +24,8 @@ one-line changes if they prove wrong in practice:
 | 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | done | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
 | 22-03 | [Permissions MCP: read + decide](./22-03-permissions-mcp.md) | done | 22-01, 22-02 | The server, registration, D5 guard, D3 tier. 22-01 defines the tier vocabulary; 22-02 makes decide effective. |
 | 22-04 | [Allowlist writers + queue](./22-04-allowlist-writes-and-queue.md) | done | 22-03 | `resolve_project_key`, queue format, versioned-settings writer, `allowlist_add` + `report_parser_issue` tools. |
-| 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | in_progress | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
-| 22-06 | [Live verification](./22-06-live-verification_human.md) | todo | all | **human** — walks brd §5 end to end with real sessions and a real Telegram chat. |
+| 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | done | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
+| 22-06 | [Live verification](./22-06-live-verification_human.md) | blocked | all | **human** — walks brd §5 end to end with real sessions and a real Telegram chat. |
 
 ## Dependency graph
 
@@ -161,3 +161,37 @@ one-line changes if they prove wrong in practice:
   **For 22-05:** import `resolve_project_key` from `.claude/hooks/project_key.py`
   and the drain helpers from `permissions-mcp/permission_queue.py` — do not
   reimplement either. This repo's key is `-data-sync-work-leangeeks-ai-claude-hooks`.
+- **2026-08-26 — 22-05 done; all five engineering tasks landed.**
+  `compact(max_age_days=30)` lives in the store under the same `LOCK_EX` as
+  every other writer, moves only **terminal** rows to
+  `permission_requests.archive.jsonl` (append across runs), never touches
+  pending rows, and has a CLI entry; `bash_manual_confirm.log` rotates to a
+  dated sibling over the size threshold. `docs/prompts/permission-review-daily.md`
+  is the reviewer prompt (drain → judge → replay parser issues → review
+  traffic incl. the H1 deny-false-positive watch → apply + installer merge →
+  compact → summarize), with the constraints restated inside and a
+  workspace-generic adoption note in the header. `shell/` carries the launcher
+  with **model and effort pinned** (invariant 9 / H8), `--dir` passed, explicit
+  `PATH`/`HOME`, and dated stderr under `temp/`.
+  Commits: `092362d` (implementation), `b650a51` (the fixture dry-run's own
+  output — 1 applied, 2 rejected, 1 stubbed), `f7c3ba2` (newline restore).
+  Tests 1020 → 1030. Review PASS, two LOW, neither fixed:
+  (1) `b650a51`'s commit body reads "No evidence_request_ids supplied" where
+  the evidence is actually a replay reproduction in the same sentence —
+  wording only; (2) **follow-up worth filing:** `pretool_hook.py:46` hard-codes
+  `~/.claude/bash_manual_confirm.log` while the store and the MCP lib both
+  honor `CLAUDE_MANUAL_CONFIRM_LOG`, so a sandboxed run cannot redirect the
+  hook's writes. Pre-existing, out of this epic's scope.
+  **The dry-run produced zero permission prompts of its own** — the 06:15
+  unattended run will not block on Telegram for its own tooling.
+- **2026-08-26 — 22-06 blocked, awaiting human evidence.** Engineering is
+  complete; the epic cannot close on suite-green (precedent 19-07 / 20-06).
+  Two preconditions are already met: `./install-claude-config.sh` was re-run
+  twice (17:10 and 17:38; backup
+  `~/.claude/backups/settings.json.20260826_171034.bak`), so the installed
+  hooks, the MCP registration and all six `mcp__permissions__*` grants are
+  live. **Still outstanding: the crontab line is NOT installed** (documented
+  in 22-05, a human step), and §1–§7 need real sessions and a real Telegram
+  chat. Nothing in this epic is behind a default-off control, so the live
+  behavior changes (deny hard-blocks; ask prompts) are already in effect on
+  this machine.
