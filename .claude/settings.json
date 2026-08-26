@@ -85,6 +85,8 @@
       "mcp__permissions__get_permission_request",
       "mcp__permissions__permission_history",
       "mcp__permissions__decide_permission_request",
+      "mcp__permissions__allowlist_add",
+      "mcp__permissions__report_parser_issue",
       "Bash(xvfb-run:*)",
       "Bash(godot:*)",
       "Bash(./:*)",

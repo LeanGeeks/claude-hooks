@@ -23,8 +23,8 @@ one-line changes if they prove wrong in practice:
 | 22-01 | [Validator: deny denies, ask asks](./22-01-validator-deny-and-ask.md) | done | — | Independently shippable; changes live behavior on install. Watch H1 (no more human-rescue for deny false positives). |
 | 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | done | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
 | 22-03 | [Permissions MCP: read + decide](./22-03-permissions-mcp.md) | done | 22-01, 22-02 | The server, registration, D5 guard, D3 tier. 22-01 defines the tier vocabulary; 22-02 makes decide effective. |
-| 22-04 | [Allowlist writers + queue](./22-04-allowlist-writes-and-queue.md) | in_progress | 22-03 | `resolve_project_key`, queue format, versioned-settings writer, `allowlist_add` + `report_parser_issue` tools. |
-| 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | todo | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
+| 22-04 | [Allowlist writers + queue](./22-04-allowlist-writes-and-queue.md) | done | 22-03 | `resolve_project_key`, queue format, versioned-settings writer, `allowlist_add` + `report_parser_issue` tools. |
+| 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | in_progress | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
 | 22-06 | [Live verification](./22-06-live-verification_human.md) | todo | all | **human** — walks brd §5 end to end with real sessions and a real Telegram chat. |
 
 ## Dependency graph
@@ -142,3 +142,22 @@ one-line changes if they prove wrong in practice:
   `actor_agent` + `resolution_source: "agent"` + the reason.
   **H1 watch is now open** — the deny flip is live with no soak period, so
   `bash_manual_confirm.log` is the place to catch false-positive hard blocks.
+- **2026-08-26 — 22-04 done.** `.claude/hooks/project_key.py` is now the only
+  project-identity function (invariant 7); `.claude/hooks/settings_writer.py`
+  generalizes the router's atomic writer to any of allow/ask/deny, with the
+  router delegating byte-compatibly and still targeting `settings.local.json`;
+  `permissions-mcp/permission_queue.py` owns queue IO (a third module the task
+  did not name — reviewer judged it sensible factoring, and 22-05's drain can
+  import it without the MCP lib). `allowlist_add` writes the caller's own
+  `.claude/settings.json` and enqueues for every other project key;
+  `report_parser_issue` always enqueues to the claude-hooks key. Refusals
+  (malformed pattern, deny collision) happen before any disk effect. Tests
+  984 → 1020, review PASS with two LOW notes both marked "no change needed".
+  **Installer re-run (2026-08-26 17:38):** `project_key.py` and
+  `settings_writer.py` are installed under `~/.claude/hooks/` and import
+  cleanly there; the global allowlist now carries all six
+  `mcp__permissions__*` grants. Queue root override for tests:
+  `CLAUDE_PERMISSION_QUEUE_DIR`.
+  **For 22-05:** import `resolve_project_key` from `.claude/hooks/project_key.py`
+  and the drain helpers from `permissions-mcp/permission_queue.py` — do not
+  reimplement either. This repo's key is `-data-sync-work-leangeeks-ai-claude-hooks`.

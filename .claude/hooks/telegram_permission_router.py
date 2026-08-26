@@ -39,6 +39,11 @@ from permission_state_store import (
     debug_log,
 )
 
+# The shared atomic settings writer (task 22-04). Flat sibling import, exactly
+# like ``permission_state_store`` above: both the repo checkout and the
+# installed ``~/.claude/hooks/`` copy put these modules in the same directory.
+import settings_writer
+
 # ``roles_config`` (epic 15) supplies the machine's relay credentials *and* its
 # per-role bindings. The import is guarded because the installer only learned
 # about this module in 15-01: a stale or partially-updated ``~/.claude/hooks/``
@@ -890,48 +895,24 @@ def generate_whitelist_pattern(request: PermissionRequest) -> str:
 
 
 def update_settings_local_json(workspace_dir: str, permission_pattern: str) -> bool:
-    """Add a permission pattern to ``.claude/settings.local.json`` atomically."""
-    settings_path = Path(workspace_dir) / ".claude" / "settings.local.json"
+    """Add a permission pattern to ``.claude/settings.local.json`` atomically.
 
-    settings: Dict[str, Any] = {}
-    if settings_path.exists():
-        try:
-            with open(settings_path, "r") as f:
-                settings = json.load(f)
-        except json.JSONDecodeError as e:
-            debug_log(f"Error parsing settings.local.json: {e}")
-            backup_path = settings_path.with_suffix(".json.backup")
-            settings_path.rename(backup_path)
-            settings = {}
-        except Exception as e:  # noqa: BLE001
-            debug_log(f"Error reading settings.local.json: {e}")
-            settings = {}
+    Delegates to ``settings_writer.add_permission_pattern`` (task 22-04), which
+    is the same read-tolerate-corrupt / dedupe / tmp+rename writer this function
+    used to carry inline — now shared with the MCP's ``allowlist_add``.
 
-    if "permissions" not in settings:
-        settings["permissions"] = {}
-    if "allow" not in settings["permissions"]:
-        settings["permissions"]["allow"] = []
-
-    allow_list = settings["permissions"]["allow"]
-    if permission_pattern in allow_list:
-        debug_log(f"Permission pattern already exists: {permission_pattern}")
-        return True
-
-    allow_list.append(permission_pattern)
-    debug_log(f"Added permission pattern: {permission_pattern}")
-
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = settings_path.with_suffix(".json.tmp")
-    try:
-        with open(temp_path, "w") as f:
-            json.dump(settings, f, indent=2)
-        temp_path.rename(settings_path)
-        return True
-    except Exception as e:  # noqa: BLE001
-        debug_log(f"Error writing settings.local.json: {e}")
-        if temp_path.exists():
-            temp_path.unlink()
-        return False
+    The target stays ``settings.local.json`` and the list stays ``allow``: the
+    Telegram Whitelist button writing unversioned local settings is deliberate
+    (brd §3.2), and promotion to versioned settings is the reviewer's job.
+    """
+    result = settings_writer.add_permission_pattern(
+        workspace_dir,
+        permission_pattern,
+        settings_filename=settings_writer.LOCAL_SETTINGS,
+        list_name="allow",
+        log=debug_log,
+    )
+    return result.ok
 
 
 def process_whitelist_update(

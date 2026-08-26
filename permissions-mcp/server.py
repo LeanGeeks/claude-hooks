@@ -4,14 +4,17 @@
 # ///
 """Permissions MCP server — read and decide Claude Code permission requests.
 
-Epic 22 task 22-03. Four tools:
+Epic 22 tasks 22-03 and 22-04. Six tools:
 
 * ``list_permission_requests`` — the current (or historical) request rows,
   each with a live "may an agent decide this?" verdict;
 * ``get_permission_request`` — one row in full, with the patterns that matched;
 * ``permission_history`` — the daily reviewer's feed;
 * ``decide_permission_request`` — write an allow/deny/stop decision for a
-  request another session (or a subagent) is parked on.
+  request another session (or a subagent) is parked on;
+* ``allowlist_add`` — promote a pattern into versioned settings: the caller's
+  own checkout directly, any other workspace via the proposal queue;
+* ``report_parser_issue`` — file a validator/parser defect for the reviewer.
 
 All logic lives in ``permissions_mcp_lib``; this file only registers tools, so
 the behaviour is testable with the repo's plain-``python3`` suite while the
@@ -26,7 +29,7 @@ caller cannot enforce the self-decision rule.
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -144,6 +147,94 @@ def decide_permission_request(request_id: str, action: str, reason: str) -> str:
     return _dumps(
         lib.decide_permission_request(
             request_id=request_id, action=action, reason=reason, identity=CALLER
+        )
+    )
+
+
+@mcp.tool()
+def allowlist_add(
+    pattern: str,
+    rationale: str,
+    scope: str = "workspace",
+    target_workspace: Optional[str] = None,
+    evidence_request_ids: Optional[List[str]] = None,
+) -> str:
+    """Promote a permission pattern into git-versioned settings.
+
+    Two destinations, one rule: a pattern for the project you are running in is
+    written straight into that checkout's `.claude/settings.json`; a pattern for
+    any OTHER project is filed as a proposal in that project's queue, for the
+    scheduled reviewer that lives there. No agent ever edits, commits or pushes
+    in a checkout it is not running in.
+
+    Every worktree of a repo counts as the same project (the queue is keyed by
+    the main checkout), so a proposal filed from a feature-branch worktree is
+    applied centrally rather than on the branch.
+
+    Args:
+        pattern: A Claude Code permission pattern — `Bash(git log:*)`,
+            `Bash(pwd)`, `WebFetch(domain:example.com)`, or a bare tool name.
+            Free text is refused.
+        rationale: Required. Why widening this is safe — the reviewer applying
+            the proposal, and the git history afterwards, both need it.
+        scope: "workspace" (default) for the target project's own settings, or
+            "user" for the claude-hooks repo's settings, which the installer
+            merges into every workspace on this machine.
+        target_workspace: Any path inside the project you are proposing for.
+            Defaults to your own workspace. Ignored when scope is "user".
+        evidence_request_ids: Optional request ids from
+            list_permission_requests / permission_history that show why the
+            prompt keeps firing.
+
+    Refused before anything is written: a pattern that is not a permission
+    pattern, and a pattern already covered by a deny entry in the target's
+    settings (deny beats allow, so the entry would be a confusing no-op — the
+    refusal names the deny entry).
+
+    Note: the deny check reads merged settings that are cached for up to 60 s in
+    this long-lived process, so it can lag a settings edit by that much. A
+    scope="user" result always says what is and is not live yet.
+    """
+    return _dumps(
+        lib.allowlist_add(
+            pattern=pattern,
+            scope=scope,
+            target_workspace=target_workspace,
+            rationale=rationale,
+            evidence_request_ids=evidence_request_ids,
+            identity=CALLER,
+        )
+    )
+
+
+@mcp.tool()
+def report_parser_issue(
+    command: str, observed: str, expected: str, notes: str = ""
+) -> str:
+    """Report a permission-parser or validator defect to the claude-hooks reviewer.
+
+    Use this when a command was denied, prompted or auto-approved in a way that
+    looks wrong — a compound the parser split badly, a wrapper it failed to peel,
+    a deny pattern that over-matched. It files a queue entry for the claude-hooks
+    reviewer; it does not change any settings.
+
+    This always queues, even when you are working in the claude-hooks checkout
+    itself: parser issues are the reviewer's input and they all arrive the same
+    way.
+
+    Args:
+        command: The raw command, exactly as it was run.
+        observed: The decision and reason you actually got.
+        expected: What you believe the right decision is, and why.
+        notes: Optional extra context (session, what you were doing).
+    """
+    return _dumps(
+        lib.report_parser_issue(
+            command=command,
+            observed=observed,
+            expected=expected,
+            notes=notes,
+            identity=CALLER,
         )
     )
 

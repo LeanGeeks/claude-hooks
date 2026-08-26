@@ -17,12 +17,18 @@ Three things this module is responsible for:
   ``decidable`` field and ``decide``'s tier check are its two callers.
 * **Deciding** a row, behind the row-shaped D5 guard, by writing the exact
   decision dict the 22-02 wait loop adopts.
+* **Writing allowlist patterns** (task 22-04) — the caller's own checkout
+  directly, every other project through the proposal queue, with the project
+  identity coming from ``project_key.resolve_project_key`` and nothing else
+  (invariant 7).
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -69,8 +75,19 @@ from permission_state_store import (  # noqa: E402
     get_requests,
     update_request_state,
 )
+from project_key import (  # noqa: E402
+    resolve_project_key,
+    resolve_project_root,
+    resolve_workspace_root,
+)
 from pretool_hook import MANUAL_CONFIRM_LOG, BashPermissionValidator  # noqa: E402
 from settings_loader import SettingsLoader  # noqa: E402
+from settings_writer import VERSIONED_SETTINGS, add_permission_pattern  # noqa: E402
+
+# Sibling module (same directory as this file, which ``server.py`` puts on
+# sys.path): the proposal queue. It never resolves a project key itself — the
+# keys it is handed come from ``resolve_project_key`` above (invariant 7).
+import permission_queue  # noqa: E402
 
 
 # Tools whose ``tool_input['command']`` is a shell command the validator can
@@ -785,4 +802,402 @@ def decide_permission_request(
         "reason": reason.strip(),
         "tier": verdict.tier_reason,
         "status": DECISION_RECORDED_STATUS,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Allowlist writing + the proposal queue (task 22-04)
+#
+# Two destinations, one rule (brd D6 / invariant 4): a pattern for the checkout
+# this agent is running in is written straight into that checkout's versioned
+# ``.claude/settings.json``; a pattern for **any other** project is filed as a
+# queue entry for the agent that lives there. Nothing in this section opens a
+# file inside a foreign checkout — not to edit, not to commit, not to push.
+# ---------------------------------------------------------------------------
+
+
+# Pattern shapes Claude Code understands: a bare tool name (``Bash``,
+# ``WebFetch``, ``mcp__permissions__*``) or the parenthesised form
+# (``Bash(git log:*)``, ``WebFetch(domain:example.com)``). Free text is refused —
+# a sentence in the allow list is silently inert, which is worse than an error.
+_BARE_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*\*?$")
+_PAREN_TOOL_RE = re.compile(r"^(?P<tool>[A-Za-z][A-Za-z0-9_.-]*)\((?P<inner>.+)\)$", re.DOTALL)
+
+# Every user-scope answer carries this (brd H6 / invariant 8): the repo's
+# settings file is the user-scoped allowlist, but it only reaches other
+# workspaces through the installer's merge.
+H6_NOTE = (
+    "H6: user-scope patterns live in the claude-hooks repo's .claude/settings.json. "
+    "That is live in the claude-hooks workspace immediately, but it does NOT reach "
+    "any other workspace until install-claude-config.sh re-runs its merge into "
+    "~/.claude/settings.json (the daily reviewer runs it when it applies user-scope "
+    "changes)."
+)
+
+QUEUED_STATUS = (
+    "proposal queued for {key}; the workspace's scheduled reviewer applies it "
+    "(nothing is written in that checkout by this call — brd D6)"
+)
+
+SCOPES = ("workspace", "user")
+
+
+@dataclass(frozen=True)
+class ParsedPattern:
+    """A permission pattern split into tool and (optional) argument part."""
+
+    raw: str
+    tool: str
+    inner: Optional[str]
+
+    @property
+    def is_bash(self) -> bool:
+        return self.tool == "Bash"
+
+    def representative_command(self) -> Optional[str]:
+        """The shortest command this Bash pattern would grant.
+
+        ``Bash(git log:*)`` → ``git log``; ``Bash(pwd)`` → ``pwd``. Used to ask
+        the validator whether a deny entry already covers the whole proposal.
+        """
+        if not self.is_bash or self.inner is None:
+            return None
+        if self.inner.endswith(":*"):
+            return self.inner[:-2]
+        return self.inner
+
+
+def parse_pattern(pattern: str) -> Optional[ParsedPattern]:
+    """Parse a permission pattern, or return ``None`` if it is not one."""
+    text = (pattern or "").strip()
+    if not text or "\n" in text:
+        return None
+    paren = _PAREN_TOOL_RE.match(text)
+    if paren:
+        inner = paren.group("inner").strip()
+        if not inner:
+            return None
+        return ParsedPattern(raw=text, tool=paren.group("tool"), inner=inner)
+    if _BARE_TOOL_RE.match(text):
+        return ParsedPattern(raw=text, tool=text, inner=None)
+    return None
+
+
+def _deny_subsumes(proposal: ParsedPattern, deny: str, validator: BashPermissionValidator) -> bool:
+    """Would ``deny`` override everything ``proposal`` grants?
+
+    Only full coverage counts. A deny that carves a slice out of a broader
+    proposal (deny ``Bash(git push:*)`` vs proposal ``Bash(git:*)``) is normal
+    layering, not a collision — the proposal still widens the rest.
+    """
+    deny_text = (deny or "").strip()
+    if not deny_text:
+        return False
+    if deny_text == proposal.raw:
+        return True
+
+    parsed_deny = parse_pattern(deny_text)
+    if parsed_deny is None:
+        return False
+
+    if parsed_deny.inner is None:
+        # A bare-tool deny (or a wildcard one like ``mcp__permissions__*``)
+        # covers the whole tool, hence the whole proposal.
+        return fnmatch.fnmatchcase(proposal.tool, parsed_deny.tool) or fnmatch.fnmatchcase(
+            proposal.raw, parsed_deny.raw
+        )
+
+    if not fnmatch.fnmatchcase(proposal.tool, parsed_deny.tool):
+        return False
+    if proposal.inner is None:
+        # ``Bash`` proposed wholesale against a narrower ``Bash(...)`` deny:
+        # layering, not a no-op.
+        return False
+
+    if proposal.is_bash:
+        command = proposal.representative_command()
+        if not command:
+            return False
+        # The validator's own pattern matcher, asked the same question its deny
+        # loop asks — no second implementation of ``Bash(...)`` matching
+        # (invariant 2). Deliberately the matcher and not
+        # ``validate_bash_command``: the full validation path short-circuits on
+        # shapes like a workspace-local ``rm`` before it ever consults the deny
+        # list, and a collision missed that way would be written as a silent
+        # no-op allow entry.
+        try:
+            return bool(validator._matches_pattern(command, deny_text))
+        except Exception:  # noqa: BLE001 — an unmatchable representative is not a collision.
+            return False
+
+    # Non-Bash tools: Claude Code matches their argument syntax natively, so the
+    # only claim made here is the textual glob one — enough for the exact and
+    # ``Tool(prefix:*)`` cases that occur in practice.
+    return fnmatch.fnmatchcase(proposal.inner, parsed_deny.inner)
+
+
+def find_deny_collision(
+    pattern: ParsedPattern, workspace_dir: str
+) -> Tuple[Optional[str], List[str]]:
+    """The deny entry that already covers ``pattern`` in ``workspace_dir``, if any.
+
+    Reads the **target's** merged settings (global + workspace + local) through
+    the same ``SettingsLoader`` the validator uses, and asks the same
+    ``BashPermissionValidator`` whether a deny pattern matches — no second
+    matcher (invariant 2's spirit; H4's 60 s settings cache applies).
+
+    Returns ``(colliding_deny_entry_or_None, all_deny_entries)``.
+    """
+    validator = _build_validator(workspace_dir)
+    deny_patterns = list(validator.denied_patterns)
+    for deny in deny_patterns:
+        if _deny_subsumes(pattern, deny, validator):
+            return deny, deny_patterns
+    return None, deny_patterns
+
+
+def claude_hooks_repo() -> str:
+    """The claude-hooks checkout — the user-scoped allowlist's home.
+
+    ``CLAUDE_HOOKS_REPO`` comes from the installer's MCP registration
+    (22-03 §5); the checkout this file lives in is the fallback, which is the
+    same directory whenever the server runs from its own repo.
+    """
+    env_repo = os.environ.get("CLAUDE_HOOKS_REPO")
+    if env_repo:
+        return str(Path(env_repo).expanduser())
+    return str(HOOKS_DIR.parent.parent)
+
+
+def _queue_source(identity: CallerIdentity) -> Dict[str, Optional[str]]:
+    return {
+        "session_id": identity.session_id,
+        "actor_agent": identity.actor_agent,
+        "cwd": identity.project_dir,
+    }
+
+
+def allowlist_add(
+    pattern: str,
+    scope: str = "workspace",
+    target_workspace: Optional[str] = None,
+    rationale: str = "",
+    evidence_request_ids: Optional[List[str]] = None,
+    identity: Optional[CallerIdentity] = None,
+) -> Dict[str, Any]:
+    """Promote a permission pattern into versioned settings, or queue it.
+
+    Own project key → a direct write of the caller's own
+    ``.claude/settings.json``. Any other key → an ``allowlist_proposal`` entry
+    in that project's queue. Both refusals (shape, deny collision) happen before
+    anything touches disk.
+    """
+    caller = identity if identity is not None else resolve_caller_identity()
+
+    parsed = parse_pattern(pattern)
+    if parsed is None:
+        return _refusal(
+            f"refused: {pattern!r} is not a permission pattern. Use a tool name "
+            "(\"Bash\", \"WebFetch\", \"mcp__permissions__*\") or the parenthesised "
+            "form (\"Bash(git log:*)\", \"Bash(pwd)\", \"WebFetch(domain:example.com)\"). "
+            "Free text in an allow list never matches anything.",
+            pattern=pattern,
+        )
+
+    normalized_scope = (scope or "workspace").strip().lower()
+    if normalized_scope not in SCOPES:
+        return _refusal(
+            f"refused: scope must be one of {', '.join(SCOPES)} (got {scope!r}). "
+            "\"workspace\" targets a project's own settings; \"user\" targets the "
+            "claude-hooks repo, which the installer merges into every workspace.",
+            pattern=parsed.raw,
+        )
+
+    if not (rationale or "").strip():
+        return _refusal(
+            "refused: a rationale is required — the reviewer applying this "
+            "proposal (and the git history afterwards) needs to know why the "
+            "pattern is safe to widen.",
+            pattern=parsed.raw,
+        )
+
+    notes: List[str] = []
+    if normalized_scope == "user":
+        target_dir = claude_hooks_repo()
+        if target_workspace:
+            notes.append(
+                f"target_workspace {target_workspace!r} ignored: scope=\"user\" always "
+                f"targets the claude-hooks checkout ({target_dir})."
+            )
+    else:
+        target_dir = target_workspace or caller.project_dir
+
+    target_key = resolve_project_key(target_dir)
+    own_root = resolve_workspace_root(caller.project_dir)
+    own_key = resolve_project_key(caller.project_dir)
+    is_own_project = target_key == own_key
+
+    # The deny check reads the settings that would actually govern the pattern:
+    # our own checkout when we are about to write it there, and the target's
+    # **main checkout** otherwise — that is where the reviewer applies a queued
+    # proposal (D7), so its deny list is the one that decides whether the entry
+    # would ever take effect.
+    settings_dir = own_root if is_own_project else resolve_project_root(target_dir)
+    try:
+        collision, deny_patterns = find_deny_collision(parsed, settings_dir)
+    except Exception as exc:  # noqa: BLE001 — unreadable settings must not become a silent write.
+        return _refusal(
+            f"refused: could not read the target's merged settings to check for a "
+            f"deny collision ({exc}). Nothing was written or queued.",
+            pattern=parsed.raw,
+            target_project_key=target_key,
+        )
+    if collision is not None:
+        return _refusal(
+            f"refused: {parsed.raw!r} collides with the deny entry {collision!r} "
+            f"already in effect for {settings_dir}. Claude Code evaluates "
+            "deny → ask → allow, so the allow entry would never take effect — a "
+            "confusing no-op. Remove or narrow the deny entry first, or propose a "
+            "pattern the deny does not cover.",
+            pattern=parsed.raw,
+            deny_entry=collision,
+            target_project_key=target_key,
+            deny_patterns_checked=len(deny_patterns),
+        )
+
+    if normalized_scope == "user":
+        notes.append(H6_NOTE)
+
+    if is_own_project:
+        result = add_permission_pattern(
+            own_root,
+            parsed.raw,
+            settings_filename=VERSIONED_SETTINGS,
+            list_name="allow",
+        )
+        if not result.ok:
+            return _refusal(
+                f"refused: could not write {result.path or own_root} ({result.error}). "
+                "Nothing was changed.",
+                pattern=parsed.raw,
+                target_project_key=target_key,
+            )
+        notes.append(
+            f"{result.path} is git-versioned and this call only edited the working "
+            "tree — commit it for the change to survive a clean checkout and reach "
+            "other worktrees."
+        )
+        if target_workspace and normalized_scope == "workspace":
+            named_root = resolve_workspace_root(target_workspace)
+            if named_root != own_root:
+                notes.append(
+                    f"the workspace you named ({target_workspace}) shares this "
+                    f"project key but is a different checkout; the write went to "
+                    f"your own checkout ({own_root}) — an agent never edits a "
+                    "checkout it is not running in (brd D6)."
+                )
+        return {
+            "ok": True,
+            "action": "wrote_settings",
+            "pattern": parsed.raw,
+            "scope": normalized_scope,
+            "target_project_key": target_key,
+            "path": result.path,
+            "added": result.added,
+            "status": (
+                f"pattern written to {result.path}"
+                if result.added
+                else f"pattern was already present in {result.path} (no change)"
+            ),
+            "notes": notes,
+        }
+
+    entry = permission_queue.build_allowlist_proposal(
+        pattern=parsed.raw,
+        scope=normalized_scope,
+        rationale=rationale.strip(),
+        evidence_request_ids=evidence_request_ids,
+        **_queue_source(caller),
+    )
+    try:
+        path = permission_queue.enqueue(target_key, entry)
+    except OSError as exc:
+        return _refusal(
+            f"refused: could not write the queue entry for {target_key} ({exc}).",
+            pattern=parsed.raw,
+            target_project_key=target_key,
+        )
+    return {
+        "ok": True,
+        "action": "queued",
+        "pattern": parsed.raw,
+        "scope": normalized_scope,
+        "target_project_key": target_key,
+        "target_workspace": target_dir,
+        "path": str(path),
+        "entry": entry,
+        "status": QUEUED_STATUS.format(key=target_key),
+        "notes": notes,
+    }
+
+
+def report_parser_issue(
+    command: str,
+    observed: str,
+    expected: str,
+    notes: str = "",
+    identity: Optional[CallerIdentity] = None,
+) -> Dict[str, Any]:
+    """File a parser/validator issue for the claude-hooks reviewer.
+
+    Always an enqueue, even when filed from the claude-hooks checkout itself:
+    parser issues are the reviewer's input, and one uniform path is worth more
+    than saving a hop (task 22-04 §4).
+    """
+    caller = identity if identity is not None else resolve_caller_identity()
+
+    missing = [
+        name
+        for name, value in (
+            ("command", command),
+            ("observed", observed),
+            ("expected", expected),
+        )
+        if not (value or "").strip()
+    ]
+    if missing:
+        return _refusal(
+            f"refused: {', '.join(missing)} required — a parser issue without the "
+            "command, what the validator did, and what it should have done is not "
+            "actionable.",
+        )
+
+    repo = claude_hooks_repo()
+    target_key = resolve_project_key(repo)
+    entry = permission_queue.build_parser_issue(
+        command=command.strip(),
+        observed=observed.strip(),
+        expected=expected.strip(),
+        notes=(notes or "").strip(),
+        **_queue_source(caller),
+    )
+    try:
+        path = permission_queue.enqueue(target_key, entry)
+    except OSError as exc:
+        return _refusal(f"refused: could not write the queue entry for {target_key} ({exc}).")
+
+    return {
+        "ok": True,
+        "action": "queued",
+        "type": permission_queue.TYPE_PARSER_ISSUE,
+        "target_project_key": target_key,
+        "target_workspace": repo,
+        "path": str(path),
+        "entry": entry,
+        "status": QUEUED_STATUS.format(key=target_key),
+        "notes": [
+            "parser issues always queue — including from the claude-hooks "
+            "workspace itself — so the reviewer sees every one of them in the "
+            "same place.",
+        ],
     }
