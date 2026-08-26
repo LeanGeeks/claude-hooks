@@ -425,13 +425,15 @@ def _format_non_whitelisted(request: PermissionRequest) -> str:
     auto-deny note. Best-effort; empty string for non-Bash / none / any failure."""
     try:
         from telegram_permission_router import _unallowlisted_bash_parts
-        denied, unknown = _unallowlisted_bash_parts(request)
+        denied, unknown, asked = _unallowlisted_bash_parts(request)
     except Exception as e:  # noqa: BLE001
         debug_log(f"Could not compute non-whitelisted parts for note: {e}")
         return ""
     parts = []
     if denied:
         parts.append("matches a denied pattern: " + ", ".join(denied))
+    if asked:
+        parts.append("matches an ask pattern: " + ", ".join(asked))
     if unknown:
         parts.append("not in allowlist: " + ", ".join(unknown))
     return "; ".join(parts)

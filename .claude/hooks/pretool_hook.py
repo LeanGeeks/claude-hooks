@@ -385,6 +385,15 @@ def replay_from_log(stdin_lines=None):
                     }
                 }
                 print(json.dumps(output))
+            elif result['decision'] == 'deny':
+                output = {
+                    'hookSpecificOutput': {
+                        'hookEventName': 'PreToolUse',
+                        'permissionDecision': 'deny',
+                        'permissionDecisionReason': result['reason']
+                    }
+                }
+                print(json.dumps(output))
             elif result['decision'] == 'ask':
                 output = {
                     'hookSpecificOutput': {
@@ -423,9 +432,10 @@ class BashPermissionValidator:
         self.settings = settings_loader.load_all_settings()
         self.allowed_patterns = self.settings.get('permissions', {}).get('allow', [])
         self.denied_patterns = self.settings.get('permissions', {}).get('deny', [])
+        self.ask_patterns = self.settings.get('permissions', {}).get('ask', [])
         self.workspace_dir = os.path.abspath(workspace_dir or os.getcwd())
 
-        debug_log(f"Loaded {len(self.allowed_patterns)} allow patterns, {len(self.denied_patterns)} deny patterns")
+        debug_log(f"Loaded {len(self.allowed_patterns)} allow patterns, {len(self.denied_patterns)} deny patterns, {len(self.ask_patterns)} ask patterns")
         debug_log(f"Workspace dir: {self.workspace_dir}")
 
     def validate_bash_command(self, command: str) -> Dict[str, Any]:
@@ -520,13 +530,20 @@ class BashPermissionValidator:
 
         # Make decision
         any_denied = any(r['denied'] for r in results)
+        any_asked = any(r.get('asked') for r in results)
         all_allowed = all(r['allowed'] for r in results)
 
         if any_denied:
-            # ANY denied → ask (let PermissionRequest handle it or user decide)
+            # ANY denied → hard deny (D1: deny means deny, aligned with native semantics)
             denied_cmds = _dedupe([r['command'] for r in results if r['denied']])
-            decision = 'ask'
+            decision = 'deny'
             reason = "Matches a denied pattern: " + _format_command_list(denied_cmds)
+        elif any_asked:
+            # Ask outranks allow: a fully-allowlisted command with an ask-matched
+            # sub-command still prompts (D2: honor permissions.ask).
+            asked_cmds = _dedupe([r['command'] for r in results if r.get('asked')])
+            decision = 'ask'
+            reason = "Matches an ask pattern: " + _format_command_list(asked_cmds)
         elif disallowed_targets:
             # A redirection writes outside the workspace, /tmp, or /dev/null.
             decision = 'ask'
@@ -1112,6 +1129,7 @@ class BashPermissionValidator:
         """
         matched_allow = []
         matched_deny = []
+        matched_ask = []
 
         # Reduce wrappers/keywords to the command that actually runs, so we never
         # authorize an arbitrary command just because its introducer is allowed.
@@ -1128,8 +1146,10 @@ class BashPermissionValidator:
                 'command': cmd,
                 'allowed': True,
                 'denied': False,
+                'asked': False,
                 'matched_allow_patterns': ['control_prefix'],
-                'matched_deny_patterns': []
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': []
             }
         cmd = effective
 
@@ -1150,8 +1170,10 @@ class BashPermissionValidator:
                     'command': cmd,
                     'allowed': True,
                     'denied': False,
+                    'asked': False,
                     'matched_allow_patterns': ['local_function'],
-                    'matched_deny_patterns': []
+                    'matched_deny_patterns': [],
+                    'matched_ask_patterns': []
                 }
 
         # First check: workspace binaries are always allowed
@@ -1161,8 +1183,10 @@ class BashPermissionValidator:
                 'command': cmd,
                 'allowed': True,
                 'denied': False,
+                'asked': False,
                 'matched_allow_patterns': ['workspace_binary'],
-                'matched_deny_patterns': []
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': []
             }
 
         # Second check: rm for workspace files is allowed
@@ -1172,8 +1196,10 @@ class BashPermissionValidator:
                 'command': cmd,
                 'allowed': True,
                 'denied': False,
+                'asked': False,
                 'matched_allow_patterns': ['workspace_rm'],
-                'matched_deny_patterns': []
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': []
             }
 
         # Build the candidate command strings to match against patterns.
@@ -1201,6 +1227,11 @@ class BashPermissionValidator:
             if any(self._matches_pattern(c, pattern) for c in candidates):
                 matched_deny.append(pattern)
 
+        # Check ask patterns (after deny, before allow)
+        for pattern in self.ask_patterns:
+            if any(self._matches_pattern(c, pattern) for c in candidates):
+                matched_ask.append(pattern)
+
         # Check allow patterns
         for pattern in self.allowed_patterns:
             if any(self._matches_pattern(c, pattern) for c in candidates):
@@ -1210,8 +1241,10 @@ class BashPermissionValidator:
             'command': cmd,
             'allowed': len(matched_allow) > 0,
             'denied': len(matched_deny) > 0,
+            'asked': len(matched_ask) > 0,
             'matched_allow_patterns': matched_allow,
-            'matched_deny_patterns': matched_deny
+            'matched_deny_patterns': matched_deny,
+            'matched_ask_patterns': matched_ask
         }
 
     def _matches_pattern(self, command: str, pattern: str) -> bool:
@@ -1378,6 +1411,20 @@ def main():
             }
             print(json.dumps(output))
             debug_log(f"ALLOWING command (bypassing normal permissions)")
+            sys.exit(0)
+        elif result['decision'] == 'deny':
+            # Hard deny — matched a deny pattern; reason names the sub-command(s)
+            # so the agent can reformulate. Flows back to the model via
+            # permissionDecisionReason (H1 mitigation).
+            output = {
+                'hookSpecificOutput': {
+                    'hookEventName': 'PreToolUse',
+                    'permissionDecision': 'deny',
+                    'permissionDecisionReason': result['reason'],
+                }
+            }
+            print(json.dumps(output))
+            debug_log(f"DENYING command: {result['reason']}")
             sys.exit(0)
         elif result['decision'] == 'ask':
             # Ask user via native Claude permission flow

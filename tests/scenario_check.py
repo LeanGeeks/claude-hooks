@@ -87,8 +87,8 @@ def check_pretool():
     # Check 4: Denied command
     result = validator.validate_bash_command("git push --force origin main")
     results.append(pass_fail(
-        result["decision"] == "ask",
-        "git push --force should return 'ask' (denied pattern)"
+        result["decision"] == "deny",
+        "git push --force should return 'deny' (denied pattern — D1: deny means deny)"
     ))
 
     # Check 5: Pipeline

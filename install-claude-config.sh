@@ -637,18 +637,22 @@ log_info "Backup created: $BACKUP_FILE"
 log_step "Step 5/5: Merging permissions, hooks, and statusline configuration"
 
 # Extract permissions from project config (supports both old and new format)
+# Legacy format has no ask equivalent — omitted keys produce an empty list via // [].
 ALLOWED_TOOLS=$(jq '.allowedTools // .permissions.allow // []' "$PROJECT_CONFIG")
 DISALLOWED_TOOLS=$(jq '.disallowedTools // .permissions.deny // []' "$PROJECT_CONFIG")
+ASK_TOOLS=$(jq '.permissions.ask // []' "$PROJECT_CONFIG")
 
 ALLOWED_COUNT=$(echo "$ALLOWED_TOOLS" | jq 'length')
 DISALLOWED_COUNT=$(echo "$DISALLOWED_TOOLS" | jq 'length')
+ASK_COUNT=$(echo "$ASK_TOOLS" | jq 'length')
 
-log_info "Found $ALLOWED_COUNT allowed tools and $DISALLOWED_COUNT disallowed tools in project config"
+log_info "Found $ALLOWED_COUNT allowed tools, $DISALLOWED_COUNT disallowed tools, and $ASK_COUNT ask tools in project config"
 
 # Start with permissions merge
 MERGED=$(jq --argjson allowed "$ALLOWED_TOOLS" \
             --argjson disallowed "$DISALLOWED_TOOLS" \
-            'del(.allowedTools, .disallowedTools) | . + {permissions: {allow: $allowed, deny: $disallowed}}' \
+            --argjson ask "$ASK_TOOLS" \
+            'del(.allowedTools, .disallowedTools) | . + {permissions: {allow: $allowed, deny: $disallowed, ask: $ask}}' \
             "$GLOBAL_CONFIG")
 
 # Merge hooks configuration if hooks were installed

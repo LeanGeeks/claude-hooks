@@ -20,8 +20,8 @@ one-line changes if they prove wrong in practice:
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 22-01 | [Validator: deny denies, ask asks](./22-01-validator-deny-and-ask.md) | todo | — | Independently shippable; changes live behavior on install. Watch H1 (no more human-rescue for deny false positives). |
-| 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | todo | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
+| 22-01 | [Validator: deny denies, ask asks](./22-01-validator-deny-and-ask.md) | done | — | Independently shippable; changes live behavior on install. Watch H1 (no more human-rescue for deny false positives). |
+| 22-02 | [External decisions reach the wait loop](./22-02-external-decisions-wait-loop.md) | in_progress | — | Store schema (`actor_agent`, `agent` source) + relay-path loop widening + Telegram finalization. No agent-facing surface yet. Concurrency + state-store races — the manager prompt's opus-implementer rule applies. |
 | 22-03 | [Permissions MCP: read + decide](./22-03-permissions-mcp.md) | todo | 22-01, 22-02 | The server, registration, D5 guard, D3 tier. 22-01 defines the tier vocabulary; 22-02 makes decide effective. |
 | 22-04 | [Allowlist writers + queue](./22-04-allowlist-writes-and-queue.md) | todo | 22-03 | `resolve_project_key`, queue format, versioned-settings writer, `allowlist_add` + `report_parser_issue` tools. |
 | 22-05 | [Daily reviewer + compaction](./22-05-daily-reviewer-and-compaction.md) | todo | 22-01, 22-04 | Prompt, schedule, queue drain, installer merge, store compaction. |
@@ -104,3 +104,11 @@ one-line changes if they prove wrong in practice:
   (`find_pending_request_by_tool_session` matches `PENDING` only), and the
   decision dict `{"action": ...}` round-trips through `_ACTION_TO_STATE` and
   `build_output_decision` unchanged.
+- **2026-08-26 — 22-01 done.** Deny hard-denies (D1), `permissions.ask` loaded,
+  merged and checked between deny and allow (D2), deny arm emitted in `main()`
+  and the replay path, installer Step 5 jq carries `ask` (§3b), downstream
+  helper now names ask-matched parts. Tests 923 → 931, all green; review PASS
+  with no BLOCKER/HIGH/MEDIUM findings. **Not live in other workspaces:**
+  `install-claude-config.sh` has not been re-run, so `~/.claude/hooks/` still
+  carries the old mapping and user-scope `ask` patterns do not yet exist
+  (invariant 8, H6). Run the installer before 22-06.

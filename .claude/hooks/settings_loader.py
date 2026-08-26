@@ -107,12 +107,15 @@ class SettingsLoader:
             settings: Settings dict (may be legacy or modern format)
 
         Returns:
-            Settings in modern format with permissions.allow and permissions.deny
+            Settings in modern format with permissions.allow, permissions.deny,
+            and permissions.ask. Legacy format has no ask equivalent; legacy files
+            contribute an empty ask list.
         """
         result = {
             'permissions': {
                 'allow': [],
-                'deny': []
+                'deny': [],
+                'ask': []
             }
         }
 
@@ -122,8 +125,10 @@ class SettingsLoader:
                 result['permissions']['allow'].extend(settings['permissions']['allow'])
             if 'deny' in settings['permissions']:
                 result['permissions']['deny'].extend(settings['permissions']['deny'])
+            if 'ask' in settings['permissions']:
+                result['permissions']['ask'].extend(settings['permissions']['ask'])
 
-        # Handle legacy format
+        # Handle legacy format (no ask equivalent — legacy contributes empty ask list)
         if 'allowedTools' in settings:
             result['permissions']['allow'].extend(settings['allowedTools'])
 
@@ -133,6 +138,7 @@ class SettingsLoader:
         # Remove duplicates while preserving order
         result['permissions']['allow'] = self._unique_ordered(result['permissions']['allow'])
         result['permissions']['deny'] = self._unique_ordered(result['permissions']['deny'])
+        result['permissions']['ask'] = self._unique_ordered(result['permissions']['ask'])
 
         return result
 
@@ -150,7 +156,8 @@ class SettingsLoader:
         result = {
             'permissions': {
                 'allow': [],
-                'deny': []
+                'deny': [],
+                'ask': []
             }
         }
 
@@ -164,9 +171,15 @@ class SettingsLoader:
         override_deny = override.get('permissions', {}).get('deny', [])
         result['permissions']['deny'] = base_deny + override_deny
 
+        # Merge ask lists (base first, then override)
+        base_ask = base.get('permissions', {}).get('ask', [])
+        override_ask = override.get('permissions', {}).get('ask', [])
+        result['permissions']['ask'] = base_ask + override_ask
+
         # Remove duplicates while preserving order (later occurrences override earlier)
         result['permissions']['allow'] = self._unique_ordered(result['permissions']['allow'])
         result['permissions']['deny'] = self._unique_ordered(result['permissions']['deny'])
+        result['permissions']['ask'] = self._unique_ordered(result['permissions']['ask'])
 
         return result
 
@@ -202,6 +215,7 @@ if __name__ == '__main__':
     print(json.dumps(settings, indent=2))
     print(f"\nAllow rules: {len(settings['permissions']['allow'])}")
     print(f"Deny rules: {len(settings['permissions']['deny'])}")
+    print(f"Ask rules: {len(settings['permissions']['ask'])}")
 
     # Show sample rules
     print("\n=== Sample Allow Rules (first 10) ===")

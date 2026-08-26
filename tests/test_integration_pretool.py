@@ -4,7 +4,7 @@ Integration Tests: PreToolUse Hook
 
 Tests the PreToolUse hook with simulated stdin payloads:
 - Allowed commands return 'allow'
-- Unknown/denied commands return 'ask'
+- Denied commands return 'deny' (hard-block, D1); unknown commands return 'ask'
 - Non-Bash tools are passed through
 - Compound commands are validated correctly
 """
@@ -69,15 +69,15 @@ class TestPreToolUseHook(unittest.TestCase):
 
         self.assertEqual(result["decision"], "ask")
 
-    def test_denied_command_returns_ask(self):
-        """Test that denied commands return 'ask' (to be handled by PermissionRequest)."""
+    def test_denied_command_returns_deny(self):
+        """Test that denied commands return 'deny' (D1: deny means deny)."""
         payload = PRETOOL_USE_PAYLOADS["denied_command"]
         command = payload["tool_input"]["command"]
 
         result = self.validator.validate_bash_command(command)
 
-        # Denied patterns trigger 'ask' (let PermissionRequest handle it)
-        self.assertEqual(result["decision"], "ask")
+        # Denied patterns hard-block — no PermissionRequest created.
+        self.assertEqual(result["decision"], "deny")
         self.assertIn("denied", result["reason"].lower())
 
     def test_mixed_allowed_unknown_returns_ask(self):
@@ -103,11 +103,11 @@ class TestPreToolUseHook(unittest.TestCase):
         self.assertEqual(result["decision"], "allow")
 
     def test_absolute_path_respects_deny_list(self):
-        """A denied command stays denied even when invoked by absolute path."""
+        """A denied command stays denied (hard-deny) even when invoked by absolute path."""
         # 'dd' is in the deny list; /bin/dd must normalize and still match it.
         result = self.validator.validate_bash_command("/bin/dd if=/dev/zero of=/dev/sda")
 
-        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["decision"], "deny")
         self.assertIn("denied", result["reason"].lower())
 
     def test_unknown_absolute_path_command_returns_ask(self):
@@ -567,11 +567,18 @@ class TestPrefixReduction(unittest.TestCase):
     def test_timeout_without_duration_does_not_bypass(self):
         """`timeout reboot` has no duration operand — `reboot` must NOT be peeled
         away as the duration (which would reduce to nothing and auto-allow). It
-        stays the command head and is validated (not whitelisted -> ask)."""
+        stays the command head and is validated. `reboot` is in the deny list,
+        so it now hard-denies (D1: deny means deny). `rm` is not in the deny
+        list so `timeout rm -rf /etc` returns 'ask' (not in allowlist)."""
         self.assertEqual(
-            self.validator.validate_bash_command("timeout reboot")["decision"], "ask")
-        self.assertEqual(
-            self.validator.validate_bash_command("timeout rm -rf /etc")["decision"], "ask")
+            self.validator.validate_bash_command("timeout reboot")["decision"], "deny")
+        self.assertIn(
+            self.validator.validate_bash_command("timeout rm -rf /etc")["decision"],
+            ("ask", "deny"),  # rm is not denied in this project, but must not auto-allow
+        )
+        # Specifically confirm it is NOT allowed (the bypass must not happen)
+        self.assertNotEqual(
+            self.validator.validate_bash_command("timeout rm -rf /etc")["decision"], "allow")
 
     def test_command_lookup_is_auto_allowed(self):
         """`command -v X` is a lookup (like which/type), not an execution of X,
@@ -1244,24 +1251,25 @@ class TestAskReasonNamesUnknownCommands(unittest.TestCase):
 
 
 class _FakeLoader:
-    """Settings loader stub with an explicit allow/deny list, so constant-
+    """Settings loader stub with an explicit allow/deny/ask list, so constant-
     substitution behaviour is tested independent of the project's own config."""
 
-    def __init__(self, allow, deny=None):
+    def __init__(self, allow, deny=None, ask=None):
         self._allow = allow
         self._deny = deny or []
+        self._ask = ask or []
 
     def load_all_settings(self):
-        return {"permissions": {"allow": self._allow, "deny": self._deny}}
+        return {"permissions": {"allow": self._allow, "deny": self._deny, "ask": self._ask}}
 
 
 class TestConstantVariableExpansion(unittest.TestCase):
     """A constant-like assignment (`GODOT=/usr/local/bin/godot`) used later as
     `$GODOT ...` is resolved to its literal so the real command is validated."""
 
-    def _validator(self, allow, deny=None):
+    def _validator(self, allow, deny=None, ask=None):
         return BashPermissionValidator(
-            _FakeLoader(allow, deny), BashCommandParser(), workspace_dir="/tmp"
+            _FakeLoader(allow, deny, ask), BashCommandParser(), workspace_dir="/tmp"
         )
 
     def test_constant_binary_path_is_resolved_and_allowed(self):
@@ -1469,6 +1477,122 @@ class TestMonitorToolHandled(unittest.TestCase):
             "tool_input": {"description": "x", "command": 'echo hi > /etc/passwd'},
         })
         self.assertEqual(decision, "ask")
+
+
+class TestDenyAndAskSemantics(unittest.TestCase):
+    """Task 22-01: deny hard-blocks; ask outranks allow but loses to deny.
+
+    Test cases mirror the task's Testing table (8 cases minimum).
+    """
+
+    def _validator(self, allow=None, deny=None, ask=None):
+        return BashPermissionValidator(
+            _FakeLoader(allow or [], deny, ask), BashCommandParser(), workspace_dir="/tmp"
+        )
+
+    # Case 1: deny pattern hard-denies — compound command names the matched sub-command
+    def test_case1_deny_hard_blocks_compound(self):
+        v = self._validator(deny=["Bash(curl:*)"])
+        result = v.validate_bash_command("echo hi && curl http://x")
+        self.assertEqual(result["decision"], "deny")
+        self.assertIn("Matches a denied pattern:", result["reason"])
+        self.assertIn("curl http://x", result["reason"])
+
+    # Case 2: deny + allow — adjacent allowed sub-command still allows after flip
+    def test_case2_deny_flip_leaves_allow_untouched(self):
+        v = self._validator(allow=["Bash(echo:*)"], deny=["Bash(curl:*)"])
+        result = v.validate_bash_command("echo hi")
+        self.assertEqual(result["decision"], "allow")
+
+    # Case 3: ask outranks allow — fully allowlisted command with one ask-match prompts
+    def test_case3_ask_outranks_allow(self):
+        v = self._validator(allow=["Bash(git:*)"], ask=["Bash(git push:*)"])
+        result = v.validate_bash_command("git push origin main")
+        self.assertEqual(result["decision"], "ask")
+        self.assertTrue(result["reason"].startswith("Matches an ask pattern:"),
+                        f"Expected ask-pattern prefix, got: {result['reason']!r}")
+
+    # Case 4: ask word-boundary — a non-matching sub-command is not ask-listed
+    def test_case4_ask_word_boundary_respected(self):
+        v = self._validator(ask=["Bash(git push:*)"])
+        result = v.validate_bash_command("git status")
+        # git status does not match "git push:*" — the asked flag must be False
+        # (decision may still be 'ask' because git status is also not allowlisted,
+        # but the reason must NOT carry the ask-pattern prefix)
+        for r in result["validation_results"]:
+            self.assertFalse(r.get("asked", False),
+                             "git status should not have asked=True against 'git push:*'")
+        self.assertNotIn("Matches an ask pattern:", result["reason"])
+
+    # Case 5: deny wins over ask when both match
+    def test_case5_deny_wins_over_ask(self):
+        v = self._validator(deny=["Bash(git push:*)"], ask=["Bash(git push:*)"])
+        result = v.validate_bash_command("git push origin main")
+        self.assertEqual(result["decision"], "deny")
+
+    # Case 6: ask in workspace settings merges with global allow
+    def test_case6_ask_merged_across_scopes(self):
+        """Simulate merged settings: global has allow for git, workspace adds ask for git push."""
+        # The loader union is exercised by _FakeLoader receiving both lists together;
+        # the merge logic in SettingsLoader is covered by its own tests.
+        v = self._validator(allow=["Bash(git:*)"], ask=["Bash(git push:*)"])
+        result = v.validate_bash_command("git push origin main")
+        self.assertEqual(result["decision"], "ask")
+        self.assertIn("Matches an ask pattern:", result["reason"])
+
+    # Case 7: legacy-format settings contribute empty ask list, no crash
+    def test_case7_legacy_format_no_ask_no_crash(self):
+        """A legacy-format settings file (allowedTools/disallowedTools) has no ask key.
+        The normalized result must have an empty ask list and must not crash."""
+        from settings_loader import SettingsLoader
+        loader = SettingsLoader.__new__(SettingsLoader)
+        legacy = {"allowedTools": ["Bash(echo:*)"], "disallowedTools": ["Bash(dd:*)"]}
+        normalized = SettingsLoader._normalize_to_modern_format(loader, legacy)
+        self.assertEqual(normalized["permissions"]["ask"], [])
+        self.assertEqual(normalized["permissions"]["allow"], ["Bash(echo:*)"])
+        self.assertEqual(normalized["permissions"]["deny"], ["Bash(dd:*)"])
+
+    # Case 8: hook-level — deny decision emits permissionDecision: "deny" with reason
+    def test_case8_hook_emits_deny_json(self):
+        """The main() hook emits the deny JSON shape for a deny-matched command."""
+        import subprocess
+        import tempfile
+
+        hook_path = Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py"
+
+        # Create a scratch workspace with a settings.json that denies curl
+        with tempfile.TemporaryDirectory() as ws:
+            settings_dir = Path(ws) / ".claude"
+            settings_dir.mkdir()
+            (settings_dir / "settings.json").write_text(
+                json.dumps({"permissions": {"deny": ["Bash(curl:*)"]}})
+            )
+
+            payload = json.dumps({
+                "tool_name": "Bash",
+                "tool_input": {"command": "true && curl http://x"},
+                "cwd": ws,
+            })
+
+            env = os.environ.copy()
+            env["CLAUDE_WORKSPACE_DIR"] = ws
+            env["CLAUDE_HOOK_DEBUG"] = "0"
+
+            proc = subprocess.run(
+                ["python3", str(hook_path)],
+                input=payload,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=10,
+            )
+
+        self.assertEqual(proc.returncode, 0)
+        output = json.loads(proc.stdout)
+        hook_out = output["hookSpecificOutput"]
+        self.assertEqual(hook_out["permissionDecision"], "deny")
+        self.assertIn("Matches a denied pattern:", hook_out["permissionDecisionReason"])
+        self.assertIn("curl http://x", hook_out["permissionDecisionReason"])
 
 
 if __name__ == "__main__":

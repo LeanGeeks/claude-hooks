@@ -139,7 +139,7 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         import telegram_permission_router as tpr
         with patch.object(
             tpr, "_unallowlisted_bash_parts",
-            return_value=(["dd if=/dev/zero"], ["mysteryfoo --bar"]),
+            return_value=(["dd if=/dev/zero"], ["mysteryfoo --bar"], []),
         ):
             text = self._capture_text(tpr)
         self.assertIn("Matches a denied pattern", text)
@@ -150,7 +150,7 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
 
     def test_message_has_no_annotation_when_all_allowed(self):
         import telegram_permission_router as tpr
-        with patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [])):
+        with patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [], [])):
             text = self._capture_text(tpr)
         self.assertNotIn("Not in allowlist", text)
         self.assertNotIn("denied pattern", text)
@@ -161,7 +161,7 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         # A fragment with shell metacharacters must not break Telegram HTML.
         with patch.object(
             tpr, "_unallowlisted_bash_parts",
-            return_value=([], ['weird <tag> & "q"']),
+            return_value=([], ['weird <tag> & "q"'], []),
         ):
             text = self._capture_text(tpr)
         self.assertIn("&lt;tag&gt; &amp;", text)
@@ -176,13 +176,13 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
             cwd=repo_root,
             tool_input={"command": "echo hi; mysteryfoo --bar; dd if=/dev/zero"},
         )
-        denied, unknown = tpr._unallowlisted_bash_parts(req)
+        denied, unknown, asked = tpr._unallowlisted_bash_parts(req)
         # `if=/dev/zero` is parsed as an env-assignment token and dropped by
         # command normalization, so the denied entry reduces to bare `dd`.
         self.assertIn("dd", denied)
         self.assertIn("mysteryfoo --bar", unknown)
         # `echo hi` is allowlisted, so it appears in neither bucket.
-        self.assertNotIn("echo hi", denied + unknown)
+        self.assertNotIn("echo hi", denied + unknown + asked)
 
     def test_command_summary_and_names_are_html_escaped(self):
         """The <pre> command summary and the workspace/session names must be
@@ -197,7 +197,7 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
              patch.object(tpr, "_default_token", "__td__"), \
              patch.object(tpr, "_clients", {"__td__": fake_client}), \
-             patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [])), \
+             patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [], [])), \
              patch("telegram_permission_router.set_telegram_message_id"):
             tpr.send_permission_message(req, "ws<&>name", "sess&ion")
         text = fake_client.send_message.call_args.kwargs["text"]
@@ -212,7 +212,7 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
     def test_unallowlisted_parts_empty_for_non_bash(self):
         import telegram_permission_router as tpr
         req = _make_request(tool_name="Read", tool_input={"file_path": "/x"})
-        self.assertEqual(tpr._unallowlisted_bash_parts(req), ([], []))
+        self.assertEqual(tpr._unallowlisted_bash_parts(req), ([], [], []))
 
 
 class TestRouting(unittest.TestCase):

@@ -369,8 +369,10 @@ def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     return "\n".join(result_lines)
 
 
-def _unallowlisted_bash_parts(request: PermissionRequest) -> tuple[list[str], list[str]]:
-    """Return ``(denied, unknown)`` sub-commands for a Bash permission request.
+def _unallowlisted_bash_parts(
+    request: PermissionRequest,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return ``(denied, unknown, asked)`` sub-commands for a Bash permission request.
 
     PreToolUse names the non-allowlisted sub-commands in its
     ``permissionDecisionReason`` so the terminal prompt can show them, but
@@ -380,15 +382,21 @@ def _unallowlisted_bash_parts(request: PermissionRequest) -> tuple[list[str], li
     ``request.cwd``, exactly as PreToolUse did), guaranteeing the annotation
     matches what the terminal shows.
 
-    Best-effort only: returns ``([], [])`` for non-Bash tools, an empty command,
-    or any failure — computing this annotation must never block sending the
-    prompt.
+    After D1, deny-matched sub-commands no longer produce PermissionRequest rows
+    (they hard-block in PreToolUse). The ``denied`` bucket goes quiet naturally
+    but is kept so the helper stays correct if settings change between request
+    creation and the sweep. The new ``asked`` bucket names sub-commands that
+    matched a ``permissions.ask`` pattern — these are what caused the prompt.
+
+    Best-effort only: returns ``([], [], [])`` for non-Bash tools, an empty
+    command, or any failure — computing this annotation must never block sending
+    the prompt.
     """
     if request.tool_name != "Bash":
-        return [], []
+        return [], [], []
     command = (request.tool_input or {}).get("command", "")
     if not command.strip():
-        return [], []
+        return [], [], []
     try:
         from pretool_hook import BashPermissionValidator
         from settings_loader import SettingsLoader
@@ -400,11 +408,12 @@ def _unallowlisted_bash_parts(request: PermissionRequest) -> tuple[list[str], li
         result = validator.validate_bash_command(command)
     except Exception as e:  # noqa: BLE001
         debug_log(f"Could not compute non-allowlisted parts: {e}")
-        return [], []
+        return [], [], []
 
     seen: set[str] = set()
     denied: list[str] = []
     unknown: list[str] = []
+    asked: list[str] = []
     for r in result.get("validation_results", []):
         cmd = r.get("command", "")
         if not cmd or cmd in seen:
@@ -412,9 +421,11 @@ def _unallowlisted_bash_parts(request: PermissionRequest) -> tuple[list[str], li
         seen.add(cmd)
         if r.get("denied"):
             denied.append(cmd)
+        elif r.get("asked"):
+            asked.append(cmd)
         elif not r.get("allowed"):
             unknown.append(cmd)
-    return denied, unknown
+    return denied, unknown, asked
 
 
 def _send_relay(
@@ -493,11 +504,15 @@ def send_permission_message(
     # Re-derive and surface which sub-commands tripped the prompt (PreToolUse's
     # reason isn't forwarded here — see _unallowlisted_bash_parts). Escaped
     # because command fragments routinely contain <, >, & (e.g. `2>&1`).
-    denied, unknown = _unallowlisted_bash_parts(request)
+    denied, unknown, asked = _unallowlisted_bash_parts(request)
     if denied:
         lines.append("")
         lines.append("🚫 <b>Matches a denied pattern:</b>")
         lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in denied]
+    if asked:
+        lines.append("")
+        lines.append("❓ <b>Matches an ask pattern (human review required):</b>")
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in asked]
     if unknown:
         lines.append("")
         lines.append("⚠️ <b>Not in allowlist:</b>")
