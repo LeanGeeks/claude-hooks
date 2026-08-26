@@ -75,6 +75,15 @@ Three nullable columns on `messages`:
 | `escalate_at` | absolute deadline for the escalation pass; NULL = never |
 | `escalate_to_token_hash` | the installation to duplicate to when `escalate_at` fires; NULL = never |
 
+**Accepted deviation (23-02): a fourth column, `parent_message_id`.** The three
+columns above all live on the *original* row, so nothing links an escalated copy
+back to its parent. Answer attribution ("answering either copy resolves both,
+attributed to the original id") and sibling cancellation both need that reverse
+link. Reviewed and accepted as the minimal mechanism — the alternatives were a
+separate `message_escalations` table or smuggling the parent id through
+`payload_json`, both more invasive. Nullable, no default, NULL for all 5006 rows
+of the production snapshot, added by `ALTER TABLE ADD COLUMN` with no rebuild.
+
 The escalation target is supplied **by the sender as a token**, hashed the same
 way installation tokens already are. The relay resolves it to an installation
 and chat; it never learns that "hpl escalates to operator".

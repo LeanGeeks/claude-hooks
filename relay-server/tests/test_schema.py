@@ -186,9 +186,10 @@ def test_v3_version_stamp(tmp_path: Path) -> None:
     from relay_server.db import SCHEMA_VERSION
     conn = connect(tmp_path / "fresh.db")
     init_schema(conn)
-    # Schema version 4 was added by epic 23-01 (messages_answer_feed index).
-    assert get_schema_version(conn) == 4
-    assert SCHEMA_VERSION == 4
+    # Schema version 5 was added by epic 23-02 (per-message nudge + escalation
+    # columns).  Version 4 was the messages_answer_feed index from 23-01.
+    assert get_schema_version(conn) == 5
+    assert SCHEMA_VERSION == 5
 
 
 def _build_v2_db(path: Path) -> sqlite3.Connection:
@@ -257,7 +258,7 @@ def _build_v2_db(path: Path) -> sqlite3.Connection:
 
 
 def test_v2_migrates_to_v3_schema(tmp_path: Path) -> None:
-    """A v2 database migrates to v4 with all new columns, tables and indexes present."""
+    """A v2 database migrates to v5 with all new columns, tables and indexes present."""
     db_path = tmp_path / "v2.db"
     conn = _build_v2_db(db_path)
     conn.close()
@@ -265,17 +266,23 @@ def test_v2_migrates_to_v3_schema(tmp_path: Path) -> None:
     conn = connect(db_path)
     init_schema(conn)
 
-    assert get_schema_version(conn) == 4
+    assert get_schema_version(conn) == 5
     assert "recipients" in _get_tables(conn)
     cols = _get_columns(conn, "messages")
     assert "nudge_count" in cols
     assert "next_nudge_at" in cols
     assert "nudge_tg_message_id" in cols
     assert "render_dirty" in cols
+    # 23-02 columns
+    assert "nudge_schedule_override" in cols
+    assert "escalate_at" in cols
+    assert "escalate_to_token_hash" in cols
+    assert "parent_message_id" in cols
     indexes = _get_indexes(conn)
     assert "messages_nudge_due" in indexes
     assert "messages_render_dirty" in indexes
     assert "messages_answer_feed" in indexes
+    assert "messages_escalation_due" in indexes
 
 
 def test_v2_migrates_message_rows_intact(tmp_path: Path) -> None:

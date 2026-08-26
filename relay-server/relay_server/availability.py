@@ -30,6 +30,7 @@ __all__ = [
     "format_windows",
     "parse_duration",
     "parse_nudge_schedule",
+    "parse_nudge_schedule_with_repeat",
     "format_nudge_schedule",
     "describe_active_status",
     "is_active",
@@ -443,13 +444,14 @@ def advance_active(
 # Nudge schedule parsing (epic 19-02)
 # ---------------------------------------------------------------------------
 
-# Matches forms like "15m", "3h", "2h30m".  Both groups are optional but at
-# least one must be present (enforced by the caller).
-_DURATION_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?$")
+# Matches forms like "15m", "3h", "2h30m", "1d", "2d12h".  All three groups
+# are optional but at least one must be present (enforced by the caller).
+_DURATION_RE = re.compile(r"^(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?$")
 
 
 def parse_duration(s: str) -> timedelta | None:
-    """Parse a duration like ``15m``, ``3h``, or ``2h30m`` into a timedelta.
+    """Parse a duration like ``15m``, ``3h``, ``2h30m``, ``1d``, or ``2d12h``
+    into a timedelta.
 
     Returns ``None`` if the string is empty, zero-length, or does not match
     the expected form.
@@ -458,13 +460,14 @@ def parse_duration(s: str) -> timedelta | None:
     if not s:
         return None
     m = _DURATION_RE.fullmatch(s)
-    if not m or (m.group(1) is None and m.group(2) is None):
+    if not m or (m.group(1) is None and m.group(2) is None and m.group(3) is None):
         return None
-    hours = int(m.group(1) or 0)
-    minutes = int(m.group(2) or 0)
-    if hours == 0 and minutes == 0:
+    days = int(m.group(1) or 0)
+    hours = int(m.group(2) or 0)
+    minutes = int(m.group(3) or 0)
+    if days == 0 and hours == 0 and minutes == 0:
         return None  # Zero-length is not a valid nudge interval.
-    return timedelta(hours=hours, minutes=minutes)
+    return timedelta(days=days, hours=hours, minutes=minutes)
 
 
 def parse_nudge_schedule(spec: str, max_entries: int) -> list[timedelta]:
@@ -485,10 +488,59 @@ def parse_nudge_schedule(spec: str, max_entries: int) -> list[timedelta]:
         td = parse_duration(p)
         if td is None:
             raise ValueError(
-                f"bad duration {p!r}; accepted forms: 15m, 3h, 2h30m"
+                f"bad duration {p!r}; accepted forms: 15m, 3h, 2h30m, 1d, 2d12h"
             )
         result.append(td)
     return result
+
+
+def parse_nudge_schedule_with_repeat(
+    spec: str, max_entries: int
+) -> tuple[list[timedelta], bool]:
+    """Parse a nudge schedule that may carry a repeating-tail marker.
+
+    A trailing ``*`` on the **last** rung means repeat that interval
+    indefinitely — e.g. ``4h,1d,3d,7d*`` nudges at 4 h, 1 d, 3 d, then
+    every 7 d forever.  A ``*`` on any rung that is not the last is a
+    configuration error and raises ``ValueError`` immediately (brd §2.4,
+    architecture §2.2).
+
+    Returns ``(schedule, repeats)`` where ``repeats`` is ``True`` when the
+    last rung carries ``*``.  ``max_entries`` applies to the rung count after
+    the ``*`` is stripped, so a repeating schedule still respects the cap.
+
+    Raises ``ValueError`` for any parse failure.
+    """
+    parts = [p.strip() for p in spec.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("empty nudge schedule")
+
+    # Detect and validate the * marker.  It is only legal on the last rung.
+    repeats = False
+    for i, part in enumerate(parts):
+        if part.endswith("*"):
+            if i != len(parts) - 1:
+                raise ValueError(
+                    f"repeating-tail marker '*' is only allowed on the last rung,"
+                    f" found it on rung {i + 1} of {len(parts)}: {part!r}"
+                )
+            repeats = True
+            parts[i] = part[:-1]  # strip the marker for duration parsing
+
+    if len(parts) > max_entries:
+        raise ValueError(
+            f"nudge schedule has {len(parts)} entries; server cap is {max_entries}"
+        )
+
+    result: list[timedelta] = []
+    for p in parts:
+        td = parse_duration(p)
+        if td is None:
+            raise ValueError(
+                f"bad duration {p!r}; accepted forms: 15m, 3h, 2h30m, 1d, 2d12h"
+            )
+        result.append(td)
+    return result, repeats
 
 
 def format_nudge_schedule(schedule: list[timedelta]) -> str:

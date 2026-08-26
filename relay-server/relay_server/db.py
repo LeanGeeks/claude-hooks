@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS messages (
     nudge_count          INTEGER NOT NULL DEFAULT 0,
     next_nudge_at        TIMESTAMP,
     nudge_tg_message_id  INTEGER,
-    render_dirty         INTEGER NOT NULL DEFAULT 0
+    render_dirty         INTEGER NOT NULL DEFAULT 0,
+    nudge_schedule_override  TEXT,
+    escalate_at              TIMESTAMP,
+    escalate_to_token_hash   TEXT,
+    parent_message_id        INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS messages_state_expiry
@@ -62,6 +66,9 @@ CREATE INDEX IF NOT EXISTS messages_render_dirty
 
 CREATE INDEX IF NOT EXISTS messages_answer_feed
     ON messages(telegram_chat_id, state, id);
+
+CREATE INDEX IF NOT EXISTS messages_escalation_due
+    ON messages(state, escalate_at) WHERE escalate_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS recipients (
     telegram_chat_id  INTEGER PRIMARY KEY,
@@ -143,6 +150,22 @@ MIGRATIONS: dict[int, list[str]] = {
         # Query: telegram_chat_id=X AND state='answered' AND id>N (+ installation_id filter).
         "CREATE INDEX IF NOT EXISTS messages_answer_feed"
         " ON messages(telegram_chat_id, state, id);",
+    ],
+    5: [
+        # Three per-message reminder-policy columns (architecture §2.2).
+        # All NULL for every existing row — absent means "behave exactly as
+        # today" (invariant 9).  ALTER TABLE ADD COLUMN in SQLite never rebuilds
+        # the table; it only appends the column definition to the schema.
+        "ALTER TABLE messages ADD COLUMN nudge_schedule_override TEXT;",
+        "ALTER TABLE messages ADD COLUMN escalate_at TIMESTAMP;",
+        "ALTER TABLE messages ADD COLUMN escalate_to_token_hash TEXT;",
+        # Parent linkage for escalated copies: a child row carries the
+        # original message's id so answers are attributed correctly (§3).
+        "ALTER TABLE messages ADD COLUMN parent_message_id INTEGER;",
+        # Partial index for the escalation pass: only open rows with a
+        # non-null escalate_at are ever scanned.
+        "CREATE INDEX IF NOT EXISTS messages_escalation_due"
+        " ON messages(state, escalate_at) WHERE escalate_at IS NOT NULL;",
     ],
 }
 

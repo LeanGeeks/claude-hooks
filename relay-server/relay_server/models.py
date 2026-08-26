@@ -46,6 +46,21 @@ class CreateMessageRequest(BaseModel):
     # at which point the joined choice counts as this member's answer. Only
     # meaningful for grouped ``question`` messages; ignored otherwise.
     multi_select: bool = False
+    # Per-message nudge schedule, e.g. ``"4h,1d,3d,7d*"`` (architecture §2.2).
+    # A trailing ``*`` on the last rung repeats that interval indefinitely.
+    # When set, this overrides the chat's ``recipients.nudge_schedule`` and the
+    # message is nudged regardless of ``recipients.nudge_enabled`` — the one
+    # place a message legitimately overrides the human's chat-level preference.
+    # NULL means: obey the chat's config (existing behaviour, invariant 9).
+    nudge_schedule: str | None = None
+    # Escalation: when ``escalate_after_sec`` and ``escalate_to_token`` are
+    # both supplied, the relay sends a duplicate to the target installation
+    # after the given amount of active time has elapsed without an answer.
+    # Both fields must be present together or both absent; supplying one without
+    # the other is a 422 error.  The token must belong to a currently-bound
+    # installation; an unbound token is rejected at send time (architecture §2.2).
+    escalate_after_sec: int | None = Field(default=None, gt=0)
+    escalate_to_token: str | None = None
 
 
 class CreateMessageResponse(BaseModel):

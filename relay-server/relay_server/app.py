@@ -28,6 +28,7 @@ from .availability import (
     is_active,
     near_tz_matches,
     parse_nudge_schedule,
+    parse_nudge_schedule_with_repeat,
     parse_tz,
     parse_windows,
 )
@@ -36,6 +37,7 @@ from .callback_data import decode as decode_callback_data
 from .config import RelayConfig, load_config
 from .db import connect, init_schema, load_recipient, run_in_thread
 from .reaper import (
+    cancel_escalated_children as _cancel_escalated_children,
     delete_nudge,
     next_nudge_due,
     reaper_loop,
@@ -635,13 +637,77 @@ def create_app(
             )
             payload_json = body.model_dump_json()
 
+            # ---- Per-message escalation (architecture §2.2) ----------------
+            # Both fields must be present together or both absent.
+            if bool(body.escalate_to_token) != bool(body.escalate_after_sec):
+                if idempotency_key:
+                    await _idem_abandon(conn, installation_id, idempotency_key)
+                raise HTTPException(
+                    status_code=422,
+                    detail="escalate_to_token and escalate_after_sec must both"
+                    " be present or both absent",
+                )
+
+            escalate_to_token_hash: str | None = None
+            escalate_at_str: str | None = None
+            if body.escalate_to_token and body.escalate_after_sec:
+                token_hash_esc = hash_token(body.escalate_to_token)
+
+                def _lookup_esc_inst(th: str = token_hash_esc):
+                    return conn.execute(
+                        "SELECT id FROM installations"
+                        " WHERE token_hash = ? AND revoked_at IS NULL"
+                        " AND telegram_chat_id IS NOT NULL",
+                        (th,),
+                    ).fetchone()
+
+                esc_inst = await run_in_thread(_lookup_esc_inst)
+                if esc_inst is None:
+                    if idempotency_key:
+                        await _idem_abandon(conn, installation_id, idempotency_key)
+                    raise HTTPException(
+                        status_code=422,
+                        detail="escalation_token_not_bound",
+                    )
+                escalate_to_token_hash = token_hash_esc
+                # Compute escalate_at in active time for the originating chat.
+                esc_recipient = await run_in_thread(load_recipient, conn, int(chat_id))
+                esc_windows = recipient_windows(esc_recipient)
+                esc_dt = advance_active(
+                    now,
+                    timedelta(seconds=body.escalate_after_sec),
+                    esc_recipient.tz,
+                    esc_windows,
+                )
+                escalate_at_str = esc_dt.isoformat() if esc_dt is not None else None
+
+            # Per-message nudge schedule: validate syntax at send time so a
+            # bad spec is rejected rather than silently defaulting.
+            nudge_schedule_override: str | None = None
+            if body.nudge_schedule:
+                cfg = getattr(request.app.state, "config", None)
+                nudge_max = int(cfg.nudge_max) if cfg else 10
+                try:
+                    parse_nudge_schedule_with_repeat(body.nudge_schedule, max(1, nudge_max))
+                except ValueError as exc:
+                    if idempotency_key:
+                        await _idem_abandon(conn, installation_id, idempotency_key)
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"invalid nudge_schedule: {exc}",
+                    ) from exc
+                nudge_schedule_override = body.nudge_schedule
+            # ---- End per-message escalation --------------------------------
+
             def _insert() -> int:
                 with conn:
                     cur = conn.execute(
                         "INSERT INTO messages("
                         "installation_id, telegram_chat_id, telegram_message_id,"
-                        " kind, payload_json, state, created_at, expires_at)"
-                        " VALUES (?, ?, ?, ?, ?, 'open', ?, ?)",
+                        " kind, payload_json, state, created_at, expires_at,"
+                        " nudge_schedule_override, escalate_at,"
+                        " escalate_to_token_hash)"
+                        " VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
                         (
                             installation_id,
                             chat_id,
@@ -650,6 +716,9 @@ def create_app(
                             payload_json,
                             now.isoformat(),
                             expires_at_str,
+                            nudge_schedule_override,
+                            escalate_at_str,
+                            escalate_to_token_hash,
                         ),
                     )
                     return int(cur.lastrowid)
@@ -1170,6 +1239,30 @@ async def _seed_next_nudge_at(
         if not awaits_human(body.model_dump(), "open"):
             return None
         recipient = await run_in_thread(load_recipient, conn, int(chat_id))
+        windows = recipient_windows(recipient)
+
+        if body.nudge_schedule:
+            # Per-message override: nudge regardless of nudge_enabled.
+            # This is the one place a message legitimately overrides the
+            # human's chat-level preference (task §2, invariant 9).
+            try:
+                schedule, _ = parse_nudge_schedule_with_repeat(
+                    body.nudge_schedule, max(1, int(config.nudge_max))
+                )
+            except ValueError:
+                logger.warning(
+                    "failed to parse per-message nudge_schedule %r for chat %s;"
+                    " no nudge seeded",
+                    body.nudge_schedule,
+                    chat_id,
+                )
+                return None
+            if not schedule:
+                return None
+            due = advance_active(now, schedule[0], recipient.tz, windows)
+            return due.isoformat() if due is not None else None
+
+        # Chat-level schedule: obey nudge_enabled.
         if not recipient.nudge_enabled:
             return None
         due = next_nudge_due(
@@ -1177,7 +1270,7 @@ async def _seed_next_nudge_at(
             recipient,
             config,
             nudge_count=0,
-            windows=recipient_windows(recipient),
+            windows=windows,
         )
         return due.isoformat() if due is not None else None
     except Exception:  # noqa: BLE001
@@ -2579,18 +2672,50 @@ async def _apply_text_answer(
     group_id, _ = _group_info(row)
     if group_id is not None:
         await _handle_grouped_reply(conn, backend, waiters, answer_waiters, row, text)
-    else:
-        # The caller owns the tag question (invariant 7): this row is the one
-        # that will need re-rendering iff it is carrying a tag right now.
-        await _record_answer(
-            conn,
-            waiters,
-            answer_waiters,
-            int(row["installation_id"]),
-            int(row["id"]),
-            {"text": text, "via": via},
-            render_dirty=awaits_human(_payload_for(row), row["state"]),
-        )
+        return
+
+    # Escalated copy: route the answer to the original and cancel this copy.
+    parent_id = row["parent_message_id"] if "parent_message_id" in row.keys() else None
+    if parent_id is not None:
+        parent = await _load_open_message_any(conn, int(parent_id))
+        if parent is not None and parent["state"] == "open":
+            wrote = await _record_answer(
+                conn,
+                waiters,
+                answer_waiters,
+                int(parent["installation_id"]),
+                int(parent["id"]),
+                {"text": text, "via": via},
+                render_dirty=awaits_human(_payload_for(parent), "open"),
+            )
+            if wrote:
+                await _cancel_escalated_children(conn, backend, int(parent["id"]))
+        else:
+            # Parent already terminal — cancel this copy silently.
+            def _cancel_stale(cid: int = int(row["id"])) -> None:
+                with conn:
+                    conn.execute(
+                        "UPDATE messages SET state = 'cancelled',"
+                        " next_nudge_at = NULL, render_dirty = 0"
+                        " WHERE id = ? AND state = 'open'",
+                        (cid,),
+                    )
+            await run_in_thread(_cancel_stale)
+        return
+
+    # The caller owns the tag question (invariant 7): this row is the one
+    # that will need re-rendering iff it is carrying a tag right now.
+    wrote = await _record_answer(
+        conn,
+        waiters,
+        answer_waiters,
+        int(row["installation_id"]),
+        int(row["id"]),
+        {"text": text, "via": via},
+        render_dirty=awaits_human(_payload_for(row), row["state"]),
+    )
+    if wrote:
+        await _cancel_escalated_children(conn, backend, int(row["id"]))
 
 
 async def _handle_callback_query(
@@ -2680,6 +2805,44 @@ async def _handle_callback_query(
         "via": "button",
     }
 
+    # Escalated copy: route the answer to the original and cancel this copy.
+    parent_id = row["parent_message_id"] if "parent_message_id" in row.keys() else None
+    if parent_id is not None:
+        parent = await _load_open_message_any(conn, int(parent_id))
+        if parent is not None and parent["state"] == "open":
+            wrote = await _record_answer(
+                conn,
+                waiters,
+                answer_waiters,
+                int(parent["installation_id"]),
+                int(parent["id"]),
+                answer,
+                render_dirty=awaits_human(_payload_for(parent), "open"),
+            )
+            if wrote:
+                await _cancel_escalated_children(conn, backend, int(parent["id"]))
+        else:
+            wrote = False
+            # Parent already terminal — cancel this copy.
+            def _cancel_stale_cb(cid: int = int(row["id"])) -> None:
+                with conn:
+                    conn.execute(
+                        "UPDATE messages SET state = 'cancelled',"
+                        " next_nudge_at = NULL, render_dirty = 0"
+                        " WHERE id = ? AND state = 'open'",
+                        (cid,),
+                    )
+            await run_in_thread(_cancel_stale_cb)
+        if cb_id:
+            try:
+                ack = f"Answered: {chosen.get('label', '')}" if wrote else "Already handled"
+                await backend.answer_callback_query(
+                    callback_query_id=cb_id, text=ack
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("answer_callback_query failed (escalated copy)")
+        return
+
     # Same as the plain-text path: the row is here, so the tag question is
     # answered here (invariant 7). ``row`` may already be terminal — then
     # ``awaits_human`` is False and ``_record_answer`` writes nothing anyway.
@@ -2692,6 +2855,8 @@ async def _handle_callback_query(
         answer,
         render_dirty=awaits_human(_payload_for(row), row["state"]),
     )
+    if wrote:
+        await _cancel_escalated_children(conn, backend, parsed.message_id)
 
     if cb_id:
         try:

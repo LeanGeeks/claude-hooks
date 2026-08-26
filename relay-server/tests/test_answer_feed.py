@@ -573,7 +573,7 @@ def _build_v3_db(path: Path) -> sqlite3.Connection:
 
 
 def test_v3_migrates_to_v4_cleanly(tmp_path: Path) -> None:
-    """A v3 database migrates to v4 and gains messages_answer_feed index."""
+    """A v3 database migrates forward and gains messages_answer_feed index."""
     db_path = tmp_path / "v3.db"
     conn = _build_v3_db(db_path)
     conn.close()
@@ -581,7 +581,7 @@ def test_v3_migrates_to_v4_cleanly(tmp_path: Path) -> None:
     conn = connect(db_path)
     init_schema(conn)
 
-    assert get_schema_version(conn) == 4
+    assert get_schema_version(conn) == 5
     indexes = {
         r["name"]
         for r in conn.execute(

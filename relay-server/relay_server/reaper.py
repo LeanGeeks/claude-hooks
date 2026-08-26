@@ -69,10 +69,12 @@ from .availability import (
     is_active,
     next_active_start,
     parse_nudge_schedule,
+    parse_nudge_schedule_with_repeat,
     parse_windows,
 )
 from .config import RelayConfig
 from .db import RecipientRow, load_recipient, run_in_thread
+from .models import NEVER_EXPIRES
 from .render import TAG, awaits_human, payload_for, render_body, strip_tag
 from .telegram_backend import (
     TelegramApiError,
@@ -202,6 +204,64 @@ def next_nudge_due(
     return advance_active(now, ladder[nudge_count], recipient.tz, windows)
 
 
+def _row_nudge_schedule(
+    row,  # sqlite3.Row — typed loosely to avoid a circular import
+    recipient: RecipientRow,
+    config: RelayConfig,
+) -> tuple[list[timedelta], bool]:
+    """Return ``(schedule, repeats)`` for a specific message row.
+
+    A row with a ``nudge_schedule_override`` uses that schedule (parsed with
+    repeating-tail support).  A row without one falls back to the chat's ladder
+    via :func:`nudge_ladder` and never repeats.
+
+    On any parse failure the override is logged and we fall back to the chat's
+    ladder — same defensive posture as :func:`nudge_ladder` itself.
+    """
+    override = row["nudge_schedule_override"] if "nudge_schedule_override" in row.keys() else None
+    if override:
+        try:
+            schedule, repeats = parse_nudge_schedule_with_repeat(
+                override, max(1, int(config.nudge_max))
+            )
+            return schedule, repeats
+        except ValueError:
+            logger.warning(
+                "reaper: unparseable nudge_schedule_override %r for row %s;"
+                " falling back to chat ladder",
+                override,
+                int(row["id"]),
+            )
+    return nudge_ladder(recipient, config), False
+
+
+def _compute_next_nudge_due(
+    now: datetime,
+    schedule: list[timedelta],
+    repeats: bool,
+    nudge_count: int,
+    tz: str | None,
+    windows: list[Window] | None,
+) -> datetime | None:
+    """When the ``nudge_count``-th nudge falls due, with repeating-tail support.
+
+    Returns ``None`` when the schedule is exhausted (and ``repeats`` is
+    ``False``) or the window config is never-active.
+
+    When ``repeats`` is ``True`` and ``nudge_count >= len(schedule)``, the last
+    rung is used again — so a ``7d*`` ladder sends every 7 active days forever.
+    """
+    if not schedule:
+        return None
+    if nudge_count < len(schedule):
+        interval = schedule[nudge_count]
+    elif repeats:
+        interval = schedule[-1]
+    else:
+        return None
+    return advance_active(now, interval, tz, windows)
+
+
 def nudge_text(payload: dict, *, extra: int) -> str:
     """The nudge body: a short recall line, plus ``+N more`` when it speaks for
     several rows (brd §5.3). Never a copy of the prompt — the reply-quote
@@ -268,6 +328,91 @@ async def delete_nudge(
         logger.exception(
             "failed to clear nudge id for message %s (will retry next tick)",
             message_id,
+        )
+
+
+async def cancel_escalated_children(
+    conn,  # sqlite3.Connection — typed loosely to avoid a circular import
+    backend: TelegramBackend,
+    parent_id: int,
+) -> None:
+    """Cancel any open escalated copies of *parent_id*.
+
+    Called when the parent is answered or expires so the duplicate(s) no longer
+    show an active keyboard in the escalation chat.  Best-effort: a failed edit
+    or nudge-delete does not block the caller's flow.
+
+    Skips Telegram edits for children with ``telegram_message_id = 0`` (a send
+    that was never completed), since there is no live Telegram message to edit.
+    """
+
+    def _fetch() -> list:
+        return conn.execute(
+            "SELECT * FROM messages WHERE parent_message_id = ? AND state = 'open'",
+            (parent_id,),
+        ).fetchall()
+
+    children = await run_in_thread(_fetch)
+    for child in children:
+        child_id = int(child["id"])
+
+        def _cancel_child(cid: int = child_id) -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE messages SET state = 'cancelled',"
+                    " next_nudge_at = NULL, render_dirty = 0"
+                    " WHERE id = ? AND state = 'open'",
+                    (cid,),
+                )
+
+        try:
+            await run_in_thread(_cancel_child)
+        except Exception:
+            logger.exception(
+                "cancel_escalated_children: failed to cancel child %s", child_id
+            )
+            continue
+
+        tg_msg_id = int(child["telegram_message_id"])
+        if tg_msg_id > 0:
+            # Only edit Telegram messages that were actually sent.
+            body = render_body(payload_for(child), "cancelled")
+            if body.strip():
+                try:
+                    await backend.edit_message(
+                        chat_id=int(child["telegram_chat_id"]),
+                        telegram_message_id=tg_msg_id,
+                        text=body,
+                        keyboard=None,
+                    )
+                except TelegramApiError as exc:
+                    if not is_not_modified(exc):
+                        logger.warning(
+                            "cancel_escalated_children: edit failed for child %s (%s)"
+                            " (best-effort)",
+                            child_id,
+                            exc.description,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "cancel_escalated_children: edit failed for child %s"
+                        " (best-effort)",
+                        child_id,
+                        exc_info=True,
+                    )
+
+            await delete_nudge(
+                conn,
+                backend,
+                message_id=child_id,
+                chat_id=int(child["telegram_chat_id"]),
+                nudge_tg_message_id=child["nudge_tg_message_id"],
+            )
+
+        logger.info(
+            "cancel_escalated_children: cancelled child %s (parent=%s)",
+            child_id,
+            parent_id,
         )
 
 
@@ -360,6 +505,18 @@ async def reaper_tick(
                 message_id,
             )
             continue
+
+        # Cancel any open escalated copies of this row so the escalation
+        # chat no longer shows an active keyboard.  Best-effort — a failure
+        # here must not block the expiry or the subsequent Telegram edits.
+        try:
+            await cancel_escalated_children(conn, backend, message_id)
+        except Exception:
+            logger.exception(
+                "reaper: failed to cancel escalated children for message %s"
+                " (best-effort, continuing)",
+                message_id,
+            )
 
         # Best-effort text re-render: the row is now 'expired', so the body
         # renders without the ``#unanswered`` tag. The state we pass is the one
@@ -455,11 +612,19 @@ async def reaper_tick(
         logger.debug("reaper: no config supplied, skipping the nudge pass")
 
     # ------------------------------------------------------------------ #
-    # 4. Binding codes — no-op (see module docstring).                    #
+    # 4. Escalation pass: rows whose escalate_at has come due.             #
+    # ------------------------------------------------------------------ #
+    try:
+        await _escalation_pass(conn, backend, now_dt, now_iso)
+    except Exception:
+        logger.exception("reaper: escalation pass failed, continuing")
+
+    # ------------------------------------------------------------------ #
+    # 5. Binding codes — no-op (see module docstring).                    #
     # ------------------------------------------------------------------ #
 
     # ------------------------------------------------------------------ #
-    # 5. Delete idempotency keys older than 24 h.                         #
+    # 6. Delete idempotency keys older than 24 h.                         #
     # ------------------------------------------------------------------ #
     cutoff_iso = (now_dt - timedelta(hours=_IDEM_RETENTION_HOURS)).isoformat()
 
@@ -649,7 +814,7 @@ async def _nudge_pass(
     def _fetch_due() -> list:
         return conn.execute(
             "SELECT id, telegram_chat_id, telegram_message_id, payload_json,"
-            " created_at, nudge_count, nudge_tg_message_id"
+            " created_at, nudge_count, nudge_tg_message_id, nudge_schedule_override"
             " FROM messages"
             " WHERE state = 'open' AND next_nudge_at IS NOT NULL"
             "   AND next_nudge_at < ?"
@@ -682,26 +847,38 @@ async def _nudge_pass(
         recipient = await run_in_thread(load_recipient, conn, chat_id)
 
         if not recipient.nudge_enabled:
-            # ``/nudge off`` clears next_nudge_at, so a due row here means a
-            # write was lost somewhere. The recipient row is authoritative.
-            logger.info(
-                "reaper: chat %s has nudges off but %d due row(s); clearing",
-                chat_id,
-                len(chat_rows),
-            )
-            await _set_due(conn, [int(r["id"]) for r in chat_rows], None)
-            continue
+            # ``/nudge off`` is authoritative for rows without their own ladder.
+            # Rows with ``nudge_schedule_override`` carry their own policy and
+            # nudge regardless of the chat-level flag — this is the one place a
+            # message legitimately overrides the human's preference (brd §2.4,
+            # invariant 9).
+            non_override = [r for r in chat_rows if not r["nudge_schedule_override"]]
+            if non_override:
+                logger.info(
+                    "reaper: chat %s has nudges off; clearing %d non-override row(s)",
+                    chat_id,
+                    len(non_override),
+                )
+                await _set_due(conn, [int(r["id"]) for r in non_override], None)
+            chat_rows = [r for r in chat_rows if r["nudge_schedule_override"]]
+            if not chat_rows:
+                continue
 
         windows = recipient_windows(recipient)
-        ladder_len = len(nudge_ladder(recipient, config))
 
-        # The cap is checked **before** the send, not after — an off-by-one here
-        # is a fourth 03:00 notification. A capped row should already carry a
-        # NULL due time; if one is due anyway it stops here.
-        capped = [r for r in chat_rows if int(r["nudge_count"]) >= ladder_len]
+        # Per-row schedule: a row with nudge_schedule_override uses it
+        # (with repeating-tail support); a row without uses the chat's ladder.
+        # "Capped" means the schedule is exhausted and the tail does not repeat.
+        def _row_is_capped(r) -> bool:
+            sched, repeating = _row_nudge_schedule(r, recipient, config)
+            if repeating:
+                return False
+            return int(r["nudge_count"]) >= len(sched)
+
+        capped = [r for r in chat_rows if _row_is_capped(r)]
         if capped:
             await _set_due(conn, [int(r["id"]) for r in capped], None)
-        chat_rows = [r for r in chat_rows if int(r["nudge_count"]) < ladder_len]
+        chat_rows = [r for r in chat_rows if not _row_is_capped(r)]
         if not chat_rows:
             continue
 
@@ -794,8 +971,9 @@ async def _nudge_pass(
             )
 
         new_count = int(target["nudge_count"]) + 1
-        target_due = next_nudge_due(
-            now_dt, recipient, config, nudge_count=new_count, windows=windows
+        target_sched, target_repeating = _row_nudge_schedule(target, recipient, config)
+        target_due = _compute_next_nudge_due(
+            now_dt, target_sched, target_repeating, new_count, recipient.tz, windows
         )
 
         # The nudge id is stored **unconditionally** while the ladder only
@@ -833,22 +1011,251 @@ async def _nudge_pass(
         # simply re-arm the same rung, which is what holds the chat to one nudge
         # per rung instead of one per row on the following tick.
         for row in folded:
-            row_due = next_nudge_due(
-                now_dt,
-                recipient,
-                config,
-                nudge_count=int(row["nudge_count"]),
-                windows=windows,
+            f_sched, f_repeating = _row_nudge_schedule(row, recipient, config)
+            row_due = _compute_next_nudge_due(
+                now_dt, f_sched, f_repeating, int(row["nudge_count"]), recipient.tz, windows
             )
             await _set_due(conn, [int(row["id"])], row_due)
 
+        target_sched_len = len(target_sched) if not target_repeating else -1
         logger.info(
-            "reaper: nudged message %s in chat %s (nudge %d/%d, +%d more)",
+            "reaper: nudged message %s in chat %s (nudge %d/%s, +%d more)",
             target_id,
             chat_id,
             new_count,
-            ladder_len,
+            "∞" if target_repeating else str(target_sched_len),
             extra,
+        )
+
+
+async def _escalation_pass(
+    conn,  # noqa: ANN001
+    backend: TelegramBackend,
+    now_dt: datetime,
+    now_iso: str,
+) -> None:
+    """Pass 4 — send a duplicate to the escalation target for open rows whose
+    ``escalate_at`` has come due.
+
+    Each escalated copy is a new messages row with ``installation_id`` equal to
+    the original's installation (so the other installation's feed never sees it
+    as its own answered row) and ``parent_message_id`` pointing back to the
+    original (so the webhook can attribute an answer from either copy to the
+    original message id — architecture §2.3, brd §2.3).
+
+    ``escalate_at`` is cleared on the parent **only after** a successful send so
+    that a transient failure leaves the row eligible for retry on the next tick
+    (brd D10: a failed thing is kept, retried and surfaced, never dropped).
+    Idempotency is provided by an existence check on the child row: if a child
+    with a non-zero ``telegram_message_id`` already exists the send is skipped
+    and only the deadline is cleared.  A child with ``telegram_message_id = 0``
+    (send previously failed before the DB commit) is reused and its send is
+    retried rather than inserting a second child.
+    """
+
+    def _fetch_due() -> list:
+        return conn.execute(
+            "SELECT id, installation_id, telegram_chat_id, telegram_message_id,"
+            " kind, payload_json, escalate_to_token_hash"
+            " FROM messages"
+            " WHERE state = 'open' AND escalate_at IS NOT NULL AND escalate_at < ?",
+            (now_iso,),
+        ).fetchall()
+
+    due = await run_in_thread(_fetch_due)
+    if not due:
+        return
+
+    for row in due:
+        message_id = int(row["id"])
+
+        # Idempotency guard: check whether a child row already exists for this
+        # parent.  A child with tg_msg_id != 0 means the send already completed
+        # — just clear escalate_at.  A child with tg_msg_id == 0 means a
+        # previous attempt inserted the child but the send (or commit) failed —
+        # reuse that row and retry rather than inserting a second child.
+        def _find_child(mid: int = message_id):
+            return conn.execute(
+                "SELECT id, telegram_message_id FROM messages"
+                " WHERE parent_message_id = ? AND state = 'open'",
+                (mid,),
+            ).fetchone()
+
+        existing_child = await run_in_thread(_find_child)
+
+        if existing_child is not None and int(existing_child["telegram_message_id"]) != 0:
+            # Already sent successfully.  Clear the deadline and move on —
+            # no second send will occur.
+            def _clear_only(mid: int = message_id) -> None:
+                with conn:
+                    conn.execute(
+                        "UPDATE messages SET escalate_at = NULL WHERE id = ?",
+                        (mid,),
+                    )
+
+            try:
+                await run_in_thread(_clear_only)
+            except Exception:
+                logger.exception(
+                    "reaper: failed to clear escalate_at for already-sent"
+                    " escalation of message %s",
+                    message_id,
+                )
+            logger.info(
+                "reaper: escalation for message %s already delivered"
+                " (child=%s); clearing escalate_at",
+                message_id,
+                int(existing_child["id"]),
+            )
+            continue
+
+        # Resolve the token hash to a bound installation.
+        token_hash = row["escalate_to_token_hash"]
+
+        def _lookup(th: str = token_hash):
+            return conn.execute(
+                "SELECT id, telegram_chat_id FROM installations"
+                " WHERE token_hash = ? AND revoked_at IS NULL"
+                " AND telegram_chat_id IS NOT NULL",
+                (th,),
+            ).fetchone()
+
+        target_inst = await run_in_thread(_lookup)
+        if target_inst is None:
+            logger.warning(
+                "reaper: escalation target for message %s has no bound"
+                " installation (token_hash=%s…); skipping",
+                message_id,
+                (token_hash or "")[:8],
+            )
+            continue
+
+        target_chat_id = int(target_inst["telegram_chat_id"])
+        target_inst_id = int(target_inst["id"])
+
+        # Use render_body on the stored payload — never re-render from a
+        # payload that may have changed since send time (task §3).
+        body_text = render_body(payload_for(row), "open")
+        if not body_text.strip():
+            logger.warning(
+                "reaper: escalation skipped for message %s (empty body)",
+                message_id,
+            )
+            continue
+
+        original_payload = payload_for(row)
+        keyboard = original_payload.get("keyboard")
+        now_child_iso = now_dt.isoformat()
+
+        if existing_child is not None:
+            # Child row exists with tg_msg_id=0 — previous send failed.
+            # Reuse the existing child id so there is never more than one
+            # child row per parent escalation.
+            child_id = int(existing_child["id"])
+            logger.info(
+                "reaper: retrying escalation for message %s using existing"
+                " child %s (previous send failed)",
+                message_id,
+                child_id,
+            )
+        else:
+            # No child yet.  Insert a placeholder row first so the keyboard
+            # can be encoded with the child's relay id (callback data uses
+            # the relay id, not the Telegram message id).
+            def _insert_child(
+                inst_id: int = int(row["installation_id"]),
+                parent_id: int = message_id,
+                pjson: str = row["payload_json"],
+            ) -> int:
+                with conn:
+                    cur = conn.execute(
+                        "INSERT INTO messages("
+                        "installation_id, telegram_chat_id, telegram_message_id,"
+                        " kind, payload_json, state, created_at, expires_at,"
+                        " parent_message_id)"
+                        " VALUES (?, ?, 0, ?, ?, 'open', ?, ?, ?)",
+                        (
+                            inst_id,
+                            target_chat_id,
+                            row["kind"],
+                            pjson,
+                            now_child_iso,
+                            NEVER_EXPIRES,
+                            parent_id,
+                        ),
+                    )
+                    return int(cur.lastrowid)
+
+            try:
+                child_id = await run_in_thread(_insert_child)
+            except Exception:
+                logger.exception(
+                    "reaper: failed to insert escalated child for message %s",
+                    message_id,
+                )
+                continue
+
+        # Send the duplicate to the target chat with the child's relay id
+        # encoded in the keyboard callback data so taps route to the child row.
+        try:
+            tg_msg_id = await backend.send_message(
+                chat_id=target_chat_id,
+                text=body_text,
+                keyboard=keyboard,
+                reply_required=False,
+                message_id=child_id,
+                force_reply=False,
+            )
+        except Exception:
+            logger.warning(
+                "reaper: escalation send FAILED for message %s (child=%s,"
+                " target_inst=%s, chat=%s); escalate_at left set for retry"
+                " on next tick",
+                message_id,
+                child_id,
+                target_inst_id,
+                target_chat_id,
+                exc_info=True,
+            )
+            continue
+
+        # Send succeeded.  Update the child's tg_msg_id and clear the parent's
+        # escalate_at in a single transaction — if we crash between send and
+        # this commit, tg_msg_id stays 0 and the next tick retries the send
+        # (one extra Telegram message possible only on a crash); once this
+        # commits, the existence check above suppresses any further attempt.
+        def _commit_success(
+            cid: int = child_id,
+            tgid: int = tg_msg_id,
+            mid: int = message_id,
+        ) -> None:
+            with conn:
+                conn.execute(
+                    "UPDATE messages SET telegram_message_id = ? WHERE id = ?",
+                    (tgid, cid),
+                )
+                conn.execute(
+                    "UPDATE messages SET escalate_at = NULL WHERE id = ?",
+                    (mid,),
+                )
+
+        try:
+            await run_in_thread(_commit_success)
+        except Exception:
+            logger.exception(
+                "reaper: failed to commit escalation success for message %s"
+                " (child=%s); escalate_at left set — next tick will retry"
+                " but send already delivered",
+                message_id,
+                child_id,
+            )
+
+        logger.info(
+            "reaper: escalated message %s → child %s in chat %s (tg_msg=%s)",
+            message_id,
+            child_id,
+            target_chat_id,
+            tg_msg_id,
         )
 
 

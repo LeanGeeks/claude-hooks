@@ -23,7 +23,7 @@ a read-only scan over the real files before writing the writer.
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
 | 23-01 | [Relay: answer feed + non-expiring messages](./23-01-relay-answer-feed.md) | done | — | `never_expires` sentinel, `GET /v1/answers`, waiter registry keyed by installation, migration. **Touches no Telegram rendering.** |
-| 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | todo | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
+| 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | done | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | todo | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | todo | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
 | 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | todo | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
@@ -171,3 +171,36 @@ rather than reverting it to test against HEAD.
   - Worth knowing for 23-05: the shared-chat case is **real in production** —
     chat `108296207` carries two installations (616 and 21 answered rows).
     The feed's `installation_id` predicate is load-bearing, not defensive.
+
+- **2026-08-26 — 23-02 done.** Implemented, reviewed (FAIL: 1 HIGH, 2 MEDIUM,
+  1 LOW), fixed, re-reviewed (PASS, 0 new). Relay suite 315 passed (stable over
+  two runs), top-level 1030 / 1 skipped.
+  - **The HIGH was a spec-vs-code gap the implementer had filed as a decision:**
+    `parse_duration` accepted only `h`/`m`, so the epic's own default ladder
+    `4h,1d,3d,7d*` — documented in brd §5, architecture §7, this file, and this
+    task's Done-when — raised `ValueError`. Tests had been rewritten to
+    `24h,72h,168h` to fit the parser. `d` support added; tests restored to the
+    spec literals so the Done-when clause is actually demonstrated. **23-04
+    would have taken a 422 on the first send from a human-written roles.toml.**
+  - **`parent_message_id` is an accepted architecture deviation** — see the note
+    added to architecture.md §2.2. Three columns cannot link a child back to its
+    parent, which answer attribution and sibling cancellation both require.
+  - **Escalation is now idempotent rather than fire-once-or-lose.** It was
+    clearing `escalate_at` before the send, so a transient Telegram failure
+    dropped the escalation permanently and silently. Now: existence-check the
+    child by `parent_message_id`; `telegram_message_id == 0` means the prior
+    send failed → reuse that row and retry; non-zero means delivered → just
+    clear. Failure leaves `escalate_at` set (WARNING logged) and the next tick
+    retries. **Residual, accepted and documented:** a crash between the Telegram
+    send and the DB commit can deliver a second message — it cannot create a
+    second child row, which would have been the worse failure.
+  - The expiry pass now cancels escalated children. Before the fix, a child from
+    a failed send (`tg_msg_id = 0`, never nudged, never expired because it
+    carries `NEVER_EXPIRES`) leaked as `state='open'` forever.
+  - `answer_waiters` removed from `reaper_tick` — nothing in the reaper records
+    answers. **If 23-05 needs the reaper to wake the feed, this comes back**;
+    the feed wake lives in `app.py`'s `_record_answer` and group finalization.
+  - Migration v5 verified against the production snapshot on both paths
+    (v3→v5 one-hop, which is what the live relay at v3 will do, and v4→v5).
+    All four columns NULL across 5006 real rows; `expires_at` kept NOT NULL
+    through the ALTERs. See `agents_output/23-02_real_db_migration_check.md`.
