@@ -42,16 +42,28 @@ relay HTTP API itself.
     posttool_hook.py             PostToolUse: cancel relay msg when terminal resolved
     notification_hook.py         Notification(idle_prompt): forward last msg to Telegram
     roles_config.py              role catalog + binding loader; roles_report, format_roles_table
+    questions_store.py           queue-file engine: anchor resolution, id allocation, compose, apply_answer
+    questions_listen_lib.py      index + listener runtime: poll loop, watermark, pending retry
+  bin/
+    questions-listen             listener process lifecycle (systemd ExecStart); logic lives in questions_listen_lib.py
   settings.json                  permissions allow/deny (+ statusline); hooks merged in by installer
+questions-mcp/
+  server.py                      questions MCP server: ask + notify tools (uv --script, registered user-scoped)
+  questions_mcp_lib.py           ask/notify logic: role resolution, write-then-send, index write
 install-claude-config.sh         merges permissions + wires hooks into global settings.json
 shell/
   profiles.example.toml          shipped template for ~/.claude/profiles.toml
   amux-spawn.bash                shell integration: auto-generates aliases from profiles
   amux-spawn-completion.bash     bash completion for amux-spawn + profile names
   claude-roles                   diagnostic: per-role destination + errors (claude-roles --help)
+  claude-questions               diagnostic: queue state, listener state, --check, --check-contract, --reindex
 docs/
   roles.example.toml             copy-paste template for .claude/roles.toml
   roles-prompt-example.md        agent-facing prose to adapt into CLAUDE.md
+  questions.example.toml         copy-paste template for [questions] in .claude/roles.toml
+  questions-prompt-example.md    agent-facing prose for async ask (when/body/options/citing id)
+  async-questions.md             operator guide: config, listener, diagnostics, "answer didn't arrive" walkthrough
+  questions-contract.md          adopter-facing statement of the six parse-contract rules + --check-contract
 relay-server/
   relay_server/
     app.py                       FastAPI app: HTTP API + Telegram webhook + update dispatch
@@ -495,6 +507,72 @@ Two facts about the relay shaped every decision:
 any config errors without ever printing token material.  `claude-roles --check`
 probes the relay for each distinct token and reports `bound` / `not bound` /
 `invalid token`.
+
+---
+
+## Async question path (epic 23)
+
+A separate, non-blocking channel: an agent writes a question to a workspace
+queue file and sends it to Telegram in one MCP call, then exits.  The answer
+arrives hours or days later, applied by a resident listener with no session
+running.
+
+### Component map
+
+```
+agent ──mcp__questions__ask──► questions-mcp/server.py
+                                   │
+                                   ├─ questions_store.py ──► docs/questions/*.md
+                                   │                          (workspace, git-tracked)
+                                   ├─ roles_config.py ──────► role → token
+                                   └─ RelayClient ─────────► POST /v1/messages
+                                                              (never_expires, escalate_to)
+                                            │
+                                            ▼
+                                    relay: messages row
+                                            │  human answers
+                                            ▼
+                                   questions-listen ──GET /v1/answers?after=&wait=25──┘
+                                       │ (systemd --user, one per machine)
+                                       ├─ index lookup: message_id → workspace_id, qid
+                                       ├─ questions_store.apply_answer()  ──► queue file
+                                       ├─ PATCH /v1/messages/{id}  ──► ✅ answer
+                                       └─ advance watermark
+```
+
+### Key invariants
+
+- **The file write precedes the relay call and is fsynced** — no crash can
+  produce a Telegram message referring to an entry that does not exist.
+- **The watermark advances only after a terminal outcome** (applied, or moved to
+  `pending`) — a crash replays, never drops.
+- **Applies are idempotent on relay message id** — every retry checks for an
+  existing answer block before inserting.
+- **`questions_store.py` is the only module that parses or writes a queue file**
+  — the MCP server and the listener both import it; neither reimplements any part
+  of the format.
+- **Absent `[questions]`, nothing changes** — every existing flow is byte-identical
+  with the listener stopped and no config present.
+
+### The listener index
+
+`~/.claude/async_questions.json` maps relay message ids to workspace routing
+entries (workspace_id, anchor mode, queue-file path relative to the resolved
+root, qid).  The watermark advances after each terminal outcome.  The routing
+entry is what lets the listener re-resolve the workspace at apply time rather
+than trusting a captured absolute path.
+
+### Diagnostics
+
+`claude-questions` shows the workspace queue state, the listener's connection
+state and watermark, and any pending applies.  `--check` probes the relay for
+each distinct token.  `--check-contract` reports queue-file conformance.
+`--reindex` rebuilds missing index entries from `**Dispatched:**` markers in the
+queue files — the recovery path for a failed index write.
+
+Full reference: `docs/async-questions.md` (operator guide),
+`docs/questions-contract.md` (adopter contract),
+`tasks/23_async_questions/architecture.md` (design detail).
 
 ---
 

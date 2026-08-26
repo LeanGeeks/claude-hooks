@@ -1,0 +1,895 @@
+#!/usr/bin/env python3
+"""Diagnostic tool for async question queues (epic 23).
+
+Usage:
+    claude-questions [--workspace-dir DIR] [--check] [--check-contract [DIR]]
+                     [--reindex] [--status] [--json]
+
+Offline by default: reads the workspace ``[questions]`` config, the listener
+index at ``~/.claude/async_questions.json``, and the listener status file.
+Never prints token material.
+
+--check
+    Probe each distinct installation token against the relay (network required).
+    Reports bound / not-bound / invalid for each.  Exit 2 on any problem.
+    Mirrors ``claude-roles --check``.
+
+--check-contract [DIR]
+    Report every heading that does **not** conform to the parse contract
+    (architecture §3.2) and what to do about it.  Never modifies any file.
+    Exit 2 if categories 1-3 (malformed id, missing status, duplicate id) are
+    found in any file.  Intended for workspace adopters.
+
+--reindex
+    Scan every queue file for ``**Dispatched:** … relay #N`` markers and
+    rebuild missing index entries (message_id → workspace/qid mapping).
+    Never touches a queue file; never overwrites an existing index record.
+    Use this after an index write fails (``index_routing_failed: True`` in the
+    ``ask`` return value) — the listener will then pick up the pending answer.
+
+--status
+    Print detailed listener state: connection state, watermarks, and pending
+    applies.  Does not require the listener lock.  This is the first thing to
+    read when "a question was answered and nothing happened".
+
+Exit codes:
+    0  clean — including "no [questions] configured" (that is valid, not a problem)
+    1  config or catalog errors
+    2  (--check) any token unbound or invalid
+    2  (--check-contract) non-conforming entries found
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+# ── Module loading — installed path first, then repo checkout ──────────────────
+#
+# Resolution mirrors telegram_permission_router.py and claude-roles:
+#   1. ~/.claude/hooks/  (after install-claude-config.sh)
+#   2. Walk up from this script for .claude/hooks/  (repo checkout)
+
+
+def _ensure_hooks_on_path() -> None:
+    installed = Path.home() / ".claude" / "hooks"
+    if installed.is_dir() and str(installed) not in sys.path:
+        sys.path.insert(0, str(installed))
+        return
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / ".claude" / "hooks"
+        if candidate.is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            return
+
+
+_ensure_hooks_on_path()
+
+try:
+    import questions_store as qs
+    import questions_listen_lib as qll
+    import roles_config as rc
+except ImportError as _import_err:
+    print(
+        f"error: {_import_err} — run install-claude-config.sh first",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+# ── Conformance checker (--check-contract) ─────────────────────────────────────
+
+#: Matches a Dispatched marker written by questions_store.mark_dispatched.
+_DISPATCHED_RE = re.compile(r"^\*\*Dispatched:\*\*\s+(\S+)\s+·\s+relay #(\d+)")
+
+
+@dataclass
+class ContractFinding:
+    category: str        # "malformed_id" | "missing_status" | "duplicate" | "mention"
+    path: Path
+    lineno: int          # 0-based line index
+    qid: str             # id token or heading text
+    detail: str          # human-readable fix guidance
+
+
+def _id_prefix(fmt: qs.QuestionsFormat) -> str:
+    """The literal prefix of the id template (e.g. ``Q-`` from ``Q-{n:03d}``)."""
+    spec_re = re.compile(r"^(?P<prefix>[^{}]*)\{n")
+    m = spec_re.match(fmt.id)
+    return m.group("prefix") if m else ""
+
+
+def _find_unknown_bracket_token(heading_line: str, status_set: set[str]) -> str | None:
+    """Return the first word inside ``[…]`` whose first word is not in *status_set*.
+
+    Returns ``None`` when no bracket is present at all; the caller should say so
+    plainly rather than printing an empty token name.
+    """
+    for m in re.finditer(r"\[([^\]\n]*)\]", heading_line):
+        inner = m.group(1).strip()
+        words = inner.split()
+        if not words:
+            continue
+        first_word = words[0]
+        if first_word not in status_set:
+            return first_word
+    return None
+
+
+def _id_start_re(fmt: qs.QuestionsFormat) -> re.Pattern[str]:
+    """A well-formed id anchored at the start of a string (same as the store's)."""
+    # Recreate without importing private helpers.
+    template_re = re.compile(
+        r"^(?P<prefix>[^{}]*)\{n(?::0(?P<width>\d+)d?)?\}(?P<suffix>[^{}]*)$"
+    )
+    m = template_re.match(fmt.id)
+    if m is None:
+        m = template_re.match(qs.DEFAULT_ID)
+    assert m is not None
+    prefix = re.escape(m.group("prefix"))
+    suffix = re.escape(m.group("suffix"))
+    return re.compile(r"^" + prefix + r"(?P<num>\d+)" + suffix + r"(?:-(?P<var>[A-Za-z]{1,4}))?(?![A-Za-z0-9_-])")
+
+
+def _id_scan_re(fmt: qs.QuestionsFormat) -> re.Pattern[str]:
+    """A well-formed id anywhere in text."""
+    template_re = re.compile(
+        r"^(?P<prefix>[^{}]*)\{n(?::0(?P<width>\d+)d?)?\}(?P<suffix>[^{}]*)$"
+    )
+    m = template_re.match(fmt.id)
+    if m is None:
+        m = template_re.match(qs.DEFAULT_ID)
+    assert m is not None
+    prefix = re.escape(m.group("prefix"))
+    suffix = re.escape(m.group("suffix"))
+    return re.compile(
+        r"(?<![A-Za-z0-9_])" + prefix + r"(?P<num>\d+)" + suffix
+        + r"(?:-(?P<var>[A-Za-z]{1,4}))?(?![A-Za-z0-9_-])"
+    )
+
+
+def _check_contract_one_file(
+    path: Path,
+    fmt: qs.QuestionsFormat,
+) -> tuple[list[ContractFinding], int, int]:
+    """Return (findings, total_entries, entries_with_bad, edits_for_bad) for one queue file."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], 0, 0
+
+    lines = text.split("\n")
+    findings: list[ContractFinding] = []
+
+    level = fmt.level
+    heading_re = re.compile(r"^ {0,3}" + "#" * level + r"(?!#)[ \t]+")
+    id_start = _id_start_re(fmt)
+    prefix = _id_prefix(fmt)
+
+    # ── Category 1: headings that look like entries but have malformed ids ──────
+    #
+    # Rule 6: the store ignores these.  We report them so adopters can decide
+    # whether they are template examples (move to a fenced block) or typos
+    # (fix the id spelling).
+    for lineno, line in enumerate(lines):
+        hm = heading_re.match(line)
+        if hm is None:
+            continue
+        text_after = line[hm.end():]
+        if not text_after.startswith(prefix) or not prefix:
+            continue
+        if id_start.match(text_after):
+            continue  # valid id — this will be an entry
+        # Starts with the id prefix but fails the full id pattern.
+        findings.append(ContractFinding(
+            category="malformed_id",
+            path=path,
+            lineno=lineno,
+            qid=text_after.split()[0] if text_after.split() else text_after,
+            detail=(
+                "ignored by the store (rule 6) — move to a fenced block if "
+                "it is documentation, or fix the id spelling"
+            ),
+        ))
+
+    # ── Parse recognised entries ──────────────────────────────────────────────
+    entries = qs.parse_entries(lines, fmt, path)
+    total = len(entries)
+
+    # ── Category 2: missing or unrecognised status token ─────────────────────
+    status_names = ", ".join(f'"{s}"' for s in fmt.status)
+    status_set = set(fmt.status)
+    for entry in entries:
+        if entry.status is None:
+            # Re-scan the heading to name the unknown token so the adopter
+            # knows what to declare in [questions.format].status.
+            heading_line = lines[entry.start] if entry.start < len(lines) else ""
+            unknown_token = _find_unknown_bracket_token(heading_line, status_set)
+            if unknown_token is not None:
+                hint = (
+                    f'found "{unknown_token}" — '
+                    "declare it in [questions.format].status, or edit the heading"
+                )
+            else:
+                hint = (
+                    "no bracket in heading — "
+                    "add a [status] bracket using a token from the configured set"
+                )
+            findings.append(ContractFinding(
+                category="missing_status",
+                path=path,
+                lineno=entry.start,
+                qid=entry.qid,
+                detail=(
+                    f"no status token from [{status_names}] found — {hint}"
+                ),
+            ))
+
+    # ── Category 3: duplicate ids within the file ─────────────────────────────
+    seen_keys: dict[tuple[int, str], qs.Entry] = {}
+    already_flagged: set[tuple[int, str]] = set()
+    for entry in entries:
+        key = (entry.number, entry.variant)
+        if key in seen_keys:
+            if key not in already_flagged:
+                # Flag the first occurrence too
+                first = seen_keys[key]
+                findings.append(ContractFinding(
+                    category="duplicate",
+                    path=path,
+                    lineno=first.start,
+                    qid=entry.qid,
+                    detail=(
+                        f"duplicate id in {path.name} — "
+                        "demote or de-id one heading to resolve the conflict"
+                    ),
+                ))
+                already_flagged.add(key)
+            findings.append(ContractFinding(
+                category="duplicate",
+                path=path,
+                lineno=entry.start,
+                qid=entry.qid,
+                detail=(
+                    f"duplicate id in {path.name} — "
+                    "demote or de-id one heading to resolve the conflict"
+                ),
+            ))
+        else:
+            seen_keys[key] = entry
+
+    # Count entries that have any bad finding (by line position — for conforming metric).
+    entries_with_bad = len(
+        {f.lineno for f in findings if f.category in ("missing_status", "duplicate")}
+    )
+    # Count distinct edits required:
+    # - one per entry with missing_status (each needs its own bracket fixed)
+    # - one per unique qid that has duplicate findings (demote one of the pair)
+    edits_for_bad = (
+        sum(1 for f in findings if f.category == "missing_status")
+        + len({f.qid for f in findings if f.category == "duplicate"})
+    )
+    return findings, total, entries_with_bad, edits_for_bad
+
+
+def cmd_check_contract(
+    store: qs.QuestionsStore | None,
+    workspace_dir: str,
+    *,
+    json_out: bool = False,
+) -> int:
+    """Scan queue files and report contract violations.
+
+    Returns 0 on clean, 2 if categories 1-3 have any findings.
+    """
+    if store is None:
+        msg = (
+            "no [questions] section in roles.toml — "
+            "nothing to check (invariant 9: clean no-op)"
+        )
+        if json_out:
+            print(json.dumps({"status": "no_config", "message": msg}))
+        else:
+            print(msg)
+        return 0
+
+    fmt = store.fmt
+    queue_files = store.queue_files()
+    if not queue_files:
+        msg = "no queue files found for this workspace"
+        if json_out:
+            print(json.dumps({"status": "no_files", "message": msg}))
+        else:
+            print(msg)
+        return 0
+
+    all_findings: list[ContractFinding] = []
+    total_entries = 0
+    bad_entries = 0   # entries with any bad finding (for conforming metric)
+    edits_for_bad = 0  # distinct edits needed for bad entries (for edits_needed metric)
+
+    for path in queue_files:
+        file_findings, file_total, file_bad, file_edits = _check_contract_one_file(path, fmt)
+        all_findings.extend(file_findings)
+        total_entries += file_total
+        bad_entries += file_bad
+        edits_for_bad += file_edits
+
+    # ── Category 4 (informational): id mentions in another entry's title ──────
+    #
+    # Collect every recognised id so we can detect cross-references.
+    id_scan = _id_scan_re(fmt)
+    id_set: set[tuple[int, str]] = set()
+    for path in queue_files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        entries = qs.parse_entries(text.split("\n"), fmt, path)
+        for entry in entries:
+            id_set.add((entry.number, entry.variant))
+
+    mention_findings: list[ContractFinding] = []
+    for path in queue_files:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        entries = qs.parse_entries(text.split("\n"), fmt, path)
+        for entry in entries:
+            # Scan the heading text AFTER the id token for other id references.
+            heading_text_after_id = entry.heading[entry.heading.index(entry.qid) + len(entry.qid):]
+            for m in id_scan.finditer(heading_text_after_id):
+                num = int(m.group("num"))
+                var = (m.group("var") or "").lower()
+                if (num, var) != (entry.number, entry.variant) and (num, var) in id_set:
+                    mentioned_id = m.group(0)
+                    mention_findings.append(ContractFinding(
+                        category="mention",
+                        path=path,
+                        lineno=entry.start,
+                        qid=entry.qid,
+                        detail=(
+                            f"mentions {mentioned_id} in its title — "
+                            "correctly ignored by the store (rule 1); no edit needed"
+                        ),
+                    ))
+
+    edits_needed = (
+        sum(1 for f in all_findings if f.category == "malformed_id")
+        + edits_for_bad  # distinct edits (not finding count)
+    )
+    conforming = total_entries - bad_entries  # entries without any bad finding
+    any_actionable = bool(edits_needed)
+
+    if json_out:
+        print(json.dumps({
+            "workspace": workspace_dir,
+            "queue_dir": str(store.queue_dir),
+            "files": [str(p) for p in queue_files],
+            "total_entries": total_entries,
+            "conforming": conforming,
+            "edits_needed": edits_needed,
+            "findings": [
+                {
+                    "category": f.category,
+                    "file": str(f.path),
+                    "line": f.lineno + 1,
+                    "qid": f.qid,
+                    "detail": f.detail,
+                }
+                for f in all_findings + mention_findings
+            ],
+        }))
+        return 2 if any_actionable else 0
+
+    # ── human-readable output ─────────────────────────────────────────────────
+    print(f"workspace:  {workspace_dir}")
+    print(f"queue dir:  {store.queue_dir}")
+    print(f"checking {len(queue_files)} file(s):")
+    for p in queue_files:
+        exists = "exists" if p.is_file() else "MISSING"
+        open_count = len([e for e in store.entries_in(p) if e.status == fmt.open_status.lower()])
+        print(f"  {p.name}  [{exists}, {open_count} open]")
+
+    # Group by file
+    by_file: dict[Path, list[ContractFinding]] = {}
+    for f in all_findings + mention_findings:
+        by_file.setdefault(f.path, []).append(f)
+
+    any_output = False
+    for path in queue_files:
+        file_fs = by_file.get(path, [])
+        if not file_fs:
+            continue
+        print(f"\n--- {path.name} ---")
+        for f in sorted(file_fs, key=lambda x: x.lineno):
+            tag = {
+                "malformed_id": "MALFORMED ID",
+                "missing_status": "MISSING STATUS",
+                "duplicate": "DUPLICATE",
+                "mention": "INFO (no edit needed)",
+            }.get(f.category, f.category.upper())
+            print(f"  {tag}  line {f.lineno + 1}: {f.qid}")
+            print(f"    → {f.detail}")
+        any_output = True
+
+    if mention_findings and not any_output:
+        print("\nINFORMATIONAL (no edit needed):")
+        for f in mention_findings:
+            print(f"  {f.qid}: {f.detail}")
+
+    print()
+    if any_actionable:
+        print(
+            f"{conforming} of {total_entries} entries conform; "
+            f"{edits_needed} edit(s) needed"
+        )
+    else:
+        print(f"{conforming} of {total_entries} entries conform; 0 edits needed")
+
+    return 2 if any_actionable else 0
+
+
+# ── Reindex (--reindex) ────────────────────────────────────────────────────────
+
+
+def cmd_reindex(store: qs.QuestionsStore | None, *, json_out: bool = False) -> int:
+    """Scan queue files and rebuild missing index entries.
+
+    Never overwrites an existing record, never moves a watermark, never touches
+    a queue file.  This is the recovery path for a failed index write
+    (``index_routing_failed: True`` in the ``ask`` return value).
+    """
+    if store is None:
+        msg = "no [questions] section — no queue files to scan (invariant 9)"
+        if json_out:
+            print(json.dumps({"status": "no_config", "message": msg}))
+        else:
+            print(msg)
+        return 0
+
+    # Build a file → role reverse-map so we can set role on the IndexEntry.
+    queue_dir = store.queue_dir
+    file_role: dict[Path, str | None] = {}
+    if store.config.queue:
+        for role_id, filename in store.config.queue.items():
+            file_role[queue_dir / filename] = role_id
+    # Flat file case — role is None
+    flat = queue_dir / store.config.file
+    if flat not in file_role:
+        file_role[flat] = None
+    # Glob-matched files also get None if not in the role map.
+
+    recovered: list[dict[str, Any]] = []
+    index = qll.read_index()
+    existing_message_ids = set(index.messages.keys())
+
+    for path in store.queue_files():
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lines = text.split("\n")
+        entries = qs.parse_entries(lines, store.fmt, path)
+
+        for entry in entries:
+            # Scan the entry's body for a Dispatched marker.
+            for body_line in lines[entry.start + 1: entry.end]:
+                m = _DISPATCHED_RE.match(body_line.lstrip())
+                if m is None:
+                    continue
+                timestamp = m.group(1)
+                message_id = int(m.group(2))
+                str_mid = str(message_id)
+                if str_mid in existing_message_ids:
+                    break  # Already in the index; this entry is fine.
+
+                # Rebuild the IndexEntry from the queue file's own data.
+                rel = store.rel_path(path)
+                role = file_role.get(path)
+                new_entry = qll.IndexEntry(
+                    workspace_id=store.workspace_id,
+                    anchor=store.config.anchor,
+                    root=str(store.root),
+                    rel_path=rel,
+                    qid=entry.qid,
+                    role=role,
+                    created_at=timestamp,
+                )
+                recovered.append({
+                    "message_id": message_id,
+                    "qid": entry.qid,
+                    "rel_path": rel,
+                    "entry": new_entry,
+                })
+                existing_message_ids.add(str_mid)
+                break  # One Dispatched line per entry.
+
+    if not recovered:
+        msg = "no missing index records found — nothing to rebuild"
+        if json_out:
+            print(json.dumps({"status": "ok", "rebuilt": 0, "records": []}))
+        else:
+            print(msg)
+        return 0
+
+    # Write all new records in one atomic index update.
+    def _apply(idx: qll.Index) -> None:
+        for item in recovered:
+            str_mid = str(item["message_id"])
+            if str_mid not in idx.messages:
+                idx.messages[str_mid] = item["entry"]
+
+    qll.mutate_index(_apply)
+
+    if json_out:
+        print(json.dumps({
+            "status": "ok",
+            "rebuilt": len(recovered),
+            "records": [
+                {"message_id": r["message_id"], "qid": r["qid"], "rel_path": r["rel_path"]}
+                for r in recovered
+            ],
+        }))
+    else:
+        print(f"rebuilt {len(recovered)} index record(s):")
+        for r in recovered:
+            print(f"  relay #{r['message_id']} → {r['qid']} ({r['rel_path']})")
+        print(
+            "\nrun `questions-listen --once` or wait for the next listener poll "
+            "to pick up the pending answer."
+        )
+    return 0
+
+
+# ── Relay token probe (--check) ───────────────────────────────────────────────
+
+
+def _check_tokens(config: qll.ListenConfig) -> tuple[list[dict[str, Any]], bool]:
+    """Probe each distinct token against ``GET /v1/installations/me``.
+
+    Returns ``(results, any_problem)``.  No token material appears in any result.
+    """
+    if not config.server_url:
+        return (
+            [{"fingerprints": ["(all tokens)"],
+              "status": "cannot check — server_url not configured"}],
+            True,
+        )
+    if not config.tokens:
+        return (
+            [{"fingerprints": ["(all tokens)"],
+              "status": "no tokens configured — nothing to check"}],
+            True,
+        )
+
+    try:
+        import httpx
+    except ImportError:
+        return (
+            [{"fingerprints": ["(all tokens)"],
+              "status": "cannot check — httpx is not installed"}],
+            True,
+        )
+
+    results: list[dict[str, Any]] = []
+    any_problem = False
+    base = config.server_url.rstrip("/")
+
+    for token in config.tokens:
+        fp = qll.token_fingerprint(token)
+        result: dict[str, Any] = {"fingerprints": [fp]}
+        try:
+            resp = httpx.get(
+                f"{base}/v1/installations/me",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("chat_bound"):
+                    result["status"] = "bound"
+                    result["label"] = data.get("label", "")
+                    result["installation_id"] = data.get("id")
+                    result["tz"] = data.get("tz")
+                    result["active_now"] = data.get("active_now")
+                    result["nudge_enabled"] = data.get("nudge_enabled")
+                else:
+                    result["status"] = "not bound — run relay-client bind"
+                    any_problem = True
+            elif resp.status_code == 401:
+                result["status"] = "invalid token (401)"
+                any_problem = True
+            else:
+                result["status"] = f"unexpected status {resp.status_code}"
+                any_problem = True
+        except Exception as exc:  # noqa: BLE001
+            result["status"] = f"connection error: {exc}"
+            any_problem = True
+        results.append(result)
+
+    return results, any_problem
+
+
+# ── Normal status display (no flags) ──────────────────────────────────────────
+
+
+def _format_workspace(
+    store: qs.QuestionsStore | None,
+    workspace_dir: str,
+    config: qs.QuestionsConfig | None,
+    anchor: qs.AnchorResolution | None,
+) -> list[str]:
+    """Format the workspace section of the normal (no-flags) output."""
+    lines: list[str] = ["async-questions"]
+    if store is None or config is None or anchor is None:
+        lines.append("  [questions]: not configured — no queue, no listener, no change to any behaviour")
+        lines.append(
+            "  To adopt: add a [questions] section to .claude/roles.toml and"
+            " run install-claude-config.sh"
+        )
+        return lines
+
+    lines.append(f"  workspace:   {config.workspace_id or workspace_dir}")
+    lines.append(f"  anchor:      {config.anchor}  (mode: {anchor.mode})")
+    lines.append(f"  root:        {anchor.root}")
+    lines.append(f"  queue dir:   {store.queue_dir}")
+
+    # Role → queue map
+    open_status = config.fmt.open_status.lower()
+    if config.queue:
+        lines.append("  queues:")
+        for role_id, filename in sorted(config.queue.items()):
+            path = store.queue_dir / filename
+            exists = path.is_file()
+            open_count = len([e for e in store.entries_in(path) if e.status == open_status]) if exists else 0
+            mark = "✓" if exists else "✗"
+            lines.append(f"    [{mark}] {role_id} → {filename}  ({open_count} open)")
+    else:
+        flat = store.queue_dir / config.file
+        exists = flat.is_file()
+        open_count = len([e for e in store.entries_in(flat) if e.status == open_status]) if exists else 0
+        mark = "✓" if exists else "✗"
+        lines.append(f"  queue:       [{mark}] {config.file}  ({open_count} open)")
+
+    # Glob-matched extra files
+    queue_set = set(store.queue_files())
+    all_files = store.queue_files()
+    if config.queue:
+        named = {store.queue_dir / fn for fn in config.queue.values()}
+        extras = [p for p in all_files if p not in named]
+        if extras:
+            lines.append("  (glob-matched extra files):")
+            for path in extras:
+                open_count = len([e for e in store.entries_in(path) if e.status == open_status])
+                lines.append(f"    {path.name}  ({open_count} open)")
+
+    # Id high-water mark
+    try:
+        next_id = store.next_id()
+        lines.append(f"  next id:     {next_id}  (max across queue + answered/)")
+    except Exception:  # noqa: BLE001
+        lines.append("  next id:     (could not determine)")
+
+    # Config errors
+    for err in config.errors:
+        lines.append(f"  config warn: {err}")
+
+    return lines
+
+
+def _format_listener(
+    listen_config: qll.ListenConfig,
+    index: qll.Index,
+    running: bool,
+) -> list[str]:
+    """Format the listener section of the normal output."""
+    lines: list[str] = []
+    lines.append("  listener:")
+    lines.append(f"    running:   {'yes' if running else 'no'}")
+    lines.append(f"    enabled:   {'yes' if listen_config.enabled else 'no'}")
+    lines.append(f"    watermark: {index.watermark}")
+    if index.watermarks:
+        for fp, wm in sorted(index.watermarks.items()):
+            lines.append(f"    feed {fp}: watermark {wm}")
+    lines.append(f"    pending:   {len(index.pending)}")
+    if index.pending:
+        lines.append(
+            "    → if an answer went missing, run: "
+            "claude-questions --reindex  then  questions-listen --once"
+        )
+        for p in index.pending[:3]:
+            lines.append(
+                f"      relay #{p.message_id}  attempts={p.attempts}"
+                f"  last_error: {p.last_error or '(none)'}"
+            )
+        if len(index.pending) > 3:
+            lines.append(f"      … {len(index.pending) - 3} more (run --status for full list)")
+    return lines
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-questions",
+        description="Inspect and diagnose async question queues for a workspace.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "exit 0: clean (including no [questions] configured)\n"
+            "exit 1: config errors\n"
+            "exit 2: (--check) relay token issues; (--check-contract) non-conforming entries"
+        ),
+    )
+    parser.add_argument(
+        "--workspace-dir",
+        default=".",
+        metavar="DIR",
+        help="workspace to inspect (default: current directory)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="probe each distinct token against the relay (requires network)",
+    )
+    parser.add_argument(
+        "--check-contract",
+        action="store_true",
+        help="check queue files for contract conformance (exit 2 on findings)",
+    )
+    parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="rebuild missing index records from Dispatched markers in queue files",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="print detailed listener status (pending applies, watermarks)",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_out",
+        help="emit machine-readable JSON instead of a table",
+    )
+    args = parser.parse_args()
+
+    workspace_dir = str(Path(args.workspace_dir).resolve())
+
+    # Load workspace config and listener config.
+    config = qs.load_questions_config(workspace_dir)
+    store: qs.QuestionsStore | None = None
+    anchor: qs.AnchorResolution | None = None
+    if config is not None:
+        anchor = qs.resolve_anchor(workspace_dir, config)
+        store = qs.QuestionsStore(config, anchor.root)
+
+    listen_config = qll.load_listen_config()
+    index = qll.read_index()
+    running = qll.listener_running()
+
+    # ── --reindex ──────────────────────────────────────────────────────────────
+    if args.reindex:
+        return cmd_reindex(store, json_out=args.json_out)
+
+    # ── --check-contract ───────────────────────────────────────────────────────
+    if args.check_contract:
+        return cmd_check_contract(store, workspace_dir, json_out=args.json_out)
+
+    # ── --status ───────────────────────────────────────────────────────────────
+    if args.status:
+        status_data = qll.read_status()
+        output = qll.format_status(status_data, index, running=running, config=listen_config)
+        if args.json_out:
+            cfg_view = listen_config.redacted()
+            print(json.dumps({
+                "running": running,
+                "config": cfg_view,
+                "watermark": index.watermark,
+                "pending": len(index.pending),
+                "pending_list": [
+                    {
+                        "message_id": p.message_id,
+                        "attempts": p.attempts,
+                        "first_failed_at": p.first_failed_at,
+                        "last_error": p.last_error,
+                    }
+                    for p in index.pending
+                ],
+            }))
+        else:
+            print(output)
+            if not running and listen_config.enabled:
+                print(
+                    "\n  listener is enabled but not running — "
+                    "start it with: systemctl --user start claude-questions-listen"
+                )
+            if not listen_config.enabled:
+                print(
+                    "\n  listener not enabled — "
+                    "add [questions_listen] enabled = true to "
+                    "~/.config/claude-tg-relay/config.toml and re-run "
+                    "install-claude-config.sh"
+                )
+        return 0
+
+    # ── normal output (no special flag) ───────────────────────────────────────
+    if args.json_out:
+        out: dict[str, Any] = {
+            "workspace": workspace_dir,
+            "config": None if config is None else {
+                "workspace_id": config.workspace_id,
+                "anchor": config.anchor,
+                "root": str(anchor.root) if anchor else None,
+                "queue_dir": str(store.queue_dir) if store else None,
+                "errors": list(config.errors),
+            },
+            "listener": listen_config.redacted(),
+            "watermark": index.watermark,
+            "pending": len(index.pending),
+            "running": running,
+        }
+        if store is not None:
+            out["files"] = [
+                {
+                    "path": str(p),
+                    "exists": p.is_file(),
+                    "open": len([e for e in store.entries_in(p)
+                                  if e.status == config.fmt.open_status.lower()]) if p.is_file() else 0,
+                }
+                for p in store.queue_files()
+            ]
+        print(json.dumps(out))
+    else:
+        for line in _format_workspace(store, workspace_dir, config, anchor):
+            print(line)
+        for line in _format_listener(listen_config, index, running):
+            print(line)
+
+        if config is not None and config.errors:
+            return 1
+
+    # ── --check ────────────────────────────────────────────────────────────────
+    check_problem = False
+    if args.check:
+        check_results, check_problem = _check_tokens(listen_config)
+        if not args.json_out:
+            n = len(check_results)
+            print(
+                f"\nchecking {n} token group(s) against "
+                f"{listen_config.server_url or '(no server_url)'}..."
+            )
+            for r in check_results:
+                fps = ", ".join(r["fingerprints"])
+                status = r["status"]
+                if r.get("label"):
+                    status += f" ({r['label']}, id={r['installation_id']})"
+                avail_parts: list[str] = []
+                if r.get("tz") is not None:
+                    avail_parts.append(f"tz={r['tz']}")
+                if r.get("active_now") is not None:
+                    avail_parts.append(f"active={'yes' if r['active_now'] else 'no'}")
+                if r.get("nudge_enabled") is not None:
+                    avail_parts.append(f"nudge={'on' if r['nudge_enabled'] else 'off'}")
+                avail_str = ("  " + "  ".join(avail_parts)) if avail_parts else ""
+                print(f"  {fps}: {status}{avail_str}")
+
+    if check_problem:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

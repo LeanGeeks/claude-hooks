@@ -70,7 +70,12 @@ Adoption of the queue-file contract happens **per workspace**, by people this
 epic will never meet, against files this epic must never touch. A contract that
 ships without a way to check conformance gets adopted approximately. So:
 
-### `claude-questions --check [dir]`
+### `claude-questions --check-contract [dir]`
+
+**Flag naming — do not collide.** §2 above already defines `--check` as the
+relay-token probe that mirrors `claude-roles --check`. The conformance checker is
+a separate flag, `--check-contract`. Keep both; they answer different questions
+("can I reach the relay?" vs "do my queue files conform?").
 
 Reports, for the workspace's configured queue set, every heading that does **not**
 conform to architecture §3.2 and what the adopter must do about it:

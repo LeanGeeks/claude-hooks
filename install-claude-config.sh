@@ -819,6 +819,143 @@ if [[ "$UV_AVAILABLE" == true && -f "$PERMISSIONS_MCP_SCRIPT" ]]; then
     fi
 fi
 
+# Register questions MCP server in ~/.claude.json (epic 23, task 23-06).
+# IMPORTANT: questions_listen_lib.py (the hook library) and questions-mcp
+# (the MCP server) are installed in the SAME pass — both are in REQUIRED_HOOKS
+# and the server is registered here.  A state where one is new and the other
+# is old silently drops index fields (see state.md 23-05 log), so partial
+# installs must never occur.  Mirrors permissions-mcp exactly: same uv gate,
+# same jq merge pattern, same CLAUDE_HOOKS_REPO env so the server can resolve
+# its hooks from the checkout at runtime.
+QUESTIONS_MCP_INSTALLED=false
+QUESTIONS_MCP_SCRIPT="$SCRIPT_DIR/questions-mcp/server.py"
+if [[ "$UV_AVAILABLE" == true && -f "$QUESTIONS_MCP_SCRIPT" ]]; then
+    if [[ ! -f "$CLAUDE_JSON" ]]; then
+        echo '{}' > "$CLAUDE_JSON"
+    fi
+    if jq empty "$CLAUDE_JSON" 2>/dev/null; then
+        jq --arg script "$QUESTIONS_MCP_SCRIPT" --arg repo "$SCRIPT_DIR" \
+            '.mcpServers = (.mcpServers // {}) + {"questions": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {"CLAUDE_HOOKS_REPO": $repo}}}' \
+            "$CLAUDE_JSON" > "$CLAUDE_JSON.tmp"
+        if jq empty "$CLAUDE_JSON.tmp" 2>/dev/null; then
+            mv "$CLAUDE_JSON.tmp" "$CLAUDE_JSON"
+            log_info "MCP server registered in ~/.claude.json: questions (uv run --script $QUESTIONS_MCP_SCRIPT)"
+            QUESTIONS_MCP_INSTALLED=true
+        else
+            log_warn "Failed to produce valid JSON for ~/.claude.json — questions MCP server not registered"
+            rm -f "$CLAUDE_JSON.tmp"
+        fi
+    else
+        log_warn "~/.claude.json is not valid JSON — skipping questions MCP server registration"
+    fi
+fi
+
+# ── claude-questions diagnostic tool (epic 23) ────────────────────────────────
+# Mirrors the claude-roles install block (epic 15): copies to CLAUDE_SHELL_DIR,
+# symlinks into ~/.local/bin when that directory is on PATH.
+# Never creates or modifies any workspace question file.
+CLAUDE_QUESTIONS_SRC="$SCRIPT_DIR/shell/claude-questions"
+CLAUDE_QUESTIONS_INSTALLED=false
+
+if [[ -f "$CLAUDE_QUESTIONS_SRC" ]]; then
+    cp "$CLAUDE_QUESTIONS_SRC" "$CLAUDE_SHELL_DIR/claude-questions"
+    chmod +x "$CLAUDE_SHELL_DIR/claude-questions"
+    log_info "Installed: claude-questions → $CLAUDE_SHELL_DIR/claude-questions"
+    if [[ -d "$USER_BIN_DIR" ]]; then
+        case ":$PATH:" in
+            *":$USER_BIN_DIR:"*)
+                ln -sf "$CLAUDE_SHELL_DIR/claude-questions" "$USER_BIN_DIR/claude-questions"
+                log_info "  Symlinked: $USER_BIN_DIR/claude-questions → $CLAUDE_SHELL_DIR/claude-questions"
+                ;;
+        esac
+    fi
+    CLAUDE_QUESTIONS_INSTALLED=true
+else
+    log_warn "claude-questions not found at $CLAUDE_QUESTIONS_SRC — skipping"
+fi
+
+# ── questions-listen binary (epic 23) ─────────────────────────────────────────
+# Symlink the listener binary into ~/.local/bin so it is on PATH for systemd.
+# The shared library (questions_listen_lib.py) is already in REQUIRED_HOOKS
+# and lands in ~/.claude/hooks/; the binary imports it from there.
+QUESTIONS_LISTEN_SRC="$SCRIPT_DIR/.claude/bin/questions-listen"
+QUESTIONS_LISTEN_INSTALLED=false
+
+if [[ -f "$QUESTIONS_LISTEN_SRC" ]]; then
+    if [[ -d "$USER_BIN_DIR" ]]; then
+        ln -sf "$QUESTIONS_LISTEN_SRC" "$USER_BIN_DIR/questions-listen"
+        log_info "Symlinked: questions-listen → $USER_BIN_DIR/questions-listen"
+        QUESTIONS_LISTEN_INSTALLED=true
+    else
+        log_warn "  $USER_BIN_DIR does not exist — questions-listen not installed on PATH"
+    fi
+else
+    log_warn "questions-listen not found at $QUESTIONS_LISTEN_SRC — skipping"
+fi
+
+# ── claude-questions-listen systemd unit (epic 23) ────────────────────────────
+# Install the systemd unit so it is present for configuration.
+# Enable it ONLY when [questions_listen] enabled = true in config.toml.
+# Never enable it silently: a machine that has not opted in must not run the
+# listener just because it ran the installer.
+# loginctl enable-linger keeps it alive after logout.
+QUESTIONS_LISTEN_SERVICE_NAME="claude-questions-listen.service"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+QUESTIONS_LISTEN_SERVICE_ENABLED=false
+
+if command -v systemctl >/dev/null 2>&1 && [[ -n "${XDG_RUNTIME_DIR:-}" || -d "/run/user/$(id -u)" ]]; then
+    mkdir -p "$SYSTEMD_USER_DIR"
+    cat > "$SYSTEMD_USER_DIR/$QUESTIONS_LISTEN_SERVICE_NAME" << 'EOF'
+[Unit]
+Description=Claude async-question answer listener
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/questions-listen
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+    log_info "Installed systemd unit: $SYSTEMD_USER_DIR/$QUESTIONS_LISTEN_SERVICE_NAME"
+    systemctl --user daemon-reload 2>/dev/null || true
+
+    # Opt-in check: enable only when config.toml carries
+    # [questions_listen] enabled = true
+    RELAY_CONFIG_TOML="$HOME/.config/claude-tg-relay/config.toml"
+    QUESTIONS_LISTEN_OPTED_IN=false
+    if [[ -f "$RELAY_CONFIG_TOML" ]]; then
+        # python3 is guaranteed available (we require it for the hooks).
+        if python3 - "$RELAY_CONFIG_TOML" << 'PYEOF' 2>/dev/null
+import sys, tomllib
+with open(sys.argv[1], "rb") as fh:
+    raw = tomllib.load(fh)
+section = raw.get("questions_listen", {})
+sys.exit(0 if section.get("enabled") else 1)
+PYEOF
+        then
+            QUESTIONS_LISTEN_OPTED_IN=true
+        fi
+    fi
+
+    if [[ "$QUESTIONS_LISTEN_OPTED_IN" == true ]]; then
+        if systemctl --user enable "$QUESTIONS_LISTEN_SERVICE_NAME" 2>/dev/null; then
+            log_info "Enabled: $QUESTIONS_LISTEN_SERVICE_NAME"
+            QUESTIONS_LISTEN_SERVICE_ENABLED=true
+        fi
+        # loginctl enable-linger so the unit survives logout.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl enable-linger "$(id -un)" 2>/dev/null || true
+            log_info "loginctl enable-linger: applied"
+        fi
+    else
+        log_info "questions-listen not enabled (add [questions_listen] enabled = true to config.toml to opt in)"
+    fi
+else
+    log_info "systemd not available — skipping questions-listen service install"
+fi
+
 # Validate merged JSON
 if ! echo "$MERGED" | jq empty 2>/dev/null; then
     log_error "Merged config is not valid JSON!"
@@ -933,6 +1070,46 @@ if [[ "$PERMISSIONS_MCP_INSTALLED" == true ]]; then
     echo "  - MCP server (permissions): installed"
 else
     echo "  - MCP server (permissions): not installed (uv missing or server.py not found)"
+fi
+
+# Show questions MCP status
+if [[ "$QUESTIONS_MCP_INSTALLED" == true ]]; then
+    echo "  - MCP server (questions): installed"
+else
+    echo "  - MCP server (questions): not installed (uv missing or server.py not found)"
+fi
+
+# Show claude-questions status
+if [[ "$CLAUDE_QUESTIONS_INSTALLED" == true ]]; then
+    echo "  - claude-questions: installed ($CLAUDE_SHELL_DIR/claude-questions)"
+    QUESTIONS_TOML="$SCRIPT_DIR/.claude/roles.toml"
+    if [[ -f "$QUESTIONS_TOML" ]]; then
+        if python3 -c "import tomllib; d=tomllib.load(open('$QUESTIONS_TOML','rb')); exit(0 if 'questions' in d else 1)" 2>/dev/null; then
+            echo "    [questions] configured — inspect with: claude-questions  (from workspace directory)"
+        else
+            echo "    No [questions] section in roles.toml (invariant 9: clean no-op)"
+            echo "    Template: $SCRIPT_DIR/docs/questions.example.toml"
+        fi
+    else
+        echo "    No roles.toml in this workspace — nothing to configure"
+        echo "    Template: $SCRIPT_DIR/docs/questions.example.toml"
+    fi
+else
+    echo "  - claude-questions: not installed"
+fi
+
+# Show questions-listen status
+if [[ "$QUESTIONS_LISTEN_INSTALLED" == true ]]; then
+    echo "  - questions-listen: installed ($USER_BIN_DIR/questions-listen)"
+    if [[ "$QUESTIONS_LISTEN_SERVICE_ENABLED" == true ]]; then
+        echo "    systemd unit enabled — start with: systemctl --user start claude-questions-listen"
+    else
+        echo "    systemd unit installed but NOT enabled"
+        echo "    To opt in: add [questions_listen] enabled = true to ~/.config/claude-tg-relay/config.toml"
+        echo "    Then re-run install-claude-config.sh to enable the unit"
+    fi
+else
+    echo "  - questions-listen: not installed"
 fi
 
 # Show tmux options status (file + running server)

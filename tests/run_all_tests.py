@@ -61,6 +61,7 @@ TEST_MODULES = {
     "unit_questions_listen": "test_unit_questions_listen",
     "unit_terminal_answers": "test_unit_terminal_answers",
     "unit_claude_roles": "test_unit_claude_roles",
+    "unit_questions_diagnostics": "test_unit_questions_diagnostics",
     "unit_logging": "test_logging_verification",
     "integration_pretool": "test_integration_pretool",
     "integration_permission": "test_integration_permission_request",

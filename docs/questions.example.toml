@@ -1,0 +1,90 @@
+# .claude/roles.toml — [questions] section
+#
+# Copy this block into your workspace .claude/roles.toml and edit the values.
+# The [questions] section enables the async agent↔human question system (epic 23).
+# Without it the system is fully inert: no queue is touched, the listener ignores
+# every answer from this workspace, and every existing flow is byte-identical.
+#
+# Full reference: docs/async-questions.md
+# Contract for adopters: docs/questions-contract.md
+# Agent-facing prose to adapt into CLAUDE.md: docs/questions-prompt-example.md
+#
+# After editing, run install-claude-config.sh once to register the MCP server.
+# Then run: claude-questions  (from this workspace directory) to verify.
+
+[questions]
+# dir: the directory that holds this workspace's queue file(s), relative to
+# the resolved anchor root (see anchor below).  The directory must exist;
+# create it with git before adding entries.
+dir = "docs/questions"
+
+# anchor: how the queue root is resolved.
+#
+#   "repo"      — git rev-parse --git-common-dir → primary worktree root.
+#                 The default and the right choice for almost every workspace:
+#                 questions raised in any worktree land in the primary checkout,
+#                 and answered/ never conflicts on branch landings.
+#   "worktree"  — the cwd's own worktree root.  Use only when questions are
+#                 deliberately branch-scoped and you accept that the answer
+#                 listener uses the captured absolute path (which may be gone
+#                 by the time the answer arrives).
+#   "path"      — an explicit absolute path (expand ~ yourself).  Required when
+#                 the queue lives outside a git repository.
+anchor = "repo"
+
+# nudge: the relay nudge ladder for unanswered questions.
+# A trailing * repeats the last rung indefinitely (async questions never expire,
+# so without * the ladder goes silent after the last rung — brd §2.4).
+nudge = "4h,1d,3d,7d*"
+
+# escalate_after: how long to wait before duplicating the question to the
+# workspace's default role.  false / 0 to disable.
+escalate_after = "24h"
+
+# max_open: refuse a new ask when this many entries are open across all queues.
+# Protects both the queue files and a human's phone from an agent run amok.
+max_open = 20
+
+# min_interval_s: minimum seconds between two ask calls for this workspace.
+# Prevents burst loops from flooding a queue in one session.
+min_interval_s = 30
+
+# [questions.format] — override the default parse contract vocabulary.
+# See docs/questions-contract.md for the six contract rules and full examples.
+
+[questions.format]
+# id: the id template.  {n} is the allocated number; :03d zero-pads to 3 digits.
+# The default matches Q-001, Q-002, …, Q-200-ds, etc.
+id = "Q-{n:03d}"
+
+# status: the recognised status vocabulary.  The FIRST token is what a freshly
+# composed entry carries; the SECOND is what apply_answer flips to.
+# Additional tokens are recognised (rule 3) but never written by the store.
+# Declare your workspace's real vocabulary here — beats rewriting headings.
+#
+# Example (for a workspace that already uses "answered" and "closed"):
+# status = ["open", "resolved", "answered", "closed"]
+status = ["open", "resolved"]
+
+# heading: the heading template for new entries.  Must start with #-marks.
+# {id}, {title}, {status} and {tags} are substituted.  The status placeholder
+# must appear as [{status}] (bracketed) so rule 3 can find it.
+# heading = "## {id} — {title}  [{status}]{tags}"
+
+# glob: the glob pattern the store uses to discover extra queue files beyond
+# those named in [questions.queue].  The default matches for-*.md.
+# glob = "for-*.md"
+
+# [questions.queue] — role-to-file mapping.
+# Each key is a role_id from [role.*]; the value is the filename within dir.
+# Omit this table entirely for a greenfield single-file workspace — the store
+# then uses the flat `file` key below (default: questions.md).
+#
+# [questions.queue]
+# hpl = "for-product-lead.md"
+# htl = "for-tech-lead.md"
+# ux  = "for-designer.md"
+
+# file: the single flat queue file to use when [questions.queue] is absent.
+# Ignored when [questions.queue] is present.
+# file = "questions.md"

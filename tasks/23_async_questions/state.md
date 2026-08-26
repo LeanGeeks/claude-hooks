@@ -37,8 +37,8 @@ lossless edits across 290 entries**. Because adopters do this themselves,
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | done | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | done | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
 | 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | done | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
-| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | todo | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
-| 23-07 | [Live verification](./23-07-live-verification_human.md) | todo | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
+| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | done | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
+| 23-07 | [Live verification](./23-07-live-verification_human.md) | blocked | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
 
 ## Dependency graph
 
@@ -344,3 +344,43 @@ parses it, everyone else imports. Neither task hand-parses the JSON.
     same pass.** Until it does, the installed 23-04 library drops `watermarks`
     and `token_fp` on write; nothing is lost, but the listener replays and skips
     the Telegram tick. Recorded in 23-06's task file.
+
+- **2026-08-27 — 23-06 done. Engineering for epic 23 is complete.**
+  Implemented → reviewed (PASS, 0 blocker / 0 high / 2 medium / 6 low) → fixed →
+  verified. Suite `Ran 1259, skipped=1`; relay 315. The count fell by one
+  because a redundant test was deleted, not because coverage was lost.
+  - Ships `shell/claude-questions` (four flags), `docs/async-questions.md`,
+    `docs/questions-contract.md`, `docs/questions-prompt-example.md`,
+    `docs/questions.example.toml`, the installer block and the systemd unit.
+  - **`--check` and `--check-contract` are deliberately two flags.** The first
+    probes the relay per token (mirrors `claude-roles --check`); the second
+    reports queue-file conformance. The task file originally used one name for
+    both — resolved before implementation.
+  - **`--reindex` closes the epic's last data-loss hole** and its marker regex
+    was verified to match exactly what `mark_dispatched` writes. A mismatch
+    would have made the recovery silently find nothing, which is worse than not
+    shipping it.
+  - `--check-contract` now **names the unknown status token**, not just the
+    configured set. Declaring an unknown token is the lossless fix; an adopter
+    cannot declare what the tool will not name.
+
+### Test-quality note for whoever picks this epic up
+
+Every one of the five engineering tasks shipped a **green suite that hid an
+unverified requirement**, each in a different disguise:
+
+| Task | The suite said | The requirement actually was |
+|---|---|---|
+| 23-01 | 270 passed | only the *first* waiter wake was tested; every later long-poll returned in 0 ms |
+| 23-02 | 303 passed | tests used `24h,72h,168h` because the documented ladder `1d,3d,7d` did not parse |
+| 23-04 | green | the test `skipTest`-ed itself when its fixture broke, leaving half the rate limit unexercised |
+| 23-06 | green | 11 tests asserted string presence/absence in a file; one had *shaped the code* to satisfy it |
+
+None were caught by running the tests. All were caught by reading each
+implementation report's **Decisions** section against the epic documents, and by
+treating an unexplained count change as worth chasing. Keep doing that.
+
+The epic-23 test files now contain **zero** `skipTest` calls and **zero** bare
+`except` clauses, and the two most load-bearing assertions (systemd never
+enabling silently; `--reindex` never writing a queue file) were **mutation-proved
+able to fail** before being accepted.
