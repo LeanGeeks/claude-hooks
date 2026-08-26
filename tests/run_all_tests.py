@@ -31,6 +31,8 @@ _tmp_store = Path(tempfile.mkdtemp(prefix="claude-hooks-tests-"))
 os.environ.setdefault("CLAUDE_PERMISSION_STATE_FILE", str(_tmp_store / "permission_requests.jsonl"))
 os.environ.setdefault("CLAUDE_PERMISSION_AUDIT_FILE", str(_tmp_store / "permission_actions.jsonl"))
 os.environ.setdefault("CLAUDE_PERMISSION_DEBUG_LOG", str(_tmp_store / "permission_state_debug.log"))
+os.environ.setdefault("CLAUDE_PERMISSION_ARCHIVE_FILE", str(_tmp_store / "permission_requests.archive.jsonl"))
+os.environ.setdefault("CLAUDE_MANUAL_CONFIRM_LOG", str(_tmp_store / "bash_manual_confirm.log"))
 
 # Test modules
 TEST_MODULES = {

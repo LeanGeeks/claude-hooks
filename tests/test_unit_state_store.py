@@ -11,6 +11,9 @@ Tests the state management for permission requests:
 - Cleanup of expired requests
 """
 
+import contextlib
+import fcntl
+import io
 import json
 import os
 import sys
@@ -25,6 +28,7 @@ from unittest.mock import patch
 # Add paths for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "hooks"))
 
+import permission_state_store as pss
 from permission_state_store import (
     PermissionRequest,
     RequestState,
@@ -36,6 +40,7 @@ from permission_state_store import (
     set_telegram_message_id,
     find_request_by_message_id,
     cleanup_expired_requests,
+    get_requests,
     _is_expired,
     _utc_now,
     _expires_at,
@@ -697,6 +702,254 @@ class TestRoleField(unittest.TestCase):
         })
         self.assertEqual(loaded.role, "ux")
         self.assertFalse(hasattr(loaded, "a_field_from_the_future"))
+
+
+class TestCompaction(unittest.TestCase):
+    """Store compaction (epic 22, task 22-05 §1).
+
+    Every case points the module's file constants at a scratch directory: the
+    functions read them as globals at call time, so patching the module
+    attribute is enough and nothing touches the developer's real ~/.claude.
+    """
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="compact-test-"))
+        self.state_file = self.temp_dir / "permission_requests.jsonl"
+        self.archive_file = self.temp_dir / "permission_requests.archive.jsonl"
+        self.confirm_log = self.temp_dir / "bash_manual_confirm.log"
+        self._patches = [
+            patch.object(pss, "STATE_FILE", self.state_file),
+            patch.object(pss, "ARCHIVE_FILE", self.archive_file),
+            patch.object(pss, "MANUAL_CONFIRM_LOG_FILE", self.confirm_log),
+        ]
+        for entry in self._patches:
+            entry.start()
+
+    def tearDown(self):
+        for entry in self._patches:
+            entry.stop()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _row(self, request_id, state, age_days, **extra):
+        stamp = (datetime.now(timezone.utc) - timedelta(days=age_days)).isoformat()
+        row = {
+            "request_id": request_id,
+            "session_id": "s-" + request_id,
+            "cwd": "/test",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "permission_suggestions": [],
+            "state": state,
+            "created_at": stamp,
+            "updated_at": stamp,
+            "expires_at": stamp,
+            "resolved_at": stamp if state != "pending" else None,
+        }
+        row.update(extra)
+        return row
+
+    def _write_rows(self, rows):
+        with open(self.state_file, "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+    def _hot_ids(self):
+        ids = []
+        with open(self.state_file) as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    ids.append(json.loads(line)["request_id"])
+        return ids
+
+    def _archive_ids(self):
+        if not self.archive_file.exists():
+            return []
+        ids = []
+        with open(self.archive_file) as handle:
+            for line in handle:
+                line = line.strip()
+                if line:
+                    ids.append(json.loads(line)["request_id"])
+        return ids
+
+    def test_old_terminal_rows_move_to_archive(self):
+        """A terminal row past the retention window leaves the hot file."""
+        self._write_rows([
+            self._row("old-allow", "allow", 45),
+            self._row("old-deny", "deny", 90),
+            self._row("recent-allow", "allow", 3),
+        ])
+
+        counts = pss.compact(max_age_days=30, rotate_confirm_log=False)
+
+        self.assertEqual(counts["scanned"], 3)
+        self.assertEqual(counts["archived"], 2)
+        self.assertEqual(counts["kept"], 1)
+        self.assertEqual(self._hot_ids(), ["recent-allow"])
+        self.assertEqual(sorted(self._archive_ids()), ["old-allow", "old-deny"])
+
+    def test_pending_rows_never_move_regardless_of_age(self):
+        """Expiry retires pending rows; compaction must not touch them."""
+        self._write_rows([
+            self._row("ancient-pending", "pending", 400),
+            self._row("old-expired", "expired", 400),
+        ])
+
+        counts = pss.compact(max_age_days=30, rotate_confirm_log=False)
+
+        self.assertEqual(counts["archived"], 1)
+        self.assertEqual(counts["kept_pending"], 1)
+        self.assertEqual(self._hot_ids(), ["ancient-pending"])
+        self.assertEqual(self._archive_ids(), ["old-expired"])
+
+    def test_archive_appends_across_two_runs(self):
+        """The second run adds to cold storage, it does not replace it."""
+        self._write_rows([
+            self._row("run-one-old", "allow", 60),
+            self._row("run-two-old", "deny", 5),
+        ])
+
+        first = pss.compact(max_age_days=30, rotate_confirm_log=False)
+        self.assertEqual(first["archived"], 1)
+        self.assertEqual(self._archive_ids(), ["run-one-old"])
+
+        # Second run with a tighter window catches the row the first one kept.
+        second = pss.compact(max_age_days=1, rotate_confirm_log=False)
+        self.assertEqual(second["archived"], 1)
+        self.assertEqual(self._archive_ids(), ["run-one-old", "run-two-old"])
+        self.assertEqual(self._hot_ids(), [])
+
+    def test_hot_file_remains_valid_jsonl(self):
+        """Every surviving line still parses, and the store's own reader agrees."""
+        self._write_rows([
+            self._row("old-allow", "allow", 40),
+            self._row("keep-pending", "pending", 200),
+            self._row("keep-recent", "resolved_terminal", 1),
+        ])
+
+        pss.compact(max_age_days=30, rotate_confirm_log=False)
+
+        raw = self.state_file.read_text()
+        self.assertTrue(raw.endswith("\n"))
+        for line in raw.splitlines():
+            json.loads(line)
+        ids = [request.request_id for request in pss.get_requests()]
+        self.assertEqual(ids, ["keep-pending", "keep-recent"])
+
+    def test_undatable_and_unparseable_rows_are_kept(self):
+        """Evidence is never deleted on a bad timestamp or a corrupt line."""
+        undatable = self._row("no-timestamps", "allow", 500)
+        undatable["created_at"] = ""
+        undatable["updated_at"] = ""
+        undatable["resolved_at"] = None
+        with open(self.state_file, "w") as handle:
+            handle.write(json.dumps(undatable) + "\n")
+            handle.write("{not json at all\n")
+            handle.write(json.dumps(self._row("old-allow", "allow", 99)) + "\n")
+
+        counts = pss.compact(max_age_days=30, rotate_confirm_log=False)
+
+        self.assertEqual(counts["archived"], 1)
+        self.assertEqual(counts["kept_unparseable"], 2)
+        raw = self.state_file.read_text().splitlines()
+        self.assertIn("{not json at all", raw)
+        self.assertEqual(self._archive_ids(), ["old-allow"])
+
+    def test_lock_is_held_across_the_rewrite(self):
+        """The exclusive flock spans read → archive → truncate → fsync.
+
+        The probe runs from inside ``_release_lock``, i.e. after the hot file
+        has already been rewritten and fsynced but before the lock is dropped.
+        A second ``open()`` is a separate open file description, so a
+        non-blocking flock from it fails exactly when the lock is genuinely
+        held.
+        """
+        self._write_rows([
+            self._row("old-allow", "allow", 60),
+            self._row("keep-recent", "allow", 1),
+        ])
+
+        observed = {}
+        original_release = pss._release_lock
+
+        def probing_release(file_obj):
+            with open(self.state_file, "r") as probe:
+                try:
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    observed["locked_during_rewrite"] = False
+                    fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                except BlockingIOError:
+                    observed["locked_during_rewrite"] = True
+                # The rewrite is already on disk at this point.
+                observed["hot_lines"] = len(
+                    [line for line in probe.read().splitlines() if line.strip()]
+                )
+            return original_release(file_obj)
+
+        with patch.object(pss, "_release_lock", probing_release):
+            pss.compact(max_age_days=30, rotate_confirm_log=False)
+
+        self.assertTrue(observed.get("locked_during_rewrite"))
+        self.assertEqual(observed.get("hot_lines"), 1)
+
+        # …and the lock is gone once compact returns.
+        with open(self.state_file, "r") as after:
+            fcntl.flock(after.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(after.fileno(), fcntl.LOCK_UN)
+
+    def test_missing_state_file_is_a_no_op(self):
+        counts = pss.compact(max_age_days=30, rotate_confirm_log=False)
+        self.assertEqual(counts["scanned"], 0)
+        self.assertEqual(counts["archived"], 0)
+        self.assertFalse(self.archive_file.exists())
+
+    def test_confirm_log_rotates_only_when_oversized(self):
+        """Rotation renames aside; ``open(..., 'a')`` recreates on next append."""
+        self.confirm_log.write_text("x" * 100)
+
+        untouched = pss.compact(
+            max_age_days=30, rotate_confirm_log=True, confirm_log_max_bytes=1000
+        )
+        self.assertIsNone(untouched["confirm_log_rotated_to"])
+        self.assertTrue(self.confirm_log.exists())
+
+        rotated = pss.compact(
+            max_age_days=30, rotate_confirm_log=True, confirm_log_max_bytes=10
+        )
+        destination = rotated["confirm_log_rotated_to"]
+        self.assertIsNotNone(destination)
+        self.assertTrue(Path(destination).exists())
+        self.assertFalse(self.confirm_log.exists())
+
+        # The append mode the pretool hook uses recreates the live log.
+        with open(self.confirm_log, "a") as handle:
+            handle.write("{}\n")
+        self.assertTrue(self.confirm_log.exists())
+
+    def test_cli_compact_prints_counts_and_archives(self):
+        """The CLI entry is the path the daily reviewer runs."""
+        self._write_rows([self._row("old-allow", "allow", 60)])
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = pss._cli(["compact", "--max-age-days", "30", "--no-rotate-log", "--json"])
+
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["archived"], 1)
+        self.assertEqual(self._archive_ids(), ["old-allow"])
+
+    def test_cli_without_a_subcommand_does_not_write(self):
+        """A bare invocation prints help — it must never run the selftest."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = pss._cli([])
+        self.assertEqual(code, 0)
+        self.assertIn("compact", buffer.getvalue())
+        self.assertFalse(self.state_file.exists())
+
 
 
 if __name__ == "__main__":

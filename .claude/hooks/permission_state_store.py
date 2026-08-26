@@ -20,7 +20,7 @@ import os
 import fcntl
 import uuid
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
@@ -39,7 +39,26 @@ def _store_path(env_var: str, default_name: str) -> Path:
 
 STATE_FILE = _store_path("CLAUDE_PERMISSION_STATE_FILE", "permission_requests.jsonl")
 AUDIT_LOG_FILE = _store_path("CLAUDE_PERMISSION_AUDIT_FILE", "permission_actions.jsonl")
+# Cold storage for compaction (epic 22, task 22-05). Append-only; never read by
+# the hot paths, only by a human or an agent doing archaeology.
+ARCHIVE_FILE = _store_path(
+    "CLAUDE_PERMISSION_ARCHIVE_FILE", "permission_requests.archive.jsonl"
+)
+# The "why did this prompt" log written by ``pretool_hook.log_manual_confirmation``.
+# The store does not write it — it only rotates it during compaction, so the
+# default must resolve to exactly the path the hook appends to. The override name
+# is the one ``permissions_mcp_lib`` already reads, so all three agree.
+MANUAL_CONFIRM_LOG_FILE = _store_path(
+    "CLAUDE_MANUAL_CONFIRM_LOG", "bash_manual_confirm.log"
+)
 DEFAULT_TTL_SECONDS = 3600  # 1 hour default TTL for pending requests
+# Retention for terminal rows in the hot state file (state.md default 2: a
+# number, not a design — change it here and in the reviewer prompt together).
+DEFAULT_RETENTION_DAYS = 30
+# Rotate the manual-confirmation log once it passes this size. It is JSONL that
+# the daily reviewer greps over a 1-day window, so the threshold only has to keep
+# the file from growing without bound.
+DEFAULT_CONFIRM_LOG_MAX_BYTES = 5 * 1024 * 1024
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
 DEBUG_LOG = _store_path("CLAUDE_PERMISSION_DEBUG_LOG", "permission_state_debug.log")
 
@@ -982,10 +1001,269 @@ def get_all_pending_requests() -> List[PermissionRequest]:
     return pending
 
 
-# For testing
-if __name__ == '__main__':
-    import sys
+def _row_activity(data: Dict[str, Any]) -> Optional[datetime]:
+    """The row's most recent activity timestamp, or None if unusable.
 
+    Same precedence as ``get_requests``' ``since`` filter — ``resolved_at``,
+    else ``updated_at``, else ``created_at`` — so "old" means the same thing to
+    the reader and to compaction.
+    """
+    raw = data.get('resolved_at') or data.get('updated_at') or data.get('created_at')
+    if not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def rotate_manual_confirm_log(
+    max_bytes: int = DEFAULT_CONFIRM_LOG_MAX_BYTES,
+) -> Optional[str]:
+    """Rename ``bash_manual_confirm.log`` aside when it exceeds ``max_bytes``.
+
+    The PreToolUse hook appends with ``open(path, 'a')``, which recreates a
+    missing file on the next write, so a rename needs no coordination with a
+    running hook: a writer holding the old descriptor finishes its line into the
+    renamed file, and the next invocation starts a fresh one.
+
+    Returns the path the log was rotated to, or None when no rotation was
+    needed. Never raises: a failed rotation must not sink a compaction run.
+    """
+    path = MANUAL_CONFIRM_LOG_FILE
+    try:
+        if not path.exists():
+            return None
+        if path.stat().st_size <= max_bytes:
+            return None
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        destination = path.with_name(f"{path.name}.{stamp}")
+        # Never clobber an existing rotation from the same second.
+        suffix = 1
+        while destination.exists():
+            destination = path.with_name(f"{path.name}.{stamp}.{suffix}")
+            suffix += 1
+        path.rename(destination)
+        return str(destination)
+    except Exception as e:
+        debug_log(f"Failed to rotate manual-confirm log: {e}")
+        return None
+
+
+def compact(
+    max_age_days: float = DEFAULT_RETENTION_DAYS,
+    rotate_confirm_log: bool = True,
+    confirm_log_max_bytes: int = DEFAULT_CONFIRM_LOG_MAX_BYTES,
+) -> Dict[str, Any]:
+    """Move terminal rows older than the cutoff out of the hot state file.
+
+    Retention policy (epic 22, task 22-05 / brd D8): the hot file keeps every
+    **pending** row regardless of age — expiry is what retires those, and a
+    pending row moved to cold storage would strand a waiting hook — plus every
+    terminal row whose most recent activity is at or after
+    ``now - max_age_days``. Everything else is appended to
+    ``permission_requests.archive.jsonl``.
+
+    A row whose timestamps are missing or unparseable is **kept**. Dropping rows
+    on a bad timestamp would quietly delete exactly the anomalies a reviewer is
+    looking for (same posture as ``get_requests``).
+
+    Runs entirely inside this module's flock protocol (brd H7 / invariant 6):
+    the exclusive lock on the state file is taken before the read and released
+    only after the rewrite is fsynced, so no concurrent writer can slip an
+    update into the window between them. The archive is appended **before** the
+    hot file is truncated, so a crash mid-run duplicates a row into cold storage
+    rather than losing it.
+
+    Args:
+        max_age_days: Retention window for terminal rows, in days.
+        rotate_confirm_log: Also rotate ``bash_manual_confirm.log`` when it is
+            over ``confirm_log_max_bytes`` (the daily reviewer does both in one
+            run). Pass False to compact the store only.
+        confirm_log_max_bytes: Size threshold for that rotation.
+
+    Returns:
+        A counts dict: ``scanned``, ``archived``, ``kept``, ``kept_pending``,
+        ``kept_unparseable``, plus ``cutoff``, ``state_file``, ``archive_file``
+        and ``confirm_log_rotated_to`` (None when nothing was rotated).
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=float(max_age_days))
+    result: Dict[str, Any] = {
+        "scanned": 0,
+        "archived": 0,
+        "kept": 0,
+        "kept_pending": 0,
+        "kept_unparseable": 0,
+        "cutoff": cutoff.isoformat(),
+        "max_age_days": float(max_age_days),
+        "state_file": str(STATE_FILE),
+        "archive_file": str(ARCHIVE_FILE),
+        "confirm_log_rotated_to": None,
+    }
+
+    terminal_values = {state.value for state in TERMINAL_STATES}
+
+    if STATE_FILE.exists():
+        with open(STATE_FILE, 'r+') as f:
+            _acquire_lock(f)
+            try:
+                f.seek(0)
+                lines = f.readlines()
+
+                kept_lines: List[str] = []
+                archived_lines: List[str] = []
+
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+
+                    result["scanned"] += 1
+
+                    try:
+                        data = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # Unparseable line: keep it verbatim. It is evidence.
+                        kept_lines.append(stripped + '\n')
+                        result["kept"] += 1
+                        result["kept_unparseable"] += 1
+                        continue
+
+                    if data.get('state') not in terminal_values:
+                        kept_lines.append(stripped + '\n')
+                        result["kept"] += 1
+                        result["kept_pending"] += 1
+                        continue
+
+                    activity = _row_activity(data)
+                    if activity is None:
+                        kept_lines.append(stripped + '\n')
+                        result["kept"] += 1
+                        result["kept_unparseable"] += 1
+                        continue
+
+                    if activity >= cutoff:
+                        kept_lines.append(stripped + '\n')
+                        result["kept"] += 1
+                        continue
+
+                    archived_lines.append(stripped + '\n')
+                    result["archived"] += 1
+
+                if archived_lines:
+                    # Append to cold storage first, then rewrite the hot file.
+                    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    with open(ARCHIVE_FILE, 'a') as archive:
+                        archive.writelines(archived_lines)
+                        archive.flush()
+                        os.fsync(archive.fileno())
+
+                    f.seek(0)
+                    f.truncate()
+                    f.writelines(kept_lines)
+                    f.flush()
+                    os.fsync(f.fileno())
+            finally:
+                _release_lock(f)
+
+    if rotate_confirm_log:
+        result["confirm_log_rotated_to"] = rotate_manual_confirm_log(
+            confirm_log_max_bytes
+        )
+
+    debug_log(
+        f"Compacted store: archived {result['archived']}, kept {result['kept']}"
+    )
+    return result
+
+
+def _cli(argv: List[str]) -> int:
+    """Command-line entry: ``python3 permission_state_store.py compact``.
+
+    Exists so the daily reviewer — and a human — can run retention without
+    hand-editing JSONL, which is the one thing invariant 6 forbids.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="permission_state_store",
+        description="Maintenance entry points for the permission state store.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    compact_parser = subparsers.add_parser(
+        "compact",
+        help="Archive terminal rows older than the retention window.",
+    )
+    compact_parser.add_argument(
+        "--max-age-days",
+        type=float,
+        default=DEFAULT_RETENTION_DAYS,
+        help=f"Retention window for terminal rows (default: {DEFAULT_RETENTION_DAYS}).",
+    )
+    compact_parser.add_argument(
+        "--no-rotate-log",
+        action="store_true",
+        help="Skip the bash_manual_confirm.log rotation.",
+    )
+    compact_parser.add_argument(
+        "--log-max-bytes",
+        type=int,
+        default=DEFAULT_CONFIRM_LOG_MAX_BYTES,
+        help=f"Rotate the confirm log above this size (default: {DEFAULT_CONFIRM_LOG_MAX_BYTES}).",
+    )
+    compact_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the counts dict as JSON instead of a human summary.",
+    )
+
+    subparsers.add_parser(
+        "selftest",
+        help="Exercise create/update/cleanup against the configured state file.",
+    )
+
+    args = parser.parse_args(argv)
+
+    if args.command == "compact":
+        counts = compact(
+            max_age_days=args.max_age_days,
+            rotate_confirm_log=not args.no_rotate_log,
+            confirm_log_max_bytes=args.log_max_bytes,
+        )
+        if args.json:
+            print(json.dumps(counts, indent=2))
+        else:
+            print(f"state file:  {counts['state_file']}")
+            print(f"archive:     {counts['archive_file']}")
+            print(f"cutoff:      {counts['cutoff']} ({counts['max_age_days']} days)")
+            print(f"scanned:     {counts['scanned']}")
+            print(f"archived:    {counts['archived']}")
+            print(
+                f"kept:        {counts['kept']} "
+                f"({counts['kept_pending']} pending, "
+                f"{counts['kept_unparseable']} undatable)"
+            )
+            rotated = counts['confirm_log_rotated_to']
+            print(f"confirm log: {rotated if rotated else 'not rotated'}")
+        return 0
+
+    if args.command == "selftest":
+        return _selftest()
+
+    parser.print_help()
+    return 0
+
+
+def _selftest() -> int:
+    """The original ``__main__`` smoke script, now behind an explicit subcommand.
+
+    It writes real rows, so it must never run by accident — a bare
+    ``python3 permission_state_store.py`` prints help instead.
+    """
     print("=== Permission State Store Tests ===\n")
 
     # Test create request
@@ -1026,3 +1304,11 @@ if __name__ == '__main__':
     print(f"\nCleaned up {cleaned} expired requests")
 
     print("\n=== Tests Complete ===")
+
+    return 0
+
+
+if __name__ == '__main__':
+    import sys
+
+    sys.exit(_cli(sys.argv[1:]))
