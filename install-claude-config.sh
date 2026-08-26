@@ -117,7 +117,7 @@ if command -v uv &> /dev/null; then
     UV_AVAILABLE=true
 else
     UV_AVAILABLE=false
-    log_warn "uv not found — context-usage MCP server will not be installed."
+    log_warn "uv not found — the context-usage and permissions MCP servers will not be installed."
     log_warn "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
 fi
 
@@ -789,6 +789,36 @@ if [[ "$UV_AVAILABLE" == true && -f "$CONTEXT_MCP_SCRIPT" ]]; then
     fi
 fi
 
+# Register permissions MCP server in ~/.claude.json (epic 22, task 22-03).
+# Same uv-availability gate and same in-place registration as context-usage: the
+# server runs from this checkout, so its hook imports track the repo while the
+# on-disk stores stay shared with the installed hooks.
+# CLAUDE_HOOKS_REPO tells the server where the checkout lives (22-04 needs it for
+# user-scope allowlist targets; harmless today, and it also lets a relocated
+# checkout resolve its hooks).
+PERMISSIONS_MCP_INSTALLED=false
+PERMISSIONS_MCP_SCRIPT="$SCRIPT_DIR/permissions-mcp/server.py"
+if [[ "$UV_AVAILABLE" == true && -f "$PERMISSIONS_MCP_SCRIPT" ]]; then
+    if [[ ! -f "$CLAUDE_JSON" ]]; then
+        echo '{}' > "$CLAUDE_JSON"
+    fi
+    if jq empty "$CLAUDE_JSON" 2>/dev/null; then
+        jq --arg script "$PERMISSIONS_MCP_SCRIPT" --arg repo "$SCRIPT_DIR" \
+            '.mcpServers = (.mcpServers // {}) + {"permissions": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {"CLAUDE_HOOKS_REPO": $repo}}}' \
+            "$CLAUDE_JSON" > "$CLAUDE_JSON.tmp"
+        if jq empty "$CLAUDE_JSON.tmp" 2>/dev/null; then
+            mv "$CLAUDE_JSON.tmp" "$CLAUDE_JSON"
+            log_info "MCP server registered in ~/.claude.json: permissions (uv run --script $PERMISSIONS_MCP_SCRIPT)"
+            PERMISSIONS_MCP_INSTALLED=true
+        else
+            log_warn "Failed to produce valid JSON for ~/.claude.json — permissions MCP server not registered"
+            rm -f "$CLAUDE_JSON.tmp"
+        fi
+    else
+        log_warn "~/.claude.json is not valid JSON — skipping permissions MCP server registration"
+    fi
+fi
+
 # Validate merged JSON
 if ! echo "$MERGED" | jq empty 2>/dev/null; then
     log_error "Merged config is not valid JSON!"
@@ -896,6 +926,13 @@ if [[ "$CONTEXT_MCP_INSTALLED" == true ]]; then
     echo "  - MCP server (context-usage): installed"
 else
     echo "  - MCP server (context-usage): not installed (uv missing or server.py not found)"
+fi
+
+# Show permissions MCP status
+if [[ "$PERMISSIONS_MCP_INSTALLED" == true ]]; then
+    echo "  - MCP server (permissions): installed"
+else
+    echo "  - MCP server (permissions): not installed (uv missing or server.py not found)"
 fi
 
 # Show tmux options status (file + running server)

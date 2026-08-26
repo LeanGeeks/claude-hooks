@@ -194,6 +194,22 @@ def _append_audit_log(entry: AuditEntry):
         debug_log(f"Failed to append audit log: {e}")
 
 
+def append_agent_decision_reason(entry: AuditEntry) -> None:
+    """Write an agent decision-reason audit entry through the store's lock/append protocol.
+
+    This is the sanctioned public path for callers (e.g. the permissions MCP
+    server) that need to record a free-text justification alongside a state
+    transition.  ``update_request_state`` has no channel for the reason string,
+    so the reason is written as its own ``agent_decision`` audit entry; this
+    function ensures it flows through the same writer that all other audit
+    entries use (invariant 6: no bespoke JSONL writers outside this module).
+
+    The on-disk shape is identical to what ``_append_audit_log`` would produce —
+    this function delegates to it and adds no transformation of its own.
+    """
+    _append_audit_log(entry)
+
+
 def create_request(
     session_id: str,
     cwd: str,
@@ -847,6 +863,88 @@ def resolve_via_terminal(
         resolution_source=RESOLUTION_SOURCE_TERMINAL,
         terminal_answers=terminal_answers,
     )
+
+
+def get_requests(
+    states: Optional[List[Any]] = None,
+    since: Optional[str] = None,
+) -> List[PermissionRequest]:
+    """
+    General reader over the state store, for callers that need rows in states
+    other than ``pending`` (the permissions MCP's listing and history tools).
+
+    Lives here rather than in the caller because readers follow the same
+    discipline as writers: one module owns the file, its lock protocol and its
+    JSONL format (epic 22 invariant 6). Nothing outside this module parses
+    ``permission_requests.jsonl``.
+
+    Args:
+        states: Iterable of states to keep, as ``RequestState`` members or raw
+            values (``"pending"``, ``"allow"``, ...). ``None`` keeps every state.
+        since: Optional ISO-8601 timestamp. Keeps rows whose most recent
+            activity is at or after it — ``resolved_at`` when the row is
+            resolved, else ``updated_at``, else ``created_at``. A row with an
+            unparseable timestamp is KEPT (dropping rows silently on a bad
+            timestamp would hide exactly the anomalies a reviewer is looking
+            for). A malformed ``since`` raises ``ValueError``.
+
+    Returns:
+        Matching requests in file order. This is a **pure** reader: unlike
+        ``get_request``/``get_all_pending_requests`` it never marks lapsed
+        pending rows expired as a side effect, so a caller asking for
+        ``pending`` here may see rows whose TTL has passed.
+    """
+    if not STATE_FILE.exists():
+        return []
+
+    wanted: Optional[set] = None
+    if states is not None:
+        wanted = {
+            state.value if isinstance(state, RequestState) else str(state)
+            for state in states
+        }
+
+    since_dt = None
+    if since:
+        since_dt = datetime.fromisoformat(since)
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    def _activity_after_cutoff(data: Dict[str, Any]) -> bool:
+        raw = (data.get('resolved_at') or data.get('updated_at')
+               or data.get('created_at'))
+        if not raw:
+            return True
+        try:
+            stamp = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            return True
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp >= since_dt
+
+    matched: List[PermissionRequest] = []
+
+    with open(STATE_FILE, 'r') as f:
+        _acquire_lock(f)
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if wanted is not None and data.get('state') not in wanted:
+                    continue
+                if since_dt is not None and not _activity_after_cutoff(data):
+                    continue
+                matched.append(PermissionRequest.from_dict(data))
+        finally:
+            _release_lock(f)
+
+    return matched
 
 
 def get_all_pending_requests() -> List[PermissionRequest]:
