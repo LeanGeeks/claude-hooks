@@ -231,6 +231,10 @@ class RelayClient:
         group_id: str | None = None,
         group_total: int | None = None,
         multi_select: bool = False,
+        never_expires: bool = False,
+        nudge_schedule: str | None = None,
+        escalate_after_sec: int | None = None,
+        escalate_to_token: str | None = None,
     ) -> MessageHandle:
         body: dict[str, Any] = {
             "kind": kind,
@@ -249,6 +253,15 @@ class RelayClient:
         # live until the Submit button is tapped (see relay _handle_grouped_button).
         if multi_select:
             body["multi_select"] = True
+        # Async-question fields (epic 23, tasks 23-01 and 23-02).
+        if never_expires:
+            body["never_expires"] = True
+        if nudge_schedule is not None:
+            body["nudge_schedule"] = nudge_schedule
+        if escalate_after_sec is not None:
+            body["escalate_after_sec"] = escalate_after_sec
+        if escalate_to_token is not None:
+            body["escalate_to_token"] = escalate_to_token
 
         headers = {"Idempotency-Key": idempotency_key or str(uuid.uuid4())}
         resp = self._request("POST", "/v1/messages", json_body=body, headers=headers)

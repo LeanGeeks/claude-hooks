@@ -57,6 +57,7 @@ TEST_MODULES = {
     "unit_profile_loader": "test_profile_loader",
     "unit_roles_config": "test_unit_roles_config",
     "unit_questions_store": "test_unit_questions_store",
+    "unit_questions_mcp": "test_unit_questions_mcp",
     "unit_terminal_answers": "test_unit_terminal_answers",
     "unit_claude_roles": "test_unit_claude_roles",
     "unit_logging": "test_logging_verification",

@@ -35,7 +35,7 @@ lossless edits across 290 entries**. Because adopters do this themselves,
 | 23-01 | [Relay: answer feed + non-expiring messages](./23-01-relay-answer-feed.md) | done | — | `never_expires` sentinel, `GET /v1/answers`, waiter registry keyed by installation, migration. **Touches no Telegram rendering.** |
 | 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | done | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | done | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
-| 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | todo | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
+| 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | done | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
 | 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | todo | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
 | 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | todo | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
 | 23-07 | [Live verification](./23-07-live-verification_human.md) | todo | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
@@ -249,3 +249,56 @@ rather than reverting it to test against HEAD.
     `install-claude-config.sh` was deliberately **not** re-run — 23-06 owns
     installation, and re-running it in a shared checkout would clobber another
     session's live config.
+
+### Index ownership — resolved 2026-08-26 (23-04 runs before 23-05)
+
+architecture §5 assigns the index shape to 23-05, but sequential execution puts
+**23-04 first** and 23-04 must write to that index. Rather than let two agents
+invent two shapes:
+
+- **23-04 creates `.claude/hooks/questions_listen_lib.py`** containing *only* the
+  index concern — the on-disk shape (architecture §5), the `flock` + atomic
+  replace protocol, and the reader/writer helpers, including `pending` and
+  `watermark` fields it does not itself use.
+- **23-05 extends that same module** with the loop, watermark advance, apply and
+  retry logic. It does not create a second module and does not restate the shape.
+
+Invariant 5 applies to the index exactly as it does to a queue file: one module
+parses it, everyone else imports. Neither task hand-parses the JSON.
+
+- **2026-08-26 — 23-04 done.** Implemented → reviewed (PASS, 0 blocker / 0 high /
+  2 medium / 2 low) → fixed → verified. Suite `Ran 1156, skipped=1` (the only
+  skip is the pre-existing `test_headless_spawn`); relay untouched at 315.
+  - **Index ownership was a real conflict in the epic docs, resolved here.**
+    architecture §5 gives the index to 23-05, but sequential execution puts
+    23-04 first and `ask` must write to it. 23-04 created
+    `.claude/hooks/questions_listen_lib.py` carrying the *whole* architecture §5
+    shape — `watermark` and `pending` included, though it uses neither — with
+    `flock` + tmp + `os.replace`. **23-05 extends this module; it must not
+    create a second one or restate the shape** (invariant 5 applies to the index
+    exactly as to a queue file).
+  - **`index_routing_failed: True` is a new result field 23-05 should know
+    about.** If the index write fails after retries, the entry and the Telegram
+    message both exist but no routing record does — and the listener resolves
+    answers by `message_id → index`, so that answer would be permanently
+    unapplied, the one outcome brd D10 forbids. It now retries with backoff,
+    then returns the flag and logs WARNING with message id, qid and path.
+    Recovery is manual: read the queue file.
+  - A test had silently disabled itself — `test_min_interval_allows_after_cooldown`
+    called `skipTest` when its fixture failed to load a config, so the
+    *recovery* half of brd D12's rate limit was never exercised (the refusal
+    half was). The logic turned out to be correct; the fixture was calling
+    `load_questions_config` without patching `CLAUDE_PROJECT_DIR`. The
+    `skipTest` escape was **replaced with an assertion**, so a broken fixture
+    now fails instead of vanishing.
+  - **Third instance of the same anti-pattern this epic** — 23-01 tested only
+    the first waiter wake, 23-02 substituted `24h,72h,168h` for the unparseable
+    `1d,3d,7d`, 23-04 skipped itself. In each case the suite was green and the
+    requirement was unverified. An audit of 23-04's new tests for `skipTest`,
+    bare `except` and no-exception-only assertions came back clean otherwise.
+  - `min_interval_s` state is in-memory per workspace (resets on server
+    restart); only `max_open` was required to be durable, and it counts open
+    entries from the queue file.
+  - The `questions-mcp` installer block is deliberately **not** written — 23-06
+    owns installation. The server mirrors `permissions-mcp` exactly so 23-06 can
+    copy that block and substitute the name.
