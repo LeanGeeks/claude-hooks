@@ -22,7 +22,7 @@ a read-only scan over the real files before writing the writer.
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 23-01 | [Relay: answer feed + non-expiring messages](./23-01-relay-answer-feed.md) | todo | — | `never_expires` sentinel, `GET /v1/answers`, waiter registry keyed by installation, migration. **Touches no Telegram rendering.** |
+| 23-01 | [Relay: answer feed + non-expiring messages](./23-01-relay-answer-feed.md) | done | — | `never_expires` sentinel, `GET /v1/answers`, waiter registry keyed by installation, migration. **Touches no Telegram rendering.** |
 | 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | todo | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
 | 23-03 | [Queue-file engine](./23-03-questions-store.md) | todo | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | todo | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
@@ -103,18 +103,31 @@ consistent throughout.
 12. **`never_expires` is a sentinel, not NULL** (brd D11). No task may drop the
     `NOT NULL` on `messages.expires_at` or add None-handling to its readers.
 
-## Live-repo hazard: epic 22 is in flight
+## Migration numbering (locked before 23-01/23-02)
 
-Epic 22 is landing in the same files as this epic. As of 2026-08-26, 22-01–22-03
-are committed (`ac221c5`, `77b3449`, `bb86c5b`) and **22-04 is in progress**, with
-22-05 still to come — all three touch `install-claude-config.sh`, `REQUIRED_HOOKS`
-and `tests/run_all_tests.py`, which are exactly the files 23-04 and 23-06 extend.
+`relay-server/relay_server/db.py` is at `SCHEMA_VERSION = 3` as of the start of
+this epic. The two relay tasks take the next two slots, in this order:
 
-Check epic 22's `state.md` before starting either, rebase onto whatever has
-landed rather than racing it, and treat a dirty tree in those files as expected
-rather than as a surprise to "clean up" — see the cp-backup-and-git-status
-discipline in the reviewer briefs. `permissions-mcp/server.py` +
-`permissions_mcp_lib.py` is now a shipped, readable precedent for 23-04.
+- **23-01 → schema version 4** — the `messages_answer_feed` index (indexes only,
+  no table rebuild; the `never_expires` sentinel needs no schema change).
+- **23-02 → schema version 5** — the three nullable reminder-policy columns plus
+  their index.
+
+Neither task may renumber the other's slot. If 23-02 lands first for any reason,
+swap the numbers here first rather than in the code.
+
+## Live-repo hazard: epic 22 (resolved)
+
+Epic 22's engineering is complete — 22-01–22-05 are committed as of 2026-08-26
+(`7014481`); only 22-06 (human live gate) remains open and it touches no code.
+The overlap files — `install-claude-config.sh`, `REQUIRED_HOOKS` and
+`tests/run_all_tests.py` — are settled, so 23-04 and 23-06 extend a landed base
+rather than racing one. `permissions-mcp/server.py` + `permissions_mcp_lib.py`
+is now a shipped, readable precedent for 23-04.
+
+The checkout is still shared by concurrent sessions: never run repo-wide git
+operations (`stash`/`checkout`/`reset` without a pathspec), and copy a file aside
+rather than reverting it to test against HEAD.
 
 ## Relationship to other epics
 
@@ -128,3 +141,33 @@ discipline in the reviewer briefs. `permissions-mcp/server.py` +
   side: its MCP `decide` refuses `AskUserQuestion` rows because "questions have
   reply semantics, not allow/deny". Copy its server registration pattern.
 - **Blocking `AskUserQuestion`** — untouched. The 60 s-cap migration is brd §9.
+
+## Log
+
+- **2026-08-26 — 23-01 done.** Implemented, reviewed (FAIL: 1 HIGH, 1 MEDIUM,
+  1 LOW), fixed, re-reviewed (PASS). Relay suite 272 passed, top-level 1030
+  passed / 1 skipped.
+  - The HIGH was real and would have crippled 23-05: `WaiterRegistry` latches
+    its `asyncio.Event`, so after an installation's first answer every
+    `GET /v1/answers?wait=N` returned in ~0 ms and the listener would have
+    tight-polled. Fixed with a new `ConditionWaiterRegistry` (multi-fire,
+    `notify_all()`) added *beside* the untouched `WaiterRegistry` — the
+    blocking answer path still depends on the latching semantics, so it was
+    deliberately not changed. Re-review confirmed no lock-ordering inversion
+    between the condition lock and `db.py`'s `_conn_lock`.
+  - Grouped-message finalization now wakes the feed too (reviewer's MEDIUM;
+    the implementer had called it out of scope, overridden by the manager —
+    a silent up-to-25 s latency was not worth leaving under 23-05).
+  - Unbounded `_conditions` keys accepted as-is: safe cleanup needs reference
+    counting, and any cleanup racing a parked waiter would drop a wake.
+    Correctness over tidiness; revisit only if installation counts explode.
+  - **Real-DB migration blocker closed by the manager**, not by an agent —
+    see `agents_output/23-01_real_db_migration_check.md`. v3→v4 against a
+    production snapshot (5006 messages): clean, 5 ms, integrity ok, no lost
+    indexes, `expires_at` still NOT NULL with zero NULL rows, idempotent on
+    re-run. Note the DB is **inside the Docker volume `relay-data`**, not at
+    `/var/lib/relay/relay.db` on the host, and it is live WAL — snapshot it
+    with the sqlite backup API, never `cp`.
+  - Worth knowing for 23-05: the shared-chat case is **real in production** —
+    chat `108296207` carries two installations (616 and 21 answered rows).
+    The feed's `installation_id` predicate is load-bearing, not defensive.

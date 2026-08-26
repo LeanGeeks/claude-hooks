@@ -42,6 +42,7 @@ from .reaper import (
     recipient_windows,
 )
 from .models import (
+    NEVER_EXPIRES,
     AnswerResponse,
     BindingRequestResponse,
     BindingStatusResponse,
@@ -66,7 +67,7 @@ from .telegram_backend import (
     is_not_modified as _is_not_modified,
 )
 from .tokens import hash_token
-from .waiters import WaiterRegistry
+from .waiters import ConditionWaiterRegistry, WaiterRegistry
 
 # Binding code TTL in minutes.
 _BINDING_TTL_MINUTES = 10
@@ -126,6 +127,12 @@ def create_app(
         app.state.backend = backend
         app.state.config = config
         app.state.waiters = WaiterRegistry()
+        # Multi-fire Condition registry for the answer feed (GET /v1/answers),
+        # keyed by installation_id.  Uses asyncio.Condition so each long-poll
+        # parks independently: unlike the Event-based WaiterRegistry, a
+        # Condition.notify_all() fires only the waiters that are currently
+        # parked, leaving future waits unaffected.
+        app.state.answer_waiters = ConditionWaiterRegistry()
         # Per-installation async lock guarding the idempotent create path so
         # two concurrent POSTs with the same Idempotency-Key in this process
         # serialize through the "claim pending row -> backend call -> store
@@ -619,7 +626,13 @@ def create_app(
                 raise HTTPException(status_code=409, detail="not_bound")
 
             now = _utcnow()
-            expires_at = now + timedelta(seconds=body.ttl_sec)
+            # never_expires uses the far-future sentinel so the NOT NULL
+            # constraint and all existing readers are untouched.
+            expires_at_str = (
+                NEVER_EXPIRES
+                if body.never_expires
+                else (now + timedelta(seconds=body.ttl_sec)).isoformat()
+            )
             payload_json = body.model_dump_json()
 
             def _insert() -> int:
@@ -636,7 +649,7 @@ def create_app(
                             body.kind,
                             payload_json,
                             now.isoformat(),
-                            expires_at.isoformat(),
+                            expires_at_str,
                         ),
                     )
                     return int(cur.lastrowid)
@@ -973,6 +986,73 @@ def create_app(
             return Response(status_code=204)
         return JSONResponse(terminal.model_dump(exclude_none=True))
 
+    # ---- Answer feed -------------------------------------------------------
+
+    _ANSWER_FEED_PAGE_CAP = 500  # architecture §7
+
+    @app.get("/v1/answers")
+    async def get_answers(
+        request: Request,
+        after: int = 0,
+        wait: int = 0,
+        installation=Depends(require_installation),
+    ) -> Response:
+        """Installation-scoped feed of answered messages.
+
+        Returns rows with id > ``after`` ordered by id ascending, capped at
+        500. ``after=0`` is a full replay (index recovery). Parks on the
+        installation waiter registry when no rows are ready and ``wait > 0``,
+        returning 204 on timeout. Scoped to the requesting installation:
+        messages from other installations sharing the same chat are excluded.
+        """
+        conn: sqlite3.Connection = request.app.state.db
+        answer_waiters: ConditionWaiterRegistry = request.app.state.answer_waiters
+        installation_id: int = installation["id"]
+        chat_id: int | None = installation["telegram_chat_id"]
+
+        def _fetch_answers() -> list:
+            if chat_id is None:
+                return []
+            return conn.execute(
+                "SELECT id, kind, answer_json, answered_at"
+                " FROM messages"
+                " WHERE telegram_chat_id = ? AND state = 'answered'"
+                "   AND id > ? AND installation_id = ?"
+                " ORDER BY id ASC"
+                " LIMIT ?",
+                (chat_id, after, installation_id, _ANSWER_FEED_PAGE_CAP),
+            ).fetchall()
+
+        # Fast path: rows already available (common case, no parking needed).
+        rows = await run_in_thread(_fetch_answers)
+        if rows:
+            return JSONResponse(_format_answer_rows(rows))
+
+        if wait <= 0:
+            return Response(status_code=204)
+
+        # Long-poll: acquire the condition lock BEFORE the second DB check so
+        # that any concurrent notify() either (a) sees us already holding the
+        # lock and blocks until after cond.wait() has registered our future,
+        # or (b) fires before we acquire — in which case the second check
+        # below will find the row and return without parking at all.
+        # This closes the race window between the first query and park().
+        cond = answer_waiters.get_condition(installation_id)
+        async with cond:
+            rows = await run_in_thread(_fetch_answers)
+            if rows:
+                return JSONResponse(_format_answer_rows(rows))
+            try:
+                await asyncio.wait_for(cond.wait(), timeout=float(wait))
+            except asyncio.TimeoutError:
+                pass
+            # Re-fetch after wake (answer is now committed) or timeout.
+            rows = await run_in_thread(_fetch_answers)
+            if rows:
+                return JSONResponse(_format_answer_rows(rows))
+
+        return Response(status_code=204)
+
     # ---- Telegram webhook --------------------------------------------------
 
     @app.post("/telegram/webhook/{secret}")
@@ -1019,6 +1099,33 @@ def create_app(
 
 
 # --- helpers shared by route handlers ---------------------------------------
+
+
+def _format_answer_rows(rows: list) -> list[dict[str, Any]]:
+    """Convert raw message rows from the answer feed query to API dicts.
+
+    Each row carries ``{id, kind, answer_json, answered_at}``; we expand
+    ``answer_json`` into the flat fields the feed contract specifies.
+    """
+    result = []
+    for row in rows:
+        raw = row["answer_json"]
+        answer: dict[str, Any] = json.loads(raw) if raw else {}
+        via = answer.get("via") or ""
+        option_idx: int | None = answer.get("option_idx")
+        # Human-readable text: button label for taps, reply text otherwise.
+        answer_text: str = answer.get("label") or answer.get("text") or ""
+        result.append(
+            {
+                "id": row["id"],
+                "kind": row["kind"],
+                "answer_text": answer_text,
+                "via": via,
+                "option_idx": option_idx,
+                "answered_at": row["answered_at"],
+            }
+        )
+    return result
 
 
 async def _load_message(
@@ -1099,6 +1206,8 @@ def _terminal_response(row: sqlite3.Row) -> AnswerResponse | None:
 async def _record_answer(
     conn: sqlite3.Connection,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
+    installation_id: int,
     message_id: int,
     answer: dict[str, Any],
     *,
@@ -1126,6 +1235,10 @@ async def _record_answer(
     rejected: it costs an edit on the hottest path in the system for every
     ungrouped answer, against brd §2.7's ~1 msg/s per chat, and buys nothing the
     sweep does not (state.md 2026-08-16). Do not reintroduce it.
+
+    ``answer_waiters`` is the installation-keyed registry for GET /v1/answers
+    long-pollers.  Woken here (same site as the message-level wake) so the feed
+    sees the answer within milliseconds of it being recorded.
     """
     now_iso = _utcnow_iso()
 
@@ -1148,6 +1261,7 @@ async def _record_answer(
     updated = await run_in_thread(_w)
     if updated:
         waiters.notify(message_id)
+        await answer_waiters.notify(installation_id)
         return True
     return False
 
@@ -1474,6 +1588,7 @@ async def _finalize_group_if_complete(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     chat_id: int,
     group_id: str,
     group_total: int | None,
@@ -1538,6 +1653,11 @@ async def _finalize_group_if_complete(
             nudge_tg_message_id=m["nudge_tg_message_id"],
         )
         waiters.notify(int(m["id"]))
+    # Wake feed long-pollers once per installation (all group members share the
+    # same installation_id; de-duplicate to avoid redundant notify() calls).
+    installation_ids = {int(m["installation_id"]) for m in members}
+    for inst_id in installation_ids:
+        await answer_waiters.notify(inst_id)
     return True
 
 
@@ -1980,10 +2100,11 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
     conn: sqlite3.Connection = app.state.db
     backend: TelegramBackend = app.state.backend
     waiters: WaiterRegistry = app.state.waiters
+    answer_waiters: ConditionWaiterRegistry = app.state.answer_waiters
 
     cbq = update.get("callback_query")
     if cbq is not None:
-        await _handle_callback_query(conn, backend, waiters, cbq)
+        await _handle_callback_query(conn, backend, waiters, answer_waiters, cbq)
         return
 
     msg = update.get("message")
@@ -2021,7 +2142,7 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
         row = await _load_message_by_tg_id(conn, int(chat_id), int(reply_to))
         if row is not None:
             await _apply_text_answer(
-                conn, backend, waiters, row, msg.get("text", ""), "reply"
+                conn, backend, waiters, answer_waiters, row, msg.get("text", ""), "reply"
             )
             return
         # Precedence 2: nudge id lookup — a reply aimed at the nudge message
@@ -2037,6 +2158,7 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
                     conn,
                     backend,
                     waiters,
+                    answer_waiters,
                     nudge_row,
                     msg.get("text", ""),
                     "nudge_reply",
@@ -2097,7 +2219,7 @@ async def _handle_update(app: FastAPI, update: dict[str, Any]) -> None:
 
     # Exactly one open target: the most-recent open row is unambiguous.
     await _apply_text_answer(
-        conn, backend, waiters, open_rows[0], msg.get("text", ""), "fallback"
+        conn, backend, waiters, answer_waiters, open_rows[0], msg.get("text", ""), "fallback"
     )
 
 
@@ -2236,6 +2358,7 @@ async def _handle_multi_select_button(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     row: sqlite3.Row,
     option_idx: int,
     chosen: dict[str, Any],
@@ -2270,7 +2393,7 @@ async def _handle_multi_select_button(
             await _safe_answer_cb(backend, cb_id, "Already submitted")
             return
         if await _finalize_group_if_complete(
-            conn, backend, waiters, chat_id, group_id, group_total
+            conn, backend, waiters, answer_waiters, chat_id, group_id, group_total
         ):
             await _safe_answer_cb(backend, cb_id, "Submitted ✓")
         else:
@@ -2340,6 +2463,7 @@ async def _handle_grouped_button(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     row: sqlite3.Row,
     option_idx: int,
     chosen: dict[str, Any],
@@ -2351,7 +2475,7 @@ async def _handle_grouped_button(
     re-render with it highlighted, and finalize the group once all are in."""
     if _is_multi_select(row):
         await _handle_multi_select_button(
-            conn, backend, waiters, row, option_idx, chosen, cb_id,
+            conn, backend, waiters, answer_waiters, row, option_idx, chosen, cb_id,
             group_id, group_total,
         )
         return
@@ -2376,7 +2500,7 @@ async def _handle_grouped_button(
         return
 
     if await _finalize_group_if_complete(
-        conn, backend, waiters, chat_id, group_id, group_total
+        conn, backend, waiters, answer_waiters, chat_id, group_id, group_total
     ):
         await _safe_answer_cb(backend, cb_id, "Submitted ✓")
         return
@@ -2406,6 +2530,7 @@ async def _handle_grouped_reply(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     row: sqlite3.Row,
     text: str,
 ) -> None:
@@ -2422,7 +2547,7 @@ async def _handle_grouped_reply(
     if not wrote:
         return
     if await _finalize_group_if_complete(
-        conn, backend, waiters, chat_id, group_id, group_total
+        conn, backend, waiters, answer_waiters, chat_id, group_id, group_total
     ):
         return
     # Still collecting — show the typed answer and leave the buttons available
@@ -2444,6 +2569,7 @@ async def _apply_text_answer(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     row: sqlite3.Row,
     text: str,
     via: str,
@@ -2452,13 +2578,15 @@ async def _apply_text_answer(
     messages, the legacy terminal ``_record_answer`` otherwise."""
     group_id, _ = _group_info(row)
     if group_id is not None:
-        await _handle_grouped_reply(conn, backend, waiters, row, text)
+        await _handle_grouped_reply(conn, backend, waiters, answer_waiters, row, text)
     else:
         # The caller owns the tag question (invariant 7): this row is the one
         # that will need re-rendering iff it is carrying a tag right now.
         await _record_answer(
             conn,
             waiters,
+            answer_waiters,
+            int(row["installation_id"]),
             int(row["id"]),
             {"text": text, "via": via},
             render_dirty=awaits_human(_payload_for(row), row["state"]),
@@ -2469,6 +2597,7 @@ async def _handle_callback_query(
     conn: sqlite3.Connection,
     backend: TelegramBackend,
     waiters: WaiterRegistry,
+    answer_waiters: ConditionWaiterRegistry,
     cbq: dict[str, Any],
 ) -> None:
     data = cbq.get("data") or ""
@@ -2534,6 +2663,7 @@ async def _handle_callback_query(
             conn,
             backend,
             waiters,
+            answer_waiters,
             row,
             parsed.option_idx,
             chosen,
@@ -2556,6 +2686,8 @@ async def _handle_callback_query(
     wrote = await _record_answer(
         conn,
         waiters,
+        answer_waiters,
+        int(row["installation_id"]),
         parsed.message_id,
         answer,
         render_dirty=awaits_human(_payload_for(row), row["state"]),

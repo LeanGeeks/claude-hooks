@@ -277,6 +277,37 @@ class RelayClient:
         resp = self._request("POST", f"/v1/messages/{message_id}/cancel")
         self._raise_for_error(resp)
 
+    def get_answers(
+        self,
+        after: int = 0,
+        wait: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Fetch answered messages from the installation-scoped answer feed.
+
+        Returns rows with ``id > after``, ordered by id ascending, capped at
+        500 server-side. Each row: ``{id, kind, answer_text, via, option_idx,
+        answered_at}``.
+
+        When ``wait > 0`` the server parks up to that many seconds if there
+        are no new rows, returning an empty list on timeout (HTTP 204). The
+        caller is responsible for advancing ``after`` between calls — set it
+        to the highest ``id`` seen so far to get only new answers.
+
+        ``after=0`` is a full replay of everything this installation has ever
+        had answered (bounded by the 500-row page cap); page by advancing
+        ``after`` to the last id returned.
+        """
+        resp = self._request(
+            "GET",
+            "/v1/answers",
+            params={"after": after, "wait": wait},
+            timeout=httpx.Timeout(wait + 10.0, connect=5.0),
+        )
+        if resp.status_code == 204:
+            return []
+        self._raise_for_error(resp)
+        return resp.json()
+
     def wait_for_answer(
         self,
         message_id: int,

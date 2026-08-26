@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -59,6 +59,9 @@ CREATE INDEX IF NOT EXISTS messages_nudge_due
 
 CREATE INDEX IF NOT EXISTS messages_render_dirty
     ON messages(render_dirty) WHERE render_dirty = 1;
+
+CREATE INDEX IF NOT EXISTS messages_answer_feed
+    ON messages(telegram_chat_id, state, id);
 
 CREATE TABLE IF NOT EXISTS recipients (
     telegram_chat_id  INTEGER PRIMARY KEY,
@@ -134,6 +137,12 @@ MIGRATIONS: dict[int, list[str]] = {
         " ON messages(state, next_nudge_at);",
         "CREATE INDEX IF NOT EXISTS messages_render_dirty"
         " ON messages(render_dirty) WHERE render_dirty = 1;",
+    ],
+    4: [
+        # Add answer-feed index: installation-scoped scan by answered id.
+        # Query: telegram_chat_id=X AND state='answered' AND id>N (+ installation_id filter).
+        "CREATE INDEX IF NOT EXISTS messages_answer_feed"
+        " ON messages(telegram_chat_id, state, id);",
     ],
 }
 

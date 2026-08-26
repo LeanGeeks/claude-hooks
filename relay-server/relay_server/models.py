@@ -11,6 +11,11 @@ MessageState = Literal["open", "answered", "expired", "cancelled"]
 
 BindingState = Literal["pending", "bound", "expired"]
 
+# Sentinel stored in messages.expires_at for rows that must never expire.
+# The expiry pass uses ``expires_at < now``, which this value never satisfies.
+# Keeping it in one constant makes a later move to real NULL a single-site change.
+NEVER_EXPIRES: str = "9999-12-31T00:00:00Z"
+
 
 class KeyboardButton(BaseModel):
     label: str
@@ -23,6 +28,10 @@ class CreateMessageRequest(BaseModel):
     keyboard: list[list[KeyboardButton]] | None = None
     reply_required: bool = False
     ttl_sec: int = Field(gt=0, le=24 * 3600)
+    # When True, ``expires_at`` is set to NEVER_EXPIRES and ``ttl_sec`` is
+    # ignored.  Every existing sender is untouched: ttl_sec stays required and
+    # capped at 24 h.  New async-question senders set never_expires=True.
+    never_expires: bool = False
     # Re-answerable group: when ``group_id`` is set, the message is editable
     # (taps update a provisional choice and re-render the keyboard with the
     # selection highlighted) until every message sharing the same ``group_id``
