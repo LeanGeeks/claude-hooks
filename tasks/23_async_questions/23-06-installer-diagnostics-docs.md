@@ -63,3 +63,41 @@ answer that question directly.
 Installer idempotency; registration present and correct; the diagnostic against
 fixtures for each failure mode; a docs lint that the example TOML parses and its
 keys all exist in the loader.
+
+## Conformance checker and adoption guide (added 2026-08-26)
+
+Adoption of the queue-file contract happens **per workspace**, by people this
+epic will never meet, against files this epic must never touch. A contract that
+ships without a way to check conformance gets adopted approximately. So:
+
+### `claude-questions --check [dir]`
+
+Reports, for the workspace's configured queue set, every heading that does **not**
+conform to architecture §3.2 and what the adopter must do about it:
+
+- headings that look like entries but whose id is malformed (the `Q-NNN`
+  template-example shape) — *ignored by the store; move to a fenced block if you
+  meant them as documentation*;
+- entry headings with **no status token from the configured set** — *declare the
+  token in `[questions.format].status`, or edit the heading*; name the unknown
+  token, since declaring is almost always the lossless fix;
+- **duplicate ids within one file** — *the store returns `conflict` and refuses;
+  demote or de-id one heading*;
+- ids that appear only as mentions inside another entry's title — informational,
+  since the contract handles these with no edit.
+
+Exit non-zero if anything in the first three categories is present. Print a
+summary line of the form `N of M entries conform; K edits needed`. Never print
+token material, and **never modify a file** — it is a checker, not a fixer.
+
+### `docs/questions-contract.md`
+
+The adopter-facing statement of the contract: the six rules, the
+`[questions.format]` overrides with worked examples, what `--check` reports and
+how to fix each finding, and the measured result that the reference workspace
+adopts with 2 lossless edits across 290 entries. Written for someone in another
+repo who has never read this epic.
+
+Tests: `--check` against a conforming fixture (exit 0), against the deliberately
+non-conforming fixture from 23-03 (exit non-zero, every category reported), and
+against a workspace with no `[questions]` section (clean no-op, exit 0).

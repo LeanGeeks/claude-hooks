@@ -7,6 +7,23 @@
 `tasks/16_telegram_spawn/architecture.md` §3.1–3.2 (lock, status file, backoff —
 the same lifecycle problems, solved once already)
 
+## Obligation inherited from 23-03 (added 2026-08-26, from its review)
+
+`questions_store` raises a typed **`QuestionsStoreError`** when a queue file is
+corrupt or unreadable — the store's deliberate "clear error" path, accepted in
+review. `ApplyResult` is reserved for the contract outcomes (`applied` /
+`not_found` / `conflict`) and was not widened.
+
+**The listener MUST catch `QuestionsStoreError` around every store call and route
+that answer to `pending`, exactly as it does a `not_found`.** An uncaught one
+takes down the resident loop — and this is the component whose entire job is to
+never lose a human decision. A file can be unreadable for ordinary reasons: a
+`git checkout` landing mid-flight, a partially-synced working tree, a permissions
+change. This is a normal operating condition, not an exceptional one.
+
+Treat `conflict` the same way: retryable, kept in `pending`, surfaced in
+`pending_answers` — never dropped, never silently applied to a guessed entry.
+
 ## Goal
 
 The resident half of the epic: with no session running and no AI in the loop,

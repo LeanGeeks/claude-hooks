@@ -4,9 +4,9 @@
 **Read first:** [brd.md](./brd.md) §2.6, §2.7, §5, D3, D8 ·
 [architecture.md](./architecture.md) §3 · [state.md](./state.md) invariants 5, 6, 7 ·
 `.claude/hooks/permission_state_store.py` (the lock + atomic-replace discipline
-to copy) · `.claude/hooks/roles_config.py` (config loading) · the **real**
-reference files at `/data/sync/work/natasha/hyppie-flow/docs/questions/` and the
-schema they follow in that repo's `docs/workflow.md` §5.2
+to copy) · `.claude/hooks/roles_config.py` (config loading) ·
+`agents_output/23-03_phase0_anchor_scan.md` (the settled Phase 0 findings —
+read this **instead of** opening the reference workspace)
 
 ## Goal
 
@@ -15,20 +15,31 @@ Pure library: no relay, no MCP, no subprocess, no network. Both the MCP server
 (23-04) and the listener (23-05) import it, so the format cannot drift between
 the writer and the answerer.
 
-## Phase 0 — settle the parse contract against reality (do this first)
+## Phase 0 — DONE (do not redo)
 
-Before writing the writer, run a **read-only** scan over every entry in the three
-reference queue files and `answered/`, and report:
+The read-only scan over the reference workspace has been run by the manager and
+the contract is settled. **Do not re-scan, and do not open
+`/data/sync/work/natasha/hyppie-flow/` for anything but curiosity — it is
+another project's live repo and is not this epic's to touch.**
 
-- how many entries the three anchors (architecture §3.2) locate cleanly;
-- every entry they do not, with why;
-- the distinct heading shapes, status tokens and tag forms actually in use;
-- the id high-water mark and any gaps or duplicates.
+- Findings: `agents_output/23-03_phase0_anchor_scan.md`
+- The contract you implement: **architecture.md §3.2, rules 1–6** (rewritten).
 
-If the anchors hold for all of them, say so and proceed. If a subset needs a
-`heading` override, that is a finding for the config defaults, not a reason to
-add heuristics. **Do not modify those files** — they are a live 300 KB artifact
-with real history in another project.
+Two framing points that changed since this task was first written:
+
+1. **This is a contract workspaces adopt, not a parser that retrofits them.**
+   Adoption is out of scope for this epic and happens per-workspace. The bar is
+   *migratable* compatibility — a queue must be editable into conformance
+   **without information loss**, not conformant as it stands.
+2. The old anchor 1 ("first heading **containing** the id as a word") is
+   **replaced** by "heading at the configured level whose text **begins** with a
+   well-formed id". The old rule mis-resolved 5 real ids to other questions'
+   entries and would have flipped the wrong entry's status. Do not implement the
+   old rule.
+
+Measured against the reference queues, the contract recognises 290/290 entries
+and needs 2 lossless edits to adopt. If your implementation changes that number,
+you have changed the contract — stop and say so.
 
 ## Scope
 
@@ -90,9 +101,8 @@ escapes the caller.
 
 ## Done when
 
-- Phase 0 findings are recorded in this file or in `state.md`.
-- Round-trip on a **copy** of the real reference files: allocate, append, answer,
-  re-read — with the resulting diff containing only the intended lines.
+- Round-trip on a contract-conforming fixture: allocate, append, answer, re-read
+  — with the resulting diff containing only the intended lines.
 - Concurrent writers (≥8 processes) allocate unique ids with no lost appends.
 - Anchor resolution is correct in a worktree, in the primary checkout, in a bare
   repo's worktree, and outside git.
@@ -101,12 +111,27 @@ escapes the caller.
 
 ## Tests
 
-Unit, no network, fixtures **copied** from real entries (never the live files):
-the three anchors against every fixture shape; id allocation under concurrency;
-`answered/` participating in allocation; atomic replace under a killed writer;
-apply idempotency / not-found / conflict; anchor ladder across all four cases;
-hostile answer text (a reply containing a heading, a status token, a fenced block
-and an answer-block field) leaving every anchor resolving as before;
-config defaulting and every `[questions.format]` override; corrupt-file
-degradation. Include one fixture that is a flat single `questions.md` with no
-roles — the brd §5 adoption test.
+Unit, no network. Fixtures are **written to the contract** (architecture §3.2) —
+not copied from any live workspace file. Cover:
+
+- each contract rule 1–6, including a heading that *mentions* another entry's id
+  (`## Q-388 — …after Q-253`) resolving to the mentioning entry and never the
+  mentioned one;
+- a status token carrying a free-text suffix (`[resolved 2026-08-13]`) parsing as
+  `resolved` with the suffix preserved on rewrite;
+- a declared non-default status set via `[questions.format].status`;
+- id allocation under ≥8 concurrent writers; `answered/` participating;
+  `max + 1` never back-filling a gap;
+- atomic replace under a killed writer; corrupt-file degradation to a clean error;
+- apply idempotency on `message_id`; `not_found`; **`conflict` on two entry
+  headings for one id** — the store must refuse, never pick;
+- anchor resolution across worktree / primary checkout / bare-repo worktree /
+  non-git;
+- hostile answer text (a reply containing a heading, a status token, a fenced
+  block and an `**Answered by:**`-shaped field) leaving every later parse
+  resolving identically — invariant 11;
+- config defaulting and every `[questions.format]` override;
+- **one deliberately non-conforming fixture** — a malformed id, a duplicate id
+  and a missing status token — asserting the store ignores what it must ignore,
+  returns `conflict`/`not_found` where it must, and modifies nothing;
+- one flat single `questions.md` with no roles — the brd §5 adoption test.

@@ -13,10 +13,20 @@ one-line changes if they prove wrong:
    (architecture §7) — numbers, not design;
 2. the pending-apply retry count before the sidecar fallback (§5.1).
 
-One genuine unknown is scoped inside 23-03 and blocks nothing before it: whether
-the three parse anchors hold against **every** real entry in the reference
-workspace's queues, or whether a subset needs `heading` overrides. Answer it with
-a read-only scan over the real files before writing the writer.
+**The one genuine unknown is now settled.** 23-03's Phase 0 scan has been run
+(read-only, by the manager) and the parse contract is rewritten in
+architecture §3.2 as six rules. Findings:
+`agents_output/23-03_phase0_anchor_scan.md`. 23-03 implements the contract and
+must not re-scan or open the reference workspace.
+
+**Scope clarification (2026-08-26, from the user).** This epic ships a
+*contract*, not a retrofit. Adoption happens per-workspace, individually, and
+the reference workspace (`hyppie-flow`, a different repo) is **evidence only and
+is never modified by this epic**. Compatibility is still a goal, but the bar is
+*migratable* compatibility: an existing queue must be editable into conformance
+**without information loss**. Measured: the reference queues adopt with **2
+lossless edits across 290 entries**. Because adopters do this themselves,
+23-06 also ships a conformance checker and an adopter-facing contract doc.
 
 ## Tasks
 
@@ -24,10 +34,10 @@ a read-only scan over the real files before writing the writer.
 |---|------|--------|------------|-------|
 | 23-01 | [Relay: answer feed + non-expiring messages](./23-01-relay-answer-feed.md) | done | — | `never_expires` sentinel, `GET /v1/answers`, waiter registry keyed by installation, migration. **Touches no Telegram rendering.** |
 | 23-02 | [Relay: per-message nudges + escalation](./23-02-relay-nudge-escalation.md) | done | — | Repeating-tail ladder, three nullable columns, the escalation reaper pass. Independent root; same files as 23-01, so coordinate the migration number. |
-| 23-03 | [Queue-file engine](./23-03-questions-store.md) | todo | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
+| 23-03 | [Queue-file engine](./23-03-questions-store.md) | done | — | `questions_store.py`: anchor resolution, config, id allocation under lock, compose, `apply_answer`. The heart of the epic. |
 | 23-04 | [Questions MCP server](./23-04-questions-mcp.md) | todo | 23-01, 23-02, 23-03 | `ask` + `notify`, role resolution, escalation-token resolution, write-then-send ordering. |
 | 23-05 | [Answer listener runtime](./23-05-listener-runtime.md) | todo | 23-01, 23-03 | `questions-listen`: loop, index, watermark, apply, PATCH, pending retry, lock, `--status`. |
-| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | todo | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. |
+| 23-06 | [Installer, diagnostics, docs](./23-06-installer-diagnostics-docs.md) | todo | 23-04, 23-05 | MCP registration, systemd unit, `shell/claude-questions`, `docs/async-questions.md`, top-level `architecture.md`. **Grew a conformance checker (`--check`) and `docs/questions-contract.md`** — see the task file. |
 | 23-07 | [Live verification](./23-07-live-verification_human.md) | todo | 23-06 | **human** — needs a real relay, a real answer given days later, and a machine that sleeps. |
 
 ## Dependency graph
@@ -204,3 +214,38 @@ rather than reverting it to test against HEAD.
     (v3→v5 one-hop, which is what the live relay at v3 will do, and v4→v5).
     All four columns NULL across 5006 real rows; `expires_at` kept NOT NULL
     through the ALTERs. See `agents_output/23-02_real_db_migration_check.md`.
+
+- **2026-08-26 — 23-03 done.** Phase 0 scan (manager, read-only) → contract
+  rewritten as architecture §3.2 rules 1–6 → implemented (opus) → reviewed
+  (PASS, 0 blocker / 0 high / 3 low) → fixed → verified. Suite 1120 passed /
+  1 skipped (baseline was 1030); relay untouched at 315.
+  - **The escaping was attacked, not just read.** 18 adversarial inputs —
+    forged `<!-- answer:N -->` markers, fence closure, 1000-backtick runs,
+    CRLF and lone-CR, zero-width characters before `#`, setext headings, and
+    answers that are themselves complete well-formed entries. The falsifiable
+    property (re-parse yields the same entries, ids and order, no new entry)
+    held for all of them. Invariant 11 is evidenced, not asserted.
+  - Two design choices worth remembering: the idempotency marker is emitted by
+    the store and only recognised **anchored at line start**, so a hostile
+    answer containing `<!-- answer:999 -->` cannot make a later genuine answer
+    999 look already-applied; and the idempotency check runs **before** the
+    ambiguity check, so a retry of an already-applied answer is not permanently
+    stuck on a duplicate that appeared afterwards (invariant 3 outranks rule 5
+    when the work is provably done).
+  - The per-line escaping guard was narrowed to the **bracketed** status shape.
+    Rule 3 parses a bracketed token, so a bare leading word was never a forgery
+    risk; guarding it turned "Open the file by clicking…" into `\Open the
+    file…` in a file humans read in git diffs.
+  - Anchor resolution reads `.git` pointers directly rather than shelling out to
+    `git rev-parse`, which is what makes it provably pure (creates nothing,
+    spawns nothing, cannot touch git state) and testable without a git binary.
+  - **Obligation passed to 23-05, already written into its task file:** the
+    store raises a typed `QuestionsStoreError` on a corrupt/unreadable queue
+    file. The listener MUST catch it and route the answer to `pending` like a
+    `not_found`. Uncaught, one unreadable file kills the resident loop — and a
+    file is unreadable for ordinary reasons (a `git checkout` mid-flight, a
+    partially-synced tree, a permissions change).
+  - `questions_store.py` is registered in `REQUIRED_HOOKS` but
+    `install-claude-config.sh` was deliberately **not** re-run — 23-06 owns
+    installation, and re-running it in a shared checkout would clobber another
+    session's live config.

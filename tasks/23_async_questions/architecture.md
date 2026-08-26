@@ -155,20 +155,70 @@ path *relative* to the resolved root — so a moved or re-cloned checkout still
 receives its answers. `anchor = "worktree"` can only use the stored absolute
 path, which is precisely why it is not the default.
 
-### 3.2 The three anchors of the parse contract
+### 3.2 The parse contract
 
 Deliberately **not** a format string for the whole heading. Matching
 `## Q-001 — MVP auth model  [resolved]  [blocks: phase-0.2/brd]` in full is where
-a template-driven parser turns brittle across projects. Instead:
+a template-driven parser turns brittle across projects.
 
-1. **Locate** — the first heading line containing the id as a word.
-2. **Status** — a bracket token on that heading line, from the configured pair.
-3. **Boundary** — the answer block is inserted before the next heading of the
+**This is a contract a workspace adopts, not a parser that retrofits one.**
+Adoption is out of scope for this epic and happens in each workspace
+individually (see state.md, Phase 0). The compatibility bar is *migratable*
+compatibility: an existing queue must be **editable into conformance without
+information loss** — not necessarily conformant as it stands.
+
+The contract, every part overridable in `[questions.format]`:
+
+1. **Entry** — a heading at the configured level (default `##`) whose text
+   **begins** with a well-formed id token. Not "contains the id somewhere".
+2. **Id** — default `Q-<digits>`, optional short alpha suffix (`Q-200-ds`).
+   Allocation is `max + 1` across the queue set **plus `answered/`**, never
+   first-free: a gap may belong to an entry archived elsewhere or living on a
+   branch this checkout cannot see.
+3. **Status** — a bracketed token on the entry heading whose **first word** is
+   from the configured status set; any free text after it is preserved and
+   ignored (`[resolved 2026-08-13]` is a valid `resolved`). Default set is
+   `open` → `resolved`; a workspace declares its own vocabulary rather than
+   rewriting its files.
+4. **Boundary** — the answer block is inserted before the next heading of the
    same-or-higher level, else at EOF.
+5. **Ambiguity refuses.** More than one entry heading for an id in the target
+   file returns `conflict`; zero returns `not_found`. Both are normal outcomes
+   that route to `pending` and surface in `pending_answers`. The store never
+   guesses which of two candidates a human meant.
+6. **Non-conforming headings are ignored, never repaired.** A heading that does
+   not begin with a well-formed id is not an entry, and the store leaves it
+   exactly as it found it.
 
-These hold for all 279 entries of the reference workspace with **zero file
-changes**, and survive title text, extra tags, and heading depth. A project whose
-format violates them overrides `heading` in `[questions.format]`.
+#### Why each rule — evidence from the reference workspace
+
+Scanned read-only over 290 live entries (`agents_output/23-03_phase0_anchor_scan.md`);
+those files were not modified and are not this epic's to modify.
+
+| Observed | Rule it justifies |
+|---|---|
+| 5 headings mention another entry's id (`## Q-388 — …after Q-253`, `[SUPERSEDED by Q-269]`, `(revives Q-173)`) | **Rule 1.** "Contains the id" would locate a *different question's* entry and flip its status. Cross-referencing ids in titles is normal authoring, not a defect. |
+| 25 entries use `[answered]`; others `[closed — superseded]`, `[resolved 2026-08-13]`, `[resolved · design-addressed @v14, pin-pending]` | **Rule 3.** Real vocabularies outgrow a pair and decorate tokens with dates and notes. Declaring the set beats editing 33 headings; the free-text suffix keeps the note. |
+| `Q-200-ds` beside `Q-200` | **Rule 2.** Adopters use id suffixes; the id pattern is configurable. |
+| Three `## Q-NNN — <short title>  [open]` schema examples live inside the queues | **Rule 6.** A malformed id is not an entry — otherwise `max_open` counts 7 open entries where 5 exist. |
+| `## ✅ ANSWER (HTL …) — … Q-265 is CLOSED.` (h2), `### Q-450 item 4 — MOVED` (h3) | **Rules 1 and 6.** Neither begins with an id at the entry level; both are correctly invisible. |
+| `## Q-291 — ANSWERED: …` duplicating `## Q-291 — …` | **Rule 5.** A genuine ambiguity a machine must refuse rather than resolve. |
+
+#### Measured adoption cost
+
+Against the reference workspace, with its vocabulary declared in
+`[questions.format].status` and no other configuration:
+
+- **290 of 290** entries recognised;
+- **0** edits for status vocabulary — declaring beats rewriting;
+- **0** edits for the five id-mention collisions — rule 1 dissolves them;
+- **0** edits for the five non-entry headings — rule 6 ignores them;
+- **2** edits total, both the duplicated `## Q-29x — ANSWERED:` summary headings,
+  each fixable by demoting the heading or dropping its leading id — **lossless**.
+
+**2 edits across 290 entries: 99.3% of the file untouched.** That is the
+migratable-compatibility bar being met, and it is the number to re-measure if
+the contract ever changes.
 
 ### 3.3 Writes
 
