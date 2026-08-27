@@ -57,7 +57,11 @@ LOG_FILE="$LOG_DIR/$(date -u +%Y-%m-%d).log"
 
 # Pinned knobs. Overridable for a manual run, but never absent: the defaults are
 # literals, so the spawn is pinned even with an empty environment.
-REVIEW_MODEL="${PERMISSION_REVIEW_MODEL:-sonnet}"
+#
+# opus, not sonnet: this job judges allowlist proposals, edits settings.json,
+# commits, and re-runs the installer unattended. The blast radius of a bad
+# judgement here is a widened permission gate on every session on the machine.
+REVIEW_MODEL="${PERMISSION_REVIEW_MODEL:-opus}"
 REVIEW_EFFORT="${PERMISSION_REVIEW_EFFORT:-high}"
 
 mkdir -p "$LOG_DIR" || {

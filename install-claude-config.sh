@@ -875,19 +875,33 @@ else
 fi
 
 # ── questions-listen binary (epic 23) ─────────────────────────────────────────
-# Symlink the listener binary into ~/.local/bin so it is on PATH for systemd.
-# The shared library (questions_listen_lib.py) is already in REQUIRED_HOOKS
-# and lands in ~/.claude/hooks/; the binary imports it from there.
+# COPY the listener into ~/.claude/bin/, then point ~/.local/bin at that copy —
+# the same shape as claude-questions above, and for the same reason.
+#
+# This was originally a symlink straight into the checkout (23-06 spec said
+# "symlink"), which broke the repo's own rule that a repo edit is not live: the
+# systemd service executed whatever was in the working tree at that instant,
+# including a half-saved file or another session's in-progress edit in a shared
+# checkout, and a branch switch silently swapped the running daemon. Worse, its
+# library (questions_listen_lib.py) IS copied to ~/.claude/hooks/, so the binary
+# was repo-fresh while its library was install-frozen and the two could drift
+# apart with nothing to signal it. Copy keeps both halves on the same clock.
+CLAUDE_BIN_DIR="$HOME/.claude/bin"
+mkdir -p "$CLAUDE_BIN_DIR"
 QUESTIONS_LISTEN_SRC="$SCRIPT_DIR/.claude/bin/questions-listen"
 QUESTIONS_LISTEN_INSTALLED=false
 
 if [[ -f "$QUESTIONS_LISTEN_SRC" ]]; then
+    cp "$QUESTIONS_LISTEN_SRC" "$CLAUDE_BIN_DIR/questions-listen"
+    chmod +x "$CLAUDE_BIN_DIR/questions-listen"
+    log_info "Installed: questions-listen → $CLAUDE_BIN_DIR/questions-listen"
     if [[ -d "$USER_BIN_DIR" ]]; then
-        ln -sf "$QUESTIONS_LISTEN_SRC" "$USER_BIN_DIR/questions-listen"
-        log_info "Symlinked: questions-listen → $USER_BIN_DIR/questions-listen"
+        # -f replaces the old repo-pointing symlink from earlier installs.
+        ln -sf "$CLAUDE_BIN_DIR/questions-listen" "$USER_BIN_DIR/questions-listen"
+        log_info "  Symlinked: $USER_BIN_DIR/questions-listen → $CLAUDE_BIN_DIR/questions-listen"
         QUESTIONS_LISTEN_INSTALLED=true
     else
-        log_warn "  $USER_BIN_DIR does not exist — questions-listen not installed on PATH"
+        log_warn "  $USER_BIN_DIR does not exist — questions-listen not on PATH"
     fi
 else
     log_warn "questions-listen not found at $QUESTIONS_LISTEN_SRC — skipping"

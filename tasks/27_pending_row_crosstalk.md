@@ -305,13 +305,28 @@ comparator.
   Comparator errors fall to `cannot_tell`, never to exclusion, and now log the tool
   name and row id.
 
-**Still open — operator only:**
+- **2026-08-27 — §4.4 probe run; the comparator is confirmed, no change needed.**
+  Captured by the operator from a session launched as `CLAUDE_HOOK_DEBUG=1 claude`
+  — the hook inherits the env, so **no edit to `~/.claude/settings.json` was
+  required** after all; the flag never has to be baked into the PostToolUse entry
+  for a one-off capture. A real PostToolUse Bash payload:
 
-- **§4.4 probe (deliberately not run).** It requires adding `CLAUDE_HOOK_DEBUG=1`
-  to the PostToolUse entry in the live `~/.claude/settings.json`; no agent edited
-  that file. Consequently the **Bash** comparator's payload shape rests on
-  code-reading rather than a captured payload. The **AskUserQuestion** comparator
-  does not depend on the probe — question text survives both transformations
-  either way.
+  ```
+  "tool_name":"Bash",
+  "tool_input":{"command":"echo hello","description":"Print hello"},
+  "tool_response":{"stdout":"hello","stde...
+  ```
+
+  So Bash `tool_input` carries exactly `{command, description}`, and
+  `_classify_candidate` compares `command` only, discarding `description` as
+  model prose — which is what the code already does
+  (`permission_state_store.py`, Bash branch). **The code-reading was right; the
+  comparator stands as shipped.** The payload also confirms the top level carries
+  `session_id`, `cwd`, `permission_mode`, `effort` and `hook_event_name`, and
+  that `agent_id` is *absent* for a main-agent call (the hook logged
+  `Agent ID: None`), which is what the `data.get('agent_id') != agent_id`
+  filter in `find_pending_request_by_tool_session` relies on.
+
+**Still open — operator only:**
 - **§7.7 live end-to-end.** The heartbeat + role-tagged parallel-question scenario
   in a real Telegram chat. Not reproducible from an agent.

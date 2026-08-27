@@ -20,7 +20,7 @@ both tasks are specified to be correct either way.
 |---|------|--------|------------|-------|
 | 26-01 | [Signal revoke](./26-01-signal-revoke_sonnet.md) | done | — | Layer 1 — the fast path. Small, and carries the probe. Inert if the harness `SIGKILL`s. |
 | 26-02 | [Orphan sweep](./26-02-orphan-sweep_sonnet.md) | done | — | Layer 2 — **the guarantee**. Holds under `SIGKILL`, crash, OOM, reboot. Ship this one even if 26-01 is skipped. |
-| 26-03 | [Live verification](./26-03-live-verification_human.md) | blocked | 26-01 + 26-02 installed | **human** — five cases, three of which are controls. Records the probe result. |
+| 26-03 | [Live verification](./26-03-live-verification_human.md) | done | 26-01 + 26-02 installed | **human** — five cases, three of which are controls. Records the probe result. |
 
 ## Dependency graph
 
@@ -197,3 +197,41 @@ to respect:
   delivers a catchable signal and layer 1 fires; absence means `SIGKILL`, layer 1
   is inert by construction, and 26-02's sweep is the only closer. Either outcome
   is a valid result — the epic is specified to be correct both ways.
+- **2026-08-27 — 26-03 run; all five cases pass. The probe is answered: the
+  harness sends `SIGTERM`.** CLI `2.1.247 (Claude Code)`. Operator drove cases
+  1–4 in a fresh session under `ai-playground-2`; case 5's sweep was fired from a
+  second session. The literal probe line:
+
+  ```
+  [2026-08-27T09:51:37.877505+00:00] Interrupt: signal 15; revoking 1 live row(s)
+  ```
+
+  So **layer 1 is live, not inert** on this build — ESC delivers a catchable
+  `SIGTERM` and `_on_interrupt` revokes before the process goes. Layer 2 remains
+  the guarantee for `SIGKILL`, crash and reboot, but it was not the closer in any
+  case here.
+
+  | # | Row | Tool | State | `resolution_source` | msg |
+  |---|---|---|---|---|---|
+  | 1 | `329d71d9cc6f` | AskUserQuestion | `resolved_terminal` | `interrupted` | 5116 |
+  | 2 | `314d7f6f66d4` | Bash | `resolved_terminal` | `interrupted` | 5117 |
+  | 3 | `5e7569975e6c` | AskUserQuestion | `resolved_terminal` | `terminal` | 5118 |
+  | 4 | `97115eab32e9` | AskUserQuestion | `reply` | `telegram` | 5119 |
+  | 5 | `d2a745e48cf7` | Bash | **`pending`** | — | 5120 |
+
+  Case 3 closed `terminal` with its hook alive — the normal path, not the brd
+  §2.3 fallback. Case 4 was answered on the phone and recorded as `reply` /
+  `telegram`, i.e. the store row outlives the upstream 60 s `AskUserQuestion`
+  cap even when the tool itself has given up.
+  **Case 5 is the one that mattered and it held:** the row stayed `pending`
+  across six tool calls over ~2 minutes from a second session — every one of them
+  a PostToolUse sweep call site — with its owner alive (`permission_request_hook`
+  PID 3772433/3772434). A live hook is never swept (invariant 3).
+  Latency: layer 1's revoke was observed as immediate on the ESC; layer 2's
+  next-hook-event latency was not exercised, so 26-02's §4 stamp-file gate stays
+  unneeded on the evidence available.
+  **Before this run neither layer had ever fired in production** — across all
+  5144 store rows `resolution_source` was only ever `telegram` (2602),
+  `terminal` (1511), `timeout` (890) or null, and the 890 `timeout` rows are the
+  failure mode this epic exists to remove.
+  No cards needed cleaning up by hand.

@@ -1,6 +1,6 @@
 # Task 26-03 — Live verification on this machine
 
-**Status:** todo · **Type:** human/live · **Depends on:** 26-01 and 26-02, both
+**Status:** done (2026-08-27) · **Type:** human/live · **Depends on:** 26-01 and 26-02, both
 **installed** (`./install-claude-config.sh`, no sudo)
 **Read first:** [brd.md](./brd.md) §4 (acceptance) · [26-01](./26-01-signal-revoke_sonnet.md) §5
 

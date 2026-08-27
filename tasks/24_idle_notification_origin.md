@@ -1,6 +1,7 @@
 # 24 — Idle notifications only for sessions the operator started
 
-**Status:** todo · **Owner:** Anton · **Created:** 2026-08-26 · **Rev:** 3 · **Type:** standalone task
+**Status:** done (2026-08-27) — all seven criteria evidenced live · **Owner:** Anton · **Created:** 2026-08-26 · **Rev:** 3 · **Type:** standalone task
+**Landed as:** `b62c545` *feat(notifications): idle cards only for operator-started sessions* · see §11
 **Depends on:** nothing technical. **Hold until epics 22 / 23 land** — they are
 in flight in the same checkout and touch neighbouring hooks.
 **Read first:** [architecture.md](../architecture.md) §"Idle notification (current)" ·
@@ -418,3 +419,91 @@ outside `amux-spawn` — the §7 residual gap.
 The only obligation this task carries forward is the seam: `should_notify_idle()`
 must be the single place the answer is decided, so that epic changes one function
 body instead of re-deriving the policy.
+
+---
+
+## 11. Implementation log
+
+- **2026-08-26 — landed as `b62c545`.** `should_notify_idle()` /
+  `session_started_by_agent()` added to `.claude/hooks/notification_hook.py`,
+  wired into `main()` ahead of the background-agents check; 165 lines of tests in
+  `tests/test_unit_notification_hook.py`; `architecture.md:115`,
+  `.claude/README.md:119` and `install-claude-config.sh:1008` updated
+  (criterion 6 ✓). Installer re-run 2026-08-27 11:36 — repo and
+  `~/.claude/hooks/notification_hook.py` are byte-identical (criterion 7 ✓).
+  `python3 -m py_compile` clean (criterion 1 ✓). Suite green at
+  **1308 ran / 1 skipped** (criterion 2 ✓; the skip is the pre-existing
+  `test_headless_spawn`).
+
+- **2026-08-27 — criterion 4 verified live, with relay-side evidence.**
+  Spawned a throwaway tracked session
+  (`amux-spawn spawn t24-idle-probe --dir <scratch> --model=haiku --effort=low
+  --no-attach`), which reached `state: idle` with `last_message: "ACK"`. The
+  `Notification` hook fired ~40 s after the turn ended and logged, in
+  `~/.claude/notification_hook_debug.log`:
+
+  ```
+  [DEBUG] Session ID: 7de4ba64-ea9f-4b2d-b9c6-b4436385933f
+  [DEBUG] Skipping idle notification: session started by agent (amux:t24-t24-idle-probe)
+  ```
+
+  **And the relay received nothing.** Querying the production DB read-only, the
+  highest message id is 5122 created at `10:25:35Z`; the probe spawned at
+  `10:30:01Z` and idled ~`10:30:40Z`, so no message exists in the window. That is
+  stronger than "no card appeared on my phone" — the send never happened at all.
+  Probe reaped with `amux-spawn rm t24-t24-idle-probe` (note the doubled prefix:
+  amux-spawn namespaces the handle by workspace, so the handle is
+  `t24-t24-idle-probe`, and `amux-spawn rm t24-idle-probe` reports "no tracked
+  handle found").
+
+- **2026-08-27 — criterion 3 satisfied as a by-product, no separate probe
+  needed.** §6 fact 10 asks whether the amux handle's `session_id` still equals
+  the session's own id. The handle for the probe carried
+  `"session_id": "7de4ba64-ea9f-4b2d-b9c6-b4436385933f"` and the notification
+  hook logged `Session ID: 7de4ba64-ea9f-4b2d-b9c6-b4436385933f` for the same
+  run. They match, so the identity check the gate rests on still holds on
+  CLI `2.1.247`.
+
+- **2026-08-27 — criterion 5 verified live, both halves, and it exercised §3.1.**
+
+  *Plain terminal, hand-started.* The `ai-playground-2` session idled at
+  `10:25:35Z`; hook logged `Idle notification sent: relay message 5122
+  (notify-only)`. Relay row 5122 carries
+
+  ```
+  <b>ai-playground-2</b>\n💤 <b>Idle</b> — waiting for input\n\n<blockquote>hello</blockquote>
+  ```
+
+  and the operator confirmed that exact card arrived in Telegram. `notify-only`
+  is correct here and not a regression: that session ran outside tmux, so
+  `resolve_amux_session()` returned `None` and `reply_enabled = amux_name is not
+  None` was False. Pre-existing behaviour, untouched by this task.
+
+  *Inside an amux session, still hand-started — the case §3.1 exists for.* This
+  repo's own operator session runs in tmux session `amux-claude-hooks-62`, so
+  `amux_name` resolves to `claude-hooks-62` and the **name alone would have
+  silenced it**. The identity check saves it: no handle names this session id,
+  so `session_started_by_agent` returns False. Logged three times over the
+  sitting:
+
+  ```
+  [DEBUG] Spawned reply injector for message 5121 → amux:claude-hooks-62
+  [DEBUG] Idle notification 5121 sent; reply injector armed for amux:claude-hooks-62
+  ```
+
+  (also 5113 and 5115). So a hand-started session inside an amux workspace both
+  **notifies and arms the injector** — the daily-use configuration, and the one
+  the task called "the trust failure you may not notice for days" if it broke.
+  **§3's second condition is now evidenced in production, not just in tests.**
+
+  Taken with the previous entry, the §3 table is verified end to end: tracked
+  session → silent (relay received nothing); hand-started outside amux → notifies,
+  notify-only; hand-started inside amux → notifies and arms.
+
+## Outcome
+
+All seven done criteria are met. The task is closed. The §7 residual gap is
+unchanged and still deliberate: a session started by a launcher that is neither
+`amux-spawn` nor a human terminal has no handle, so it is treated as
+operator-started and notifies — fail-open, as designed (§1). The settings
+surface in §10 remains the follow-up epic.
