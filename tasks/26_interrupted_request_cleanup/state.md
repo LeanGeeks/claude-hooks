@@ -18,9 +18,9 @@ both tasks are specified to be correct either way.
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 26-01 | [Signal revoke](./26-01-signal-revoke_sonnet.md) | todo | — | Layer 1 — the fast path. Small, and carries the probe. Inert if the harness `SIGKILL`s. |
+| 26-01 | [Signal revoke](./26-01-signal-revoke_sonnet.md) | done | — | Layer 1 — the fast path. Small, and carries the probe. Inert if the harness `SIGKILL`s. |
 | 26-02 | [Orphan sweep](./26-02-orphan-sweep_sonnet.md) | done | — | Layer 2 — **the guarantee**. Holds under `SIGKILL`, crash, OOM, reboot. Ship this one even if 26-01 is skipped. |
-| 26-03 | [Live verification](./26-03-live-verification_human.md) | todo | 26-01 + 26-02 installed | **human** — five cases, three of which are controls. Records the probe result. |
+| 26-03 | [Live verification](./26-03-live-verification_human.md) | blocked | 26-01 + 26-02 installed | **human** — five cases, three of which are controls. Records the probe result. |
 
 ## Dependency graph
 
@@ -172,3 +172,28 @@ to respect:
   passed (+15 cases). Installer re-run. **26-01 still owns
   `RESOLUTION_SOURCE_INTERRUPTED` and `lock_timeout`; the constant block was left
   tidy for it to extend.**
+- **2026-08-27 — 26-01 landed; epic engineering complete.** Implemented against
+  a checkout where 26-02 had already landed, so the `revoke_telegram_message`
+  move was consumed, not re-applied, and `RESOLUTION_SOURCE_INTERRUPTED` replaced
+  the placeholder comment 26-02 left at `:99`. Review found 0 BLOCKER / 0 HIGH.
+  **The `os._exit(0)` question is settled:** exit 0 with **no stdout** is this
+  hook's documented "no decision" path — the harness falls back to its native TUI
+  prompt — and the handler never writes to stdout, so an interrupt cannot be read
+  as an approval. The revoke runs in a daemon thread with `join(1.0)` per
+  decision 5, because `RelayClient`'s 5 s connect / 35 s read with three backed-off
+  retries can exceed a minute against an unreachable relay.
+  **A pre-existing test leak was found and fixed at its cause:** `TestEscalation`'s
+  `_run()` stopped patches in FIFO order, and one method patches
+  `update_request_state` twice, so the first mock survived teardown and leaked into
+  later classes. Fixed with `reversed(stack)`. All 22 `TestEscalation` methods
+  still pass once un-mocked — each installs its own mock via `_run()`, so **none was
+  asserting vacuously**. Suite 1291 → 1298 passed (+7). Installer re-run.
+- **2026-08-27 — 26-03 moved to `blocked`, awaiting human evidence.** Both
+  implementation layers are installed. **The §5 probe log is
+  `~/.claude/permission_request_debug.log`** (`permission_request_hook.py:143`) —
+  an earlier report named the wrong file; the 26-03 task file was already correct.
+  `debug_log` closes the file before returning, so the line is on disk before
+  `os._exit(0)`. Presence of `Interrupt: signal` after an ESC means the harness
+  delivers a catchable signal and layer 1 fires; absence means `SIGKILL`, layer 1
+  is inert by construction, and 26-02's sweep is the only closer. Either outcome
+  is a valid result — the epic is specified to be correct both ways.

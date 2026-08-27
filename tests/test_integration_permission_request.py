@@ -3084,7 +3084,7 @@ class TestEscalation(unittest.TestCase):
         stack.extend(extra_patches)
         for p in stack:
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in stack])
+        self.addCleanup(lambda: [p.stop() for p in reversed(stack)])
 
         fn = lambda: self.hook.handle_ask_user_question(
             session_id="sess", cwd="/tmp/ws",
@@ -3875,6 +3875,218 @@ class TestAgentWrittenDecisions(unittest.TestCase):
             self.hook._EXTERNALLY_DECIDABLE_STATES,
             {"allow", "deny", "stop"},
         )
+
+
+class TestSignalHandler(unittest.TestCase):
+    """Epic 26 layer 1: _on_interrupt registry and signal handler (task 26-01 §3).
+
+    Cases 3-7 from the task spec. The handler is called directly (with os._exit
+    patched) rather than via a real signal — sending a real signal to the test
+    runner would be catastrophic.
+    """
+
+    def setUp(self):
+        import permission_request_hook as hook
+        import telegram_permission_router as tpr
+        import permission_state_store as pss
+        self.hook = hook
+        self.tpr = tpr
+        self.pss = pss
+
+        # Isolated state store — same pattern as TestSweepOrphanedRequests.
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="signal-handler-test-"))
+        self.state_file = self.temp_dir / "permission_requests.jsonl"
+        self._patches = [
+            patch.object(pss, "STATE_FILE", self.state_file),
+            patch.object(pss, "AUDIT_LOG_FILE",
+                         self.temp_dir / "permission_actions.jsonl"),
+        ]
+        for p in self._patches:
+            p.start()
+
+        # Reset the module-level registry and arming flag for each test.
+        self._orig_live_rows = dict(hook._LIVE_ROWS)
+        hook._LIVE_ROWS.clear()
+        self._orig_handler_armed = hook._handler_armed
+        hook._handler_armed = False
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        # Restore registry state so other tests are unaffected.
+        self.hook._LIVE_ROWS.clear()
+        self.hook._LIVE_ROWS.update(self._orig_live_rows)
+        self.hook._handler_armed = self._orig_handler_armed
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _make_pending(self, request_id: str, msg_id: int = None) -> "PermissionRequest":
+        from permission_state_store import create_request
+        req = create_request(
+            session_id="s-" + request_id,
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        # Override the request_id to make tests predictable.
+        import json
+        rows = self.state_file.read_text().splitlines()
+        rewritten = []
+        for line in rows:
+            d = json.loads(line)
+            if d["request_id"] == req.request_id:
+                d["request_id"] = request_id
+                if msg_id is not None:
+                    d["telegram_message_id"] = msg_id
+            rewritten.append(json.dumps(d))
+        self.state_file.write_text("\n".join(rewritten) + "\n")
+        req.request_id = request_id
+        if msg_id is not None:
+            req.telegram_message_id = msg_id
+        return req
+
+    # ── Case 3 ───────────────────────────────────────────────────────────────
+
+    def test_interrupt_marks_both_rows_terminal_and_revokes(self):
+        """Two registered rows → both resolved_terminal/interrupted; revoke
+        called once per row that has a message_id."""
+        req_a = self._make_pending("int-row-a", msg_id=101)
+        req_b = self._make_pending("int-row-b", msg_id=102)
+        self.hook._register_live_row(req_a)
+        self.hook._register_live_row(req_b)
+
+        revoked = []
+        def fake_revoke(row):
+            revoked.append(row.telegram_message_id)
+
+        with patch.object(self.tpr, "remove_inline_buttons"), \
+             patch.object(self.tpr, "set_message_reaction"), \
+             patch.object(self.hook.telegram_router, "revoke_telegram_message",
+                          side_effect=fake_revoke), \
+             patch.object(self.hook.os, "_exit"):
+            self.hook._on_interrupt(15, None)
+
+        # Both rows must be marked terminal.
+        from permission_state_store import get_request, RESOLUTION_SOURCE_INTERRUPTED
+        row_a = get_request("int-row-a")
+        row_b = get_request("int-row-b")
+        self.assertEqual(row_a.state, "resolved_terminal")
+        self.assertEqual(row_a.resolution_source, RESOLUTION_SOURCE_INTERRUPTED)
+        self.assertEqual(row_b.state, "resolved_terminal")
+        self.assertEqual(row_b.resolution_source, RESOLUTION_SOURCE_INTERRUPTED)
+
+        # Revoke called once per row with a message_id.
+        self.assertIn(101, revoked)
+        self.assertIn(102, revoked)
+        self.assertEqual(len(revoked), 2)
+
+    # ── Case 4 ───────────────────────────────────────────────────────────────
+
+    def test_interrupt_no_message_id_marks_terminal_no_revoke(self):
+        """A registered row with no telegram_message_id is marked terminal but
+        no revoke is attempted."""
+        req = self._make_pending("int-no-msg")
+        req.telegram_message_id = None
+        self.hook._register_live_row(req)
+
+        revoked = []
+        with patch.object(self.hook.telegram_router, "revoke_telegram_message",
+                          side_effect=lambda r: revoked.append(r)), \
+             patch.object(self.hook.os, "_exit"):
+            self.hook._on_interrupt(15, None)
+
+        from permission_state_store import get_request
+        row = get_request("int-no-msg")
+        self.assertEqual(row.state, "resolved_terminal")
+        self.assertEqual(len(revoked), 0)
+
+    # ── Case 5 ───────────────────────────────────────────────────────────────
+
+    def test_already_resolved_row_keeps_its_resolution(self):
+        """A row already resolved (e.g. via Telegram) must not be re-labelled
+        interrupted when the handler fires. update_request_state is idempotent
+        for terminal rows."""
+        from permission_state_store import (
+            update_request_state, get_request,
+            RequestState, RESOLUTION_SOURCE_TELEGRAM,
+        )
+        req = self._make_pending("int-already-done", msg_id=999)
+        # Resolve it via Telegram first.
+        update_request_state(
+            "int-already-done",
+            RequestState.ALLOW,
+            resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+        )
+
+        # Register (simulates the hook having registered before resolution).
+        self.hook._register_live_row(req)
+
+        with patch.object(self.hook.telegram_router, "revoke_telegram_message"), \
+             patch.object(self.hook.os, "_exit"):
+            self.hook._on_interrupt(15, None)
+
+        row = get_request("int-already-done")
+        # Must keep the original resolution, not be overwritten by interrupted.
+        self.assertEqual(row.state, "allow")
+        self.assertEqual(row.resolution_source, RESOLUTION_SOURCE_TELEGRAM)
+
+    # ── Case 6 ───────────────────────────────────────────────────────────────
+
+    def test_revoke_failure_does_not_stop_other_rows(self):
+        """If revoke raises for one row, the other rows are still processed
+        and no exception escapes the handler."""
+        req_a = self._make_pending("int-revoke-fail-a", msg_id=201)
+        req_b = self._make_pending("int-revoke-fail-b", msg_id=202)
+        self.hook._register_live_row(req_a)
+        self.hook._register_live_row(req_b)
+
+        revoked = []
+        def fake_revoke(row):
+            if row.telegram_message_id == 201:
+                raise RuntimeError("network error")
+            revoked.append(row.telegram_message_id)
+
+        with patch.object(self.hook.telegram_router, "revoke_telegram_message",
+                          side_effect=fake_revoke), \
+             patch.object(self.hook.os, "_exit"):
+            # Must not raise.
+            self.hook._on_interrupt(15, None)
+
+        # Row b must still be revoked despite row a failing.
+        self.assertIn(202, revoked)
+
+        # Both rows marked terminal (state write happens before revoke).
+        from permission_state_store import get_request
+        self.assertEqual(get_request("int-revoke-fail-a").state, "resolved_terminal")
+        self.assertEqual(get_request("int-revoke-fail-b").state, "resolved_terminal")
+
+    # ── Case 7 ───────────────────────────────────────────────────────────────
+
+    def test_handler_arming_is_idempotent(self):
+        """Registering N rows must install the handler exactly once, not N times."""
+        import signal as signal_mod
+
+        req_a = self._make_pending("int-arm-a")
+        req_b = self._make_pending("int-arm-b")
+        req_c = self._make_pending("int-arm-c")
+
+        arm_count = [0]
+        original_signal = signal_mod.signal
+
+        def counting_signal(sig, handler):
+            arm_count[0] += 1
+            return original_signal(sig, handler)
+
+        with patch.object(self.hook.signal, "signal", side_effect=counting_signal):
+            self.hook._register_live_row(req_a)
+            self.hook._register_live_row(req_b)
+            self.hook._register_live_row(req_c)
+
+        # Three signals × one arming = 3 calls total (SIGTERM, SIGHUP, SIGINT).
+        self.assertEqual(arm_count[0], 3,
+                         "handler must be armed exactly once (3 signals × 1)")
 
 
 if __name__ == "__main__":

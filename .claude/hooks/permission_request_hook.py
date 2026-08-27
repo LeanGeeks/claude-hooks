@@ -29,12 +29,14 @@ Action mappings:
 import json
 import queue
 import re
+import signal
 import sys
 import os
 import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -53,6 +55,7 @@ from permission_state_store import (
     cleanup_expired_requests,
     sweep_orphaned_requests,
     RESOLUTION_SOURCE_AGENT,
+    RESOLUTION_SOURCE_INTERRUPTED,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
     RESOLUTION_SOURCE_TIMEOUT,
@@ -68,6 +71,59 @@ from telegram_permission_router import (
     remove_inline_buttons,
 )
 import session_yolo_store
+
+# ── Epic 26 layer 1: signal handler registry ─────────────────────────────────
+# request_id -> the row, for cleanup on signal (epic 26 layer 1).
+_LIVE_ROWS: "OrderedDict[str, PermissionRequest]" = OrderedDict()
+_handler_armed = False
+
+
+def _on_interrupt(signum, frame):
+    """Signal handler: mark live rows terminal and strip Telegram buttons.
+
+    The debug_log line is the epic's probe (§5): if it appears in the log,
+    the harness sent a catchable signal (not SIGKILL) and layer 1 worked.
+    """
+    debug_log(f"Interrupt: signal {signum}; revoking {len(_LIVE_ROWS)} live row(s)")
+    rows = list(_LIVE_ROWS.values())
+    _LIVE_ROWS.clear()
+    for row in rows:
+        try:
+            update_request_state(
+                row.request_id,
+                RequestState.RESOLVED_TERMINAL,
+                resolution_source=RESOLUTION_SOURCE_INTERRUPTED,
+                lock_timeout=0.5,
+            )
+        except Exception as e:          # noqa: BLE001 — H1
+            debug_log(f"Interrupt: row {row.request_id} not marked: {e}")
+
+    def _revoke_all():
+        for row in rows:
+            if row.telegram_message_id:
+                try:
+                    telegram_router.revoke_telegram_message(row)
+                except Exception as e:  # noqa: BLE001 — H1
+                    debug_log(f"Interrupt: revoke of {row.telegram_message_id} failed: {e}")
+
+    t = threading.Thread(target=_revoke_all, daemon=True)
+    t.start()
+    t.join(1.0)                 # bounded; see decision 5
+    os._exit(0)
+
+
+def _register_live_row(row: "PermissionRequest") -> None:
+    """Register a row in the signal-handler registry, arming the handler once."""
+    global _handler_armed
+    _LIVE_ROWS[row.request_id] = row
+    if not _handler_armed:
+        _handler_armed = True
+        for _sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                signal.signal(_sig, _on_interrupt)
+            except (ValueError, OSError):   # not the main thread / not supported
+                pass
+
 
 # ── Per-question record for AskUserQuestion groups ────────────────────────────
 # A small dataclass (not a tuple) so 15-04/15-05 can add fields without
@@ -477,6 +533,7 @@ def _mark_relay_resolved(request_id: str, decision: Dict[str, Any]) -> None:
             reply_text=decision.get("reply_text"),
             resolution_source=RESOLUTION_SOURCE_TELEGRAM,
         )
+        _LIVE_ROWS.pop(request_id, None)
     except Exception as e:  # noqa: BLE001 — never disrupt the decision path.
         debug_log(f"Failed to mark request {request_id} relay-resolved: {e}")
 
@@ -546,6 +603,7 @@ def _record_auto_deny(request_id: str) -> None:
             RequestState.DENY,
             resolution_source=RESOLUTION_SOURCE_TIMEOUT,
         )
+        _LIVE_ROWS.pop(request_id, None)
     except Exception as e:  # noqa: BLE001 — never disrupt the hook's exit path.
         debug_log(f"Failed to record auto-deny for {request_id}: {e}")
 
@@ -823,6 +881,7 @@ def _finalize_on_terminal_win(
             if row and row.state == RequestState.PENDING.value:
                 try:
                     resolve_via_terminal(rec.child.request_id)
+                    _LIVE_ROWS.pop(rec.child.request_id, None)
                 except Exception as e:  # noqa: BLE001
                     debug_log(
                         f"Failed to mark {rec.child.request_id} terminal-resolved: {e}"
@@ -868,6 +927,9 @@ def _finalize_losing_groups(
             except Exception as e:  # noqa: BLE001 — a dead chat must not block
                 debug_log(f"Failed to finalize losing message {rec.message_id}: {e}")
             try:
+                # No _LIVE_ROWS.pop here (epic 26 task 26-01 §3d): the row is
+                # now terminal (REPLY), so update_request_state's own idempotency
+                # (state.md invariant 2) will refuse any handler re-label.
                 update_request_state(
                     rec.child.request_id,
                     RequestState.REPLY,
@@ -1039,6 +1101,7 @@ def _wait_for_group_answers(
                         reply_text=reply_text,
                         resolution_source=RESOLUTION_SOURCE_TELEGRAM,
                     )
+                    _LIVE_ROWS.pop(rec.child.request_id, None)
 
             # 4. A group is won when every one of its children has answered.
             if (
@@ -1250,6 +1313,10 @@ def handle_ask_user_question(
                     except Exception as _ce:
                         debug_log(f"Failed to cancel sibling {rec.message_id}: {_ce}")
                     try:
+                        # No _LIVE_ROWS.pop here (epic 26 task 26-01 §3d): the
+                        # row is now terminal (DENY), so update_request_state's
+                        # idempotency (state.md invariant 2) refuses any handler
+                        # re-label.
                         update_request_state(
                             rec.child.request_id,
                             RequestState.DENY,
@@ -1258,6 +1325,8 @@ def handle_ask_user_question(
                     except Exception:  # noqa: BLE001
                         pass
                 return None
+            _child.telegram_message_id = _mid
+            _register_live_row(_child)
             records.append(_ChildRecord(child=_child, question=q, message_id=_mid, body=_body))
         return records
 
@@ -1561,6 +1630,12 @@ def main():
             )
         else:
             debug_log(f"Telegram message sent with ID: {message_id}")
+            request.telegram_message_id = message_id
+
+        # Register this row for signal-handler cleanup (epic 26 layer 1).
+        # A row with no telegram_message_id is still worth registering so the
+        # handler can at least mark it terminal.
+        _register_live_row(request)
 
         # Race relay long-poll (if delivered) against terminal resolution.
         decision = wait_for_response(

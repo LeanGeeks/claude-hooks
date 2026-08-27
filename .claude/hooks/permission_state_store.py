@@ -95,9 +95,9 @@ RESOLUTION_SOURCE_TIMEOUT = "timeout"
 # the relay-path wait loop adopts a terminal state only when it carries this
 # source. Callers pass it explicitly — see update_request_state's inference note.
 RESOLUTION_SOURCE_AGENT = "agent"
+# Epic 26 layer 1: the hook caught a signal and cleaned up its own rows.
+RESOLUTION_SOURCE_INTERRUPTED = "interrupted"
 # Epic 26 layer 2: the owning process was gone when a later hook swept the row.
-# RESOLUTION_SOURCE_INTERRUPTED ("interrupted") is added by task 26-01 in this
-# same block — leave it tidy for that agent to extend rather than rewrite.
 RESOLUTION_SOURCE_ORPHANED = "orphaned"
 
 
@@ -187,6 +187,19 @@ def _ensure_state_directory():
 def _acquire_lock(file_obj):
     """Acquire exclusive lock on file"""
     fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX)
+
+
+def _acquire_lock_bounded(file_obj, timeout: float) -> bool:
+    """Non-blocking acquire with a deadline. True if the lock is held."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(file_obj.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.025)
 
 
 def _release_lock(file_obj):
@@ -432,6 +445,7 @@ def update_request_state(
     resolution_source: Optional[str] = None,
     terminal_answers: Optional[str] = None,
     actor_agent: Optional[str] = None,
+    lock_timeout: Optional[float] = None,
 ) -> Optional[PermissionRequest]:
     """
     Update the state of a request.
@@ -446,13 +460,19 @@ def update_request_state(
         reply_text: Optional reply text (for reply actions)
         actor_user_id: Optional Telegram user ID who performed the action
         resolution_source: Optional source of resolution
-            ("telegram" | "terminal" | "timeout" | "agent")
+            ("telegram" | "terminal" | "timeout" | "agent" | "interrupted" | "orphaned")
         terminal_answers: Optional reduced JSON of the terminal's answers.
             Written only when a value is passed, so a later sweep over sibling
             rows cannot blank out what PostToolUse recorded a moment earlier.
         actor_agent: Optional human-readable actor string for an agent-written
             decision. Written only when a value is passed (same guarded shape as
             actor_user_id), so a later write cannot blank out the attribution.
+        lock_timeout: When None (default), acquires the file lock with blocking
+            LOCK_EX, exactly as before. When a float, uses a bounded non-blocking
+            acquire (25 ms polling) that gives up after this many seconds and
+            returns None — the same "did not update" contract the function already
+            has for a terminal row. Used by the signal handler (epic 26 layer 1)
+            to avoid deadlocking against a lock the main thread already holds.
 
     Returns:
         Updated PermissionRequest if successful, None if request not found
@@ -483,7 +503,15 @@ def update_request_state(
 
     # Hold lock for entire read-modify-write operation to prevent race conditions
     with open(STATE_FILE, 'r+') as f:
-        _acquire_lock(f)
+        if lock_timeout is not None:
+            if not _acquire_lock_bounded(f, lock_timeout):
+                debug_log(
+                    f"update_request_state: could not acquire lock within {lock_timeout}s "
+                    f"for {request_id}; giving up (layer 2 sweep will recover)"
+                )
+                return None
+        else:
+            _acquire_lock(f)
         try:
             # Ensure we read from beginning of file
             f.seek(0)

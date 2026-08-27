@@ -1353,5 +1353,153 @@ class TestCompaction(unittest.TestCase):
 
 
 
+class TestBoundedLock(unittest.TestCase):
+    """Epic 26 layer 1: lock_timeout parameter on update_request_state (task 26-01 §1b).
+
+    Case 1: lock_timeout=None is byte-identical to today's behaviour.
+    Case 2: a lock held by a *separate process* causes a bounded-timeout call
+            to return None within the budget (not hang).
+    """
+
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="bounded-lock-test-"))
+        self.state_file = self.temp_dir / "permission_requests.jsonl"
+        self._patches = [
+            patch.object(pss, "STATE_FILE", self.state_file),
+            patch.object(pss, "AUDIT_LOG_FILE",
+                         self.temp_dir / "permission_actions.jsonl"),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _make_request(self, request_id: str = "lock-test-req") -> "pss.PermissionRequest":
+        return create_request(
+            session_id="s-lock-test",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+
+    # ── Case 1 ───────────────────────────────────────────────────────────────
+
+    def test_backward_compat_none_and_default_use_blocking_path(self):
+        """Backward-compatibility guard: omitting lock_timeout or passing None
+        both succeed when the lock is uncontested, and terminal-row idempotency
+        is unchanged.
+
+        Note: this test passes even if lock_timeout is ignored entirely, because
+        no contention is present.  Case 2 is the real regression guard that
+        verifies the bounded path actually fires under contention.
+        """
+        # Default path (no lock_timeout argument).
+        req1 = self._make_request()
+        result_default = update_request_state(
+            req1.request_id,
+            pss.RequestState.ALLOW,
+        )
+        self.assertIsNotNone(result_default)
+        self.assertEqual(result_default.state, "allow")
+
+        # Explicit None: must reach the same blocking path and succeed.
+        req2 = self._make_request()
+        result_none = update_request_state(
+            req2.request_id,
+            pss.RequestState.ALLOW,
+            lock_timeout=None,
+        )
+        self.assertIsNotNone(result_none)
+        self.assertEqual(result_none.state, "allow")
+
+        # Terminal-row idempotency is unchanged: a second write returns None.
+        result_terminal = update_request_state(
+            req2.request_id,
+            pss.RequestState.DENY,
+            lock_timeout=None,
+        )
+        self.assertIsNone(result_terminal)
+
+    # ── Case 2 ───────────────────────────────────────────────────────────────
+
+    def test_bounded_lock_times_out_when_lock_held_by_separate_process(self):
+        """A sub-process that holds the flock causes a bounded acquire to give
+        up and return None within approximately the requested budget.
+
+        Must use a *separate process* — an in-process second flock on the same
+        fd would not reproduce the deadlock scenario (H2).
+
+        The call is wrapped in a daemon thread with a hard 2-second deadline so
+        that the test FAILS rather than HANGS if lock_timeout is ever ignored
+        (e.g. the bounded path is accidentally removed).
+        """
+        import subprocess
+        import threading
+
+        req = self._make_request()
+
+        # The locker script opens the state file, acquires LOCK_EX, signals
+        # ready via a line on stdout, then sleeps until its stdin is closed.
+        locker_src = f"""
+import fcntl, sys, time
+state_file = {str(self.state_file)!r}
+with open(state_file, 'r+') as f:
+    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+    sys.stdout.write("locked\\n")
+    sys.stdout.flush()
+    sys.stdin.read()   # block until closed
+"""
+        locker = subprocess.Popen(
+            [sys.executable, "-c", locker_src],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+        try:
+            # Wait for the locker to hold the lock.
+            ready = locker.stdout.readline()
+            self.assertEqual(ready.strip(), b"locked")
+
+            # Run update_request_state in a daemon thread so a hang does not
+            # freeze the test runner — join with a 2-second hard cap and fail
+            # explicitly if it is still alive after that.
+            result_holder = [None]
+            def _call():
+                result_holder[0] = update_request_state(
+                    req.request_id,
+                    pss.RequestState.ALLOW,
+                    lock_timeout=0.25,
+                )
+
+            t = threading.Thread(target=_call, daemon=True)
+            start = time.monotonic()
+            t.start()
+            t.join(timeout=2.0)
+            elapsed = time.monotonic() - start
+
+            if t.is_alive():
+                self.fail(
+                    "update_request_state with lock_timeout=0.25 did not return within "
+                    "2.0 s — bounded acquire was probably ignored (would hang forever)"
+                )
+            result = result_holder[0]
+        finally:
+            locker.stdin.close()
+            locker.wait(timeout=5)
+
+        self.assertIsNone(result, "bounded acquire should return None when lock is held")
+        self.assertLess(elapsed, 0.6, f"should give up quickly, took {elapsed:.3f}s")
+
+        # The on-disk row must remain pending.
+        on_disk = pss.get_request(req.request_id)
+        self.assertEqual(on_disk.state, "pending",
+                         "On-disk state must remain pending when lock could not be acquired")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
