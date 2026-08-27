@@ -19,7 +19,7 @@ both tasks are specified to be correct either way.
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
 | 26-01 | [Signal revoke](./26-01-signal-revoke_sonnet.md) | todo | — | Layer 1 — the fast path. Small, and carries the probe. Inert if the harness `SIGKILL`s. |
-| 26-02 | [Orphan sweep](./26-02-orphan-sweep_sonnet.md) | todo | — | Layer 2 — **the guarantee**. Holds under `SIGKILL`, crash, OOM, reboot. Ship this one even if 26-01 is skipped. |
+| 26-02 | [Orphan sweep](./26-02-orphan-sweep_sonnet.md) | done | — | Layer 2 — **the guarantee**. Holds under `SIGKILL`, crash, OOM, reboot. Ship this one even if 26-01 is skipped. |
 | 26-03 | [Live verification](./26-03-live-verification_human.md) | todo | 26-01 + 26-02 installed | **human** — five cases, three of which are controls. Records the probe result. |
 
 ## Dependency graph
@@ -158,4 +158,17 @@ to respect:
   process the harness is waiting to reap. The handler now runs the revokes in a
   daemon thread with `join(1.0)` (26-01 decision 5) and brd §3 H3 states the
   measurement instead of asserting a budget the code could not meet.
-
+- **2026-08-27 — 26-02 landed.** Implemented, reviewed and fixed. The
+  `revoke_telegram_message` move was performed by this task (26-01 had not run),
+  taking `resolve_role_token` with it as `_resolve_role_token`; its debug lines
+  now go to `permission_state_debug.log`, which nothing referenced under the old
+  destination. Sweep cost measured at **23.6 ms against a copy** of the store, so
+  both call sites call it unconditionally with no stamp-file gate. Review found
+  0 BLOCKER / 0 HIGH; the two MEDIUMs were coverage gaps on unknown-liveness
+  paths (`owner_start_ticks = None` with a live owner, and `PermissionError` from
+  `os.kill`) — both now have sweep-context tests that were **watched to fail**
+  with the decision inverted before being accepted. Per-call-site `try/except`
+  added around the sweep as defence in depth for invariant 1. Suite 1278 → 1291
+  passed (+15 cases). Installer re-run. **26-01 still owns
+  `RESOLUTION_SOURCE_INTERRUPTED` and `lock_timeout`; the constant block was left
+  tidy for it to extend.**

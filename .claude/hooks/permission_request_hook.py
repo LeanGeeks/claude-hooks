@@ -51,6 +51,7 @@ from permission_state_store import (
     resolve_via_terminal,
     update_request_state,
     cleanup_expired_requests,
+    sweep_orphaned_requests,
     RESOLUTION_SOURCE_AGENT,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
@@ -1437,6 +1438,17 @@ def main():
 
         # Cleanup expired requests periodically
         cleanup_expired_requests()
+        # Sweep orphaned rows (epic 26 layer 2). Runs once per prompt, which is
+        # lower frequency than PostToolUse, so no stamp-file gate needed.
+        # State first, buttons second (invariant 5); fail open (invariant 1).
+        try:
+            for _row in sweep_orphaned_requests():
+                try:
+                    telegram_router.revoke_telegram_message(_row)
+                except Exception as e:      # noqa: BLE001 — H1
+                    debug_log(f"Sweep: revoke of {_row.telegram_message_id} failed: {e}")
+        except Exception as e:          # noqa: BLE001 — H1 defence in depth
+            debug_log(f"Sweep: unexpected error in sweep_orphaned_requests: {type(e).__name__}: {e}")
         session_yolo_store.prune()
 
         # Read hook input from stdin

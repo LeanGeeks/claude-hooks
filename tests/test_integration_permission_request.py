@@ -1393,10 +1393,12 @@ class TestPostToolRoleRevoke(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _revoke(self, request):
+        # revoke_telegram_message was moved to telegram_permission_router (epic
+        # 26-02); posttool_hook now delegates to it.
         tpr = self.posttool_hook.telegram_permission_router
         with patch.object(tpr, "remove_inline_buttons") as remove, \
              patch.object(tpr, "set_message_reaction", return_value=True) as react:
-            ok = self.posttool_hook.revoke_telegram_message(request)
+            ok = tpr.revoke_telegram_message(request)
         return ok, remove, react
 
     def test_role_tagged_request_revoked_through_the_roles_client(self):

@@ -811,6 +811,77 @@ def set_message_reaction(message_id: int, emoji: str) -> bool:
     return True
 
 
+def _resolve_role_token(request: PermissionRequest) -> "Optional[str]":
+    """Re-resolve the installation token for ``request.role``.
+
+    The token is never persisted — only the role id is — so a hook running in a
+    separate process from the one that sent the message must look it up again
+    from the row's own ``cwd``.
+
+    Returns ``None`` (the default destination) when the request carries no role
+    or when resolution fails for any reason. A failed revoke must never affect
+    tool execution, so every failure is logged and swallowed.
+
+    Moved from ``posttool_hook.py`` (epic 26-02) so that ``sweep_orphaned_requests``
+    call sites in both ``posttool_hook`` and ``permission_request_hook`` can share
+    the same revoke path without duplicating the role-token logic.
+
+    ``roles_config`` is imported inside the function (not via the module-level
+    name) to ensure patching ``roles_config.load_bindings`` in tests works
+    correctly regardless of test-suite ordering — the same reason the original
+    ``posttool_hook.resolve_role_token`` did it this way.
+    """
+    role = getattr(request, 'role', None)
+    if not role:
+        return None
+    try:
+        import roles_config as _rc  # always the live sys.modules entry
+        catalog = _rc.load_catalog(request.cwd)
+        if catalog is None:
+            debug_log(f"No roles catalog for {request.cwd}; using default client")
+            return None
+        bindings = _rc.load_bindings()
+        destination = _rc.resolve_destination(catalog, bindings, role)
+        if destination.token is None:
+            debug_log(f"Role {role!r} has no binding; using default client")
+        return destination.token
+    except Exception as e:
+        debug_log(f"Role token resolution failed for {role!r}: {type(e).__name__}: {e}")
+        return None
+
+
+def revoke_telegram_message(request: PermissionRequest) -> bool:
+    """Revoke a Telegram message by removing buttons and adding reaction.
+
+    Args:
+        request: The PermissionRequest whose ``telegram_message_id`` should be
+            revoked. Taking the whole row (not a bare id) is what lets us reach
+            the right destination: the relay scopes messages to the installation
+            that created them, so cancelling a role message against the default
+            token would 404.
+
+    Returns:
+        True if the cancel actually landed, False otherwise.
+
+        The return value tracks ``remove_inline_buttons`` alone.
+        ``set_message_reaction`` is a no-op shim that returns True
+        unconditionally, so reporting *its* result made the caller's log line
+        unfalsifiable.
+
+    Moved from ``posttool_hook.py`` (epic 26-02) so that the sweep call sites
+    in both hooks share one revoke implementation.
+    """
+    message_id = request.telegram_message_id
+    token = _resolve_role_token(request)
+
+    cancelled = remove_inline_buttons(message_id, token=token)
+
+    # Reaction shim; kept for when the relay grows a reaction API.
+    set_message_reaction(message_id, '✅')
+
+    return cancelled
+
+
 def edit_message_text(
     message_id: int,
     text: str,

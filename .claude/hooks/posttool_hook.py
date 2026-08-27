@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from permission_state_store import (
     find_pending_request_by_tool_session,
     resolve_via_terminal,
+    sweep_orphaned_requests,
 )
 import telegram_permission_router
 
@@ -104,70 +105,6 @@ def reduce_tool_response(tool_response) -> str:
     return encoded
 
 
-def resolve_role_token(request) -> "str | None":
-    """Re-resolve the installation token for ``request.role``.
-
-    The token is never persisted — only the role id is — so this hook, which
-    runs in a separate process from the one that sent the message, has to look
-    it up again from the row's own ``cwd``.
-
-    Returns ``None`` (the default destination) when the request carries no role
-    or when resolution fails for any reason. A failed revoke must never affect
-    tool execution, so every failure is logged and swallowed.
-    """
-    role = getattr(request, 'role', None)
-    if not role:
-        return None
-    try:
-        import roles_config
-
-        catalog = roles_config.load_catalog(request.cwd)
-        if catalog is None:
-            log_debug(f"No roles catalog for {request.cwd}; using default client")
-            return None
-        bindings = roles_config.load_bindings()
-        destination = roles_config.resolve_destination(catalog, bindings, role)
-        if destination.token is None:
-            log_debug(f"Role {role!r} has no binding; using default client")
-        return destination.token
-    except Exception as e:
-        log_debug(f"Role token resolution failed for {role!r}: {type(e).__name__}: {e}")
-        return None
-
-
-def revoke_telegram_message(request) -> bool:
-    """
-    Revoke a Telegram message by removing buttons and adding reaction.
-
-    Args:
-        request: The PermissionRequest whose ``telegram_message_id`` should be
-            revoked. Taking the whole row (not a bare id) is what lets us reach
-            the right destination: the relay scopes messages to the installation
-            that created them, so cancelling a role message against the default
-            token would 404.
-
-    Returns:
-        True if the cancel actually landed, False otherwise.
-
-        The return value tracks ``remove_inline_buttons`` alone. ``set_message_reaction``
-        is a no-op shim (the relay exposes no reaction API) that returns True
-        unconditionally, so reporting *its* result made the caller's
-        "Revoked Telegram message" log line unfalsifiable — it printed just the
-        same when the cancel had failed.
-    """
-    message_id = request.telegram_message_id
-    token = resolve_role_token(request)
-
-    cancelled = telegram_permission_router.remove_inline_buttons(
-        message_id, token=token
-    )
-
-    # Reaction shim; kept for when the relay grows a reaction API.
-    telegram_permission_router.set_message_reaction(message_id, '✅')
-
-    return cancelled
-
-
 def main():
     """Main hook entry point."""
     try:
@@ -198,6 +135,18 @@ def main():
         if not telegram_permission_router.TELEGRAM_ENABLED:
             log_debug("Telegram not enabled, skipping")
             sys.exit(0)
+
+        # Sweep orphaned rows (epic 26 layer 2). Runs before find_pending so the
+        # orphan check runs on every tool call — the highest-frequency hook event.
+        # State first, buttons second (invariant 5); fail open (invariant 1).
+        try:
+            for _row in sweep_orphaned_requests():
+                try:
+                    telegram_permission_router.revoke_telegram_message(_row)
+                except Exception as e:      # noqa: BLE001 — H1
+                    log_debug(f"Sweep: revoke of {_row.telegram_message_id} failed: {e}")
+        except Exception as e:          # noqa: BLE001 — H1 defence in depth
+            log_debug(f"Sweep: unexpected error in sweep_orphaned_requests: {type(e).__name__}: {e}")
 
         # Find pending request for this tool/session/agent
         pending_request = find_pending_request_by_tool_session(
@@ -234,7 +183,7 @@ def main():
 
         # Revoke the Telegram message if we have a message ID
         if pending_request.telegram_message_id:
-            success = revoke_telegram_message(pending_request)
+            success = telegram_permission_router.revoke_telegram_message(pending_request)
             if success:
                 log_debug(f"Revoked Telegram message {pending_request.telegram_message_id}")
             else:

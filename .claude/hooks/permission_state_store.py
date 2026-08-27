@@ -18,6 +18,7 @@ State machine: pending -> allow|deny|stop|whitelist|reply|expired
 import json
 import os
 import fcntl
+import socket
 import uuid
 import time
 from datetime import datetime, timedelta, timezone
@@ -94,6 +95,10 @@ RESOLUTION_SOURCE_TIMEOUT = "timeout"
 # the relay-path wait loop adopts a terminal state only when it carries this
 # source. Callers pass it explicitly — see update_request_state's inference note.
 RESOLUTION_SOURCE_AGENT = "agent"
+# Epic 26 layer 2: the owning process was gone when a later hook swept the row.
+# RESOLUTION_SOURCE_INTERRUPTED ("interrupted") is added by task 26-01 in this
+# same block — leave it tidy for that agent to extend rather than rewrite.
+RESOLUTION_SOURCE_ORPHANED = "orphaned"
 
 
 @dataclass
@@ -128,6 +133,12 @@ class PermissionRequest:
     # *reduced* view of ``tool_response``, never the raw payload (the store is
     # append-only JSONL, re-read in full on every hook invocation).
     terminal_answers: Optional[str] = None
+    # Who created this row (epic 26 layer 2). A row whose owner is gone is
+    # closed by ``sweep_orphaned_requests``; a row with no owner (written before
+    # epic 26) is never swept and keeps its TTL behaviour.
+    owner_pid: Optional[int] = None
+    owner_start_ticks: Optional[int] = None   # /proc/<pid>/stat field 22
+    owner_host: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -229,6 +240,20 @@ def append_agent_decision_reason(entry: AuditEntry) -> None:
     _append_audit_log(entry)
 
 
+def _proc_start_ticks(pid: int) -> Optional[int]:
+    """Field 22 of /proc/<pid>/stat, or None if it cannot be read.
+
+    ``comm`` (field 2) is parenthesised and may contain spaces *and* ')', so the
+    only safe split is on the LAST ') ' — never ``split()`` on the whole line.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r") as f:
+            rest = f.read().rsplit(") ", 1)[1].split()
+        return int(rest[19])          # field 22 = index 19 after state (field 3)
+    except Exception:
+        return None
+
+
 def create_request(
     session_id: str,
     cwd: str,
@@ -265,6 +290,22 @@ def create_request(
     # rows this append log accumulates (8 hex / 32 bits was collision-prone).
     request_id = uuid.uuid4().hex[:12]
 
+    # Stamp owner identity (epic 26 layer 2). All three inside one try/except so
+    # a row that cannot be stamped keeps None for all three and is never swept —
+    # exactly today's behaviour for legacy rows.
+    owner_pid: Optional[int] = None
+    owner_start_ticks: Optional[int] = None
+    owner_host: Optional[str] = None
+    try:
+        _pid = os.getpid()
+        owner_pid = _pid
+        owner_start_ticks = _proc_start_ticks(_pid)
+        owner_host = socket.gethostname()
+    except Exception:
+        owner_pid = None
+        owner_start_ticks = None
+        owner_host = None
+
     request = PermissionRequest(
         request_id=request_id,
         session_id=session_id,
@@ -278,6 +319,9 @@ def create_request(
         expires_at=_expires_at(ttl_seconds),
         agent_id=agent_id,
         role=role,
+        owner_pid=owner_pid,
+        owner_start_ticks=owner_start_ticks,
+        owner_host=owner_host,
     )
 
     # Append to state file with lock
@@ -674,6 +718,156 @@ def cleanup_expired_requests() -> int:
         Number of requests marked expired.
     """
     return len(expire_pending_requests())
+
+
+def sweep_orphaned_requests() -> List[PermissionRequest]:
+    """Close pending rows whose owning process no longer exists.
+
+    Returns:
+        List of rows that were swept (state set to RESOLVED_TERMINAL /
+        orphaned). The caller is responsible for revoking their Telegram
+        messages — the store does no network I/O.
+
+    Decision table for each pending, non-expired row:
+
+    | Condition                                  | Action          |
+    |--------------------------------------------|-----------------|
+    | owner_pid is None (pre-epic row)           | skip            |
+    | owner_host != socket.gethostname()         | skip            |
+    | owner_pid == os.getpid()                   | skip (us)       |
+    | os.kill(pid, 0) raises ProcessLookupError  | sweep           |
+    | os.kill(pid, 0) raises PermissionError     | skip (alive)    |
+    | _proc_start_ticks(pid) is None             | skip (unknown)  |
+    | stored owner_start_ticks is None           | skip (unknown)  |
+    | ticks differ from stored value             | sweep (reused)  |
+    | otherwise                                  | skip (alive)    |
+
+    Unknown liveness always means LEAVE ALONE (brd §3 H4): failing to sweep
+    is invisible and harmless; sweeping a live row destroys a prompt the
+    operator is looking at.
+    """
+    if not STATE_FILE.exists():
+        return []
+
+    swept_requests: List[PermissionRequest] = []
+    now = _utc_now()
+    changed = False
+
+    try:
+        this_host = socket.gethostname()
+    except Exception:
+        # Cannot determine our hostname — skip the entire sweep.
+        debug_log("sweep_orphaned_requests: gethostname() failed, skipping")
+        return []
+
+    this_pid = os.getpid()
+
+    with open(STATE_FILE, 'r+') as f:
+        _acquire_lock(f)
+        try:
+            f.seek(0)
+            lines = f.readlines()
+            kept_lines: List[str] = []
+
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                try:
+                    data = json.loads(stripped)
+
+                    if data.get('state') != RequestState.PENDING.value:
+                        kept_lines.append(json.dumps(data) + '\n')
+                        continue
+
+                    # Skip expired rows — leave them to expire_pending_requests.
+                    if _is_expired(data.get('expires_at', '')):
+                        kept_lines.append(json.dumps(data) + '\n')
+                        continue
+
+                    owner_pid = data.get('owner_pid')
+                    if owner_pid is None:
+                        # Legacy row (no owner stamp) — never swept.
+                        kept_lines.append(json.dumps(data) + '\n')
+                        continue
+
+                    if data.get('owner_host') != this_host:
+                        # Different host — we cannot see its /proc.
+                        kept_lines.append(json.dumps(data) + '\n')
+                        continue
+
+                    if owner_pid == this_pid:
+                        # This process created the row — cannot be orphaned yet.
+                        kept_lines.append(json.dumps(data) + '\n')
+                        continue
+
+                    # --- Liveness check ---
+                    do_sweep = False
+                    try:
+                        os.kill(owner_pid, 0)
+                        # Process exists (or we lack permission). Check start time
+                        # to guard against PID reuse.
+                        current_ticks = _proc_start_ticks(owner_pid)
+                        stored_ticks = data.get('owner_start_ticks')
+                        if current_ticks is None or stored_ticks is None:
+                            # Cannot confirm identity — leave alone.
+                            do_sweep = False
+                        elif current_ticks != stored_ticks:
+                            # PID was reused by a different process — owner is gone.
+                            do_sweep = True
+                        else:
+                            # Same PID, same start time — owner is alive.
+                            do_sweep = False
+                    except ProcessLookupError:
+                        # PID is gone.
+                        do_sweep = True
+                    except PermissionError:
+                        # Process exists but belongs to another user — alive.
+                        do_sweep = False
+                    except Exception:
+                        # Unexpected error — fail open, leave alone.
+                        do_sweep = False
+
+                    if do_sweep:
+                        data['state'] = RequestState.RESOLVED_TERMINAL.value
+                        data['resolution_source'] = RESOLUTION_SOURCE_ORPHANED
+                        data['resolved_at'] = now
+                        data['updated_at'] = now
+                        swept_requests.append(PermissionRequest.from_dict(data))
+                        changed = True
+
+                    kept_lines.append(json.dumps(data) + '\n')
+
+                except json.JSONDecodeError:
+                    kept_lines.append(stripped + '\n')
+
+            # Only rewrite the file when something changed.
+            if changed:
+                f.seek(0)
+                f.truncate()
+                f.writelines(kept_lines)
+                f.flush()
+                os.fsync(f.fileno())
+
+        finally:
+            _release_lock(f)
+
+    for request in swept_requests:
+        audit_entry = AuditEntry(
+            timestamp=_utc_now(),
+            request_id=request.request_id,
+            action=RESOLUTION_SOURCE_ORPHANED,
+            actor_user_id=None,
+            previous_state=RequestState.PENDING.value,
+            new_state=RequestState.RESOLVED_TERMINAL.value,
+        )
+        _append_audit_log(audit_entry)
+
+    if swept_requests:
+        debug_log(f"sweep_orphaned_requests: swept {len(swept_requests)} rows")
+
+    return swept_requests
 
 
 def mark_expired_notified(request_id: str) -> bool:
