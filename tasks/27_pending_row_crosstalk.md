@@ -286,3 +286,32 @@ writing.
 against the installed copy, and this file updated with the probe result from §4.4
 (what a real PostToolUse `tool_input` contains) whether or not it changed the
 comparator.
+
+---
+
+## 10. Implementation log
+
+- **2026-08-27 — landed.** Implemented, reviewed and fixed; committed on `main`.
+  Landed **second** relative to epic 26, so per that epic's cross-link the sweep,
+  bounded-lock and signal-handler classes were re-run: **22/22 green**. Full suite
+  1300 → 1308 ran / 1307 passed (1 pre-existing unrelated error).
+  Review confirmed §4.1's trap is closed: a **"different call"** row is excluded
+  outright at `permission_state_store.py:1163` and is unreachable by any fallback,
+  tiebreak or exception path — verified by code trace, by an ad-hoc probe of the
+  §1 scenario, and by direct invocation of `_classify_candidate`.
+  Both AskUserQuestion payload transformations named in §4.2 now have tests that
+  were **watched to fail** under whole-dict comparison: the alias-stripped header
+  (`'Q-531'` stored vs `'@htl Q-531'` posted) and the `updatedInput` answers merge.
+  Comparator errors fall to `cannot_tell`, never to exclusion, and now log the tool
+  name and row id.
+
+**Still open — operator only:**
+
+- **§4.4 probe (deliberately not run).** It requires adding `CLAUDE_HOOK_DEBUG=1`
+  to the PostToolUse entry in the live `~/.claude/settings.json`; no agent edited
+  that file. Consequently the **Bash** comparator's payload shape rests on
+  code-reading rather than a captured payload. The **AskUserQuestion** comparator
+  does not depend on the probe — question text survives both transformations
+  either way.
+- **§7.7 live end-to-end.** The heartbeat + role-tagged parallel-question scenario
+  in a real Telegram chat. Not reproducible from an agent.
