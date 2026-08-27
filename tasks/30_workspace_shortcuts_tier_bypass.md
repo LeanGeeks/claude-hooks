@@ -20,9 +20,13 @@ return `allowed: True` above `_tier_override_result`:
 
 | Shortcut | Line |
 |---|---|
-| `local_function` | `pretool_hook.py:1326` |
-| `workspace_binary` | `:1332` |
-| `workspace_rm` | `:1345` |
+| `local_function` | `pretool_hook.py:1385` |
+| `workspace_binary` | `:1398` |
+| `workspace_rm` | `:1411` |
+
+**Line numbers refreshed 2026-08-27** after tasks 28 (`9a48e3e`) and 31
+(`b2f9ee8`) landed; the `:1326/:1332/:1345` anchors in the original filing are
+stale. Re-anchor by the `matched_allow_patterns` marker string, not by number.
 
 Measured in a scratch workspace, fixture verified:
 
