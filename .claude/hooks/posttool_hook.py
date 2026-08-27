@@ -148,12 +148,16 @@ def main():
         except Exception as e:          # noqa: BLE001 — H1 defence in depth
             log_debug(f"Sweep: unexpected error in sweep_orphaned_requests: {type(e).__name__}: {e}")
 
-        # Find pending request for this tool/session/agent
+        # Find pending request for this tool/session/agent.
+        # Pass tool_input so the three-valued classifier (task 27 §4) can
+        # exclude rows that belong to a concurrent call of the same tool in
+        # the same session, preventing cross-call crosstalk.
         pending_request = find_pending_request_by_tool_session(
             session_id=session_id,
             tool_name=tool_name,
             cwd=cwd,
             agent_id=agent_id,
+            tool_input=tool_input,
         )
 
         if not pending_request:

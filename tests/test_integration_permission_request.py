@@ -573,10 +573,11 @@ class TestTerminalResolutionRace(unittest.TestCase):
         _mock_catalog,       # load_catalog → None (legacy mode)
         _mock_bindings,      # load_bindings → MagicMock (unused in legacy mode)
     ):
-        """Two questions, answered in the terminal. The PostToolUse hook only
-        flips the *most recent* child (the last one) to resolved_terminal, while
-        the first child's thread is still parked in a long-poll. Every sibling's
-        keyboard must still be stripped — not just the last one."""
+        """Two questions, answered in the terminal. The PostToolUse hook flips
+        whichever child matches the answered call's tool_input (task 27 §4 —
+        three-valued classifier). In this test the last child is resolved; the
+        first child's thread is still parked in a long-poll. Every sibling's
+        keyboard must still be stripped — not just the resolved one."""
         from permission_request_hook import handle_ask_user_question
         from permission_state_store import RequestState
 
@@ -587,8 +588,10 @@ class TestTerminalResolutionRace(unittest.TestCase):
         ]
         msg_ids = {"child-1": 501, "child-2": 502}
 
-        # Only the *last* child is flipped to resolved_terminal (mirrors
-        # find_pending_request_by_tool_session returning the most recent row).
+        # The last child is flipped to resolved_terminal here to simulate
+        # find_pending_request_by_tool_session matching the most-recently-created
+        # child when tool_input comparison cannot distinguish siblings (e.g.
+        # identical questions — task 27 H4).
         def _get_request_side_effect(request_id):
             if request_id == "child-2":
                 return _make_request(
@@ -789,6 +792,304 @@ class TestCrossAgentIsolation(unittest.TestCase):
 
         loaded = get_request(req.request_id)
         self.assertEqual(loaded.agent_id, "agent-xyz")
+
+    # ------------------------------------------------------------------
+    # Task 27 — cross-call crosstalk: tool_input discriminator
+    # ------------------------------------------------------------------
+
+    def test_askuserquestion_different_question_excluded(self):
+        """§7.1 regression — AskUserQuestion.
+
+        Two pending rows, same session/tool/cwd, different questions. The first
+        is resolved (reply) as Telegram does it, leaving only the second pending.
+        PostToolUse fires with the *first* call's tool_input. It must find NO
+        row and write nothing — the second row stays pending.
+        """
+        from permission_state_store import (
+            RequestState,
+            create_request,
+            find_pending_request_by_tool_session,
+            update_request_state,
+        )
+
+        # Row 1: heartbeat question (already answered via Telegram → reply)
+        row1 = create_request(
+            session_id="sess-aq",
+            cwd="/project",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Heartbeat: cut it?"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+        update_request_state(
+            row1.request_id,
+            RequestState.REPLY,
+            resolution_source="telegram",
+        )
+
+        # Row 2: Q-531 — still pending, different question
+        create_request(
+            session_id="sess-aq",
+            cwd="/project",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Q-531: biome tests/**?"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # PostToolUse fires with the FIRST call's tool_input — must find nothing.
+        found = find_pending_request_by_tool_session(
+            session_id="sess-aq",
+            tool_name="AskUserQuestion",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"question": "Heartbeat: cut it?"},
+        )
+        self.assertIsNone(found, "Second row must NOT be returned for a different question")
+
+    def test_askuserquestion_same_question_found(self):
+        """§7.3 control — a single pending AskUserQuestion answered in the TUI
+        is still found when tool_input carries the matching question."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="sess-aq-ctrl",
+            cwd="/project",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Deploy to prod?"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        found = find_pending_request_by_tool_session(
+            session_id="sess-aq-ctrl",
+            tool_name="AskUserQuestion",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"question": "Deploy to prod?"},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_bash_different_command_excluded(self):
+        """§7.2 regression — Bash.
+
+        Two pending rows, different commands. PostToolUse fires with the first
+        command's tool_input. The second row must NOT be returned.
+        """
+        from permission_state_store import (
+            RequestState,
+            create_request,
+            find_pending_request_by_tool_session,
+            update_request_state,
+        )
+
+        # Row 1: already answered (Telegram)
+        row1 = create_request(
+            session_id="sess-bash",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "make build"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+        update_request_state(
+            row1.request_id,
+            RequestState.REPLY,
+            resolution_source="telegram",
+        )
+
+        # Row 2: still pending, different command
+        create_request(
+            session_id="sess-bash",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "rm -rf dist"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # PostToolUse fires with the FIRST command — must find nothing.
+        found = find_pending_request_by_tool_session(
+            session_id="sess-bash",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"command": "make build"},
+        )
+        self.assertIsNone(found, "Second row must NOT be returned for a different command")
+
+    def test_bash_same_command_found(self):
+        """§7.3 control — a single pending Bash row is still found when
+        tool_input carries the matching command."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="sess-bash-ctrl",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "npm test"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        found = find_pending_request_by_tool_session(
+            session_id="sess-bash-ctrl",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"command": "npm test"},
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_tool_input_none_legacy_behaviour(self):
+        """§7.5 control — omitting tool_input (None) treats every row as
+        "cannot_tell", preserving the pre-task-27 behaviour exactly."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="sess-legacy",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={"command": "echo hello"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # Caller omits tool_input — legacy path must still find the row.
+        found = find_pending_request_by_tool_session(
+            session_id="sess-legacy",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+            # tool_input intentionally omitted (defaults to None)
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_empty_tool_input_row_is_cannot_tell(self):
+        """§7.5 control — a row whose stored tool_input is empty (argument-less
+        MCP call) is treated as "cannot_tell" and is still matched."""
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        req = create_request(
+            session_id="sess-empty-ti",
+            cwd="/project",
+            tool_name="Bash",
+            tool_input={},   # empty — no command key
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        found = find_pending_request_by_tool_session(
+            session_id="sess-empty-ti",
+            tool_name="Bash",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"command": "make install"},
+        )
+        self.assertIsNotNone(found, "Empty-input row must fall through to cannot_tell and be matched")
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_askuserquestion_alias_stripped_header_matches(self):
+        """§4.2 — role-routed rows store the alias-stripped question text.
+
+        The row holds 'Q-531' (stored by permission_request_hook after stripping
+        the '@htl' alias prefix).  PostToolUse receives the realistic multi-question
+        shape {'questions': [{'header': '@htl Q-531', 'question': 'Q-531'}]}.
+        The comparator must extract the question string from the questions list and
+        compare it against the row's stored string — so the alias prefix in 'header'
+        does not trigger a "different" verdict.
+        """
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        # Row stored by permission_request_hook after alias-stripping the header.
+        req = create_request(
+            session_id="sess-alias",
+            cwd="/project",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Q-531"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # PostToolUse receives the realistic multi-question payload.  The 'header'
+        # field carries the original '@htl Q-531' alias prefix; 'question' holds
+        # the bare text.  The comparator must use 'question', not 'header'.
+        found = find_pending_request_by_tool_session(
+            session_id="sess-alias",
+            tool_name="AskUserQuestion",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"questions": [{"header": "@htl Q-531", "question": "Q-531"}]},
+        )
+        self.assertIsNotNone(found, "alias-prefixed header must not prevent a match")
+        self.assertEqual(found.request_id, req.request_id)
+
+    def test_askuserquestion_updatedinput_answers_merge_matches(self):
+        """§4.2 — Telegram-answered calls arrive at PostToolUse with updatedInput applied.
+
+        When the relay answers a question, permission_request_hook returns
+        {**tool_input, 'answers': {...}} as updatedInput (hook lines 1342-1352).
+        The 'answers' key is merged into the dict that PostToolUse passes back to the
+        store.  The comparator must compare question strings, not the whole dict, so
+        the extra 'answers' key does not trigger a "different" verdict.
+
+        This is the second of two live transformations §4.2 says the comparator must
+        be immune to; the alias-stripped-header test covers the first.
+        """
+        from permission_state_store import (
+            create_request,
+            find_pending_request_by_tool_session,
+        )
+
+        # Row stored with the bare question text.
+        req = create_request(
+            session_id="sess-updatedinput",
+            cwd="/project",
+            tool_name="AskUserQuestion",
+            tool_input={"question": "Deploy now?"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            agent_id=None,
+        )
+
+        # PostToolUse receives the Telegram-enriched payload: original tool_input
+        # plus an 'answers' key added by updatedInput ({**tool_input, 'answers': ...}).
+        found = find_pending_request_by_tool_session(
+            session_id="sess-updatedinput",
+            tool_name="AskUserQuestion",
+            cwd="/project",
+            agent_id=None,
+            tool_input={"question": "Deploy now?", "answers": {"Deploy now?": "yes"}},
+        )
+        self.assertIsNotNone(found, "updatedInput answers merge must not prevent a match")
+        self.assertEqual(found.request_id, req.request_id)
 
 
 class _FakeRelayClient:

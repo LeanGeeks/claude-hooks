@@ -778,10 +778,11 @@ def _child_wait_loop(
 def _any_child_resolved_in_terminal(groups: Dict[str, List["_ChildRecord"]]) -> bool:
     """True when *any* child row reads ``resolved_terminal``.
 
-    The PostToolUse hook only flips the most recent pending child
-    (``find_pending_request_by_tool_session`` returns a single row), but that
-    signals the whole AskUserQuestion was answered at the keyboard. Detecting it
-    on any child is what stops a loop parked elsewhere leaving keyboards live.
+    The PostToolUse hook flips whichever pending child matches the answered
+    call's tool_input (task 27 §4 — three-valued classifier).  When any child
+    of this group is resolved_terminal that signals the whole AskUserQuestion
+    was answered at the keyboard. Detecting it on any child is what stops a
+    loop parked elsewhere leaving keyboards live.
     """
     for records in groups.values():
         for rec in records:

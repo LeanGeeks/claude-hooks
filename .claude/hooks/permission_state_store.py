@@ -1015,11 +1015,81 @@ def find_pending_request_by_session(session_id: str) -> Optional[PermissionReque
     return get_pending_request_for_session(session_id)
 
 
+def _classify_candidate(
+    row_tool_input: Dict[str, Any],
+    posted_tool_input: Optional[Dict[str, Any]],
+    tool_name: str,
+) -> str:
+    """Three-valued classifier for one candidate row (§4, task 27).
+
+    Returns one of:
+      "same"       — the row's stored input identifies this specific call
+      "different"  — the row's stored input identifies a *different* call
+      "cannot_tell" — no verified comparator for this shape, or insufficient
+                     data to decide; treated as eligible for legacy fallback
+
+    Rules:
+    - If ``posted_tool_input`` is None, every row is "cannot_tell" so that
+      callers that omit tool_input preserve existing behaviour exactly.
+    - Only ``AskUserQuestion`` and ``Bash`` have verified comparators (§4.2).
+      Everything else is "cannot_tell" — an unverified comparator that wrongly
+      returns "different" is the H2 failure mode (orphaned cards).
+    - H4: two byte-identical questions asked in parallel stay indistinguishable;
+      "cannot_tell" is the correct verdict and ``created_at`` picks one.
+      Both candidates carry the same answer, so the wrong pick is harmless.
+    - H1 (fail open): any exception within this function is caught by the
+      caller, which treats the row as "cannot_tell" and logs.
+    """
+    if posted_tool_input is None:
+        return "cannot_tell"
+
+    if tool_name == "AskUserQuestion":
+        # Compare question TEXT only — never the whole dict.
+        # Two live reasons: role-routed rows store the alias-stripped header
+        # (the row holds 'Q-531' where the payload says '@htl Q-531'), and a
+        # Telegram-answered call reaches PostToolUse with updatedInput applied
+        # ({**tool_input, 'answers': {...}}). Question strings survive both;
+        # the dict does not (§4.2).
+        row_q = row_tool_input.get("question") if isinstance(row_tool_input, dict) else None
+        # posted tool_input may be the original shape {questions: [...]} or the
+        # alias-stripped single-question shape {question: "..."}. Accept both.
+        posted_q: Optional[str] = None
+        if isinstance(posted_tool_input, dict):
+            if "question" in posted_tool_input:
+                posted_q = posted_tool_input.get("question")
+            elif "questions" in posted_tool_input:
+                questions = posted_tool_input.get("questions")
+                if isinstance(questions, list) and questions:
+                    # Take first question's text as the representative string.
+                    # For single-question calls this is exact. For multi-question
+                    # calls each child row was created with its own single
+                    # question, so the child's row_q matches the posted first
+                    # question only if it is that child — others are "different".
+                    first = questions[0]
+                    if isinstance(first, dict):
+                        posted_q = first.get("question")
+        if row_q and posted_q:
+            return "same" if row_q == posted_q else "different"
+        return "cannot_tell"
+
+    if tool_name == "Bash":
+        # command is the identity; description is model prose (§4.2).
+        row_cmd = (row_tool_input.get("command") if isinstance(row_tool_input, dict) else None) or ""
+        posted_cmd = (posted_tool_input.get("command") if isinstance(posted_tool_input, dict) else None) or ""
+        if row_cmd and posted_cmd:
+            return "same" if row_cmd == posted_cmd else "different"
+        return "cannot_tell"
+
+    # All other tools: no verified comparator — cannot tell.
+    return "cannot_tell"
+
+
 def find_pending_request_by_tool_session(
     session_id: str,
     tool_name: str,
     cwd: Optional[str] = None,
     agent_id: Optional[str] = None,
+    tool_input: Optional[Dict[str, Any]] = None,
 ) -> Optional[PermissionRequest]:
     """
     Find a pending request matching tool name and session.
@@ -1032,14 +1102,27 @@ def find_pending_request_by_tool_session(
         tool_name: Name of the tool that was executed
         cwd: Optional working directory to match
         agent_id: Optional subagent id to match (prevents cross-agent cancellation)
+        tool_input: The posted tool input for this specific call.  When supplied,
+            uses a three-valued per-row classifier (§4, task 27) to exclude rows
+            that definitively belong to a *different* concurrent call of the same
+            tool in the same session.  When omitted (None) every row is treated as
+            "cannot_tell" — preserving the pre-task-27 behaviour exactly.
 
     Returns:
-        Most recent matching pending PermissionRequest if found, None otherwise
+        Most recent matching pending PermissionRequest if found, None otherwise.
+        Returns None when every candidate is excluded as "different call" — the
+        correct no-op for a call whose row was already resolved by its own hook.
+
+    Three-valued classification per candidate row:
+      "same"        → eligible, preferred
+      "different"   → excluded outright — never reaches any fallback
+      "cannot_tell" → eligible, used only when no "same" row exists
     """
     if not STATE_FILE.exists():
         return None
 
-    matching_requests = []
+    same_call: List[PermissionRequest] = []
+    cannot_tell: List[PermissionRequest] = []
 
     with open(STATE_FILE, 'r') as f:
         _acquire_lock(f)
@@ -1063,19 +1146,47 @@ def find_pending_request_by_tool_session(
                             continue
                         request = PermissionRequest.from_dict(data)
                         # Skip if expired
-                        if not _is_expired(request.expires_at):
-                            matching_requests.append(request)
+                        if _is_expired(request.expires_at):
+                            continue
+                        # Three-valued classification (task 27 §4).
+                        # H1: any exception from _classify_candidate is caught
+                        # here so the row falls through to "cannot_tell".
+                        try:
+                            verdict = _classify_candidate(
+                                request.tool_input,
+                                tool_input,
+                                tool_name,
+                            )
+                        except Exception as e:  # noqa: BLE001 — H1 fail open
+                            # debug_log() itself is wrapped in try/except so
+                            # it cannot re-raise and defeat the fail-open goal.
+                            debug_log(
+                                f"_classify_candidate error for "
+                                f"{tool_name}/{request.request_id}: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            verdict = "cannot_tell"
+                        if verdict == "same":
+                            same_call.append(request)
+                        elif verdict == "cannot_tell":
+                            cannot_tell.append(request)
+                        # "different" → excluded outright, not appended anywhere.
+                        # The fallback (cannot_tell) is therefore unreachable by
+                        # a row that has been definitively excluded — this is the
+                        # key invariant that prevents the §4.1 trap.
                 except json.JSONDecodeError:
                     continue
         finally:
             _release_lock(f)
 
-    if not matching_requests:
+    # Prefer "same call" rows; fall back to "cannot_tell"; empty → None.
+    eligible = same_call if same_call else cannot_tell
+    if not eligible:
         return None
 
-    # Return most recent by created_at
-    matching_requests.sort(key=lambda r: r.created_at, reverse=True)
-    return matching_requests[0]
+    # Return most recent by created_at (§4.3: multiple matches are legitimate).
+    eligible.sort(key=lambda r: r.created_at, reverse=True)
+    return eligible[0]
 
 
 def resolve_via_terminal(
