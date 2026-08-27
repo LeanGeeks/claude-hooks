@@ -20,7 +20,17 @@ class BashCommandParser:
     # Note: an unquoted newline IS a command separator (treated like ';').
     # Escaped/continuation newlines, quoted newlines, heredoc bodies, and
     # command-substitution newlines are handled specially and do NOT split.
-    OPERATORS = ['&&', '||', '|', ';']
+    #
+    # A bare `&` is a command separator too — `cmd1 & cmd2` backgrounds `cmd1`
+    # and runs `cmd2`, and BOTH execute. Omitting it (task 31) made the parser
+    # return one sub-command headed by `cmd1`, so everything after the `&` was
+    # never classified against any pattern: `true & <anything>` allowed. The
+    # three shapes where `&` is NOT a separator are handled in _check_operator,
+    # which matches `&&` and every redirection form that carries a `&` (`&>`,
+    # `&>>`, `2>&1`, `>&`, `<&`, `1>&2`) BEFORE the lone `&` can be seen, and by
+    # the quote/heredoc/case-pattern state machine in _tokenize_with_quotes,
+    # which never reaches the operator check for a `&` that is data.
+    OPERATORS = ['&&', '||', '|', ';', '&']
 
     # Redirection operators (NOT command separators)
     REDIRECTIONS = ['>', '>>', '<', '<>', '<<', '2>&1', '2>', '&>', '&>>', '1>&2', '2>>', '1>', '<&', '>&']
@@ -846,14 +856,32 @@ class BashCommandParser:
 
         Returns:
             Operator string if found, empty string otherwise
+
+        ORDER IS LOAD-BEARING for `&` (task 31). The list is scanned in order
+        and the FIRST match wins, so every operator that merely CONTAINS a `&`
+        must be matched here before the bare `&` in the single-character set
+        below is ever reached:
+
+        - `&&` is first, so it always beats the lone `&`.
+        - `&>>` precedes `&>`, so the append form is not truncated to `&>` plus
+          a stray `>`.
+        - the fd-duplication forms are matched at the character that STARTS
+          them, never at their `&`: `2>&1` and `1>&2` whole; `>&` at the `>` and
+          `<&` at the `<`, which also covers `n>&m`, `n<&m`, `>&-` and `<&-`
+          (the leading fd digits stay ordinary word characters, the operator is
+          recognized at the `>`/`<`, and the scan resumes past the `&`).
+
+        So the lone `&` below is only ever reached where bash reads one too: as
+        the asynchronous-execution separator.
         """
         # Check multi-character operators first (longest match)
-        for op in ['&&', '||', '2>&1', '>>', '&>>', '2>>', '<<', '<>', '1>&2', '>&', '<&', '1>']:
+        for op in ['&&', '||', '2>&1', '>>', '&>>', '&>', '2>>', '<<', '<>', '1>&2', '>&', '<&', '1>']:
             if command[pos:pos+len(op)] == op:
                 return op
 
-        # Check single-character operators (not newline - newlines are handled separately)
-        if command[pos] in ('|', ';', '>', '<'):
+        # Check single-character operators (not newline - newlines are handled
+        # separately). `&` is a command separator: `cmd1 & cmd2` runs both.
+        if command[pos] in ('|', ';', '>', '<', '&'):
             return command[pos]
 
         return ''
@@ -1191,6 +1219,14 @@ if __name__ == '__main__':
         ("git diff > out.txt 2>&1", ["git diff"]),
         ('echo "foo | bar"', ['echo "foo | bar"']),
         ("cmd1 || cmd2", ["cmd1", "cmd2"]),
+        # A bare `&` separates commands: `cmd1 & cmd2` runs BOTH (task 31).
+        ("echo ok & nslookup example.com", ["echo ok", "nslookup example.com"]),
+        ("echo ok& nslookup example.com", ["echo ok", "nslookup example.com"]),
+        ("a & b & c", ["a", "b", "c"]),
+        ("sleep 1 &", ["sleep 1"]),           # trailing `&`: one command, no empty tail
+        ("cmd &> /tmp/f", ["cmd"]),           # `&>` is a redirection, not a separator
+        ("cmd &>> /tmp/f", ["cmd"]),
+        ("echo 'a & b'", ["echo 'a & b'"]),   # quoted `&` is data
         ("ls -la | grep foo | wc -l", ["ls -la", "grep foo", "wc -l"]),
         ("PATH=\"\" ./script.sh", ["./script.sh"]),
         ("git diff activecdn-module/handler.go 2>&1 | head -100", ["git diff activecdn-module/handler.go", "head -100"]),
