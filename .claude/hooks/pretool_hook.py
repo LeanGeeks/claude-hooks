@@ -20,6 +20,7 @@ Replay Mode Usage:
 import io
 import json
 import re
+import shlex
 import sys
 import os
 from datetime import datetime, timezone
@@ -195,7 +196,15 @@ NOOP_BUILTINS = {
 # Curated set of shell builtins that are safe to auto-allow by head-token match,
 # without requiring a pattern entry in settings.json. A sub-command whose HEAD
 # TOKEN (the bare command word after stripping leading KEY=VALUE env prefixes) is
-# in this set is approved immediately, before the pattern lookup.
+# in this set skips the ALLOW pattern lookup.
+#
+# ALLOW-TIER ONLY (task 28 §2.1). The shortcut runs *below* the deny and ask
+# lookups: an operator's `permissions.deny` / `permissions.ask` entry for one of
+# these builtins is matched first and wins, so the shortcut can never downgrade a
+# deny to a prompt or an ask to an auto-allow (epic 22 invariant 1, brd D1/D2).
+# The original landing (6283e6b) returned before any pattern lookup, which made
+# all 19 tokens un-retractable by the operator; that was the bug this ordering
+# fixes. Do not move the shortcut back above _tier_override_result.
 #
 # Selection criteria: the builtin must NOT be able to execute an arbitrary
 # command string or replace the current process image. All entries only inspect
@@ -229,17 +238,30 @@ SAFE_BUILTINS = {
     'set', 'export', 'read', 'for', 'done', 'fi', 'break',
     'shift', 'local', 'wait', 'umask', 'ulimit', 'getopts',
     'return', 'continue', 'unset', 'readonly',
-    # Not in NOOP_BUILTINS — SAFE_BUILTINS is the only auto-allow path for these:
-    #   source — executes a file, but only a file named by a literal path that
-    #            is already on disk; no code-generation surface (unlike eval).
+    # Not in NOOP_BUILTINS — SAFE_BUILTINS is the only auto-allow path for these.
+    # BOTH carry an extra guard beyond the head-token match (task 28 §2.2/§2.3);
+    # neither is auto-allowed on its head token alone:
+    #   source — executes a file. The shortcut applies ONLY when the operand is a
+    #            LITERAL path (`source ./lib.sh`): a file already on disk, no
+    #            code-generation surface. When the operand carries a shell
+    #            expansion (`source "$X"`, `source $(mktemp)`, `source `mktemp``)
+    #            the target is chosen at runtime, so the shortcut is refused and
+    #            the sub-command falls through to the normal pattern path.
+    #            See _source_operand_is_literal.
     #   trap   — registers a handler string for later delivery; the handler runs
-    #            when the signal/event fires, not at trap-call time. The parser
-    #            validates any $(…) command substitution within the handler string
-    #            as a separate sub-command, but a literal handler string (e.g.,
-    #            single-quoted, as in `trap 'rm -rf /' EXIT`) is NOT extracted or
-    #            validated at trap-registration time — it runs when the signal fires.
-    #            trap is allowed on its head token alone; the handler content is
-    #            not inspected by the hook.
+    #            when the signal/event fires, not at trap-call time, in THIS
+    #            shell. The handler is therefore extracted and validated as its
+    #            own sub-command (the way a $(…) substitution already is) and the
+    #            verdict for the whole `trap ...` sub-command is the handler's
+    #            verdict: `trap 'curl … | sh' EXIT` inherits whatever
+    #            `curl … | sh` decides. A handler that cannot be parsed with
+    #            confidence asks, never allows, and so does any handler whose
+    #            RAW text carries a `$` or a backtick — what `trap` registers is
+    #            a template and this validator has no model of the environment it
+    #            expands in. Only the forms that register no handler at all
+    #            (`trap`, `trap -p/-l …`, `trap - SIG`, `trap '' SIG`,
+    #            `trap SIG`) take the bare shortcut.
+    #            See _trap_handler_verdict.
     'source', 'trap',
 }
 
@@ -286,6 +308,34 @@ def _strip_function_def_header(cmd: str):
         return None, cmd
     name = m.group('fname') or m.group('pname')
     return name, cmd[m.end():].strip()
+
+
+def _head_token(cmd: str) -> str:
+    """
+    The bare command word of an ALREADY-REDUCED sub-command ('' when empty).
+
+    Both auto-allow paths that key on SAFE_BUILTINS take their head token from
+    here, and both feed it the output of _reduce_to_effective_command — leading
+    `KEY=VALUE` env prefixes and wrapper/keyword introducers are peeled by then,
+    so this is a plain first-word split.
+
+    (Its predecessor, _effective_head_token, peeled `KEY=VALUE` off the
+    UN-reduced sub-command: the one prefix the parser had already stripped, and
+    none of the thirteen — `if`, `while`, `env`, `timeout 5`, ... — that do reach
+    it. That mismatch was review finding MEDIUM 1; see task 28 §5.)
+    """
+    parts = cmd.split()
+    return parts[0] if parts else ''
+
+
+def _collapse_whitespace(text: str) -> str:
+    """
+    Whitespace-collapse a string the way the parser normalizes a sub-command
+    (BashCommandParser._strip_grouping_tokens re-joins `text.split()` with single
+    spaces). Kept here so the trap path can recognise a token the parser flattened
+    and recover its original text.
+    """
+    return ' '.join(text.split())
 
 
 def _dedupe(items: List[str]) -> List[str]:
@@ -554,7 +604,9 @@ class BashPermissionValidator:
             expanded = self._expand_constants(cmd, const_assignments, off)
             if expanded != cmd:
                 debug_log(f"  Expanded constants: {cmd!r} -> {expanded!r}")
-            result = self._check_single_command(expanded, function_defs, off)
+            result = self._check_single_command(expanded, function_defs, off,
+                                                raw_command=command,
+                                                unexpanded_cmd=cmd)
             results.append(result)
             debug_log(f"  Sub-command {cmd!r}: allowed={result['allowed']}, denied={result['denied']}")
 
@@ -934,7 +986,7 @@ class BashPermissionValidator:
         rest = parts[1] if len(parts) > 1 else ''
         return f"source {rest}" if rest else 'source'
 
-    def _reduce_to_effective_command(self, cmd: str) -> str:
+    def _reduce_to_effective_command(self, cmd: str, noop_reveal: bool = False) -> str:
         """
         Peel leading control-keyword and wrapper prefixes off a sub-command so we
         validate the command that actually runs, not the token that introduces it.
@@ -959,6 +1011,16 @@ class BashPermissionValidator:
         Returns the effective command string, or '' when the sub-command runs
         nothing dangerous on its own: a bare prefix (e.g. `do`, `env`) or a
         `command -v` lookup.
+
+        `noop_reveal=True` changes ONE thing: where a no-op builtin or a
+        scaffolding keyword would collapse the whole sub-command to '', the
+        prefix-peeled remainder is returned instead (`if unset SECRET` ->
+        `unset SECRET`, `while read -r line` -> `read -r line`). The caller in
+        _check_single_command needs that string to run the deny/ask lookup on the
+        SAME text the normal pattern path would see; with the un-reduced
+        sub-command, thirteen peelable prefixes hid the head token from the gate
+        (review finding MEDIUM 1). It is NOT used to decide what executes — the
+        reduction that drives the allow/deny decision still uses the default.
 
         Examples:
             'do curl http://x'        -> 'curl http://x'
@@ -1003,14 +1065,14 @@ class BashPermissionValidator:
             # Loop/case headers and block terminators are scaffolding that runs
             # nothing on its own; the whole sub-command reduces to a no-op.
             if head in SCAFFOLDING_KEYWORDS:
-                return ''
+                return ' '.join(tokens) if noop_reveal else ''
 
             # No-op builtins (`:`, `true`, `false`, `exit`, `return`) run nothing
             # dangerous regardless of their arguments, so the whole sub-command
             # reduces to a no-op. Matched on the bare head (these are builtins,
             # never path-qualified).
             if head in NOOP_BUILTINS:
-                return ''
+                return ' '.join(tokens) if noop_reveal else ''
 
             # `case WORD in` is a header whose WORD is data, not a command (like
             # `for ... in`). Peel `case ... in` so the arm bodies that follow are
@@ -1134,27 +1196,37 @@ class BashPermissionValidator:
         bash's last-write-wins). If that assignment is non-constant, the
         reference is left untouched (the value is unknown, so the command stays
         on its normal allow/deny path). Unknown names are likewise left as-is.
+
+        This expansion never authorises a `trap` handler. _trap_handler_verdict
+        reads the handler out of the PRE-expansion sub-command and refuses any
+        handler whose raw spelling carries a `$` or a backtick, so a literal
+        substituted here can no longer decide what a deferred handler runs (task
+        28 §5, round 5).
         """
         if not const_assignments or '$' not in cmd:
             return cmd
 
-        def resolve(name):
-            eligible = [
-                lit for off, lit in const_assignments.get(name, [])
-                if cmd_offset is None or off < cmd_offset
-            ]
-            # Latest write wins; a trailing non-constant poisons the reference.
-            return eligible[-1] if eligible else None
+        # A None cmd_offset would raise TypeError below, which main()'s blanket
+        # except turns into sys.exit(0) — an ALLOW. Round 4's _resolve_constant
+        # had a `cmd_offset is None` arm; inlining it here dropped that. Both
+        # callers pass an int today, so this asserts the contract rather than
+        # silently failing open if a third caller ever appears.
+        assert cmd_offset is not None, "_expand_constants requires a cmd_offset"
 
         def repl(match):
             name = match.group('braced') or match.group('plain')
-            literal = resolve(name)
+            eligible = [lit for off, lit in const_assignments.get(name, [])
+                        if off < cmd_offset]
+            literal = eligible[-1] if eligible else None
             return literal if literal is not None else match.group(0)
 
         return _VAR_REF_RE.sub(repl, cmd)
 
     def _check_single_command(self, cmd: str, function_defs: dict = None,
-                              cmd_offset: int = None) -> Dict[str, Any]:
+                              cmd_offset: int = None,
+                              _trap_depth: int = 0,
+                              raw_command: str = None,
+                              unexpanded_cmd: str = None) -> Dict[str, Any]:
         """
         Check if single command matches any pattern
 
@@ -1170,6 +1242,19 @@ class BashPermissionValidator:
                 offset; this prevents a command from being auto-allowed because a
                 same-named function is defined *after* it (and so is not yet in
                 effect when the command runs).
+            raw_command: The command text this sub-command was parsed OUT of,
+                before normalization. `cmd` has had its whitespace collapsed
+                (`_strip_grouping_tokens` re-joins on single spaces), which
+                destroys newlines inside a quoted argument — and a `trap`
+                handler's newlines are command separators. Only the trap path
+                uses this, to recover the handler's real text; see
+                _recover_raw_handler.
+            unexpanded_cmd: This same sub-command BEFORE _expand_constants
+                rewrote its `$VAR` references (None when no expansion step ran,
+                i.e. `cmd` is already the text as written). Only the trap path
+                uses it, and it needs it for one thing: a handler must be judged
+                on the text the user wrote, not on a literal this validator
+                substituted into it. See _trap_handler_verdict.
 
         Returns:
             Dictionary with:
@@ -1179,8 +1264,6 @@ class BashPermissionValidator:
             - matched_patterns: List of patterns that matched
         """
         matched_allow = []
-        matched_deny = []
-        matched_ask = []
 
         # Reduce wrappers/keywords to the command that actually runs, so we never
         # authorize an arbitrary command just because its introducer is allowed.
@@ -1192,6 +1275,31 @@ class BashPermissionValidator:
             # command after it (e.g. 'do', 'env'), a loop header / block
             # terminator, a no-op builtin (':', 'exit', ...), a function-def
             # header, or a `command -v/-V` lookup.
+            #
+            # Ten of the SAFE_BUILTINS tokens (`unset`, `set`, `export`, `read`,
+            # `shift`, ...) are ALSO in NOOP_BUILTINS/SCAFFOLDING_KEYWORDS and so
+            # reach an auto-allow through this door instead of the shortcut
+            # below. The deny/ask lookup has to happen here too, or the fix in
+            # §2.1 would only cover `trap`/`source` and an operator's
+            # `Bash(unset:*)` deny would still be silently ignored (that is
+            # exactly what was measured). The gate is deliberately narrow — only
+            # head tokens in SAFE_BUILTINS — so the genuine "runs nothing"
+            # returns (function-def headers, `command -v`, `((…))`, `:`/`exit`,
+            # `cd`, `declare`, ...) keep their existing behaviour untouched and
+            # cannot acquire a new false deny.
+            #
+            # The lookup runs on the PREFIX-PEELED sub-command, not on `cmd`:
+            # `if unset SECRET`, `while read -r line`, `env unset SECRET` and ten
+            # more peelable spellings otherwise hide the head token from the gate
+            # and the operator's deny is silently ignored (review finding
+            # MEDIUM 1). `noop_reveal=True` returns exactly the text the normal
+            # pattern path at the bottom of this method would have matched, so
+            # the two callers can no longer disagree.
+            noop_effective = self._reduce_to_effective_command(cmd, noop_reveal=True)
+            if _head_token(noop_effective) in SAFE_BUILTINS:
+                override = self._tier_override_result(noop_effective)
+                if override is not None:
+                    return override
             debug_log(f"Command {cmd!r} runs nothing (bare prefix or lookup) - auto-allowing")
             return {
                 'command': cmd,
@@ -1206,24 +1314,55 @@ class BashPermissionValidator:
 
         # SAFE_BUILTINS: if the effective head token (the command word after env
         # prefix stripping by _reduce_to_effective_command) is a known-safe shell
-        # builtin, allow immediately without a pattern lookup. The head-token check
-        # is precise: we split on whitespace and take the first token, then require
-        # it has no '/' (so /bin/trap is not mistaken for the bare builtin trap).
+        # builtin, skip the ALLOW pattern lookup. The head-token check is precise:
+        # we split on whitespace and take the first token, then require it has no
+        # '/' (so /bin/trap is not mistaken for the bare builtin trap).
         # This handles:
         #   VAR=x trap ...  → _reduce_to_effective_command peels VAR=x → head=trap ✓
         #   /bin/trap ...   → head='/bin/trap' → '/' present → not matched ✓
-        _effective_head = cmd.split()[0] if cmd.split() else ''
+        #
+        # The shortcut is ALLOW-TIER ONLY (task 28 §2.1): deny and ask are matched
+        # first and win, so it can never override the operator's lists.
+        _effective_head = _head_token(cmd)
         if _effective_head and '/' not in _effective_head and _effective_head in SAFE_BUILTINS:
-            debug_log(f"Command {cmd!r} head token {_effective_head!r} in SAFE_BUILTINS - auto-allowing")
-            return {
-                'command': cmd,
-                'allowed': True,
-                'denied': False,
-                'asked': False,
-                'matched_allow_patterns': ['safe_builtin'],
-                'matched_deny_patterns': [],
-                'matched_ask_patterns': []
-            }
+            override = self._tier_override_result(cmd)
+            if override is not None:
+                return override
+
+            # §2.2 — `trap` registers a handler that runs in THIS shell when the
+            # signal fires. Validate it as its own sub-command; the verdict for
+            # the trap is the handler's verdict.
+            if _effective_head == 'trap':
+                verdict = self._trap_handler_verdict(cmd, function_defs, cmd_offset,
+                                                     _trap_depth, raw_command,
+                                                     unexpanded_cmd)
+                if verdict is not None:
+                    return verdict
+
+            # §2.3 — `source` only shortcuts a literal path operand. A runtime
+            # target (`source "$X"`, `source $(mktemp)`) falls through to the
+            # normal pattern path, which asks unless a pattern vouches for it.
+            #
+            # Only the `source` spelling is tested: `.` is not in SAFE_BUILTINS,
+            # so a `. ./lib.sh` never reaches this shortcut at all and asks
+            # instead of auto-allowing (the earlier `in ('source', '.')` test had
+            # a dead arm — review finding LOW). DENY stays symmetric across both
+            # spellings through _alias_variant; the allow side is deliberately
+            # left asymmetric on the safe side rather than widened here.
+            if _effective_head == 'source' and not self._source_operand_is_literal(cmd):
+                debug_log(f"Command {cmd!r} sources a non-literal target - "
+                          f"skipping the SAFE_BUILTINS shortcut")
+            else:
+                debug_log(f"Command {cmd!r} head token {_effective_head!r} in SAFE_BUILTINS - auto-allowing")
+                return {
+                    'command': cmd,
+                    'allowed': True,
+                    'denied': False,
+                    'asked': False,
+                    'matched_allow_patterns': ['safe_builtin'],
+                    'matched_deny_patterns': [],
+                    'matched_ask_patterns': []
+                }
 
         # A call to a function defined EARLIER in this same compound command runs
         # only its (separately validated) body, so it is a no-op here. This also
@@ -1274,37 +1413,10 @@ class BashPermissionValidator:
                 'matched_ask_patterns': []
             }
 
-        # Build the candidate command strings to match against patterns.
-        # Path-qualified invocations (e.g. /bin/ls, /usr/bin/grep) are reduced to
-        # a bare-name variant (ls, grep) so they match the same Bash(<name>:*)
-        # patterns as the bare command. Generated commands vary in this way.
-        candidates = [cmd]
-        normalized = self._basename_variant(cmd)
-        if normalized != cmd:
-            candidates.append(normalized)
-            debug_log(f"Basename-normalized variant: {normalized!r}")
+        candidates = self._pattern_candidates(cmd)
 
-        # Canonicalize builtin-spelling aliases (currently `.` -> `source`) so a
-        # single allow/deny pattern covers every spelling of the same builtin.
-        # Applied to each existing candidate so it composes with the basename
-        # variant above.
-        for c in list(candidates):
-            aliased = self._alias_variant(c)
-            if aliased != c and aliased not in candidates:
-                candidates.append(aliased)
-                debug_log(f"Builtin-alias variant: {aliased!r}")
-
-        # Check deny patterns first (deny takes precedence)
-        for pattern in self.denied_patterns:
-            if any(self._matches_pattern(c, pattern) for c in candidates):
-                matched_deny.append(pattern)
-
-        # Check ask patterns (after deny, before allow)
-        for pattern in self.ask_patterns:
-            if any(self._matches_pattern(c, pattern) for c in candidates):
-                matched_ask.append(pattern)
-
-        # Check allow patterns
+        # Deny first (deny takes precedence), then ask (before allow), then allow.
+        matched_deny, matched_ask = self._match_deny_and_ask(cmd, candidates)
         for pattern in self.allowed_patterns:
             if any(self._matches_pattern(c, pattern) for c in candidates):
                 matched_allow.append(pattern)
@@ -1317,6 +1429,508 @@ class BashPermissionValidator:
             'matched_allow_patterns': matched_allow,
             'matched_deny_patterns': matched_deny,
             'matched_ask_patterns': matched_ask
+        }
+
+    def _pattern_candidates(self, cmd: str) -> List[str]:
+        """
+        Build the candidate command strings to match against Bash(...) patterns.
+
+        Path-qualified invocations (e.g. /bin/ls, /usr/bin/grep) are reduced to a
+        bare-name variant (ls, grep) so they match the same Bash(<name>:*)
+        patterns as the bare command; generated commands vary in this way. Then
+        builtin-spelling aliases are canonicalized (currently `.` -> `source`) so
+        a single allow/deny pattern covers every spelling of the same builtin.
+        The alias pass is applied to each existing candidate so it composes with
+        the basename variant.
+
+        One implementation, used by both the deny/ask override that guards the
+        auto-allow shortcuts and the normal pattern lookup — two candidate
+        builders that disagreed would be a bypass.
+        """
+        candidates = [cmd]
+        normalized = self._basename_variant(cmd)
+        if normalized != cmd:
+            candidates.append(normalized)
+            debug_log(f"Basename-normalized variant: {normalized!r}")
+
+        for c in list(candidates):
+            aliased = self._alias_variant(c)
+            if aliased != c and aliased not in candidates:
+                candidates.append(aliased)
+                debug_log(f"Builtin-alias variant: {aliased!r}")
+        return candidates
+
+    def _match_deny_and_ask(self, cmd: str, candidates: List[str] = None):
+        """Return (matched_deny_patterns, matched_ask_patterns) for a command."""
+        if candidates is None:
+            candidates = self._pattern_candidates(cmd)
+        matched_deny = [p for p in self.denied_patterns
+                        if any(self._matches_pattern(c, p) for c in candidates)]
+        matched_ask = [p for p in self.ask_patterns
+                       if any(self._matches_pattern(c, p) for c in candidates)]
+        return matched_deny, matched_ask
+
+    def _tier_override_result(self, cmd: str):
+        """
+        The deny/ask verdict that no auto-allow shortcut may skip.
+
+        Returns a result dict when `cmd` matches an operator deny or ask pattern,
+        else None. Deny outranks ask (brd D2); a deny match never degrades to a
+        prompt (epic 22 invariant 1). Callers use it as a gate in front of an
+        auto-allow return, so the shortcut only ever skips the ALLOW lookup.
+        """
+        matched_deny, matched_ask = self._match_deny_and_ask(cmd)
+        if matched_deny:
+            debug_log(f"Command {cmd!r} matches deny pattern(s) {matched_deny} - "
+                      f"auto-allow shortcut refused")
+            return {
+                'command': cmd,
+                'allowed': False,
+                'denied': True,
+                'asked': bool(matched_ask),
+                'matched_allow_patterns': [],
+                'matched_deny_patterns': matched_deny,
+                'matched_ask_patterns': matched_ask
+            }
+        if matched_ask:
+            debug_log(f"Command {cmd!r} matches ask pattern(s) {matched_ask} - "
+                      f"auto-allow shortcut refused")
+            return {
+                'command': cmd,
+                'allowed': False,
+                'denied': False,
+                'asked': True,
+                'matched_allow_patterns': [],
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': matched_ask
+            }
+        return None
+
+    def _source_operand_is_literal(self, cmd: str) -> bool:
+        """
+        True when a `source` invocation's file operand carries no shell
+        expansion.
+
+        The name is about expansion, not about resolvability: a glob or a `~`
+        (`source *.sh`, `source ~/evil.sh`) contains no `$`/backtick and so
+        passes. That is deliberate — the file it names is already on disk, which
+        is the same property `source ./x.sh` has and §2.3 already allows — but it
+        is NOT the stronger "we know exactly which path" claim (review finding
+        LOW).
+
+        `source ./lib.sh` reads a file that is already on disk — nothing is
+        generated, so the head-token shortcut is sound. `source "$X"`,
+        `source $SCRIPT` and `source $(mktemp)` choose the target at runtime,
+        which is a code-execution surface the shortcut cannot vouch for, so those
+        fall through to the normal pattern path.
+
+        Note the third form: the parser strips a `$(…)`/backtick token out of the
+        normalized sub-command (it is extracted and validated separately), so
+        `source $(mktemp)` arrives here as a bare `source` with NO operand. An
+        empty operand is therefore treated as non-literal too — there is no path
+        left to vouch for.
+        """
+        parts = cmd.split(None, 1)
+        operand = parts[1].strip() if len(parts) > 1 else ''
+        if not operand:
+            return False
+        return '$' not in operand and '`' not in operand
+
+    # `trap -l` lists signal names and `trap -p [SIG...]` prints existing
+    # dispositions; neither registers a handler. `--` ends option parsing. A bare
+    # `-` is the RESET argument, not a flag.
+    _TRAP_QUERY_FLAG_CHARS = set('lp')
+
+    # A shell expansion in the handler's RAW text: what `trap` registers is a
+    # template, the text it expands to is computed in an environment this
+    # validator does not model, and four review rounds proved that enumerating
+    # the ways that environment can change is a list with holes in it. Any
+    # handler carrying one of these asks. See _trap_handler_verdict.
+    _TRAP_EXPANSION_CHARS = ('$', '`')
+
+    def _trap_handler(self, cmd: str):
+        """
+        Extract the handler argument of a `trap` invocation.
+
+        Returns (handler, confident):
+          - (None, True)  — this invocation registers no handler at all: bare
+            `trap`, the query forms `trap -l` / `trap -p [SIG...]`, the reset
+            forms `trap - SIG` and `trap SIG` (a lone sigspec resets it), and the
+            ignore form `trap '' SIG`.
+          - (handler, True) — `handler` is the command string that will run when
+            the signal fires, with its quoting removed.
+          - (None, False) — the invocation could not be parsed with confidence
+            (unbalanced quotes, an unrecognised option). The caller must ask.
+
+        bash's grammar is `trap [-lp] [[ARG] SIGSPEC ...]`; ARG is the handler.
+        Quoting is undone with shlex so a single- or double-quoted handler comes
+        back as one token — `cmd.split()` would shred it.
+        """
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError as e:
+            debug_log(f"trap handler extraction failed for {cmd!r}: {e}")
+            return None, False
+
+        i = 1  # tokens[0] is `trap`
+        n = len(tokens)
+        while i < n:
+            token = tokens[i]
+            if token == '--':
+                i += 1
+                break
+            if token == '-' or not token.startswith('-'):
+                break
+            flags = token[1:]
+            if flags and set(flags) <= self._TRAP_QUERY_FLAG_CHARS:
+                # A query/list form: every remaining argument is a sigspec.
+                return None, True
+            debug_log(f"trap: unrecognised option {token!r} in {cmd!r}")
+            return None, False
+
+        if i >= n:
+            return None, True  # bare `trap` (or `trap --`): lists dispositions
+
+        handler = tokens[i]
+        if handler == '-' or not handler.strip():
+            # `trap - SIG` resets to the default disposition; `trap '' SIG`
+            # ignores the signal. Neither runs anything.
+            return None, True
+
+        # NOTE on bash's lone-sigspec rule. `trap EXIT` — one argument that is a
+        # valid signal spec — resets EXIT rather than running a command called
+        # `EXIT`, so it too registers nothing. We deliberately do NOT exempt it,
+        # because the parser normalizes an UNQUOTED substitution handler down to
+        # exactly that shape: `trap $(gen) EXIT` and `trap `gen` EXIT` both
+        # arrive here as `trap EXIT` (the substitution is extracted as its own
+        # sub-command and the token is dropped). Exempting the shape would leave
+        # the original bypass open through a second door — an attacker only needs
+        # an allowlisted generator (`echo`, `cat`, `printf`) to hand `trap` an
+        # uninspected handler. A genuine reset is spelled `trap - EXIT`, which
+        # stays allowed; the bare-sigspec spelling asks.
+        return handler, True
+
+    def _raw_token_values(self, raw_command: str) -> List[str]:
+        """
+        Every token text in `raw_command` exactly as written, recursing into
+        command substitutions. Used to look up a normalized token's pre-collapse
+        source; see _recover_raw_handler.
+        """
+        values = []
+        try:
+            tokens = self.parser._tokenize_with_quotes(raw_command)
+        except (ValueError, IndexError, RecursionError) as e:
+            debug_log(f"raw re-tokenize of {raw_command!r} failed: {e}")
+            return values
+        for token_type, token_value, _offset in tokens:
+            values.append(token_value)
+            if token_type == 'CMD_SUBST' and token_value.strip():
+                values.extend(self._raw_token_values(token_value))
+        return values
+
+    def _matching_raw_handler_tokens(self, handler: str, raw_command: str):
+        """
+        The pre-collapse text of every token in `raw_command` whose own
+        whitespace-collapse is exactly `handler`.
+
+        `handler` is read out of the sub-command BEFORE constant expansion (see
+        _trap_handler_verdict), so this validator has substituted nothing into it
+        and the token that is its source matches it literally. No expansion step
+        belongs here: a token that would only match once `$X` is resolved is a
+        token whose text bash has not fixed yet, and the `$` rule refuses those
+        outright instead of guessing a value for them.
+
+        One scan, one matcher: a second, subtly different token matcher is
+        exactly how the newline bypass came back in round 3.
+        """
+        matches = []
+        for value in self._raw_token_values(raw_command):
+            try:
+                flat_words = shlex.split(_collapse_whitespace(value))
+                raw_words = shlex.split(value)
+            except ValueError:
+                continue  # an unbalanced fragment cannot be the handler token
+            if len(flat_words) != 1 or len(raw_words) != 1:
+                continue  # the handler is a single token; this is not it
+            if flat_words[0] == handler:
+                matches.append(raw_words[0])
+        return matches
+
+    def _recover_raw_handler(self, handler: str, raw_command: str):
+        r"""
+        Return (handler_text, confident) with the handler's PRE-NORMALIZATION
+        text where that text can be identified in `raw_command`.
+
+        Why this exists (review finding BLOCKER 1). The parser keeps a quoted
+        handler as one token, but _normalize_command re-joins the sub-command on
+        single spaces, so every newline INSIDE the quotes becomes a space:
+
+            trap 'echo start\nrm -rf /etc' EXIT
+                -> "trap 'echo start rm -rf /etc' EXIT"
+
+        The handler then parses as ONE command whose first word is `echo`, and
+        `rm -rf /etc` is validated as an argument to it — the trap allowed on the
+        strength of its first line while bash runs both. Newlines are command
+        separators inside a handler exactly as they are anywhere else, so the
+        real text has to come back before the handler is parsed.
+
+        The lookup is by content, not by offset: an offset identifies a top-level
+        sub-command but not a `trap` nested inside a substitution, where every
+        extracted sub-command shares the enclosing offset.
+
+        THE GOVERNING RULE (review round 2): a substitution this method cannot
+        PROVE is this handler's source must ask — never allow, and never deny, on
+        a guess. Two things follow from it.
+
+        1. A token that lost no whitespace is a candidate too. The old code
+           skipped those ("it is not the source"), which let an unrelated
+           newline-bearing decoy elsewhere in the command be the ONLY candidate
+           and replace a harmless handler with it — a false DENY, which
+           hard-blocks with no human rescue (epic 22 H1, review MEDIUM):
+
+               echo 'echo a\ncurl http://e/x' >/dev/null; trap 'echo a curl http://e/x' EXIT
+
+           With the real token also standing as itself, that command now has two
+           distinct candidates and asks instead of denying.
+
+        2. NO candidate means ask. Once a collapse actually happened somewhere in
+           `raw_command`, the handler's own token must turn up in the scan; if it
+           does not, something about this command defeats the lookup (an
+           unbalanced fragment, a re-tokenization failure, a normalization this
+           method does not model) and there is no proof left to lean on.
+
+        (Round 2 had a third rule — match modulo constant expansion — because the
+        handler reached this method already expanded. It no longer does: the `$`
+        rule in _trap_handler_verdict refuses every handler a constant could have
+        been substituted into, so matching is literal again.)
+
+        The one path that still returns the handler untouched is the one where
+        nothing could have been lost: `raw_command` is already flat, or None
+        because a caller did not thread it through.
+        """
+        if not raw_command or _collapse_whitespace(raw_command) == raw_command:
+            return handler, True
+
+        candidates = set(self._matching_raw_handler_tokens(handler, raw_command))
+
+        if not candidates:
+            debug_log(f"trap handler {handler!r} matches no raw token of "
+                      f"{raw_command!r} though whitespace was collapsed - asking")
+            return handler, False
+        if len(candidates) == 1:
+            recovered = candidates.pop()
+            debug_log(f"trap handler recovered from raw source: {recovered!r}")
+            return recovered, True
+        debug_log(f"trap handler {handler!r} matches several raw spellings "
+                  f"{sorted(candidates)!r} - asking")
+        return handler, False
+
+    def _trap_handler_verdict(self, cmd: str, function_defs: dict,
+                              cmd_offset: int, depth: int = 0,
+                              raw_command: str = None,
+                              unexpanded_cmd: str = None):
+        r"""
+        Validate a `trap` handler as its own sub-command and return the verdict
+        the whole `trap ...` sub-command inherits, or None when the trap
+        registers no handler (the caller then applies the plain shortcut).
+
+        The handler runs later, but it runs in THIS shell, with the same
+        authority the command being gated has right now — so it is extracted and
+        validated exactly the way a `$(…)` substitution already is. `trap 'curl …
+        | sh' EXIT` therefore decides whatever `curl … | sh` decides.
+
+        `function_defs`/`cmd_offset` are passed through so the common
+        `cleanup() { …; }; trap cleanup EXIT` shape still resolves the handler to
+        the locally defined function (whose body is validated separately).
+
+        THE `$` RULE (task 28 §5, round 5; operator's decision). A handler whose
+        RAW text — as written in the command, before this validator expanded
+        anything — contains a `$` or a backtick cannot be vouched for, and asks.
+        Both quoting regimes, unconditionally, with no dependence on whether an
+        assignment to the name is visible, where it sits, or how it is spelled.
+
+        The reason it has to be that blunt. What `trap` registers is a TEMPLATE,
+        and this validator has no model of the environment it expands in. Four
+        review rounds tried to keep the expansion and bound the damage by
+        enumerating the ways a name can be rebound, and four rounds shipped a
+        list with holes in it — a single-quoted handler binds at FIRE time, so
+        every later write counts, and `const_assignments` only ever sees bare
+        standalone `KEY=VALUE` statements:
+
+            X=echo; trap '$X http://e/x' EXIT; X=curl          <- round 4 caught this one
+            X=echo; trap '$X http://e/x' EXIT; export X=curl   <- and missed these six
+            X=echo; trap '$X http://e/x' EXIT; declare X=curl
+            X=echo; trap '$X http://e/x' EXIT; read X <<< curl
+            X=echo; trap '$X http://e/x' EXIT; printf -v X curl
+            X=echo; trap '$X http://e/x' EXIT; for X in curl; do :; done
+            X=echo; trap '$X http://e/x' EXIT; f(){ X=curl; }; f
+
+        A DOUBLE-quoted handler is expanded when `trap` runs, so modelling it at
+        the registration offset looked exact — but only if the binding the
+        validator resolves is the binding bash has, and an EARLIER rebind in a
+        form the map cannot see shadows the one it can:
+
+            X=echo; export X=curl;  trap "$X http://e/x" EXIT   <- registers `curl …`
+            X=echo; declare X=curl; trap "$X http://e/x" EXIT   <- registers `curl …`
+
+        Both measured `allow`. The class is closed here by construction rather
+        than by list: no `$`, no backtick, no guess.
+
+        A DENY still stands. The rule downgrades allow→ask, never deny→ask, so
+        the handler's sub-commands are validated FIRST and a deny that is
+        provable from the handler's literal text survives it (epic 22 invariant
+        1, deny is final):
+
+            X=/tmp/a; trap 'curl http://evil; echo $X' EXIT; X=/tmp/b   -> deny
+
+        `curl http://evil` is a literal; what `$X` holds cannot make it safe.
+        Because the sub-commands validated are the RAW ones, a deny can never
+        come from an expansion instead — `X=curl; trap "$X http://e/x" EXIT`
+        validates the head `$X`, which matches no pattern and asks, rather than
+        the `curl` a guessed binding would have produced (round 3 MEDIUM 1, a
+        false deny, stays fixed).
+
+        Anything that cannot be parsed with confidence returns ASK, never allow
+        (task 27 H2: an over-tight matcher is annoying, an over-loose one is the
+        bug being fixed).
+        """
+        # The handler must be read out of the text the user wrote. `cmd` has had
+        # its `$VAR` references replaced with literals by _expand_constants, and
+        # a literal this validator chose is exactly what the `$` rule refuses to
+        # decide on. `unexpanded_cmd` is that same sub-command before the
+        # rewrite; reduce it the same way `cmd` was reduced so the two are token-
+        # aligned (`VAR=x trap …`, `env trap …`, `if trap …` all peel).
+        written = cmd if unexpanded_cmd is None \
+            else self._reduce_to_effective_command(unexpanded_cmd)
+        if _head_token(written) != 'trap':
+            # Expansion is what made this a `trap` at all (`T=trap; $T "$X …"
+            # EXIT`), so the invocation in front of us is not the one that was
+            # written and its handler token cannot be located in the source.
+            return self._trap_ask_result(written, 'trap_assembled_by_expansion')
+
+        # Every verdict below is reported against `written` rather than `cmd`.
+        # The prompt has to show the text the rule was read off: rendering
+        # `X=echo; trap "$X http://e/x" EXIT; export X=curl` as
+        # `trap 'echo http://e/x' EXIT` would put a harmless-looking command in
+        # front of the operator and ask them to approve it, when the whole reason
+        # for the prompt is that `echo` is a value this validator guessed.
+        handler, confident = self._trap_handler(written)
+        if not confident:
+            return self._trap_ask_result(written, 'trap_handler_unparsed')
+        if handler is None:
+            return None
+
+        # `source` reached us with its whitespace collapsed, which turns a
+        # two-line handler into one line and hides everything after the first.
+        # Put the newlines back before the handler is parsed (BLOCKER 1); when
+        # the source cannot be pinned down unambiguously — including when it
+        # cannot be pinned down at all — ask.
+        handler, confident = self._recover_raw_handler(handler, raw_command)
+        if not confident:
+            return self._trap_ask_result(written, 'trap_handler_ambiguous_source')
+
+        if depth >= 3:
+            # A trap that registers a trap that registers a trap… stop unrolling
+            # and prompt rather than guess.
+            debug_log(f"trap handler nesting too deep for {written!r} - asking")
+            return self._trap_ask_result(written, 'trap_handler_nested')
+
+        try:
+            parsed = self.parser.parse_with_offsets(handler)
+        except (ValueError, IndexError, RecursionError) as e:
+            debug_log(f"trap handler {handler!r} did not parse: {e}")
+            return self._trap_ask_result(written, 'trap_handler_unparsed')
+        if not parsed:
+            debug_log(f"trap handler {handler!r} produced no sub-commands - asking")
+            return self._trap_ask_result(written, 'trap_handler_unparsed')
+
+        results = [
+            self._check_single_command(sub, function_defs, cmd_offset,
+                                       _trap_depth=depth + 1,
+                                       raw_command=handler,
+                                       unexpanded_cmd=sub)
+            for sub, _off in parsed
+        ]
+
+        # The handler is validated "exactly the way a $(…) substitution already
+        # is" (§2.2) — and that includes the write-redirect gate, which
+        # _check_single_command does not apply (the parser strips redirect
+        # targets before command matching, so validate_bash_command runs the gate
+        # separately over the whole command). Without this the handler was the
+        # one place a write could go anywhere unprompted: `trap 'echo ok >
+        # /etc/cron.d/pwn' EXIT` allowed while both `echo ok > /etc/cron.d/pwn`
+        # and `$(echo ok > /etc/cron.d/pwn)` asked (review finding HIGH 1).
+        # A `$VAR` target is not resolved here and never will be — it falls to
+        # the same literal-prefix rule and asks when it has no allowed anchor.
+        disallowed_targets = _dedupe([
+            target
+            for target, _off in self.parser.extract_write_redirect_targets(handler)
+            if not self._is_redirect_target_allowed(target)
+        ])
+        if disallowed_targets:
+            debug_log(f"trap handler {handler!r} writes outside the allowed roots: "
+                      f"{disallowed_targets}")
+        matched_deny = _dedupe([p for r in results for p in r['matched_deny_patterns']])
+        matched_ask = _dedupe([p for r in results for p in r['matched_ask_patterns']])
+
+        # Deny first, and before the `$` rule: a deny read off the handler's own
+        # literal text is provable whatever the environment holds, and epic 22
+        # invariant 1 says deny is final. Round 4 asked here instead, which threw
+        # a provable deny away (review MEDIUM).
+        if any(r['denied'] for r in results):
+            return {
+                'command': written,
+                'allowed': False,
+                'denied': True,
+                'asked': bool(matched_ask),
+                'matched_allow_patterns': [],
+                'matched_deny_patterns': matched_deny,
+                'matched_ask_patterns': matched_ask
+            }
+
+        # THE `$` RULE. The registered handler is a template and this is where we
+        # stop pretending to know what it expands to — see the docstring. It also
+        # subsumes §2.3's runtime-assembly case: `trap "$(cat payload)" EXIT`
+        # parses into the allowlisted `cat payload`, but what gets REGISTERED is
+        # that file's contents, and `trap "$CMD" EXIT` registers whatever $CMD
+        # holds. Validating the generator is not validating the handler.
+        if any(ch in handler for ch in self._TRAP_EXPANSION_CHARS):
+            return self._trap_ask_result(written, 'trap_handler_expansion')
+
+        if (any(r.get('asked') for r in results)
+                or not all(r['allowed'] for r in results)
+                or disallowed_targets):
+            return {
+                'command': written,
+                'allowed': False,
+                'denied': False,
+                'asked': bool(matched_ask),
+                'matched_allow_patterns': [],
+                'matched_deny_patterns': [],
+                'matched_ask_patterns': matched_ask
+            }
+        # Handler fully allowed: the trap registration itself stays allowed.
+        return None
+
+    @staticmethod
+    def _trap_ask_result(cmd: str, marker: str) -> Dict[str, Any]:
+        """
+        An ask verdict for a trap whose handler could not be vouched for.
+
+        Reported as "neither allowed nor denied" rather than as an ask-PATTERN
+        match, so the prompt says the honest thing ("Not in allowlist — review
+        before approving: `trap ...`") instead of naming an operator pattern that
+        never matched. `marker` names the reason in the debug log.
+        """
+        debug_log(f"trap {cmd!r} -> ask ({marker})")
+        return {
+            'command': cmd,
+            'allowed': False,
+            'denied': False,
+            'asked': False,
+            'matched_allow_patterns': [],
+            'matched_deny_patterns': [],
+            'matched_ask_patterns': []
         }
 
     def _matches_pattern(self, command: str, pattern: str) -> bool:
