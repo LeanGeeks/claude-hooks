@@ -118,9 +118,42 @@ Deliverables, in this order:
   `except Exception: sys.exit(0)`. That is the crash-shaped instance of this
   same default and should be decided consistently with whatever this task
   concludes. Coordinate; do not decide it twice.
-- **[32](./32_separator_suppression_tokens.md)** must land first. Its operator
-  table, token-stream derivation and real-bash sweeps are the foundation this
-  builds on, and its `known_gap` column is the beginning of §3 item 1's list.
+- **[32](./32_separator_suppression_tokens.md)** landed 2026-08-28 as `3e7baa9`.
+  Its operator table, token-stream derivation, declined-delimiter marker and
+  real-bash sweeps are the foundation this builds on, and its recorded gaps are
+  the beginning of §3 item 1's list.
+- **[36](./36_parser_cleanups_from_task_32.md)** carries two narrow `ask`-direction
+  cleanups out of 32; independent of this task.
+
+### Concrete inputs handed over from task 32
+
+Each of these is a live `allow` where bash runs something the validator never
+classified. They are the raw material for §3 item 1's enumeration:
+
+1. **An unquoted heredoc delimiter means bash expands the body.**
+   `cat <<EOF\n$(shred -u /etc/passwd)\nEOF\necho done` runs `shred`; every
+   parser version reports `['cat','echo done']` and answers `allow`. Identical
+   at HEAD and after 32. **The commonest heredoc shape there is**, and the
+   confidence signal — whether the delimiter was quoted — is known at parse
+   time, which makes it a good first test of this task's rule.
+2. **Backtick-carried unterminated heredoc**, and specifically the `<<-`
+   spelling, which is a genuine HEAD-`deny` → `allow`:
+   ``x=`cat <<-EOF\necho `\nshred -u /tmp/x\n` `` — bash runs `cat` then
+   `shred`. (The plain-`<<` sibling is `allow` at HEAD too, so no new
+   capability; task 32 §16.8 bullet 3 understated this by not naming the `<<-`
+   cell.)
+3. **`SCAFFOLDING_KEYWORDS` reduces a sub-command to `''` → auto-allow.**
+   `fi shred -u /etc/passwd`, `done …`, `esac …`, `for …` all decide `allow`.
+   Latent only because bash rejects those strings — an unconditional head-token
+   allow with no tail check.
+4. **The command word's quoting is never removed.** `'shred' git status`,
+   `s""hred git status`, `\shred git status` decide `ask` while bash runs
+   `shred`. Deny-direction, but the same class: the validator vouches for the
+   spelling, not the command.
+5. **`FUSED_FD_OPERATORS` is not word-boundary gated.**
+   `./scripts/build2>&1 --all` decides `allow` as `./scripts/build --all` while
+   bash runs `./scripts/build2 --all`. Needs an allowlisted path that is a
+   prefix of another executable ending in a digit. Identical at HEAD.
 
 ## 5. What would make this task succeed
 
