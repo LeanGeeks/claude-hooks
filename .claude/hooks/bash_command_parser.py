@@ -33,23 +33,83 @@ class BashCommandParser:
     OPERATORS = ['&&', '||', '|', ';', '&']
 
     # Redirection operators (NOT command separators)
-    REDIRECTIONS = ['>', '>>', '<', '<>', '<<', '2>&1', '2>', '&>', '&>>', '1>&2', '2>>', '1>', '<&', '>&']
+    #
+    # `>|` is bash's noclobber-override write (GREATER_BAR). It was absent from
+    # both this table and the _check_operator scan until task 32 round 4, so it
+    # lexed as REDIRECT `>` plus a SPURIOUS OP `|` — and an OP reopens
+    # reserved-word position, which handed `echo hi >| [[ ; shred … ]]` a `[[`
+    # that suppressed the `;`. See BASH_OPERATOR_TOKENS below: the fix is not
+    # "add `>|`", it is "stop guessing at bash's lexer".
+    REDIRECTIONS = ['>', '>>', '<', '<>', '<<', '<<-', '<<<', '>|',
+                    '2>&1', '2>', '&>', '&>>', '1>&2', '2>>', '<&', '>&']
 
-    # Redirections that take an argument (file/fd)
-    REDIRECTIONS_WITH_ARG = ['>', '>>', '<', '<>', '<<', '2>', '&>', '&>>', '2>>', '1>']
+    # Redirections whose argument is STILL IN THE TOKEN STREAM when the
+    # redirect is emitted, so `_split_on_operators` must drop one more token.
+    #
+    # `<<` and `<<-` are absent DELIBERATELY. The heredoc branch of
+    # `_tokenize_with_quotes` consumes the delimiter word itself before it
+    # emits `REDIRECT '<<'`, so listing them here dropped a SECOND word — the
+    # command name. `<<EOF shred git status` was reported as `git status` and
+    # auto-allowed while bash ran `shred git status` (task 32 round 5, item 1;
+    # pre-existing for `<<`, and a round-4 regression for `<<-`, which round 4
+    # taught the tokenizer to recognize without removing it from this table).
+    # A bare `<<` with no delimiter never enters that branch and reaches the
+    # operator scan instead — but it has no operand either (`cat << ;` is a
+    # bash syntax error), so it must not skip a token in that shape either.
+    #
+    # `<<<` stays: the here-string is emitted by the operator scan with its
+    # word operand untouched, so that operand really is the next token.
+    REDIRECTIONS_WITH_ARG = ['>', '>>', '<', '<>', '<<<', '>|',
+                             '2>', '&>', '&>>', '2>>']
 
-    # Redirections that don't take an argument
+    # Redirections that don't take an argument.
+    # `>&` is here for its fd-duplication reading ONLY (`>&2`, `>&-`, `n>&m`).
+    # Its other reading, `>& FILE`, is an exact synonym for `&> FILE` and is
+    # normalized to that spelling by _check_operator, so it never reaches this
+    # table with a path operand — see _is_bare_amp_write_redirect (task 32).
     REDIRECTIONS_NO_ARG = ['2>&1', '1>&2', '<&', '>&']
+
+    # Redirections whose OPERAND WORD is still in the token stream when the
+    # redirect is emitted, so `_split_on_operators` must drop the next token.
+    #
+    # That is REDIRECTIONS_WITH_ARG (path operands) PLUS the two fd-duplication
+    # forms, whose operand is an fd number or `-` rather than a path. bash
+    # consumes that word either way. Leaving it in the stream made it an extra
+    # ARGUMENT in argument position — harmless, and pinned that way for three
+    # rounds — but at COMMAND-START position it becomes the sub-command HEAD:
+    # `printf A ; <&1 shred -u /etc/passwd` was reported as
+    # `1 shred -u /etc/passwd`, so the head was `1` and the real command was
+    # never classified (task 32 round 5, item 6). The fused spellings `2>&1`
+    # and `1>&2` are matched WHOLE and carry no separate operand token, so they
+    # are absent here.
+    #
+    # Not the LEADING fd word: `cmd 3>&1` still reports `cmd 3`. That is a
+    # different defect with its own task; see task 32 §11.10.
+    REDIRECTIONS_CONSUMING_A_WORD = REDIRECTIONS_WITH_ARG + ['<&', '>&']
 
     # Words after which a NEW command may begin, so a `case` appearing right
     # after one is the `case` KEYWORD rather than an argument. Used to gate
     # case-statement recognition: mistaking an argument for the keyword would
     # make us drop the following tokens as pattern text, which could hide a real
     # command from validation. Terminators (`done`, `fi`, `esac`) are absent —
-    # a command can only follow them after a separator, which sets the flag
-    # anyway.
+    # a command can only follow them after a separator, and a separator reopens
+    # reserved-word position on its own.
+    #
+    # These are the ONLY words _at_reserved_word_position() lets a reserved word
+    # be seen through, and only when the keyword was itself at reserved-word
+    # position: measured, `> /tmp/z if [[ -f x ]]` is `if: command not found`,
+    # so an `if` that is a redirect TARGET makes the `[[` after it an argument.
     CMD_POSITION_WORDS = frozenset({
         'if', 'then', 'elif', 'else', 'while', 'until', 'do', '{', '!', 'time',
+        # Grouping openers. `( list )` and `{ list ; }` both begin a command
+        # LIST, so the first word inside one is at command position — bash runs
+        # `( [[ -f a && -f b ]] )` as ONE conditional, and without `(` here the
+        # `[[` inside a subshell stopped being the reserved word and the `&&`
+        # split it in two (task 32 round-2 MEDIUM). `{` was already listed.
+        # Only the SPACE-SEPARATED `(` is seen: `(` is not a tokenizer
+        # metacharacter here, so a glued `([[ … ]])` is the single word `([[`
+        # and stays a (safe-direction) mis-parse — see task 32 §9.
+        '(',
     })
 
     # Redirections that WRITE to their path operand (create/truncate/append, or
@@ -58,7 +118,122 @@ class BashCommandParser:
     # target needs no write-destination gating. `<>` opens for read AND write
     # and CREATES the file when absent, so it IS a write. The fd-dup forms in
     # REDIRECTIONS_NO_ARG carry no path and so are absent here too.
-    WRITE_REDIRECTIONS_WITH_ARG = ['>', '>>', '<>', '2>', '&>', '&>>', '2>>', '1>']
+    #
+    # `>|` writes exactly like `>` (it only overrides `noclobber`), and it is
+    # here because measured bash creates the file for every spelling — `>|`,
+    # `1>|`, `2>|`, `{v}>|`. Before round 4 all four returned NO write target.
+    WRITE_REDIRECTIONS_WITH_ARG = ['>', '>>', '<>', '>|', '2>', '&>', '&>>', '2>>']
+
+    # Hard cap on recursion into nested substitutions and arithmetic.
+    #
+    # CPython raises RecursionError at ~1000 frames, and `pretool_hook.main()`
+    # wraps the whole decision in `except Exception: sys.exit(0)` — so a raise
+    # is not a crash, it is NO DECISION, which Claude Code reads as "the hook
+    # had nothing to say" and falls through to the normal permission flow with
+    # the deny erased. Measured on the real hook path: `("$((" * 3000) +
+    # "\nshred -u /etc/passwd"` exited 0 with no output (task 32 round 5,
+    # item 5). Whether that blanket handler should fail CLOSED is
+    # `tasks/34_nul_byte_fail_open.md`'s question, not this one's; this cap
+    # only stops the raise.
+    #
+    # Past the cap the nested text stays glued to its enclosing WORD instead of
+    # being re-parsed. Round 5 documented that as failing toward `ask` "never
+    # toward allow", on the theory that the sub-command head becomes the glued,
+    # unmatchable text. That was FALSE and round 6 measured it (task 32 §13,
+    # blocker 1): the head is the ALLOWLISTED WORD IN FRONT of the substitution,
+    # not the glued text, so the whole command was ALLOWED —
+    #
+    #     echo A $($($(... 65 deep ...  shred -u /etc/passwd  ...)))
+    #         depth 64 -> deny   ['echo A', 'shred -u /etc/passwd']
+    #         depth 65 -> ALLOW  ['echo A']          <- the truncation
+    #         HEAD     -> deny
+    #         bash     -> runs the payload
+    #
+    # — and an explicit `allow` is WORSE than the RecursionError it replaced,
+    # because a fail-open at least falls through to the native prompt. Every
+    # carrier reached it: `$(…)`, `` `…` ``, `<(…)`, `$((…))`, and the
+    # write-target gate.
+    #
+    # So truncation is no longer silent. Each of the three gates that refuses
+    # to recurse REPORTS that refusal, and the reported thing is unmatchable,
+    # so the head that decides is the truncation itself rather than whatever
+    # allowlisted word happens to precede it:
+    #
+    #   parse_with_offsets   appends TRUNCATED_SUBSTITUTION_COMMAND as a
+    #                        sub-command  (covers `$(…)`, `` `…` ``, `<(…)`)
+    #   _scan_arith          forwards it as a nested CMD_SUBST, because
+    #                        arithmetic nesting grows depth inside the
+    #                        TOKENIZER while parse_with_offsets is still at
+    #                        depth 0  (covers `$((…))`)
+    #   _scan_write_targets  appends TRUNCATED_SUBSTITUTION_TARGET, an
+    #                        unresolvable path, so the write-destination gate
+    #                        refuses to vouch for a redirect it could not see
+    #
+    # The cost is a prompt on nesting deeper than the cap that is entirely
+    # benign — measured, `echo A $(… 70 deep … echo hi …)` is `ask` here and
+    # `allow` at HEAD. Real commands nest a handful deep; 64 is far above
+    # anything a human writes and far below the frame limit (each level costs
+    # 2-3 frames).
+    MAX_SUBSTITUTION_DEPTH = 64
+
+    # What a gate reports when it declines to recurse past MAX_SUBSTITUTION_DEPTH.
+    #
+    # Both are deliberately UNMATCHABLE rather than merely unusual. The
+    # sub-command spelling carries no shell metacharacter, so nothing
+    # downstream can re-tokenize it into something with a friendlier head, it
+    # cannot be peeled away by _reduce_to_effective_command as a control prefix
+    # or an env assignment, and it is not a SAFE_BUILTINS token — so it reaches
+    # the pattern lookup, matches no `Bash(<binary>:*)` an operator would ever
+    # write, and the compound command falls to `ask`. The target spelling
+    # begins with `$`, which `_is_redirect_target_allowed` already treats as an
+    # unresolved expansion it will not vouch for.
+    TRUNCATED_SUBSTITUTION_COMMAND = '__unparsed_nested_substitution__'
+    TRUNCATED_SUBSTITUTION_TARGET = '$__unparsed_nested_substitution__'
+
+    # bash's operator tokens, transcribed from the grammar rather than guessed.
+    #
+    # This is the `other_token_alist` of bash's parse.y (the two- and
+    # three-character operators its lexer recognizes) plus the single-character
+    # metacharacters that are operators on their own. It is the SPINE of
+    # _check_operator: any operator missing from it is lexed as a shorter
+    # prefix, the remainder is re-read, and a redirection can turn into a
+    # separator — an `OP`, which reopens reserved-word position and lets a `[[`
+    # swallow every separator after it. Three of task 32's doors were exactly
+    # that shape (`&`, `>|`, `1>&`).
+    #
+    # Ordered LONGEST FIRST so the scan is a maximal munch, as bash's is.
+    # Sorting by length is done here, once, rather than trusted to the order
+    # someone happens to type the list in.
+    #
+    # Absent by design:
+    # - `(` / `)`: the tokenizer treats them as ordinary word characters except
+    #   inside a `case` pattern list, and `(` is instead listed in
+    #   CMD_POSITION_WORDS. Making them operators here would re-split every
+    #   `$(…)`-adjacent word; the grouping-paren handling in _normalize_command
+    #   covers what we need.
+    # - the fd-prefixed forms (`n>`, `{v}>`, `n>&m`): bash lexes the fd as a
+    #   separate NUMBER/REDIR_WORD token, and so do we — see the fd-prefix
+    #   branch in _tokenize_with_quotes. `2>&1` and `1>&2` are kept as FUSED
+    #   entries below only because matching them whole avoids leaking the fd
+    #   digit out as a phantom command word.
+    BASH_OPERATOR_TOKENS = sorted(
+        [
+            # list terminators / control operators
+            '&&', '||', '|&', ';;', ';&', ';;&', '|', ';', '&',
+            # redirections
+            '<', '>', '>>', '<<', '<<-', '<<<', '<&', '>&', '&>', '&>>',
+            '<>', '>|',
+        ],
+        key=len, reverse=True)
+
+    # Fused fd+operator spellings matched WHOLE, ahead of the table above.
+    #
+    # These are not bash operators — bash reads `2>&1` as NUMBER `2`, operator
+    # `>&`, word `1`. We match them whole so the fd digit never reaches the
+    # word buffer: as a leading token a stray `2` becomes the head of a
+    # sub-command (the `n>&-` residual recorded in task 32 §10.9). Matching
+    # them here is a narrowing of that residual, not a model of bash.
+    FUSED_FD_OPERATORS = ['2>&1', '1>&2']
 
     def __init__(self):
         """Initialize parser"""
@@ -82,7 +257,8 @@ class BashCommandParser:
         """
         return [cmd for cmd, _offset in self.parse_with_offsets(command)]
 
-    def parse_with_offsets(self, command: str) -> List[Tuple[str, int]]:
+    def parse_with_offsets(self, command: str,
+                           _depth: int = 0) -> List[Tuple[str, int]]:
         """
         Like parse_compound_command, but pairs each sub-command with the source
         offset at which its execution anchors. Callers that reason about
@@ -100,12 +276,16 @@ class BashCommandParser:
         order), then substitution-extracted commands appended — the same shape
         parse_compound_command has always produced. The offsets are what convey
         true source order; do not infer it from list position.
+
+        `_depth` is internal: it counts how many substitutions deep this call
+        is, and is capped at MAX_SUBSTITUTION_DEPTH so a pathological nesting
+        cannot raise RecursionError out of the hook — see that constant.
         """
         if not command or not command.strip():
             return []
 
         # Tokenize the command
-        tokens = self._tokenize_with_quotes(command)
+        tokens = self._tokenize_with_quotes(command, _depth=_depth)
 
         # Split on operators
         command_groups = self._split_on_operators(tokens)
@@ -121,46 +301,339 @@ class BashCommandParser:
         # extracted command anchors at the substitution's own source offset, so
         # a function defined AFTER the substitution cannot appear to precede a
         # call made INSIDE it.
-        for token_type, token_value, token_offset in tokens:
-            if token_type == 'CMD_SUBST' and token_value.strip():
-                # Recursively parse the content of command substitutions
-                for sub_cmd, _rel_offset in self.parse_with_offsets(token_value):
-                    result.append((sub_cmd, token_offset))
+        if _depth < self.MAX_SUBSTITUTION_DEPTH:
+            for token_type, token_value, token_offset in tokens:
+                if token_type == 'CMD_SUBST' and token_value.strip():
+                    # Recursively parse the content of command substitutions
+                    for sub_cmd, _rel_offset in self.parse_with_offsets(
+                            token_value, _depth=_depth + 1):
+                        result.append((sub_cmd, token_offset))
+        elif any(t_type == 'CMD_SUBST' and t_val.strip()
+                 for t_type, t_val, _t_off in tokens):
+            # At the cap we refuse to look any further, and we SAY SO. Silently
+            # returning only what this level parsed left the decision to the
+            # allowlisted head in front of the substitution — an explicit
+            # `allow` on a payload HEAD denied. See MAX_SUBSTITUTION_DEPTH.
+            #
+            # Conditional on there actually being a substitution here, so a
+            # nesting that BOTTOMS OUT exactly at the cap still parses cleanly
+            # and costs no prompt. That test is complete: the one carrier whose
+            # depth grows inside the tokenizer is arithmetic, and `_scan_arith`
+            # forwards its own refusal AS a CMD_SUBST token, so it is visible
+            # right here.
+            #
+            # Offset 0 anchors the sentinel at the start of this level, the
+            # conservative end for the function-definition ordering rule; the
+            # caller overwrites it with the enclosing substitution's offset
+            # anyway.
+            result.append((self.TRUNCATED_SUBSTITUTION_COMMAND, 0))
 
         return result
 
+    # bash's METACHARACTERS, the unquoted characters that end a WORD — and so
+    # end a heredoc delimiter word. Transcribed from bash's `shell_meta_chars`
+    # plus the blanks; `\n` is included because a delimiter word cannot span a
+    # line. Everything else is an ordinary word character: `-`, `.`, `:`, `=`,
+    # `#`, `!`, `*`, `$`, `{`, `}` and the rest all belong to the delimiter.
+    HEREDOC_DELIM_TERMINATORS = frozenset(' \t\n|&;()<>')
+
     @staticmethod
-    def _parse_heredoc_delim(command: str, i: int) -> Tuple[Optional[str], int]:
+    def _heredoc_line_starts(command: str, pos: int,
+                             strip_tabs: bool) -> List[int]:
+        """Offsets in the terminator line at `pos` a delimiter may start at.
+
+        `[pos]` for `<<`. For `<<-` it is `[pos, pos_past_leading_tabs]` — the
+        RAW line FIRST, then the tab-stripped one — because bash accepts
+        EITHER, and the three `closes_heredoc` copies must ask the same
+        question.
+
+        Round 7 asked only the second. That is right for the ordinary
+        delimiter, but `<<-` does not stop a delimiter from BEGINNING with a
+        tab: quote removal and escaping make one an ordinary word character, so
+        `<<-'\\tEOF'`, `<<-"\\tEOF"` and `<<-\\\\\\tEOF` all have the delimiter
+        `\\tEOF`. Against such a delimiter a tab-stripped candidate can NEVER
+        match — stripping removes the very tab the delimiter starts with — so
+        the body never closed and swallowed the rest of the script:
+        `cat <<-'\\tEOF' / body / \\tEOF / shred -u /etc/passwd` went from
+        HEAD's `deny` to `allow` while bash ran the payload.
+
+        The union is bash's own rule, not a widened guess. Measured on bash
+        5.3.9 over {11 delimiter words} x {16 candidate lines} x {`<<`,`<<-`}
+        = 352 cells, `line == delim or (<<- and lstrip_tabs(line) == delim)`
+        matched in 352/352:
+
+            operator  delimiter   line        closes?
+            `<<-`     `\\tEOF`     `\\tEOF`     YES  (raw)
+            `<<-`     `\\tEOF`     `EOF`       no   (stripping is not undone)
+            `<<-`     `\\tEOF`     `\\t\\tEOF`   no
+            `<<-`     `\\t\\tEOF`   `\\t\\tEOF`   YES  (raw)
+            `<<-`     `\\t\\tEOF`   `\\tEOF`     no
+            `<<-`     ` EOF`      `\\t EOF`    YES  (stripped)
+            `<<-`     `EOF`       `\\t\\tEOF`   YES  (stripped)
+            `<<-`     `EOF`       ` EOF`      no   (only TABS are stripped)
+            `<<`      `\\tEOF`     `\\tEOF`     YES  (raw)
+            `<<`      `\\tEOF`     `EOF`       no
+
+        Adding the raw offset cannot disturb any delimiter that does not begin
+        with a tab: for those, a raw match implies a stripped match (nothing
+        was stripped), so the two offsets answer identically. And when the
+        delimiter DOES begin with a tab the stripped offset can never match, so
+        the two are mutually exclusive and the order is immaterial. The change
+        is therefore confined, provably, to tab-leading delimiters under `<<-`.
+        Task 32 §15, blocker 2.
+        """
+        starts = [pos]
+        if strip_tabs:
+            j = pos
+            n = len(command)
+            while j < n and command[j] == '\t':
+                j += 1
+            if j != pos:
+                starts.append(j)
+        return starts
+
+    @staticmethod
+    def _parse_heredoc_delim(command: str,
+                             i: int) -> Tuple[Optional[str], int,
+                                              bool, bool]:
         """
         Parse a heredoc operator at `command[i:]` (caller guarantees
         `command[i:i+2] == '<<'`).
 
-        Returns `(delimiter, j)` where `j` is the index just past the delimiter
-        token, or `(None, i)` if this is not a heredoc that introduces a body
-        (a bare `<<` with no delimiter word, or a `<<<` here-string). Mirrors
-        the delimiter parsing in `_tokenize_with_quotes` so the two stay in
-        sync — the quote around the delimiter (`<<'EOF'`) is consumed but does
-        not affect how the body is matched.
+        Returns `(delimiter, j, strip_tabs, declined)` where `j` is the index
+        just past the delimiter token and `strip_tabs` is True for the `<<-`
+        spelling, whose terminator line may be indented with TABS.
+
+        Returns `(None, i, False, declined)` when this is not a heredoc that
+        introduces a body: a `<<<` here-string, a bare `<<` with no delimiter
+        word, a delimiter that is empty, unterminated, or spans a newline, or
+        one that embeds a command substitution or an ANSI-C / locale
+        translation quote (see below). bash could never match a terminator
+        line for most of those, and refusing the heredoc leaves the text
+        after it to be tokenized as commands.
+
+        `declined` separates the two kinds of `None`. It is True only for a
+        delimiter this scanner RECOGNISED and refused to model — `$(`, a
+        backtick, `$'`, `$"` — the four spellings for which bash DOES open a
+        heredoc body with a delimiter we decline to compute. It is False for
+        every other `None`, which is a heredoc bash does not open either (a
+        here-string, a syntax error, an unterminated quote).
+
+        The distinction is load-bearing, not documentation. "Refusing fails
+        toward `ask`" was true only of the residual corpus that happened to be
+        measured: refusing hands the BODY to the tokenizer, and a first body
+        line that opens another swallowing construct (`cat <<Z`, `echo 'x`)
+        eats the real terminator AND the payload, leaving a split that is
+        entirely allowlisted — an `allow`, not an `ask`. Round 9's callers
+        therefore report the refusal with
+        `TRUNCATED_SUBSTITUTION_COMMAND`, which makes "a refusal can never
+        reach `allow`" true BY CONSTRUCTION rather than by corpus shape. Task
+        32 §16.
+
+        This is the ONE implementation of the rule: `_tokenize_with_quotes`,
+        `_scan_paren_subst` and `_scan_backtick` all call it. Round 4 taught
+        `<<-` to a hand-copied duplicate inside the tokenizer and left the two
+        scanners on the old reading; a single function cannot drift that way.
+
+        THE DELIMITER IS A WHOLE WORD, WITH QUOTE REMOVAL. Rounds 4-6 scanned
+        the unquoted spelling as `[A-Za-z0-9_]*` and the quoted spelling as
+        "verbatim up to the closing quote, and stop there". Both are wrong, and
+        together they stranded the tail of every delimiter that is not purely
+        alphanumeric: `<<EOF-1` yielded `EOF` and left `-1` behind, `<<'E'OF`
+        yielded `E` and left `OF` behind. Measured on bash 5.3.9, one row per
+        spelling, `cat <<D / body / <line> / echo TAIL`:
+
+            spelling      bash's delimiter   ordinary word chars / quote removal
+            `<<EOF-1`     `EOF-1`            `-` is not a metacharacter
+            `<<EOF.txt`   `EOF.txt`          nor is `.`
+            `<<E:F`       `E:F`              nor `:`, `=`, `#`, `!`, `*`
+            `<<${X}`      `${X}`             NOT expanded, and `{`/`}` are words
+            `<<$X`        `$X`               nor is a bare `$` expanded
+            `<<E'O'F`     `EOF`              quote removal, mid-word
+            `<<'E'OF`     `EOF`              quote removal, leading quote
+            `<<"E\\$F"`    `E$F`              `\\` escapes `$` inside `"`
+            `<<"E\\OF"`    `E\\OF`             but is LITERAL before anything else
+            `<<'E\\OF'`    `E\\OF`             and always literal inside `'`
+            `<<E\\ F`      `E F`              an escaped blank joins the word
+            `<<E\\<nl>F`   `EF`               `\\`+newline is a line continuation
+            `<<EOF\\r`     `EOF\\r`            CR is an ordinary character
+            `<<EOF;`      `EOF`              `;`, `|`, `&`, `<`, `>`, `(`, `)`
+                                             and blanks END the word
+
+        Truncating the word was masked for two rounds because the terminator
+        comparison in `_scan_paren_subst`/`_scan_backtick` is a PREFIX match:
+        the truncated `EOF` still prefix-matched the real terminator line
+        `EOF-1`, so the body closed anyway. Round 6 made the TOKENIZER's
+        comparison exact (correctly — see `_tokenize_with_quotes.closes_heredoc`)
+        and the mask came off: the body never closed, and everything after it
+        was swallowed. `cat <<EOF-1 / body / EOF-1 / shred -u /etc/passwd` went
+        from HEAD's `deny ['cat -1', 'shred -u /etc/passwd']` to
+        `allow ['cat -1']` while bash ran the payload. 34 ASCII spellings flipped
+        that way, CRLF line endings among them. See task 32 §14.
+
+        `$(`, `$((` and a backtick are the one construct bash absorbs into the
+        word THROUGH a metacharacter (`cat <<$(echo E)` has the literal,
+        unexpanded delimiter `$(echo E)`). Rather than grow a second nested
+        scanner here, this refuses the heredoc outright — and REPORTS the
+        refusal, which is what keeps it from reaching `allow`; see `declined`
+        above and the refusal sites below.
+
+        Two claims rounds 7-8 made about that refusal were wrong, and are
+        corrected here rather than deleted, because each one hid a blocker:
+
+        - "it is exactly what the alnum scan already did, so it is not a new
+          answer". True only at the START of the word. Measured on HEAD's own
+          scanner, `<<$(echo E)` and `` <<`echo E` `` did come back empty and
+          were refused — but `<<E$(echo x)F` came back `E`, a NON-EMPTY
+          delimiter, so HEAD opened a heredoc where this refuses one. Mid-word
+          it IS a new answer.
+        - "it fails toward `ask`". Not by itself it does not: refusing hands
+          the BODY to the tokenizer, and a body line that opens another
+          swallowing construct eats the terminator and the payload, leaving an
+          all-allowlisted split — `allow`. That is why the refusal is now
+          reported. See the refusal sites below.
+
+        `$'…'` and `$"…"` are refused on the same terms and for a sharper
+        reason: bash's quote removal takes the `$` AWAY (`<<$'EOF'` has the
+        delimiter `EOF`), so a scanner that treats `$` as an ordinary word
+        character and then opens a quote produces `$EOF` — a delimiter no
+        terminator line can ever equal. See the refusal site below for the
+        measured table and why decoding them is not worth it.
         """
         # `<<<` is a here-string, not a heredoc: it has no multi-line body.
         if command[i:i+3] == '<<<':
-            return None, i
+            return None, i, False, False
+        n = len(command)
         j = i + 2
-        while j < len(command) and command[j] in (' ', '\t'):
+        # `<<-EOF` / `<<- EOF`: the `-` belongs to the OPERATOR, not to the
+        # delimiter, and it is what makes bash strip leading TABS from the
+        # terminator line. It counts only GLUED to the `<<` — `<< -EOF` is a
+        # delimiter that starts with a dash, not the tab-stripping spelling.
+        strip_tabs = False
+        if j < n and command[j] == '-':
+            strip_tabs = True
             j += 1
-        quote_char = None
-        if j < len(command) and command[j] in ('"', "'"):
-            quote_char = command[j]
+        while j < n and command[j] in (' ', '\t'):
             j += 1
-        delim_start = j
-        while j < len(command) and (command[j].isalnum() or command[j] == '_'):
+        # One word scanner for the quoted and unquoted spellings alike. Folding
+        # them is what fixes `<<'E'OF`: a separate leading-quote branch returns
+        # at the closing quote and can never see the `OF` glued after it.
+        parts = []
+        quote = None  # None, "'", or '"'
+        while j < n:
+            c = command[j]
+            if quote == "'":
+                if c == '\n':
+                    # A quoted delimiter cannot span a line; bash would never
+                    # match a terminator for it. Refuse (safe direction).
+                    return None, i, False, False
+                if c == "'":
+                    quote = None
+                else:
+                    parts.append(c)
+                j += 1
+                continue
+            if quote == '"':
+                if c == '\n':
+                    return None, i, False, False
+                if c == '"':
+                    quote = None
+                    j += 1
+                    continue
+                if c == '\\' and j + 1 < n and command[j + 1] in '$`"\\':
+                    parts.append(command[j + 1])
+                    j += 2
+                    continue
+                if c == '\\' and j + 1 < n and command[j + 1] == '\n':
+                    j += 2  # line continuation, removed
+                    continue
+                # Inside `"` a backslash is LITERAL before anything else.
+                parts.append(c)
+                j += 1
+                continue
+            if c in ('"', "'"):
+                quote = c
+                j += 1
+                continue
+            if c == '\\':
+                if j + 1 >= n:
+                    parts.append(c)  # trailing `\`: bash keeps it literally
+                    j += 1
+                    continue
+                if command[j + 1] == '\n':
+                    j += 2  # line continuation, removed
+                    continue
+                parts.append(command[j + 1])
+                j += 2
+                continue
+            if c == '`' or command[j:j+2] == '$(':
+                # bash absorbs a whole substitution into the word; we decline —
+                # and we SAY SO, so the caller can report the refusal.
+                return None, i, False, True
+            if command[j:j+2] in ("$'", '$"'):
+                # ANSI-C quoting (`$'…'`) and locale translation (`$"…"`).
+                # bash removes the `$` ALONG WITH the quotes, so the delimiter
+                # of `<<$'EOF'` is `EOF`, not `$EOF`. Round 7 opened the quote
+                # at the `'` but had already appended the `$` as an ordinary
+                # word character, and the exact-line terminator match then
+                # never fired: `cat <<$'EOF' / body / EOF / shred -u
+                # /etc/passwd` went from HEAD's `deny` to `allow` while bash
+                # ran the payload. Measured on bash 5.3.9 off its
+                # `wanted `X'` warning:
+                #
+                #     spelling      bash's delimiter   round 7's
+                #     `<<$'EOF'`    `EOF`              `$EOF`
+                #     `<<$"EOF"`    `EOF`              `$EOF`
+                #     `<<E$'x'F`    `ExF`              `E$xF`
+                #     `<<$''E`      `E`                `$E`
+                #
+                # We REFUSE rather than implement the quoting, for the same
+                # reason as `$(` above — and, since round 9, we SAY SO, which
+                # is what stops the refusal reaching `allow`.
+                #
+                # Round 8 justified the refusal as "exactly what HEAD's alnum
+                # scan already answered, so it is not a new answer". Measured
+                # on HEAD's own scanner, that holds only at the START of the
+                # word:
+                #
+                #     spelling        HEAD        round 7   round 8/9
+                #     `<<$'EOF'`      None        `$EOF`    None (refused)
+                #     `<<$"EOF"`      None        `$EOF`    None (refused)
+                #     `<<$''E`        None        `$E`      None (refused)
+                #     `<<E$'x'F`      `E`         `E$xF`    None (refused)
+                #     `<<E$"x"F`      `E`         `E$xF`    None (refused)
+                #     `<<E$'x'F.txt`  `E`         `E$xF...` None (refused)
+                #
+                # The mid-word rows are a NEW answer: HEAD came back with a
+                # non-empty `E` and opened a heredoc. So this refusal is a
+                # deliberate loss of precision there, not a restatement of
+                # HEAD, and the reported marker is what keeps the loss on the
+                # `ask` side of the line.
+                #
+                # Decoding `$'…'` properly means the whole ANSI-C escape set
+                # (`\n \t \\ \' \xHH \0nnn \uHHHH \cX` …). `$"…"` is not
+                # merely harder — it is IMPOSSIBLE from the script text.
+                # Measured with a real gettext catalogue (`msgid "EOF"` ->
+                # `msgstr "ZZTOP"`, `TEXTDOMAIN=btest`), bash's own warning
+                # reads ``wanted `ZZTOP'``: the delimiter is the TRANSLATED
+                # string, so it is a function of the locale's message
+                # catalogue, not of the command. Neither belongs in a word
+                # scanner. Task 32 §15 blocker 1, §16.
+                #
+                # An ESCAPED `$` is not this: `<<\$'EOF'` is handled by the
+                # backslash branch above, which consumes `\$` before `j` ever
+                # points at the `$`, and yields bash's `$EOF`.
+                return None, i, False, True
+            if c in BashCommandParser.HEREDOC_DELIM_TERMINATORS:
+                break
+            parts.append(c)
             j += 1
-        delimiter = command[delim_start:j]
+        if quote is not None:
+            return None, i, False, False  # unterminated quote
+        delimiter = ''.join(parts)
         if not delimiter:
-            return None, i
-        if quote_char is not None and j < len(command) and command[j] == quote_char:
-            j += 1
-        return delimiter, j
+            return None, i, False, False
+        return delimiter, j, strip_tabs, False
 
     def _scan_paren_subst(self, command: str, start: int) -> Tuple[str, int]:
         """
@@ -182,7 +655,42 @@ class BashCommandParser:
         quote = None  # None, "'", or '"'
         heredoc_delim = None  # active heredoc delimiter, once `<<DELIM` is seen
         heredoc_seen_nl = False  # body begins after the first newline past `<<`
+        heredoc_strip = False  # `<<-`: the terminator line may be tab-indented
         n = len(command)
+
+        def closes_heredoc(pos):
+            """Index just past the terminator if the line at `pos` BEGINS with
+            it, else None. `<<-` strips leading TABS — see
+            `_parse_heredoc_delim`.
+
+            A PREFIX match, deliberately, and NOT the exact-line rule the
+            top-level tokenizer uses. This function serves bash's `$(...)`
+            EXTENT scanner, and bash's own extent scanner is prefix-matched
+            while its heredoc READER is exact. Measured on bash 5.3.9, one
+            variable per row, `x=$(cat <<EOF / <body> / EOF / printf INNER / )`:
+
+                body line   substitution ends at          heredoc body
+                `EOF )`     the `)` ON THAT LINE          unterminated
+                `EOFY )`    the `)` ON THAT LINE          unterminated
+                `EOF)`      the `)` ON THAT LINE          unterminated
+                `XEOF )`    the final `)`                 `XEOF )`
+                ` EOF )`    the final `)`                 ` EOF )`
+
+            So a line beginning with the delimiter ends the body for the
+            purpose of finding the closing paren, and a leading space or any
+            other prefix does not. Round 6 briefly made this exact and MEASURED
+            the cost: `echo $(cat <<EOF\nEOF )\nEOF\nprintf T\n) ; ls` then
+            hid the `EOF` that bash really runs. See task 32 §13.
+
+            Under `<<-` the RAW line is tried before the tab-stripped one, the
+            same union the tokenizer's copy uses — see `_heredoc_line_starts`.
+            """
+            for k in BashCommandParser._heredoc_line_starts(
+                    command, pos, heredoc_strip):
+                if command[k:k+len(heredoc_delim)] == heredoc_delim:
+                    return k + len(heredoc_delim)
+            return None
+
         while i < n and depth > 0:
             c = command[i]
             # Inside a heredoc body: skip every char until a line equal to the
@@ -190,8 +698,9 @@ class BashCommandParser:
             if heredoc_delim is not None and heredoc_seen_nl:
                 if c == '\n':
                     i += 1
-                    if command[i:i+len(heredoc_delim)] == heredoc_delim:
-                        i += len(heredoc_delim)
+                    end = closes_heredoc(i)
+                    if end is not None:
+                        i = end
                         heredoc_delim = None
                     continue
                 i += 1
@@ -209,7 +718,14 @@ class BashCommandParser:
                 i += 1
                 continue
             if heredoc_delim is None and command[i:i+2] == '<<':
-                delim, j = self._parse_heredoc_delim(command, i)
+                # The refusal flag is for the TOKENIZER, which is the copy
+                # that emits sub-commands; here it only matters where the
+                # substitution ENDS, and a refused heredoc is not tracked
+                # either way. The body still reaches the tokenizer through this
+                # substitution's own CMD_SUBST token, which is where the
+                # refusal gets reported.
+                delim, j, heredoc_strip, _declined = \
+                    self._parse_heredoc_delim(command, i)
                 if delim is not None:
                     heredoc_delim = delim
                     heredoc_seen_nl = False
@@ -218,6 +734,12 @@ class BashCommandParser:
             if c == '\n' and heredoc_delim is not None and not heredoc_seen_nl:
                 heredoc_seen_nl = True
                 i += 1
+                # The FIRST body line is a candidate terminator too — see the
+                # tokenizer's newline handler (task 32 round 5, item 3).
+                end = closes_heredoc(i)
+                if end is not None:
+                    i = end
+                    heredoc_delim = None
                 continue
             if c == '(':
                 depth += 1
@@ -244,13 +766,37 @@ class BashCommandParser:
         n = len(command)
         heredoc_delim = None
         heredoc_seen_nl = False
+        heredoc_strip = False  # `<<-`: the terminator line may be tab-indented
+
+        def closes_heredoc(pos):
+            """Index just past the terminator if the line at `pos` BEGINS with
+            it, else None. `<<-` strips leading TABS — see
+            `_parse_heredoc_delim`.
+
+            A PREFIX match for the same reason as `_scan_paren_subst`'s: this
+            finds the substitution's EXTENT, and bash's extent scanning is
+            prefix-matched even though its heredoc reader is exact. The
+            exact-line rule belongs to the top-level tokenizer's
+            `closes_heredoc`, which is what actually decides where commands
+            are. Task 32 §13.
+
+            Under `<<-` the RAW line is tried before the tab-stripped one, the
+            same union the other two copies use — see `_heredoc_line_starts`.
+            """
+            for k in BashCommandParser._heredoc_line_starts(
+                    command, pos, heredoc_strip):
+                if command[k:k+len(heredoc_delim)] == heredoc_delim:
+                    return k + len(heredoc_delim)
+            return None
+
         while i < n:
             c = command[i]
             if heredoc_delim is not None and heredoc_seen_nl:
                 if c == '\n':
                     i += 1
-                    if command[i:i+len(heredoc_delim)] == heredoc_delim:
-                        i += len(heredoc_delim)
+                    end = closes_heredoc(i)
+                    if end is not None:
+                        i = end
                         heredoc_delim = None
                     continue
                 i += 1
@@ -259,7 +805,14 @@ class BashCommandParser:
                 i += 2
                 continue
             if heredoc_delim is None and command[i:i+2] == '<<':
-                delim, j = self._parse_heredoc_delim(command, i)
+                # The refusal flag is for the TOKENIZER, which is the copy
+                # that emits sub-commands; here it only matters where the
+                # substitution ENDS, and a refused heredoc is not tracked
+                # either way. The body still reaches the tokenizer through this
+                # substitution's own CMD_SUBST token, which is where the
+                # refusal gets reported.
+                delim, j, heredoc_strip, _declined = \
+                    self._parse_heredoc_delim(command, i)
                 if delim is not None:
                     heredoc_delim = delim
                     heredoc_seen_nl = False
@@ -268,6 +821,12 @@ class BashCommandParser:
             if c == '\n' and heredoc_delim is not None and not heredoc_seen_nl:
                 heredoc_seen_nl = True
                 i += 1
+                # The FIRST body line is a candidate terminator too — see the
+                # tokenizer's newline handler (task 32 round 5, item 3).
+                end = closes_heredoc(i)
+                if end is not None:
+                    i = end
+                    heredoc_delim = None
                 continue
             if c == '`':
                 i += 1
@@ -275,7 +834,8 @@ class BashCommandParser:
             i += 1
         return command[start + 1:i - 1], i
 
-    def _scan_arith(self, command: str, start: int) -> Tuple[int, List[Tuple[str, int]]]:
+    def _scan_arith(self, command: str, start: int,
+                    _depth: int = 0) -> Tuple[int, List[Tuple[str, int]]]:
         """
         Scan an arithmetic expansion `$((...))` beginning at `start` (the `$`).
 
@@ -307,14 +867,38 @@ class BashCommandParser:
         interior = command[interior_start:interior_end]
         nested = []
         if interior.strip():
-            for t_type, t_val, t_off in self._tokenize_with_quotes(interior):
-                if t_type == 'CMD_SUBST':
-                    nested.append((t_val, interior_start + t_off))
+            if _depth < self.MAX_SUBSTITUTION_DEPTH:
+                for t_type, t_val, t_off in self._tokenize_with_quotes(
+                        interior, _depth=_depth + 1):
+                    if t_type == 'CMD_SUBST':
+                        nested.append((t_val, interior_start + t_off))
+            else:
+                # The cap, reported rather than applied in silence. Arithmetic
+                # is the one carrier whose nesting grows `_depth` inside the
+                # TOKENIZER (`$((` * N re-enters _scan_arith without
+                # parse_with_offsets ever recursing), so parse_with_offsets is
+                # still at depth 0 and its own sentinel never fires. Forwarding
+                # the sentinel as a nested CMD_SUBST makes it a sub-command by
+                # the ordinary route. See MAX_SUBSTITUTION_DEPTH.
+                nested.append((self.TRUNCATED_SUBSTITUTION_COMMAND,
+                               interior_start))
         return i, nested
 
-    def _tokenize_with_quotes(self, command: str) -> List[Tuple[str, str]]:
+    def _tokenize_with_quotes(self, command: str,
+                              _allow_conditional: bool = True,
+                              _depth: int = 0) -> List[Tuple[str, str]]:
         """
         Tokenize command into (type, value) pairs
+
+        `_allow_conditional` is internal (task 32): when False, a `[[` never
+        opens a conditional and every operator stays a command separator. The
+        pass sets it False for itself on retry when a `[[` turned out to be
+        UNTERMINATED — see the end of this method.
+
+        `_depth` is internal too: nesting depth through arithmetic and
+        substitutions, capped at MAX_SUBSTITUTION_DEPTH. The retry passes it
+        THROUGH unchanged — a retry is the same string at the same depth, not a
+        level deeper.
 
         Token types:
         - ENV: Environment variable assignment (KEY=VALUE)
@@ -342,6 +926,7 @@ class BashCommandParser:
         # Heredoc handling
         heredoc_delimiter = None  # The delimiter we're looking for
         heredoc_seen_first_nl = False  # Track if we've passed first newline after <<
+        heredoc_strip_tabs = False  # `<<-`: terminator line may be tab-indented
 
         # Command substitution handling
         cmd_subst_depth = 0  # Paren depth inside $(...)
@@ -355,6 +940,14 @@ class BashCommandParser:
         # whole `[[ ... ]]` as one sub-command. Command substitutions inside it
         # ARE still extracted (handled before the operator checks), so a
         # `[[ $(rm -rf /) ]]` still validates `rm -rf /` on its own.
+        #
+        # TASK 32: this suppression is entered ONLY for a `[[` at command
+        # position, the way bash recognizes the reserved word. It used to fire
+        # for ANY flushed token spelled `[[`, so an ordinary ARGUMENT spelled
+        # `[[` (`echo [[ ; nslookup evil`) switched separator detection off for
+        # the rest of the string and folded every following command into the
+        # allowlisted head. `echo [[` is a plain word to bash and the `;` after
+        # it still separates — measured under `set -T`.
         in_conditional = False
 
         # Case-statement handling. `case WORD in pat1|pat2) body ;; ... esac`
@@ -375,19 +968,85 @@ class BashCommandParser:
         case_stack = []
         case_paren_depth = 0  # extglob nesting inside the current pattern list
 
-        # True while the next word would begin a new command. Gates `case`
-        # recognition: without it, an argument that merely spells `case`
-        # (`echo case ... in`) would flip us into pattern mode and DROP the
-        # commands that follow — a bypass, not just a mis-parse.
-        at_cmd_start = True
+        # RESERVED-WORD POSITION — derived from the emitted token stream, never
+        # tracked as a flag (task 32 round 3).
+        #
+        # Both consumers of this property (`case` pattern mode and the `[[`
+        # conditional) suppress or drop text, so each must be reachable only
+        # from a position where bash itself would read a RESERVED WORD. bash
+        # recognizes one only as the first word of a command; a redirection, an
+        # assignment prefix, an expansion or a preceding word all close that
+        # window. Measured, every one of these is a syntax error or a
+        # "command not found":
+        #
+        #     2>&1 if true; then :; fi      $(true) if true; then :; fi
+        #     > /tmp/z if true; then :; fi  X=1 if true; then :; fi
+        #     2>&1 [[ -f x ]]               <(true) [[ -f x ]]
+        #     > /tmp/z [[ -f x ]]           X=1 [[ -f x ]]
+        #     2>&1 case a in a) :;; esac    $(true) case a in a) :;; esac
+        #     > /tmp/z if [[ -f x ]]        (`if` after a redirect TARGET is not
+        #                                    reserved either — `if: command not
+        #                                    found`)
+        #
+        # `reserved_word_position[k]` records whether the token at index k was
+        # emitted at reserved-word position; `_at_reserved_word_position()` then
+        # answers the same question for the token about to be emitted, as a
+        # TOTAL function of the last token's TYPE:
+        #
+        #   (no tokens)            -> True   start of input
+        #   OP                     -> True   a separator opens a command
+        #   WORD in the keyword set-> whatever that keyword's own answer was
+        #   WORD / ENV / REDIRECT /
+        #   CMD_SUBST / CASE_PATTERN
+        #                          -> False  the position is consumed
+        #
+        # Those five are exhaustive: they are every type this tokenizer ever
+        # appends. Deriving the answer from the token stream — rather than from
+        # a flag updated at each site that happens to remember — is what closes
+        # the whole "advanced a word without flushing characters" class at once.
+        # A flag maintained inside flush_current() below its `if not current`
+        # early-out missed every construct that consumes a bash word while
+        # leaving the buffer empty: a fused `2>&1`/`1>&2`, a redirect whose
+        # target is the next token (`> [[ ; evil ]]`), a heredoc `<<`, an
+        # fd-prefixed `3<>`, and every substitution the tokenizer lifts into a
+        # token of its own (`$(…)`, `` `…` ``, `<(…)`, `>(…)`). Each of those
+        # emits a REDIRECT or a CMD_SUBST, so each is now decisive on its own.
+        # The rule itself is `_at_reserved_word_position`, a pure function of
+        # the token list and this record, so it can be read — and asserted —
+        # on its own rather than only through the tokenizer.
+        reserved_word_position = {}
+
+        # True when the character buffer is empty but the current WORD is not:
+        # a glued `$(...)`/`` `...` ``/`<(...)` was lifted out into its own
+        # token, and bash still counts it as word content. Used solely to decide
+        # whether a `#` begins a comment (task 32): bash starts a comment only
+        # at the START of a word, so `echo $(date)#x` is an argument, not a
+        # comment, exactly as `echo ok#c` is. Every other mid-word position
+        # leaves `current` non-empty and is covered by that instead.
+        #
+        # It is deliberately NOT consulted by _at_reserved_word_position(): every
+        # site that sets it emits a CMD_SUBST immediately before doing so, and
+        # CMD_SUBST already answers False there, so consulting both would be two
+        # mechanisms for one rule. `test_word_open_paths_emit_a_substitution_token`
+        # pins that implication rather than leaving it as a comment.
+        word_open = False
 
         def flush_current():
             """Flush current token buffer"""
-            nonlocal in_conditional, at_cmd_start
+            nonlocal in_conditional, word_open
+            # Cleared unconditionally: a flush ends the word whether or not any
+            # characters were buffered for it (a lone `$(...)` word buffers none).
+            word_open = False
             if not current:
                 return
             token_str = ''.join(current)
             current.clear()
+
+            # Read BEFORE this token is appended, so it describes this token's
+            # own position. Nothing below may reorder past the append.
+            at_cmd_start = self._at_reserved_word_position(
+                tokens, reserved_word_position)
+            reserved_word_position[len(tokens)] = at_cmd_start
 
             in_pattern = bool(case_stack) and case_stack[-1] == 'pattern'
 
@@ -416,22 +1075,82 @@ class BashCommandParser:
                 # `[[` / `]]` are recognized only as standalone tokens (bash
                 # requires them space-separated), so toggling on the flushed
                 # word is exact — a glued `a[[b` or `${arr[[i]]}` never matches.
-                if token_str == '[[':
+                #
+                # `[[` additionally has to be at RESERVED-WORD POSITION: bash
+                # treats it as a reserved word only where a command may begin,
+                # and as an ordinary argument anywhere else. Without the gate,
+                # one `[[` argument suppressed every separator to end of string
+                # (task 32 §1a).
+                if token_str == '[[' and at_cmd_start and _allow_conditional:
                     in_conditional = True
                 elif token_str == ']]':
                     in_conditional = False
 
-            # A `KEY=VALUE` env prefix precedes the command it applies to, so it
-            # leaves command position intact; every other word consumes it
-            # unless it is a keyword that introduces a further command.
-            if tokens[-1][0] != 'ENV':
-                at_cmd_start = token_str in self.CMD_POSITION_WORDS
+        def closes_heredoc(pos):
+            """Index just past the heredoc terminator if the line beginning at
+            `pos` is it, else None.
+
+            `<<-` strips leading TABS from the terminator line — that IS the
+            operator's meaning. Round 4 taught the tokenizer to RECOGNIZE
+            `<<-` without teaching it this, so the canonical indented block
+
+                cat <<-EOF
+                \thello
+                \tEOF
+                shred git status
+
+            never found its terminator and swallowed the rest of the script:
+            `allow ['cat']` where HEAD denied (task 32 round 5, item 2).
+
+            The comparison is an EXACT-LINE match, as bash's is: after the
+            optional `<<-` tab strip the delimiter must run to end-of-line or
+            end-of-input. A PREFIX match is what round 5 shipped, on the
+            argument that closing the body EARLY only surfaces body text as
+            commands — "more sub-commands, never fewer". That argument is
+            WRONG, and round 6 measured why (task 32 §13, blocker 2): the
+            residual of the line that falsely closed the body is then tokenized,
+            and it can reopen a SWALLOWING state — a fresh heredoc or an
+            unterminated quote — which eats the real terminator and every
+            command after it:
+
+                cat <<EOF
+                EOF cat <<Z
+                EOF
+                shred -u /etc/passwd
+
+            Prefix-matching closes the body on `EOF cat <<Z`, the residual
+            `cat <<Z` opens a heredoc whose delimiter `Z` never appears, and the
+            payload is swallowed: `allow ['cat cat']` where HEAD (which never
+            tested the first body line) denied. A 102-case fuzz over
+            {3 delimiters} x {18 residuals} x {`<<`,`<<-`} found 24 such rows,
+            and bash executed the payload in 24/24. So the prefix match DOES
+            make the error it was documented as unable to make, and it makes it
+            only in company with the first-body-line test below — the two round-5
+            changes are correct only together.
+
+            The two SCANNERS (`_scan_paren_subst`, `_scan_backtick`) keep the
+            prefix match on purpose and are not a fourth copy that drifted:
+            they find a substitution's EXTENT, which bash itself scans with a
+            prefix-matched terminator even though its heredoc READER is exact.
+            Both readings are measured; see `_scan_paren_subst.closes_heredoc`
+            for the table and task 32 §13 for the cost of unifying them.
+
+            Under `<<-` the RAW line is tried before the tab-stripped one —
+            see `_heredoc_line_starts`.
+            """
+            for j in BashCommandParser._heredoc_line_starts(
+                    command, pos, heredoc_strip_tabs):
+                end = j + len(heredoc_delimiter)
+                if (command[j:end] == heredoc_delimiter
+                        and command[end:end + 1] in ('\n', '')):
+                    return end
+            return None
 
         def emit_separator(value, offset):
-            """Append a command separator, reopening command position."""
-            nonlocal at_cmd_start
+            """Append a command separator, which reopens reserved-word position
+            — see _at_reserved_word_position(), which reads that off the OP
+            token itself rather than off a flag set here."""
             tokens.append(('OP', value, offset))
-            at_cmd_start = True
 
         while i < len(command):
             # While the buffer is empty, keep the start offset pinned to the
@@ -448,14 +1167,14 @@ class BashCommandParser:
                 if char == '\n':
                     # End of line - check if next line starts with delimiter
                     i += 1
-                    # Check if the delimiter appears at start of next line
-                    if command[i:i+len(heredoc_delimiter)] == heredoc_delimiter:
+                    end = closes_heredoc(i)
+                    if end is not None:
                         # Found the delimiter! Consume it, but leave the newline
                         # that follows so the newline handler can emit a command
                         # separator — otherwise a command after the heredoc (e.g.
                         # `cat <<EOF\n...\nEOF\necho done`) would merge into the
                         # heredoc command.
-                        i += len(heredoc_delimiter)
+                        i = end
                         heredoc_delimiter = None
                         continue
                     # Not the delimiter, continue in heredoc mode
@@ -523,7 +1242,7 @@ class BashCommandParser:
             # double quotes, so it is intentionally absent here.
             if in_quote == '"' and command[i:i+3] == '$((':
                 arith_start = i
-                end, nested = self._scan_arith(command, i)
+                end, nested = self._scan_arith(command, i, _depth)
                 current.extend(command[arith_start:end])
                 for content, off in nested:
                     tokens.append(('CMD_SUBST', content, off))
@@ -571,7 +1290,7 @@ class BashCommandParser:
                 # keeps its argument); forward only the command substitutions
                 # nested inside, with offsets mapped to absolute source
                 # positions so the function-definition ordering logic holds.
-                end, nested = self._scan_arith(command, i)
+                end, nested = self._scan_arith(command, i, _depth)
                 current.extend(command[arith_start:end])
                 for content, off in nested:
                     tokens.append(('CMD_SUBST', content, off))
@@ -623,6 +1342,9 @@ class BashCommandParser:
                 # closing `)` (i now points just past it).
                 subst_content = command[subst_start:i-1]
                 tokens.append(('CMD_SUBST', subst_content, subst_start))
+                # The `/dev/fd/N` this expands to is word content: a `#` glued
+                # after it is not a comment.
+                word_open = True
                 continue
 
             # Handle command substitution $(
@@ -642,6 +1364,10 @@ class BashCommandParser:
                     # current token.
                     current.extend(command[subst_start:end])
 
+                # What the substitution expands to is word content, so a `#`
+                # glued right after it continues the word rather than opening a
+                # comment (`echo $(date)#x`).
+                word_open = True
                 i = end
                 continue
 
@@ -662,6 +1388,8 @@ class BashCommandParser:
                     # the current token.
                     current.extend(command[subst_start:end])
 
+                # Word content, like the `$(...)` case above.
+                word_open = True
                 i = end
                 continue
 
@@ -671,39 +1399,69 @@ class BashCommandParser:
                 i += 1
                 continue
 
-            # Check for heredoc operator (<<). Suppressed inside `[[ ]]`, where
-            # `<` is a string comparison, not a redirection.
+            # A heredoc operator: `<<`, or its tab-stripping spelling `<<-`.
+            # Suppressed inside `[[ ]]`, where `<` is a string comparison, not
+            # a redirection.
+            #
+            # `<<<` is the HERE-STRING — a different operator, with a word
+            # operand and no body — and `_parse_heredoc_delim` rejects it, so
+            # the operator scan below emits it. The branch is still ENTERED for
+            # it, and that is deliberate: the `flush_current()` here is
+            # load-bearing. `<` is a bash METACHARACTER, so it ends the word
+            # before it. Round 4 guarded the whole branch with
+            # `command[i:i+3] != '<<<'` and called the guard unobservable; in
+            # `case` PATTERN mode, where the operator scan below is suppressed,
+            # nothing else ends the word, so `case a in esac<<<x ; shred …`
+            # buffered `esac<<<x`, the `case` never closed, and every separator
+            # to end of string was swallowed — allow, where HEAD denied and
+            # bash runs `shred` (task 32 round 5, item 4). The guard was a live
+            # bypass, not an unobservable branch.
             if command[i:i+2] == '<<' and not in_conditional:
                 flush_current()
-                # Check if it's quoted or unquoted heredoc
-                j = i + 2
-                # Skip whitespace after <<
-                while j < len(command) and command[j] in (' ', '\t'):
-                    j += 1
-
-                # Check for quoted delimiter
-                quote_char = None
-                if j < len(command) and command[j] in ('"', "'"):
-                    quote_char = command[j]
-                    j += 1
-
-                # Extract delimiter (alphanumerics and underscore)
-                delim_start = j
-                while j < len(command) and (command[j].isalnum() or command[j] == '_'):
-                    j += 1
-                delimiter = command[delim_start:j]
-
-                # Skip closing quote if we had one
-                if quote_char is not None and j < len(command) and command[j] == quote_char:
-                    j += 1
-
-                if delimiter:
+                delimiter, j, strip_tabs, declined = \
+                    self._parse_heredoc_delim(command, i)
+                if delimiter is not None:
                     heredoc_delimiter = delimiter
+                    heredoc_strip_tabs = strip_tabs
                     heredoc_seen_first_nl = False  # Will look for delimiter after first newline
                     tokens.append(('REDIRECT', '<<', i))
                     # Skip to after the delimiter (and closing quote if any)
                     i = j
                     continue
+                if declined:
+                    # A heredoc bash DOES open, whose delimiter we decline to
+                    # compute (`<<$(…)`, ``<<`…` ``, `<<$'…'`, `<<$"…"`).
+                    #
+                    # Refusing is not the end of it. The body is handed back to
+                    # this same loop as ordinary text, and a first body line
+                    # that opens another SWALLOWING construct — `cat <<Z`,
+                    # `echo 'x` — eats the real terminator and the payload with
+                    # it, leaving a split that is entirely allowlisted:
+                    #
+                    #   cat <<E$'x'F / cat <<Z / ExF / shred -u /etc/passwd
+                    #     HEAD   -> deny   ['cat xF', 'shred -u /etc/passwd']
+                    #     round 8-> allow  ["cat E$'x'F", 'cat']
+                    #     bash   -> runs cat, then shred
+                    #
+                    # So the refusal is REPORTED, exactly as the depth cap's is
+                    # (see MAX_SUBSTITUTION_DEPTH): an unmatchable sub-command
+                    # that no `Bash(<binary>:*)` pattern can match, carried
+                    # as a CMD_SUBST token so `parse_with_offsets` makes it a
+                    # sub-command by the ordinary route. That makes "a refused
+                    # heredoc can never reach `allow`" true BY CONSTRUCTION —
+                    # the property round 8 only had by accident of which
+                    # residuals its corpus happened to contain. The cost is a
+                    # prompt where HEAD sometimes managed a `deny`; `ask`
+                    # is the safe direction and `allow` is not. Task 32 §16.
+                    #
+                    # The token is emitted BEFORE falling through to the
+                    # operator scan, which lexes the `<<` as an ordinary
+                    # redirection — deliberately: both answer False to
+                    # `_at_reserved_word_position`, so the position this branch
+                    # leaves behind is the one round 8 left, and only the extra
+                    # sub-command is new.
+                    tokens.append(('CMD_SUBST',
+                                   self.TRUNCATED_SUBSTITUTION_COMMAND, i))
 
             # File-descriptor prefix on a redirection: a digit run glued with
             # no space to a redirect operator (`2>`, `3<>`, `4>>`) names the fd
@@ -714,19 +1472,72 @@ class BashCommandParser:
             # a phantom command word (the bug that mis-parsed `exec 3<>/dev/...`
             # into a `3 /dev/... 2` non-command).
             #
-            # Skipped when the digit already begins a recognized fused operator
-            # (`2>&1`, `2>>`, `1>`): the normal operator check below handles
-            # those whole. Skipped for the heredoc (`n<<`) and fd-dup (`n>&m`,
-            # `n<&m`) forms, whose trailing fd/delimiter is not a path operand —
-            # they keep their existing handling.
-            if (char.isdigit() and not current and not in_conditional
-                    and not self._check_operator(command, i)):
-                j = i
-                while j < len(command) and command[j].isdigit():
-                    j += 1
-                fd_op = self._check_operator(command, j) if j < len(command) else ''
-                if (fd_op and fd_op != '<<' and self._is_redirect(fd_op)
-                        and fd_op not in self.REDIRECTIONS_NO_ARG):
+            # Skipped when the digit already begins a recognized FUSED operator
+            # (`2>&1`, `1>&2`): the normal operator check below handles those
+            # whole — the precondition `not _check_operator(command, i)` is what
+            # excludes them, and it is the ONLY exclusion left.
+            #
+            # The fd-dup forms (`n>&m`, `n<&m`, `n>&-`) used to be excluded too,
+            # which is what leaked the fd word into the command: `2>&- printf
+            # ok` reported the head as `2`, and at COMMAND-START position that
+            # hides the command entirely — `printf A ; 3<&1 __t32_tail__` was
+            # reported as `3 __t32_tail__` (task 32 round 5, item 6). bash runs
+            # `printf ok` for the first and `__t32_tail__` for the second, so
+            # dropping the fd word is the FAITHFUL reading, and it is the same
+            # reading this branch already gave `3>`, `3<>` and `1>&`.
+            # The heredoc forms are handled by their own branch just above.
+            #
+            # This branch is what makes `1>`, `1>>`, `1>|` and `1>&` work now
+            # that `1>` is no longer matched whole (task 32 round 4): bash
+            # lexes NUMBER then operator, and so does this.
+            # The fd word is a digit run (bash's NUMBER) or a `{name}` varname
+            # (bash's REDIR_WORD, which stores the allocated fd in `$name`).
+            # `{name}` counts ONLY when a redirect operator follows it with no
+            # space — that is bash's own rule, and it is what keeps `echo {v}`
+            # and the brace expansion `echo {a,b}` ordinary words. Measured:
+            # `echo hi {v}> f` prints `hi`, not `hi {v}`, so dropping the fd
+            # word is faithful; leaking it made `{v}>| f printf ok` report the
+            # head as `{v}` (task 32 round 4, the same leading-fd-word leak the
+            # `2>&-` known_gap records).
+            fd_word_end = i
+            if not current and not word_open and not in_conditional:
+                if char.isdigit():
+                    while (fd_word_end < len(command)
+                           and command[fd_word_end].isdigit()):
+                        fd_word_end += 1
+                else:
+                    match = self._FD_VARNAME_RE.match(command, i)
+                    if match:
+                        fd_word_end = match.end()
+            if (fd_word_end > i and not self._check_operator(command, i)):
+                j = fd_word_end
+                # bash lets an fd word precede only an operator that STARTS
+                # with `<` or `>` (its grammar spells every `NUMBER redirection`
+                # rule that way). `&>` and `&>>` are not among them: in
+                # `printf A 2&> f` the `2` is an ordinary ARGUMENT, and
+                # swallowing it as an fd would drop a word the command really
+                # receives. Testing the source character rather than the
+                # returned token keeps this correct through the `>&` -> `&>`
+                # normalization, which rewrites the token but not the source.
+                fd_op = (self._check_operator(command, j)
+                         if j < len(command) and command[j] in ('<', '>')
+                         else '')
+                if fd_op in ('<<', '<<-'):
+                    # `n<<DELIM` / `{v}<<-DELIM`: the heredoc branch above
+                    # consumes the delimiter for itself, so there is no operand
+                    # token to skip — but the fd word must still be DROPPED.
+                    # Left in the stream it became the sub-command HEAD:
+                    # `printf A ; 3<<1 __t32_tail__` was reported as
+                    # `3 __t32_tail__`, hiding the command bash really runs.
+                    #
+                    # Only the COMMAND-START sweep can see this; in argument
+                    # position (`printf A 3<<1 __t32_tail__`) the tail is an
+                    # argument and bash never runs it, which is exactly why
+                    # four rounds of an argument-position-only sweep reported 0
+                    # (task 32 round 5, item 6).
+                    i = j
+                    continue
+                if fd_op and self._is_redirect(fd_op):
                     tokens.append(('REDIRECT', fd_op, i))
                     i = j + len(fd_op)
                     continue
@@ -753,13 +1564,29 @@ class BashCommandParser:
                     i += 1
                     continue
                 flush_current()
-                case_stack[-1] = 'body'
                 case_paren_depth = 0
-                # The arm body is a new command; without a separator here it
-                # would merge into the `case ... in` header token group.
-                emit_separator(';', i)
-                i += 1
-                continue
+                # `flush_current` runs the case state machine, and its `esac`
+                # rule POPS the statement. `( case a in a) x ;; esac)` reaches
+                # this `)` with `esac` buffered: the flush closes the statement
+                # and the stack is empty, so there is no arm to open — this `)`
+                # closes the enclosing GROUP. Assigning `case_stack[-1]` blind
+                # raised IndexError, and main()'s blanket `except Exception:
+                # sys.exit(0)` turned that into NO DECISION: a real `deny` was
+                # lost on valid, idiomatic bash (task 32 round 4, BLOCKER 3).
+                # Fall through instead and let `)` be an ordinary character,
+                # which is how the tokenizer treats a grouping paren elsewhere.
+                if case_stack:
+                    case_stack[-1] = 'body'
+                    # The arm body is a new command; without a separator here
+                    # it would merge into the `case ... in` header token group.
+                    emit_separator(';', i)
+                    i += 1
+                    continue
+                in_case_pattern = False
+                # The buffer was just flushed, so re-pin the token start: we
+                # are falling through mid-iteration, past the top-of-loop
+                # `if not current: current_start = i`.
+                current_start = i
 
             # An `esac` glued to an arm terminator (`... ;; esac;; ...`) closes an
             # INNER case, and the terminator then belongs to the ENCLOSING arm.
@@ -781,7 +1608,13 @@ class BashCommandParser:
                 if term:
                     flush_current()
                     emit_separator(';', i)
-                    case_stack[-1] = 'pattern'
+                    # Same underflow as the pattern-`)` branch above: the flush
+                    # runs the case state machine, and a buffered `esac`
+                    # (`case a in b) esac;; esac`) pops the statement, leaving
+                    # nothing to return to pattern mode. The `;;` is then just
+                    # a separator, which is what was already emitted.
+                    if case_stack:
+                        case_stack[-1] = 'pattern'
                     case_paren_depth = 0
                     i += len(term)
                     continue
@@ -794,9 +1627,27 @@ class BashCommandParser:
             # is a closing `]]` glued to this operator (e.g. `]];`, `]]|`): it
             # hasn't been flushed yet, so in_conditional is still True — flush it
             # now to end the conditional and let the operator split.
-            op = self._check_operator(command, i)
+            op = self._check_operator(command, i, _word_glued=word_open)
             if op and in_conditional and ''.join(current) == ']]':
                 flush_current()  # flips in_conditional False
+            # The same shape for `case`: an `esac` GLUED to a metacharacter.
+            # bash lexes `esac` as a word of its own — `<`, `>`, `|`, `&` and
+            # `;` all END a word — and in pattern position that word is the
+            # reserved word that closes the statement. Operator detection is
+            # suppressed in pattern mode, so without this flush the buffer grew
+            # to `esac<x`, the state machine never saw a bare `esac`, the case
+            # stayed open, and every separator to end of input was swallowed:
+            # `case a in esac<x ; shred -u /etc/passwd` decided ALLOW while
+            # bash ran `shred` (task 32 round 5, item 4; the `<<<` spelling of
+            # the same hole is closed by the heredoc branch's flush above).
+            #
+            # Only `esac` gets this: measured, `case a in a<b ; …` and
+            # `case a in a<<b ; …` are bash SYNTAX ERRORS — nothing runs — so
+            # no other pattern word can hide a command this way, and flushing
+            # them would start splitting patterns bash keeps whole.
+            if op and in_case_pattern and ''.join(current) == 'esac':
+                flush_current()  # runs the state machine, popping the `case`
+                in_case_pattern = bool(case_stack) and case_stack[-1] == 'pattern'
             if op and not in_conditional and not in_case_pattern:
                 flush_current()
                 # Classify operator as OP or REDIRECT
@@ -807,8 +1658,27 @@ class BashCommandParser:
                 i += len(op)
                 continue
 
-            # Handle comments - skip from # to end of line (when not in quotes)
-            if char == '#' and in_quote is None:
+            # Handle comments - skip from # to end of line (when not in quotes).
+            #
+            # A `#` only starts a comment at a WORD BOUNDARY. bash: "A word
+            # beginning with # causes that word and all remaining characters on
+            # that line to be ignored" — beginning with, not containing. Mid-word
+            # it is an ordinary character, so `echo ok#c`, `echo a#b#c` and
+            # `url=http://x/#frag` all keep their tail and the line continues.
+            #
+            # `not current and not word_open` is exactly "at the start of a
+            # word": `current` covers the ordinary case, `word_open` covers the
+            # one shape where the buffer is empty mid-word (a glued `$(...)`,
+            # backtick or `<(...)` was lifted into its own token). An escaped or
+            # quoted `#` never reaches here at all — `\#` is consumed by the
+            # escape branch and a quoted one by the in_quote branch — and an
+            # escaped space keeps `current` non-empty, so `echo a\ #b` stays one
+            # word, as in bash.
+            #
+            # Before this gate (task 32 §1b) ANY unquoted `#` ate the rest of the
+            # line, so `echo ok#c ; nslookup evil` was reported as the single
+            # sub-command `echo ok` and the tail was never classified.
+            if char == '#' and in_quote is None and not current and not word_open:
                 # Skip everything until end of line
                 while i < len(command) and command[i] != '\n':
                     i += 1
@@ -829,11 +1699,24 @@ class BashCommandParser:
                 # NOT a command separator.
                 if heredoc_delimiter is not None and not heredoc_seen_first_nl:
                     heredoc_seen_first_nl = True
-                else:
-                    # An unquoted newline separates commands, just like ';'.
-                    # (Quoted, escaped/continuation, heredoc, and command-subst
-                    # newlines are handled before reaching this point.)
-                    emit_separator(';', i)
+                    i += 1
+                    # ...and the FIRST body line has to be tested for the
+                    # terminator right here. Content mode only ever tested a
+                    # line reached after a SUBSEQUENT newline, so a heredoc
+                    # whose terminator is its first body line — `cat <<E\nE\n`,
+                    # the shortest legal heredoc — never closed and swallowed
+                    # every command after it: `cat <<E\nE\nshred git status`
+                    # decided allow with sub-commands `['cat']`
+                    # (task 32 round 5, item 3).
+                    end = closes_heredoc(i)
+                    if end is not None:
+                        i = end
+                        heredoc_delimiter = None
+                    continue
+                # An unquoted newline separates commands, just like ';'.
+                # (Quoted, escaped/continuation, heredoc, and command-subst
+                # newlines are handled before reaching this point.)
+                emit_separator(';', i)
                 i += 1
                 continue
 
@@ -844,9 +1727,61 @@ class BashCommandParser:
         # Flush final token
         flush_current()
 
+        # An UNTERMINATED `[[` (task 32 §3a). bash rejects such a command
+        # outright — `bash -c '[[ -f x ; nslookup evil'` is a syntax error and
+        # NOTHING runs — so no split we produce here can be unfaithful to what
+        # executes. What we must not do is keep the suppression: it swallows
+        # every separator from the `[[` to the end of the string, and the only
+        # thing standing between that and a bypass would be our own `]]`
+        # detection being exactly as good as bash's. Re-tokenize with the
+        # conditional disabled instead, which surfaces the hidden commands and
+        # so fails toward `ask`. Clearing the flag at the next separator was the
+        # alternative and is wrong: it reopens the hole for a genuine
+        # `[[ a && b ]]`.
+        if in_conditional and _allow_conditional:
+            return self._tokenize_with_quotes(command, _allow_conditional=False,
+                                              _depth=_depth)
+
         return tokens
 
-    def _check_operator(self, command: str, pos: int) -> str:
+    def _at_reserved_word_position(self, tokens, recorded) -> bool:
+        """Would bash read a RESERVED WORD as the next token appended here?
+
+        A total function of the LAST EMITTED TOKEN's type, over the five types
+        this tokenizer ever appends:
+
+            (no tokens)                      True   start of input
+            OP                               True   a separator opens a command
+            WORD in CMD_POSITION_WORDS       whatever that keyword's own answer
+                                                    was — see below
+            WORD / ENV / REDIRECT /
+            CMD_SUBST / CASE_PATTERN         False  the position is consumed
+
+        `recorded` maps a token's index to the answer given for it, so the
+        keyword case is a recurrence rather than a rescan: a keyword is
+        transparent only when IT was itself a reserved word. Measured,
+        `> /tmp/z if [[ -f x ]]` is `if: command not found`, so an `if` that is
+        a redirect TARGET makes the `[[` after it an ordinary argument.
+
+        A WORD with no recorded answer reads as CONSUMED. Nothing reaches that
+        today — every WORD is appended by `flush_current`, which records first
+        — so it is the safe default for a future path that forgets, not live
+        behaviour. `test_the_reserved_word_rule_is_total_over_token_types`
+        asserts every branch directly, including the ones the tokenizer cannot
+        currently reach; an unobservable branch and an untested one look
+        identical otherwise (task 32 §9.6, mutation M13).
+        """
+        if not tokens:
+            return True
+        token_type, token_value, _offset = tokens[-1]
+        if token_type == 'OP':
+            return True  # `;` `&` `&&` `||` `|` and the newline separator
+        if token_type == 'WORD' and token_value in self.CMD_POSITION_WORDS:
+            return recorded.get(len(tokens) - 1, False)
+        return False  # WORD, ENV, REDIRECT, CMD_SUBST, CASE_PATTERN
+
+    def _check_operator(self, command: str, pos: int,
+                        _word_glued: bool = False) -> str:
         """
         Check if position starts with an operator
 
@@ -857,34 +1792,145 @@ class BashCommandParser:
         Returns:
             Operator string if found, empty string otherwise
 
-        ORDER IS LOAD-BEARING for `&` (task 31). The list is scanned in order
-        and the FIRST match wins, so every operator that merely CONTAINS a `&`
-        must be matched here before the bare `&` in the single-character set
-        below is ever reached:
+        THE TABLE IS BASH'S, NOT OURS (task 32 round 4). Every operator this
+        function does not know is lexed as a shorter prefix and the remainder
+        is re-read — and when the remainder happens to be `|` or `&`, a
+        REDIRECTION becomes a SEPARATOR. A separator is an `OP`, and `OP`
+        reopens reserved-word position, so the redirect's TARGET becomes a
+        place where `[[` is the conditional keyword and every following
+        separator is swallowed. Three of task 32's doors were that exact shape:
 
-        - `&&` is first, so it always beats the lone `&`.
-        - `&>>` precedes `&>`, so the append form is not truncated to `&>` plus
-          a stray `>`.
-        - the fd-duplication forms are matched at the character that STARTS
-          them, never at their `&`: `2>&1` and `1>&2` whole; `>&` at the `>` and
-          `<&` at the `<`, which also covers `n>&m`, `n<&m`, `>&-` and `<&-`
-          (the leading fd digits stay ordinary word characters, the operator is
-          recognized at the `>`/`<`, and the scan resumes past the `&`).
+            cmd &  x        (task 31)  `&` was in no table at all
+            cmd >| [[ ; x ]]           `>|` lexed as `>` + spurious OP `|`
+            cmd 1>& [[ ; x ]]          `1>` won the scan, leaving OP `&`
 
-        So the lone `&` below is only ever reached where bash reads one too: as
-        the asynchronous-execution separator.
+        So the list is no longer hand-maintained here: it is
+        BASH_OPERATOR_TOKENS, transcribed from bash's grammar and sorted
+        longest-first for maximal munch, preceded by FUSED_FD_OPERATORS.
+        `test_check_operator_reproduces_bash_word_boundaries` walks bash's
+        redirection and list-terminator productions and fails loudly for any
+        operator missing from it — an operator the parser does not know cannot
+        be enumerated from the parser, which is why three review rounds of
+        parser-derived corpora missed `>|` and `1>&`.
+
+        `1>` is deliberately ABSENT. bash has no `1>` operator: it lexes NUMBER
+        `1` then `>`, and so do we, via the fd-prefix branch in
+        _tokenize_with_quotes. Matching `1>` whole shadowed both `1>&` (bash's
+        `&>` synonym — it WRITES the operand) and `1>|`, and additionally made
+        `echo x 1>> /etc/passwd` report `>` as its write target instead of the
+        path. `2>&1` and `1>&2` remain fused for a different reason — see
+        FUSED_FD_OPERATORS.
+
+        A BARE `>&` is reported as `&>` when its operand is a path (task 32).
+        In bash `>& word` is an exact synonym for `&> word` — both send stdout
+        AND stderr to the file — and only degenerates to fd duplication when
+        the operand is a digit run or `-`. Keeping `>&` in every case left
+        `cmd >& /tmp/f` parsed as `['cmd /tmp/f']` with NO write target, so the
+        write-destination gate could not see `echo x >& /etc/passwd` at all.
+        The two spellings are the same length, so returning the synonym also
+        keeps the caller's `pos += len(op)` correct.
         """
-        # Check multi-character operators first (longest match)
-        for op in ['&&', '||', '2>&1', '>>', '&>>', '&>', '2>>', '<<', '<>', '1>&2', '>&', '<&', '1>']:
-            if command[pos:pos+len(op)] == op:
+        # Fused fd+operator spellings first: `2>&1` must beat `2` + `>&`, so
+        # the fd digit never leaks out as a word.
+        for op in self.FUSED_FD_OPERATORS:
+            if command.startswith(op, pos):
                 return op
 
-        # Check single-character operators (not newline - newlines are handled
-        # separately). `&` is a command separator: `cmd1 & cmd2` runs both.
-        if command[pos] in ('|', ';', '>', '<', '&'):
-            return command[pos]
+        # bash's operator table, longest match first (maximal munch).
+        for op in self.BASH_OPERATOR_TOKENS:
+            if command.startswith(op, pos):
+                if op == '>&' and self._is_bare_amp_write_redirect(
+                        command, pos, _word_glued):
+                    return '&>'
+                return op
 
         return ''
+
+    # A bash word-boundary character: anything that cannot be part of a word.
+    _METACHARS = frozenset(' \t\n|&;()<>')
+
+    # bash's REDIR_WORD: `{name}` immediately before a redirection operator
+    # allocates a file descriptor and stores it in `$name`. Matched only at a
+    # token boundary and only when an operator follows (see the fd-prefix
+    # branch), so `echo {v}` and `echo {a,b}` stay ordinary words.
+    _FD_VARNAME_RE = re.compile(r'\{[A-Za-z_][A-Za-z0-9_]*\}')
+
+    def _is_bare_amp_write_redirect(self, command: str, pos: int,
+                                    word_glued: bool = False) -> bool:
+        """
+        True when the `>&` at `pos` is bash's `&>` synonym rather than an
+        fd duplication, i.e. `cmd >& FILE` — stdout AND stderr to a path.
+
+        bash's two rules, both measured:
+
+        1. The `&>`-synonym reading applies to a BARE `>&` and to fd 1 — and
+           to nothing else. Measured on bash 5.3, `echo hi N>& TARGETFILE`:
+
+               >&    1>&    01>&   001>&   -> TARGETFILE created
+               0>&   00>&   2>&    3>&     -> "ambiguous redirect", no file
+               10>&  11>&   {v}>&           -> "ambiguous redirect", no file
+
+           `1>& word` is stdout duplication onto a word, and duplicating
+           stdout onto a path IS `&> word` — so bash writes the file, exactly
+           as for the bare spelling. Every other fd demands an fd operand and
+           fails the whole redirection, so those stay on the fd-dup path.
+           The test is on the prefix's VALUE, not its text: `001` is fd 1.
+
+           Before round 4 fd 1 was rejected here and never even reached this
+           function — `1>` won the operator scan, so `echo hi 1>& [[ ; shred
+           … ]]` lexed as REDIRECT `1>` + OP `&`, and the OP reopened
+           reserved-word position for the `[[`. Fd 1 is precisely the fd where
+           bash runs the tail AND writes the file.
+
+           The prefix is a *pure numeric word*, so a digit run glued to `>&`
+           counts only when what precedes it is a word boundary: `foo3>&bar`
+           is the word `foo3` followed by a bare `>&`, exactly as bash reads
+           it.
+        2. The operand decides: a digit run (`>&2`, `>& 1`) or `-` (`>&-`,
+           `>& -`) is fd duplication or fd close, which writes to no path.
+           Anything else — `/tmp/f`, `"$LOG"`, `$var` — is the file operand of
+           the `&>` synonym.
+        """
+        # Rule 1: reject an fd-prefixed `n>&`, except fd 1.
+        #
+        # `word_glued` says the caller is mid-word with an empty buffer because
+        # a `$(...)`/`` `...` ``/`<(...)` was just lifted into its own token. The
+        # digits are then WORD CONTENT, not an fd token, so there is no prefix:
+        # bash writes the file for `echo a $(true)2>&/tmp/f` (measured) while
+        # the subshell spelling `(true)2>&/tmp/f` — same `)` in the source, no
+        # lift — is an "ambiguous redirect" that writes nothing. The walk-back
+        # cannot tell those apart from the text alone, since it accepts `)` as a
+        # word boundary; the tokenizer can, and does (task 32 round-2 LOW 2).
+        if not word_glued:
+            j = pos - 1
+            while j >= 0 and command[j].isdigit():
+                j -= 1
+            if j < pos - 1 and (j < 0 or command[j] in self._METACHARS):
+                # An fd prefix. Only fd 1 keeps the `&>`-synonym reading.
+                #
+                # Compared as TEXT with leading zeros stripped, never through
+                # `int()`. CPython refuses to convert a decimal string longer
+                # than 4300 digits and raises ValueError, which `main()`'s
+                # blanket handler turns into NO DECISION — measured on the real
+                # hook path, `("1" * 4301) + ">& f\nshred -u /etc/passwd"`
+                # exited 0 with no output where HEAD denied (task 32 round 5,
+                # item 5). `'1'`, `'01'`, `'001'` all strip to `'1'`; `'0'`
+                # strips to `''` (fd 0, correctly rejected); `'10'` stays
+                # `'10'`. No arithmetic, so no length can raise.
+                if command[j+1:pos].lstrip('0') != '1':
+                    return False
+
+        # Rule 2: inspect the operand.
+        k = pos + 2
+        while k < len(command) and command[k] in (' ', '\t'):
+            k += 1
+        end = k
+        while end < len(command) and command[end] not in self._METACHARS:
+            end += 1
+        operand = command[k:end]
+        if not operand:
+            return False
+        return not (operand.isdigit() or operand == '-')
 
     def _is_redirect(self, op: str) -> bool:
         """Check if operator is a redirection"""
@@ -1002,8 +2048,9 @@ class BashCommandParser:
             return []
         return self._scan_write_targets(command)
 
-    def _scan_write_targets(self, command: str) -> List[Tuple[str, int]]:
-        tokens = self._tokenize_with_quotes(command)
+    def _scan_write_targets(self, command: str,
+                            _depth: int = 0) -> List[Tuple[str, int]]:
+        tokens = self._tokenize_with_quotes(command, _depth=_depth)
         targets = []
         pending = False  # previous token was a write redirect awaiting its path
         for t_type, t_val, t_off in tokens:
@@ -1019,7 +2066,16 @@ class BashCommandParser:
             if t_type == 'REDIRECT' and t_val in self.WRITE_REDIRECTIONS_WITH_ARG:
                 pending = True
             elif t_type == 'CMD_SUBST' and t_val.strip():
-                targets.extend(self._scan_write_targets(t_val))
+                if _depth < self.MAX_SUBSTITUTION_DEPTH:
+                    targets.extend(self._scan_write_targets(t_val, _depth + 1))
+                else:
+                    # A redirect we could not look at is not the same as no
+                    # redirect. Reporting an unresolvable target makes the
+                    # write-destination gate refuse to vouch for it, instead of
+                    # reporting NO write target for
+                    # `echo A $(… 65 deep … echo x > /etc/passwd …)` — which is
+                    # what turned HEAD's `ask` into an `allow`.
+                    targets.append((self.TRUNCATED_SUBSTITUTION_TARGET, t_off))
         return targets
 
     @staticmethod
@@ -1088,7 +2144,7 @@ class BashCommandParser:
             elif token_type == 'REDIRECT':
                 # Redirections are stripped
                 # Only skip next token if this redirect takes an argument
-                if token_value in self.REDIRECTIONS_WITH_ARG:
+                if token_value in self.REDIRECTIONS_CONSUMING_A_WORD:
                     skip_next = True
             elif token_type == 'CASE_PATTERN':
                 # A `case` arm pattern is data matched against a word, not a
