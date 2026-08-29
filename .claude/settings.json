@@ -283,7 +283,9 @@
       "Bash(mktemp:*)",
       "Bash(ffmpeg:*)",
       "Bash(agent-browser:*)",
-      "Bash(crontab -l:*)"
+      "Bash(crontab -l:*)",
+      "Bash(identify:*)",
+      "Bash(google-chrome --headless=new:*)"
     ],
     "deny": [
       "Bash(shred:*)",
