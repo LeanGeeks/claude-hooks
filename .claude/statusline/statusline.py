@@ -59,12 +59,13 @@ def load_status_input(stdin_text: str) -> dict:
 # Provider / billing detection
 # ---------------------------------------------------------------------------
 
-_KNOWN_PROVIDERS = {"claude", "zai", "local", "deepseek", "fireworks", "minimax", "kimi", "mock", "unknown"}
+_KNOWN_PROVIDERS = {"claude", "zai", "ccr", "local", "deepseek", "fireworks", "minimax", "kimi", "mock", "unknown"}
 _KNOWN_BILLINGS = {"subscription", "api", "local"}
 
 _PROFILE_DEFAULTS = {
     "claude":    "claude-max",
     "zai":       "glm-plan",
+    "ccr":       "ccr-plan",
     "local":     "local",
     "deepseek":  "deepseek-api",
     "fireworks": "fireworks-api",
@@ -74,12 +75,27 @@ _PROFILE_DEFAULTS = {
 }
 
 
-def _infer_provider_billing(base_url: Optional[str]) -> tuple:
-    """Return (provider, billing) inferred from ANTHROPIC_BASE_URL."""
+def _is_ccr_token(auth_token: Optional[str]) -> bool:
+    """claude-code-router client API keys use the ccr- prefix."""
+    return bool(auth_token) and auth_token.strip().lower().startswith("ccr-")
+
+
+def _infer_provider_billing(base_url: Optional[str], auth_token: Optional[str] = None) -> tuple:
+    """Return (provider, billing) inferred from ANTHROPIC_BASE_URL and auth token."""
+    # A ccr- router token identifies the gateway even when the URL alone is ambiguous.
+    if _is_ccr_token(auth_token):
+        return "ccr", "subscription"
+
     if not base_url:
         return "claude", "subscription"
 
     url = base_url.lower()
+
+    # claude-code-router gateway — must be checked before the localhost/LAN
+    # heuristics: claude-router.localhost and LAN-hosted routers proxy
+    # subscription providers, they do not serve local models.
+    if "claude-router" in url:
+        return "ccr", "subscription"
 
     if "127.0.0.1" in url or "localhost" in url:
         return "local", "local"
@@ -100,10 +116,36 @@ def _infer_provider_billing(base_url: Optional[str]) -> tuple:
     return "unknown", "api"
 
 
+# Router alias prefixes (claude-code-router zai-/ocg- model aliases) — stripped
+# so family detection and pricing lookups see the underlying model id.
+_VENDOR_PREFIX_RE = re.compile(r'^(?:zai|ocg)-', re.IGNORECASE)
+
+
+def _strip_vendor_prefix(name: str) -> str:
+    return _VENDOR_PREFIX_RE.sub('', name, count=1)
+
+
 def _normalize_model_name(raw: str, provider: str) -> str:
-    """Strip context-window suffixes and return a compact display name."""
-    clean = re.sub(r'\[.*?\]', '', raw).strip()
+    """Strip context-window suffixes and router alias prefixes, return a display name."""
+    clean = _strip_vendor_prefix(re.sub(r'\[.*?\]', '', raw).strip())
     lower = clean.lower()
+
+    # Concrete families first — a name like "deepseek-v4-flash-haiku" carries a
+    # tier keyword but is not a Claude model, so prefix matches outrank the
+    # generic opus/sonnet/haiku keywords below.
+    # GLM family
+    if lower.startswith("glm"):
+        suffix = clean[3:]  # e.g. "-4.7", "-5.1"
+        if provider == "fireworks":
+            return f"Fireworks GLM{suffix}"
+        return f"GLM{suffix}"
+
+    if lower.startswith("deepseek"):
+        return "DeepSeek"
+    if lower.startswith("minimax"):
+        return "MiniMax"
+    if lower.startswith("kimi"):
+        return "Kimi"
 
     # Claude family — match by tier keyword present in the name
     if "opus" in lower:
@@ -120,20 +162,6 @@ def _normalize_model_name(raw: str, provider: str) -> str:
             return clean
         return f"{base} local"
 
-    # GLM family
-    if lower.startswith("glm"):
-        suffix = clean[3:]  # e.g. "-4.7", "-5.1"
-        if provider == "fireworks":
-            return f"Fireworks GLM{suffix}"
-        return f"GLM{suffix}"
-
-    if lower.startswith("deepseek"):
-        return "DeepSeek"
-    if lower.startswith("minimax"):
-        return "MiniMax"
-    if lower.startswith("kimi"):
-        return "Kimi"
-
     return clean or "Claude"
 
 
@@ -146,7 +174,8 @@ def detect_environment(env: dict, status_input: dict) -> StatusEnvironment:
     model_ov    = env.get("CC_STATUS_MODEL",    "").strip()
 
     base_url = env.get("ANTHROPIC_BASE_URL", "").strip()
-    inferred_provider, inferred_billing = _infer_provider_billing(base_url or None)
+    auth_token = env.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    inferred_provider, inferred_billing = _infer_provider_billing(base_url or None, auth_token or None)
 
     provider = provider_ov if provider_ov in _KNOWN_PROVIDERS else inferred_provider
     billing  = billing_ov  if billing_ov  in _KNOWN_BILLINGS  else inferred_billing
@@ -172,8 +201,8 @@ def detect_environment(env: dict, status_input: dict) -> StatusEnvironment:
 
 
 def _pricing_key(raw_model: str) -> str:
-    """Strip context suffix (e.g. '[500k]') and lowercase, for pricing config lookup."""
-    cleaned = re.sub(r'\[.*?\]', '', raw_model).strip().lower()
+    """Strip context suffix (e.g. '[500k]') and router alias prefix, lowercase for pricing lookup."""
+    cleaned = _strip_vendor_prefix(re.sub(r'\[.*?\]', '', raw_model).strip()).lower()
     return cleaned
 
 
@@ -830,6 +859,143 @@ def format_glm_subscription_quota(env: StatusEnvironment) -> list:
 
 
 # ---------------------------------------------------------------------------
+# claude-code-router quota (GET /v1/quota on the gateway)
+# ---------------------------------------------------------------------------
+
+def fetch_ccr_quota(base_url: str, token: str, timeout_seconds: float = 2.0) -> dict:
+    """
+    Fetch provider quota snapshots from a claude-code-router gateway.
+
+    The gateway authenticates with the same ccr- client key Claude Code uses,
+    and answers within its own ~1.5s timeout race, so the caller's timeout is
+    a backstop. Raises urllib.error.HTTPError / URLError / socket.timeout.
+    """
+    url = f"{base_url}/v1/quota"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+        return json.loads(resp.read())
+
+
+def parse_ccr_quota(payload) -> Optional[QuotaSummary]:
+    """
+    Map a /v1/quota response into a QuotaSummary via its zai provider entry.
+
+    Provider entries are keyed by display name ("Z.ai (Global) - Coding Plan"),
+    so zai is recognized by a case-insensitive "z.ai" substring. Meter values:
+    used is the percentage number, resetAt an ISO-8601 UTC string. Returns None
+    when the payload carries no usable zai entry (absent or status "error") —
+    callers treat that like a failed fetch, never caching it over good data.
+    """
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, list):
+        return None
+
+    entry = next(
+        (
+            p for p in providers
+            if isinstance(p, dict) and "z.ai" in str(p.get("provider") or "").lower()
+        ),
+        None,
+    )
+    if entry is None or entry.get("status") in ("error", "unsupported"):
+        return None
+
+    meters = {
+        m.get("id"): m
+        for m in (entry.get("meters") or [])
+        if isinstance(m, dict)
+    }
+
+    def meter_pct(meter_id: str) -> Optional[float]:
+        used = meters.get(meter_id, {}).get("used")
+        try:
+            return float(used) if used is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def meter_reset_epoch(meter_id: str) -> Optional[float]:
+        iso = meters.get(meter_id, {}).get("resetAt")
+        if not iso:
+            return None
+        try:
+            parsed = datetime.datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+            return parsed.timestamp()
+        except ValueError:
+            return None
+
+    return QuotaSummary(
+        five_hour_pct=meter_pct("five_hour_quota"),
+        five_hour_reset_at=meter_reset_epoch("five_hour_quota"),
+        seven_day_pct=meter_pct("weekly_quota"),
+        seven_day_reset_at=meter_reset_epoch("weekly_quota"),
+        mcp_pct=None,
+    )
+
+
+def _ccr_cache_path(token: str) -> str:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
+    cache_dir = os.path.expanduser("~/.cache/claude-statusline")
+    return os.path.join(cache_dir, f"ccr-quota-{token_hash}.json")
+
+
+def format_ccr_quota(env: StatusEnvironment) -> list:
+    """
+    Fetch and format quota segments from the claude-code-router gateway.
+
+    Same cache/TTL/stale policy as the direct zai path, keyed by the router
+    token so several sessions behind one gateway share a single cache file.
+    """
+    base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+
+    if not base_url or not token:
+        return ["quota ?"]
+
+    gateway_base = derive_zai_usage_base_url(base_url)
+    cache_path = _ccr_cache_path(token)
+
+    cached = read_glm_quota_cache(cache_path)
+    if cached is not None:
+        summary = parse_ccr_quota(cached)
+        if summary is not None:
+            return format_glm_quota_segment(summary)
+
+    try:
+        raw = fetch_ccr_quota(gateway_base, token, timeout_seconds=2.0)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return ["quota ?"]
+        raw = None
+    except (urllib.error.URLError, socket.timeout, OSError, json.JSONDecodeError):
+        raw = None
+    except Exception:
+        raw = None
+
+    if isinstance(raw, dict):
+        summary = parse_ccr_quota(raw)
+        if summary is not None:
+            write_glm_quota_cache(cache_path, raw)
+            return format_glm_quota_segment(summary)
+        # Usable envelope without a zai entry (e.g. upstream errored) — do not
+        # cache over previously good data; fall through to stale cache.
+
+    stale = _read_glm_quota_cache_any_age(cache_path)
+    if stale is not None:
+        summary = parse_ccr_quota(stale)
+        if summary is not None:
+            summary.stale = True
+            return format_glm_quota_segment(summary)
+
+    return ["quota ?"]
+
+
+# ---------------------------------------------------------------------------
 # Z.ai peak hours (credit-rate windows)
 # ---------------------------------------------------------------------------
 
@@ -891,10 +1057,26 @@ def _format_countdown_short(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def ccr_quota_has_zai() -> bool:
+    """True when the last seen /v1/quota payload carried a zai provider entry."""
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
+    if not token:
+        return False
+    payload = _read_glm_quota_cache_any_age(_ccr_cache_path(token))
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, list):
+        return False
+    return any(
+        isinstance(p, dict) and "z.ai" in str(p.get("provider") or "").lower()
+        for p in providers
+    )
+
+
 def format_zai_peak_segments(env: StatusEnvironment,
                              now_epoch: Optional[float] = None) -> tuple:
     """
-    Prefix/suffix segments for the peak-hours note (zai subscription only):
+    Prefix/suffix segments for the peak-hours note (zai subscription only —
+    also behind the ccr router when the gateway fronts a zai provider):
 
       during peak:  prefix '🔥 PEAK HOURS', suffix
                     'Peak hours end at 20:00 (in 3:50)'
@@ -903,7 +1085,12 @@ def format_zai_peak_segments(env: StatusEnvironment,
 
     Wall-clock times are local, matching the quota reset rendering.
     """
-    if env.provider != "zai" or env.billing != "subscription":
+    if env.billing != "subscription":
+        return [], []
+    if env.provider == "ccr":
+        if not ccr_quota_has_zai():
+            return [], []
+    elif env.provider != "zai":
         return [], []
 
     now = now_epoch if now_epoch is not None else time.time()
@@ -932,25 +1119,27 @@ def format_zai_peak_segments(env: StatusEnvironment,
 # ---------------------------------------------------------------------------
 
 def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
+    # Quota first: the ccr peak-hours check reads the cache the quota fetch warms.
+    quota_segments: list = []
+    if env.billing == "subscription":
+        if env.provider == "claude":
+            quota_segments = format_claude_rate_limits(status_input)
+        elif env.provider == "zai":
+            quota_segments = format_glm_subscription_quota(env)
+        elif env.provider == "ccr":
+            quota_segments = format_ccr_quota(env)
+    elif env.billing == "api":
+        quota_segments = compute_api_cost(status_input, env)
+    # local: no extras
+
     peak_prefix, peak_suffix = format_zai_peak_segments(env)
 
     # First segment: model + billing hint for plan/subscription providers
     model_label = env.model
-    if env.provider == "zai" and env.billing == "subscription":
+    if env.provider in ("zai", "ccr") and env.billing == "subscription":
         model_label = f"{model_label} plan"
 
-    parts = [*peak_prefix, model_label, format_context_segment(status_input)]
-
-    if env.billing == "subscription":
-        if env.provider == "claude":
-            parts.extend(format_claude_rate_limits(status_input))
-        elif env.provider == "zai":
-            parts.extend(format_glm_subscription_quota(env))
-    elif env.billing == "api":
-        parts.extend(compute_api_cost(status_input, env))
-    # local: no extras
-
-    parts.extend(peak_suffix)
+    parts = [*peak_prefix, model_label, format_context_segment(status_input), *quota_segments, *peak_suffix]
     return " | ".join(parts)
 
 

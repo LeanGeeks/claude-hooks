@@ -1,0 +1,13 @@
+{
+  "model": {
+    "display_name": "zai-glm-5.3[1m]"
+  },
+  "context_window": {
+    "used_percentage": 41,
+    "remaining_percentage": 59,
+    "current_usage": 410000,
+    "context_window_size": 1000000
+  },
+  "session_id": "test-ccr-plan",
+  "version": "1.0"
+}
