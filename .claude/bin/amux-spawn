@@ -329,11 +329,12 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
         model_pinned = (lib.extract_model_flag(forward_flags) is not None
                         or bool(os.environ.get("ANTHROPIC_MODEL")))
         # CLAUDE_CODE_EFFORT_LEVEL is deliberately NOT counted as a pin.
-        # Two independent reasons: (1) amux's AMUX_ENV_ALLOWLIST does not carry
-        # it, so it cannot reach the child at all (brd §1 finding 5); (2) even
-        # if it could, it overrides --effort rather than backing it up (brd §1
-        # finding 6), so counting it would silence the warning about the one
-        # input that can silently un-pin every per-spawn --effort flag.
+        # amux's env allowlist is prefix-based now (ANTHROPIC_*/CLAUDE_*), so
+        # the var DOES reach the child — brd §1 finding 5's premise (and brd
+        # decision B, keeping it out of the allowlist) is superseded. It is
+        # still not a pin because it overrides --effort rather than backing it
+        # up (brd §1 finding 6): counting it would silence the warning about
+        # the one input that can silently un-pin every per-spawn --effort flag.
         effort_pinned = lib.extract_flag_value(forward_flags, "--effort") is not None
         if not model_pinned:
             _eprint("amux-spawn: warning: non-TTY (agent) spawn pins no model — "
