@@ -32,6 +32,7 @@ import permission_request_hook  # noqa: E402
 from permission_state_store import (  # noqa: E402
     PermissionRequest,
     RequestState,
+    RESOLUTION_SOURCE_BYPASS,
     create_request,
     get_request,
 )
@@ -401,6 +402,116 @@ class TestHookMainPath(unittest.TestCase):
 
         self.assertEqual(ctx.exception.code, 0)
         mock_create_request.assert_called_once()
+
+
+class TestBypassPermissionsAutoAllow(unittest.TestCase):
+    """`bypassPermissions` sessions are auto-allowed without a Telegram prompt.
+
+    A PreToolUse hook that returns ``ask`` (pretool_hook's write-redirect gate,
+    for one) outranks ``--dangerously-skip-permissions``, so Claude raises a
+    permission request even in a session launched with `amux-spawn --yolo`. The
+    hook answers those itself instead of prompting the operator.
+    """
+
+    def _run_main(self, payload, tool_name="Bash"):
+        """Drive main() over *payload*; return (exit_code, printed, mocks)."""
+        request = _make_request(
+            request_id="bypass-req",
+            session_id=payload["session_id"],
+            tool_input=payload["tool_input"],
+        )
+        printed = []
+
+        def _enable():
+            permission_request_hook.telegram_router.TELEGRAM_ENABLED = True
+
+        with patch("permission_request_hook.cleanup_expired_requests"), \
+                patch("permission_request_hook.sweep_orphaned_requests", return_value=[]), \
+                patch("permission_request_hook.session_yolo_store.prune"), \
+                patch("permission_request_hook.session_yolo_store.is_enabled",
+                      return_value=False), \
+                patch("permission_request_hook.create_request", return_value=request), \
+                patch("permission_request_hook.update_request_state") as mock_update, \
+                patch("permission_request_hook.send_permission_message",
+                      return_value=12345) as mock_send, \
+                patch("permission_request_hook.wait_for_response",
+                      return_value={"action": "allow"}), \
+                patch("permission_request_hook.handle_ask_user_question",
+                      return_value={"action": "allow"}) as mock_question, \
+                patch("permission_request_hook.time.sleep"), \
+                patch("permission_request_hook.load_telegram_config", side_effect=_enable), \
+                patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                patch("builtins.print", side_effect=lambda *a, **kw: printed.append(a[0] if a else "")):
+            with self.assertRaises(SystemExit) as ctx:
+                permission_request_hook.main()
+
+        return ctx.exception.code, printed, {
+            "update": mock_update,
+            "send": mock_send,
+            "question": mock_question,
+        }
+
+    @staticmethod
+    def _payload(**overrides):
+        base = {
+            "session_id": "bypass-session",
+            "cwd": "/tmp/workspace",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hi > /etc/passwd"},
+            "permission_suggestions": [],
+            "permission_mode": "bypassPermissions",
+        }
+        base.update(overrides)
+        return base
+
+    def test_bypass_mode_allows_without_sending_telegram(self):
+        code, printed, mocks = self._run_main(self._payload())
+
+        self.assertEqual(code, 0)
+        mocks["send"].assert_not_called()
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow"
+        )
+
+    def test_bypass_mode_records_allow_row_with_bypass_source(self):
+        _code, _printed, mocks = self._run_main(self._payload())
+
+        mocks["update"].assert_called_once()
+        args, kwargs = mocks["update"].call_args
+        self.assertEqual(args[0], "bypass-req")
+        self.assertEqual(args[1], RequestState.ALLOW)
+        self.assertEqual(kwargs["decision"], {"action": "bypass"})
+        self.assertEqual(kwargs["resolution_source"], RESOLUTION_SOURCE_BYPASS)
+
+    def test_default_mode_still_prompts(self):
+        """Guard: only bypassPermissions short-circuits, not every session."""
+        _code, _printed, mocks = self._run_main(
+            self._payload(permission_mode="default")
+        )
+
+        mocks["send"].assert_called_once()
+
+    def test_missing_permission_mode_still_prompts(self):
+        """Older payloads carry no permission_mode; they must not auto-allow."""
+        payload = self._payload()
+        del payload["permission_mode"]
+
+        _code, _printed, mocks = self._run_main(payload)
+
+        mocks["send"].assert_called_once()
+
+    def test_bypass_mode_still_forwards_ask_user_question(self):
+        """Questions ask for an answer, not a permission — they stay forwarded."""
+        _code, _printed, mocks = self._run_main(
+            self._payload(
+                tool_name="AskUserQuestion",
+                tool_input={"questions": [{"question": "which?", "options": []}]},
+            )
+        )
+
+        mocks["question"].assert_called_once()
+        mocks["update"].assert_not_called()
 
 
 class TestWorkspaceNameExtraction(unittest.TestCase):

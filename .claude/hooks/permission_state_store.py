@@ -99,6 +99,11 @@ RESOLUTION_SOURCE_AGENT = "agent"
 RESOLUTION_SOURCE_INTERRUPTED = "interrupted"
 # Epic 26 layer 2: the owning process was gone when a later hook swept the row.
 RESOLUTION_SOURCE_ORPHANED = "orphaned"
+# The session runs in bypassPermissions mode (`claude --dangerously-skip-permissions`,
+# which is what `amux-spawn --yolo` expands to on the Claude path, or an interactive
+# switch to bypass mode). The hook auto-allowed without ever asking anyone, so the row
+# is neither a Telegram tap nor a terminal answer.
+RESOLUTION_SOURCE_BYPASS = "bypass"
 
 
 @dataclass

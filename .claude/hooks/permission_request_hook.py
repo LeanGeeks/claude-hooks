@@ -55,6 +55,7 @@ from permission_state_store import (
     cleanup_expired_requests,
     sweep_orphaned_requests,
     RESOLUTION_SOURCE_AGENT,
+    RESOLUTION_SOURCE_BYPASS,
     RESOLUTION_SOURCE_INTERRUPTED,
     RESOLUTION_SOURCE_TELEGRAM,
     RESOLUTION_SOURCE_TERMINAL,
@@ -1536,11 +1537,13 @@ def main():
         tool_input = input_data.get('tool_input', {})
         permission_suggestions = input_data.get('permission_suggestions', [])
         agent_id = input_data.get('agent_id') or None
+        permission_mode = input_data.get('permission_mode', '')
 
         debug_log(f"Session: {session_id}")
         debug_log(f"CWD: {cwd}")
         debug_log(f"Tool: {tool_name}")
         debug_log(f"Agent ID: {agent_id}")
+        debug_log(f"Permission mode: {permission_mode}")
         debug_log(f"Tool input: {json.dumps(tool_input)[:200]}")
         debug_log(f"Permission suggestions: {permission_suggestions}")
 
@@ -1579,17 +1582,34 @@ def main():
         )
         debug_log(f"Created request: {request.request_id}")
 
-        # YOLO mode: the operator previously tapped YOLO for this session, so
-        # auto-allow without sending a Telegram message or prompting. Recorded as
-        # a normal ALLOW (resolution source telegram, since it stems from the
-        # earlier button tap) for the audit trail.
-        if session_yolo_store.is_enabled(session_id):
-            debug_log(f"Session {session_id} in YOLO mode; auto-allowing {request.request_id}")
+        # Auto-allow paths — no Telegram message, no prompt. Both still record a
+        # normal ALLOW row so the audit trail keeps every request:
+        #
+        # 1. YOLO mode: the operator previously tapped YOLO for this session (or
+        #    ran /yolo). Resolution source is telegram, since it stems from the
+        #    earlier button tap.
+        # 2. bypassPermissions: the session was launched with
+        #    `--dangerously-skip-permissions` (what `amux-spawn --yolo` expands to
+        #    on the Claude path) or switched to bypass mode interactively. Claude
+        #    asks us anyway whenever a PreToolUse hook returns `ask` — that
+        #    decision outranks the CLI flag — so pretool_hook's write-redirect
+        #    gate would otherwise prompt in a session that asked for no prompts.
+        #    Nobody is consulted here, so the source is neither telegram nor
+        #    terminal.
+        #
+        # Both sit AFTER the AskUserQuestion branch above: questions are still
+        # forwarded in either mode (they ask for an answer, not a permission).
+        bypass_mode = permission_mode == 'bypassPermissions'
+        if session_yolo_store.is_enabled(session_id) or bypass_mode:
+            reason = 'bypassPermissions' if bypass_mode else 'YOLO mode'
+            debug_log(f"Session {session_id} in {reason}; auto-allowing {request.request_id}")
             update_request_state(
                 request.request_id,
                 RequestState.ALLOW,
-                decision={"action": "yolo"},
-                resolution_source=RESOLUTION_SOURCE_TELEGRAM,
+                decision={"action": "bypass" if bypass_mode else "yolo"},
+                resolution_source=(
+                    RESOLUTION_SOURCE_BYPASS if bypass_mode else RESOLUTION_SOURCE_TELEGRAM
+                ),
             )
             print(json.dumps({
                 'hookSpecificOutput': {
