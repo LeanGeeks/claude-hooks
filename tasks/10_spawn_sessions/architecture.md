@@ -146,6 +146,7 @@ writes (tmp+rename) everywhere. **No task invents fields outside this list.**
   "background_tasks": [ /* Stop.background_tasks verbatim */ ],
   "permission_pending": false,              // last Notification marker; cleared on next Stop
   "mtime_at_stop":   1719000000.0,          // transcript mtime (epoch float) observed at last Stop
+  "stopped_at":      "<iso8601>",           // wall-clock timestamp of last Stop (for lifecycle log)
   "created_at":      "<iso8601>",
   "updated_at":      "<iso8601>"            // last producer write (wall clock; for audit only)
 }
@@ -159,10 +160,13 @@ path from the first `Stop` payload over computing it. `stuck` is **never persist
 ### 6.1 Producer hooks
 
 Spawn-aware hooks, firing only for handle-bearing sessions:
+- **`UserPromptSubmit`** (turn start): `state = running`; `stopped_at` is not
+  touched (it records when the last `Stop` fired, not when a new turn began).
 - **`Stop`** (authoritative): `last_message ← last_assistant_message`,
   `background_tasks ← payload`; `state = idle` iff empty else `running`; clear
-  `permission_pending`; snapshot `mtime_at_stop ← current transcript mtime`; capture
-  the real `transcript_path` from the payload.
+  `permission_pending`; snapshot `mtime_at_stop ← current transcript mtime`;
+  `stopped_at ← current wall-clock ISO-8601`; capture the real `transcript_path`
+  from the payload.
 - **`SubagentStop`** (recommended): the experiment (§2.2) shows it fires around the
   background-shell lifecycle and carries `background_tasks`. Treat it like `Stop` for
   freshness — refresh `background_tasks`/`mtime_at_stop` — but do **not** let it set

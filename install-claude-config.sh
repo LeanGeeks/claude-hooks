@@ -721,6 +721,15 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
                 # sessions). Each handle-gates: a no-op for plain/human sessions and
                 # other repos. Stop is authoritative (sets idle); SubagentStop is
                 # freshness-only; SessionEnd marks terminated.
+                # Epic-37 adds UserPromptSubmit (turn-start recording) so the
+                # event log can answer "is a turn open" without the transcript.
+                UserPromptSubmit: [{
+                    matcher: "*",
+                    hooks: [{
+                        type: "command",
+                        command: ("python3 " + $producer_path + " --event UserPromptSubmit")
+                    }]
+                }],
                 Stop: [{
                     matcher: "*",
                     hooks: [{
@@ -751,7 +760,7 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
         log_info "  - PermissionRequest: python3 $GLOBAL_HOOKS_DIR/permission_request_hook.py"
         log_info "  - PostToolUse: python3 $GLOBAL_HOOKS_DIR/posttool_hook.py"
         log_info "  - Notification (idle_prompt): python3 $GLOBAL_HOOKS_DIR/notification_hook.py"
-        log_info "  - Notification (permission_prompt) + Stop/SubagentStop/SessionEnd: python3 $GLOBAL_HOOKS_DIR/spawn_producer_hook.py"
+        log_info "  - Notification (permission_prompt) + UserPromptSubmit/Stop/SubagentStop/SessionEnd: python3 $GLOBAL_HOOKS_DIR/spawn_producer_hook.py"
 fi
 
 # Merge statusLine configuration if statusline was installed

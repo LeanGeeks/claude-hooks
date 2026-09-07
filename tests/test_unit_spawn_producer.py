@@ -517,5 +517,543 @@ class TestFailOpen(unittest.TestCase):
                 self.assertEqual(h["state"], "idle")
 
 
+import lifecycle_events  # noqa: E402
+
+
+class TestLifecycleEventLog(unittest.TestCase):
+    """Epic 37 (task 37-01): lifecycle event log production."""
+
+    def test_stop_appends_lifecycle_event(self):
+        """A Stop on a tracked Claude handle appends a stop event to the log."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                _run("Stop",
+                     {"last_assistant_message": "task complete",
+                      "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 1)
+                ev = events[0]
+                self.assertEqual(ev["event"], "stop")
+                self.assertEqual(ev["state"], "idle")
+                self.assertEqual(ev["seq"], 1)
+                self.assertEqual(ev["last_message"], "task complete")
+                self.assertEqual(ev["background_tasks_count"], 0)
+                self.assertFalse(ev["permission_pending"])
+                self.assertIn("ts", ev)
+                self.assertEqual(
+                    ev["session_id"], "11111111-2222-3333-4444-555555555555"
+                )
+
+    def test_stop_with_bg_appends_running_event(self):
+        """A Stop with live background tasks records state=running in the log."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                bg = [{"type": "shell", "status": "running", "id": "t1"}]
+                _run("Stop",
+                     {"last_assistant_message": "kicked off CI",
+                      "background_tasks": bg,
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["state"], "running")
+                self.assertEqual(events[0]["background_tasks_count"], 1)
+
+    def test_subagent_stop_appends_event(self):
+        """SubagentStop appends a subagent_stop event without changing state."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                h0["state"] = "running"
+                lib.write_handle("proj-2", h0)
+
+                _run("SubagentStop",
+                     {"background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event"], "subagent_stop")
+                self.assertEqual(events[0]["state"], "running")
+
+    def test_permission_prompt_appends_event(self):
+        """A permission_prompt Notification appends a permission_prompt event."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                h0["state"] = "running"
+                lib.write_handle("proj-2", h0)
+
+                _run("Notification",
+                     {"notification_type": "permission_prompt"},
+                     amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event"], "permission_prompt")
+                self.assertTrue(events[0]["permission_pending"])
+                self.assertEqual(events[0]["state"], "running")
+
+    def test_session_end_appends_event_with_last_state(self):
+        """SessionEnd appends a session_end event with last_state."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                h0["state"] = "idle"
+                lib.write_handle("proj-2", h0)
+
+                _run("SessionEnd", {"reason": "clear"}, amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["event"], "session_end")
+                self.assertEqual(events[0]["state"], "terminated")
+                self.assertEqual(events[0]["last_state"], "idle")
+
+    def test_idle_prompt_notification_produces_no_event(self):
+        """An idle_prompt Notification must NOT append a lifecycle event."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                _run("Notification",
+                     {"notification_type": "idle_prompt"},
+                     amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 0)
+
+    def test_plain_session_produces_no_event(self):
+        """An untracked session produces no lifecycle log at all."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _run("Stop",
+                     {"last_assistant_message": "hi", "background_tasks": []},
+                     amux_name=None)
+                # No .lifecycle.jsonl files anywhere.
+                self.assertEqual(
+                    list(lib.SPAWN_DIR.glob("*.lifecycle.jsonl")), []
+                )
+
+    def test_codex_handle_produces_no_event(self):
+        """A Codex handle must NOT get a lifecycle log written."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                codex = lib.new_handle(
+                    name="review-123",
+                    session_id="01a00000-0000-7000-8000-000000000001",
+                    run_id="rid", abs_dir="/ws/proj", transcript_path="",
+                    stuck_after_s=600, provider=lib.PROVIDER_CODEX,
+                )
+                lib.write_handle("review-123", codex)
+
+                _run("Stop",
+                     {"last_assistant_message": "done",
+                      "background_tasks": []},
+                     amux_name="review-123")
+
+                events = lifecycle_events.read_events(
+                    lib.SPAWN_DIR, "review-123"
+                )
+                self.assertEqual(len(events), 0)
+
+    def test_events_are_ordered_with_monotonic_seq(self):
+        """Multiple events produce monotonically increasing seq numbers."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                # Stop (turn 1)
+                _run("Stop",
+                     {"last_assistant_message": "turn 1",
+                      "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                # Turn start (follow-up)
+                _run("UserPromptSubmit", {}, amux_name="proj-2")
+
+                # Stop (turn 2)
+                _run("Stop",
+                     {"last_assistant_message": "turn 2",
+                      "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                # SessionEnd
+                _run("SessionEnd", {"reason": "clear"}, amux_name="proj-2")
+
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "proj-2")
+                self.assertEqual(len(events), 4)
+                seqs = [e["seq"] for e in events]
+                self.assertEqual(seqs, [1, 2, 3, 4])
+                event_types = [e["event"] for e in events]
+                self.assertEqual(
+                    event_types,
+                    ["stop", "turn_start", "stop", "session_end"],
+                )
+
+
+class TestUserPromptSubmit(unittest.TestCase):
+    """Epic 37 (task 37-01): UserPromptSubmit turn-start recording."""
+
+    def test_turn_start_sets_running_and_clears_permission(self):
+        """UserPromptSubmit transitions handle to running."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                # Simulate: worker was idle, then gets a follow-up.
+                h0["state"] = "idle"
+                h0["permission_pending"] = True  # stale from a prior gate
+                lib.write_handle("proj-2", h0)
+
+                code = _run("UserPromptSubmit", {}, amux_name="proj-2")
+                self.assertEqual(code, 0)
+
+                h = lib.read_handle("proj-2")
+                self.assertEqual(h["state"], "running")
+                self.assertFalse(h["permission_pending"])
+
+    def test_turn_start_on_spawning_transitions_to_running(self):
+        """UserPromptSubmit on a fresh (spawning) handle goes to running."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                h_before = lib.read_handle("proj-2")
+                self.assertEqual(h_before["state"], "spawning")
+
+                code = _run("UserPromptSubmit", {}, amux_name="proj-2")
+                self.assertEqual(code, 0)
+
+                h = lib.read_handle("proj-2")
+                self.assertEqual(h["state"], "running")
+
+    def test_turn_start_is_handle_gated(self):
+        """UserPromptSubmit with no tracked handle produces nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                code = _run("UserPromptSubmit", {}, amux_name=None)
+                self.assertEqual(code, 0)
+                self.assertEqual(list(lib.SPAWN_DIR.glob("*.json")), [])
+                self.assertEqual(
+                    list(lib.SPAWN_DIR.glob("*.lifecycle.jsonl")), []
+                )
+
+    def test_turn_start_no_handle_no_event(self):
+        """UserPromptSubmit for an amux session without handle no-ops."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                code = _run("UserPromptSubmit", {}, amux_name="untracked")
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    list(lib.SPAWN_DIR.glob("*.lifecycle.jsonl")), []
+                )
+
+
+class TestStoppedAtField(unittest.TestCase):
+    """Epic 37 (task 37-01): producer-owned stopped_at timestamp."""
+
+    def test_stop_writes_stopped_at(self):
+        """A Stop sets stopped_at to an ISO timestamp."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                _run("Stop",
+                     {"last_assistant_message": "done",
+                      "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+
+                h = lib.read_handle("proj-2")
+                self.assertIsNotNone(h["stopped_at"])
+                self.assertIsInstance(h["stopped_at"], str)
+                # stopped_at == updated_at (both set in the same call).
+                self.assertEqual(h["stopped_at"], h["updated_at"])
+
+    def test_stopped_at_in_handle_fields(self):
+        """stopped_at is in the schema and produced by new_handle."""
+        self.assertIn("stopped_at", lib.HANDLE_FIELDS)
+        h = lib.new_handle(
+            name="test", session_id="sid", run_id="rid",
+            abs_dir="/ws", transcript_path="/t.jsonl", stuck_after_s=600,
+        )
+        self.assertIn("stopped_at", h)
+        self.assertIsNone(h["stopped_at"])
+        self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+
+    def test_stopped_at_preserved_by_turn_start(self):
+        """UserPromptSubmit does NOT reset stopped_at (it records the last Stop)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                # First Stop sets stopped_at.
+                _run("Stop",
+                     {"last_assistant_message": "done",
+                      "background_tasks": [],
+                      "transcript_path": str(tpath)},
+                     amux_name="proj-2")
+                h_after_stop = lib.read_handle("proj-2")
+                stopped_at = h_after_stop["stopped_at"]
+                self.assertIsNotNone(stopped_at)
+
+                # Follow-up: UserPromptSubmit should NOT clear stopped_at.
+                _run("UserPromptSubmit", {}, amux_name="proj-2")
+                h_after_turn = lib.read_handle("proj-2")
+                self.assertEqual(h_after_turn["stopped_at"], stopped_at)
+                self.assertEqual(h_after_turn["state"], "running")
+
+
+class TestNoTranscriptWorker(unittest.TestCase):
+    """Epic 37 (task 37-01): a tracked worker with NO transcript file.
+
+    This is the fixture shape the driving run exposed (evidence.md s1):
+    every fleet handle had mtime_at_stop=None because the transcript
+    did not exist. The lifecycle event log must still produce a complete
+    record.
+    """
+
+    def test_full_lifecycle_without_transcript(self):
+        """Complete lifecycle with no transcript file produces ordered events."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                # No transcript file created.
+                _seed_handle("no-tx", "/ws/proj", "/nonexistent/path.jsonl")
+
+                # 1. Turn start (seed prompt submitted).
+                _run("UserPromptSubmit", {}, amux_name="no-tx")
+                h = lib.read_handle("no-tx")
+                self.assertEqual(h["state"], "running")
+
+                # 2. Stop with background work.
+                _run("Stop",
+                     {"last_assistant_message": "kicked off CI",
+                      "background_tasks": [{"type": "shell", "id": "t1"}],
+                      "transcript_path": ""},
+                     amux_name="no-tx")
+                h = lib.read_handle("no-tx")
+                self.assertEqual(h["state"], "running")
+                self.assertIsNone(h["mtime_at_stop"])  # no transcript
+                self.assertIsNotNone(h["stopped_at"])  # producer-owned!
+
+                # 3. SubagentStop (bg drains).
+                _run("SubagentStop",
+                     {"background_tasks": []},
+                     amux_name="no-tx")
+
+                # 4. Turn start (follow-up via amux send).
+                _run("UserPromptSubmit", {}, amux_name="no-tx")
+                h = lib.read_handle("no-tx")
+                self.assertEqual(h["state"], "running")
+
+                # 5. Stop clean (idle transition).
+                _run("Stop",
+                     {"last_assistant_message": "all done",
+                      "background_tasks": []},
+                     amux_name="no-tx")
+                h = lib.read_handle("no-tx")
+                self.assertEqual(h["state"], "idle")
+
+                # 6. SessionEnd.
+                _run("SessionEnd", {"reason": "clear"}, amux_name="no-tx")
+
+                # Verify the complete event record.
+                events = lifecycle_events.read_events(lib.SPAWN_DIR, "no-tx")
+                self.assertEqual(len(events), 6)
+                types = [e["event"] for e in events]
+                self.assertEqual(types, [
+                    "turn_start", "stop", "subagent_stop",
+                    "turn_start", "stop", "session_end",
+                ])
+                # Seqs are monotonically increasing.
+                seqs = [e["seq"] for e in events]
+                self.assertEqual(seqs, [1, 2, 3, 4, 5, 6])
+
+                # The turn-start after the first idle proves "a turn is
+                # open right now" is derivable from the log alone.
+                self.assertEqual(events[3]["event"], "turn_start")
+                self.assertEqual(events[3]["state"], "running")
+
+                # The idle transition is the stop with bg_count=0.
+                self.assertEqual(events[4]["event"], "stop")
+                self.assertEqual(events[4]["state"], "idle")
+                self.assertEqual(events[4]["background_tasks_count"], 0)
+
+                # SessionEnd carries last_state.
+                self.assertEqual(events[5]["last_state"], "idle")
+
+    def test_idle_transition_recorded_for_agent_spawned_session(self):
+        """The idle event is the producer's Stop with bg=[], not notification_hook.
+
+        This is what notification_hook's origin gate currently drops for
+        agent-spawned sessions. The lifecycle log records it from the
+        producer path instead, using the hook payload (not the transcript).
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_handle("worker-1", "/ws/proj", "/no/transcript.jsonl")
+
+                _run("Stop",
+                     {"last_assistant_message": "finished the implementation",
+                      "background_tasks": []},
+                     amux_name="worker-1")
+
+                events = lifecycle_events.read_events(
+                    lib.SPAWN_DIR, "worker-1"
+                )
+                self.assertEqual(len(events), 1)
+                ev = events[0]
+                self.assertEqual(ev["event"], "stop")
+                self.assertEqual(ev["state"], "idle")
+                self.assertEqual(ev["background_tasks_count"], 0)
+                self.assertEqual(
+                    ev["last_message"], "finished the implementation"
+                )
+
+    def test_follow_up_after_idle_shows_turn_open(self):
+        """After a settled worker gets a follow-up, the log shows a turn is open.
+
+        This is the regression open_turn exists for: without a turn_start
+        event, a worker sent a follow-up via amux send still reads idle.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_handle("worker-2", "/ws/proj", "/no/tx.jsonl")
+
+                # Worker finishes -> idle.
+                _run("Stop",
+                     {"last_assistant_message": "done",
+                      "background_tasks": []},
+                     amux_name="worker-2")
+
+                # Follow-up sent.
+                _run("UserPromptSubmit", {}, amux_name="worker-2")
+
+                events = lifecycle_events.read_events(
+                    lib.SPAWN_DIR, "worker-2"
+                )
+                self.assertEqual(len(events), 2)
+                self.assertEqual(events[0]["event"], "stop")
+                self.assertEqual(events[0]["state"], "idle")
+                self.assertEqual(events[1]["event"], "turn_start")
+                self.assertEqual(events[1]["state"], "running")
+
+                # The handle also says running (not stale idle).
+                h = lib.read_handle("worker-2")
+                self.assertEqual(h["state"], "running")
+
+
+class TestLifecycleFailOpen(unittest.TestCase):
+    """Epic 37: lifecycle event write failure must never disrupt the session."""
+
+    def test_event_write_failure_does_not_block_handle_write(self):
+        """If the lifecycle log directory is unwritable, handle still updates."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                _seed_handle("proj-2", "/ws/proj", str(tpath))
+
+                # Make the spawn dir read-only so the lifecycle log can't be
+                # written (but the handle write has already happened via
+                # tmp+rename, which works in the dir).
+                # Actually, we need to test that append_event failure doesn't
+                # prevent the main function from succeeding. We mock it.
+                original_append = lifecycle_events.append_event
+
+                def failing_append(*args, **kwargs):
+                    raise IOError("disk full")
+
+                lifecycle_events.append_event = failing_append
+                try:
+                    code = _run(
+                        "Stop",
+                        {"last_assistant_message": "done",
+                         "background_tasks": [],
+                         "transcript_path": str(tpath)},
+                        amux_name="proj-2",
+                    )
+                    self.assertEqual(code, 0)
+
+                    # Handle was still written correctly.
+                    h = lib.read_handle("proj-2")
+                    self.assertEqual(h["state"], "idle")
+                    self.assertEqual(h["last_message"], "done")
+                finally:
+                    lifecycle_events.append_event = original_append
+
+
 if __name__ == "__main__":
     unittest.main()
+

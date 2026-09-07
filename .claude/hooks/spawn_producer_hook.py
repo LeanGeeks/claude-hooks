@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Producer hook for tracked ``amux-spawn`` sessions (epic 10, task 10-02).
+"""Producer hook for tracked ``amux-spawn`` sessions (epic 10, task 10-02;
+epic 37, task 37-01).
 
 This is the state-machine *producer*: it keeps each tracked session's handle
 (``~/.amux/spawn/<name>.json``) current from Claude Code lifecycle events, so the
@@ -7,22 +8,31 @@ read side (10-03) can report ``running | idle | stuck | terminated``. Producer i
 ``Stop``-based; the activity clock is the transcript mtime (no per-tool
 heartbeat). It writes only the fields defined in architecture s6.0.
 
-One executable handles all four events, dispatched by ``--event``:
+One executable handles all five events, dispatched by ``--event``:
 
+- ``UserPromptSubmit`` (epic 37): record the start of a turn. Sets ``state``
+  to ``running`` and clears ``permission_pending``, then appends a
+  ``turn_start`` lifecycle event. This makes "a turn is open right now"
+  derivable from the event log alone, without parsing the transcript tail.
 - ``Stop`` (authoritative): ``last_message <- last_assistant_message``;
   ``background_tasks <- payload``; ``state = idle`` iff ``background_tasks == []``
   else ``running``; clear ``permission_pending``; capture the real
   ``transcript_path`` from the payload; snapshot ``mtime_at_stop`` = the transcript
-  file's current mtime at processing time; bump ``updated_at``.
+  file's current mtime at processing time; write ``stopped_at`` = ISO wall-clock
+  timestamp of the turn end (producer-owned fact); bump ``updated_at``;
+  append a ``stop`` lifecycle event (which is also the idle transition for
+  agent-spawned sessions when ``background_tasks == []``).
 - ``SubagentStop``: freshness only — refresh ``background_tasks`` + ``mtime_at_stop``
   (and ``transcript_path`` if the payload carries one) but NEVER set ``state: idle``
   (a subagent finishing is not the main turn ending; leave ``idle`` to ``Stop``).
+  Appends a ``subagent_stop`` lifecycle event.
 - ``Notification`` (matcher ``permission_prompt``): set ``permission_pending=true``
   (reason-context for 10-03). The next ``Stop`` clears it. ``idle_prompt`` is
   informational only and is ignored here — the existing notification_hook owns the
-  Telegram idle notification.
+  Telegram idle notification. Appends a ``permission_prompt`` lifecycle event.
 - ``SessionEnd`` (optional): mark ``state=terminated`` + ``reason``, preserving
-  ``last_state`` (the last-known running/idle).
+  ``last_state`` (the last-known running/idle). Appends a ``session_end``
+  lifecycle event.
 
 Every event is **handle-gated**: it no-ops fast for sessions without a handle
 (plain/human sessions, other repos' sessions). Resolution uses
@@ -34,6 +44,13 @@ which includes legacy handles that have no ``provider`` key at all.
 Handle writes are read-modify-write, so the epic-20 fields this hook does not
 own (``provider``, ``activity_path``, ``result_path``, ``process_pid``,
 ``exit_code``, ``failure``) are preserved verbatim.
+
+**Lifecycle event log** (epic 37, ``lifecycle_events.py``): after each handle
+write, the producer appends a bounded, ordered record to
+``~/.amux/spawn/<name>.lifecycle.jsonl``. The write is ``O_APPEND`` (atomic
+for records under ``PIPE_BUF``), fail-soft (never raises), and AFTER the
+handle write (ordering invariant: state on disk before the event announcing
+it). The ``lifecycle_events`` module owns the record format.
 
 Fail-OPEN: any error exits 0 so the session is never disrupted; but a handle is
 never silently corrupted (writes are atomic tmp+rename via the shared lib, and we
@@ -53,11 +70,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import amux_spawn_lib as lib
+import lifecycle_events
 
 CLAUDE_DIR = Path.home() / ".claude"
 
 # Events this producer understands. Anything else is ignored (fail-open no-op).
-KNOWN_EVENTS = {"Stop", "SubagentStop", "Notification", "SessionEnd"}
+# Epic 37 added UserPromptSubmit (turn-start recording).
+KNOWN_EVENTS = {"Stop", "SubagentStop", "Notification", "SessionEnd",
+                "UserPromptSubmit"}
 
 
 def debug_log(message: str) -> None:
@@ -127,8 +147,14 @@ def handle_stop(name: str, handle: dict, payload: dict) -> None:
 
     Sets last_message, background_tasks, state (idle iff bg empty else running),
     clears permission_pending, captures the real transcript_path, snapshots
-    mtime_at_stop, and bumps updated_at. Read-modify-write so unrelated s6.0
-    fields (name/session_id/run_id/dir/stuck_after_s/created_at) are preserved.
+    mtime_at_stop, writes the producer-owned stopped_at timestamp, and bumps
+    updated_at. Read-modify-write so unrelated s6.0 fields
+    (name/session_id/run_id/dir/stuck_after_s/created_at) are preserved.
+
+    After the handle write, appends a ``stop`` lifecycle event. This is also
+    the idle transition for agent-spawned sessions (when bg is empty) -- the
+    event that notification_hook's origin gate currently drops for tracked
+    handles.
     """
     background_tasks = _payload_background_tasks(payload)
     # Prefer the real transcript path from the payload; fall back to whatever the
@@ -148,9 +174,25 @@ def handle_stop(name: str, handle: dict, payload: dict) -> None:
     if transcript_path:
         handle["transcript_path"] = transcript_path
     handle["mtime_at_stop"] = _current_mtime(transcript_path)
-    handle["updated_at"] = lib.iso_now()
+    # Producer-owned turn-end timestamp (epic 37): the hook knows the turn
+    # ended and knows when.  Kept alongside mtime_at_stop (non-breaking).
+    handle["stopped_at"] = lib.iso_now()
+    handle["updated_at"] = handle["stopped_at"]
 
     lib.write_handle(name, handle)
+
+    # Lifecycle event AFTER the handle write (ordering invariant).
+    lifecycle_events.append_event(
+        lib.SPAWN_DIR,
+        name,
+        event=lifecycle_events.EVENT_STOP,
+        state=handle["state"],
+        session_id=handle.get("session_id"),
+        last_message=handle.get("last_message"),
+        background_tasks_count=len(background_tasks),
+        permission_pending=False,
+    )
+
     debug_log(
         f"Stop: amux:{name} state={handle['state']} "
         f"bg={len(background_tasks)} mtime_at_stop={handle['mtime_at_stop']}"
@@ -174,6 +216,18 @@ def handle_subagent_stop(name: str, handle: dict, payload: dict) -> None:
     handle["updated_at"] = lib.iso_now()
 
     lib.write_handle(name, handle)
+
+    # Lifecycle event AFTER the handle write (ordering invariant).
+    lifecycle_events.append_event(
+        lib.SPAWN_DIR,
+        name,
+        event=lifecycle_events.EVENT_SUBAGENT_STOP,
+        state=handle.get("state", "running"),
+        session_id=handle.get("session_id"),
+        background_tasks_count=len(background_tasks),
+        permission_pending=handle.get("permission_pending", False),
+    )
+
     debug_log(
         f"SubagentStop: amux:{name} bg={len(background_tasks)} "
         f"mtime_at_stop={handle['mtime_at_stop']} (state left {handle.get('state')!r})"
@@ -195,6 +249,17 @@ def handle_notification(name: str, handle: dict, payload: dict) -> None:
     handle["permission_pending"] = True
     handle["updated_at"] = lib.iso_now()
     lib.write_handle(name, handle)
+
+    # Lifecycle event AFTER the handle write (ordering invariant).
+    lifecycle_events.append_event(
+        lib.SPAWN_DIR,
+        name,
+        event=lifecycle_events.EVENT_PERMISSION_PROMPT,
+        state=handle.get("state", "running"),
+        session_id=handle.get("session_id"),
+        permission_pending=True,
+    )
+
     debug_log(f"Notification permission_prompt: amux:{name} permission_pending=true")
 
 
@@ -214,6 +279,17 @@ def handle_session_end(name: str, handle: dict, payload: dict) -> None:
     handle["state"] = "terminated"
     handle["updated_at"] = lib.iso_now()
     lib.write_handle(name, handle)
+
+    # Lifecycle event AFTER the handle write (ordering invariant).
+    lifecycle_events.append_event(
+        lib.SPAWN_DIR,
+        name,
+        event=lifecycle_events.EVENT_SESSION_END,
+        state="terminated",
+        session_id=handle.get("session_id"),
+        last_state=handle.get("last_state"),
+    )
+
     reason = payload.get("reason")
     debug_log(
         f"SessionEnd: amux:{name} terminated "
@@ -221,11 +297,41 @@ def handle_session_end(name: str, handle: dict, payload: dict) -> None:
     )
 
 
+def handle_user_prompt_submit(name: str, handle: dict, payload: dict) -> None:
+    """Record the start of a turn (``UserPromptSubmit``, epic 37).
+
+    Sets ``state`` to ``running`` (a turn is now open) and clears
+    ``permission_pending`` (if a turn is starting, any prior permission gate
+    was resolved).  The lifecycle event records this as a ``turn_start``, so
+    a reader can tell "a turn is open right now" from the log alone — the
+    case that ``open_turn`` transcript-tail parsing exists for, which 37-02
+    is expected to delete.
+    """
+    handle["state"] = "running"
+    handle["permission_pending"] = False
+    handle["updated_at"] = lib.iso_now()
+
+    lib.write_handle(name, handle)
+
+    # Lifecycle event AFTER the handle write (ordering invariant).
+    lifecycle_events.append_event(
+        lib.SPAWN_DIR,
+        name,
+        event=lifecycle_events.EVENT_TURN_START,
+        state="running",
+        session_id=handle.get("session_id"),
+        permission_pending=False,
+    )
+
+    debug_log(f"UserPromptSubmit: amux:{name} state=running (turn started)")
+
+
 _DISPATCH = {
     "Stop": handle_stop,
     "SubagentStop": handle_subagent_stop,
     "Notification": handle_notification,
     "SessionEnd": handle_session_end,
+    "UserPromptSubmit": handle_user_prompt_submit,
 }
 
 

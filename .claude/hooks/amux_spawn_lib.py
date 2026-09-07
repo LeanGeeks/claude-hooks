@@ -455,6 +455,13 @@ PROVIDERS = (PROVIDER_CLAUDE, PROVIDER_CODEX)
 # so they are unique per segment only). It counts LAUNCH attempts: a handle at
 # ``attempt == N`` with fewer than N ``thread.started`` segments in its event
 # artifact has an attempt in flight whose evidence has not started arriving.
+#
+# Epic 37 added ``stopped_at`` (task 37-01): ISO-8601 timestamp of the last
+# ``Stop`` event, written by the producer hook.  This is the producer-owned
+# turn-end fact that removes the transcript-mtime dependency for "when did
+# the turn end" — the hook knows the turn ended and knows when.  Kept
+# alongside ``mtime_at_stop`` (which stays for non-breaking compatibility);
+# ``stopped_at`` is the authoritative clock once 37-02 lands.
 HANDLE_FIELDS = (
     "name",
     "provider",
@@ -475,6 +482,7 @@ HANDLE_FIELDS = (
     "background_tasks",
     "permission_pending",
     "mtime_at_stop",
+    "stopped_at",
     "created_at",
     "updated_at",
 )
@@ -553,6 +561,7 @@ def upgrade_handle(handle: dict[str, Any]) -> dict[str, Any]:
     for key in ("result_path", "process_pid", "exit_code", "failure"):
         upgraded.setdefault(key, None)
     upgraded.setdefault("attempt", 1)
+    upgraded.setdefault("stopped_at", None)
     return upgraded
 
 
@@ -675,6 +684,7 @@ def new_handle(
         "background_tasks": [],
         "permission_pending": False,
         "mtime_at_stop": None,
+        "stopped_at": None,
         "created_at": now,
         "updated_at": now,
     }

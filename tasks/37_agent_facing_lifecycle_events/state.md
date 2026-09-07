@@ -77,7 +77,7 @@ tasks on it breaks integration:
 
 | # | Task | Status | Depends on | Notes |
 |---|---|---|---|---|
-| 37-01 | [Claude lifecycle event log producer](./37-01-claude-event-log-producer_opus.md) | todo | — | Hooks append durable ordered events incl. **turn start**; idle recorded from the producer's `Stop`; bounded records; no consumer change |
+| 37-01 | [Claude lifecycle event log producer](./37-01-claude-event-log-producer_opus.md) | done | — | Hooks append durable ordered events incl. **turn start**; idle recorded from the producer's `Stop`; bounded records; no consumer change |
 | 37-02 | [Lifecycle reducer and honest status](./37-02-lifecycle-reducer-and-status.md) | todo | 37-01 | State read not inferred; transcript dependency removed; `stuck` stops conflating four situations |
 | 37-03 | [`watch`: bulk subscribe + digests](./37-03-watch-bulk-subscribe_opus.md) | todo | 37-01, 37-02 | One subscription per consumer; two delivery regimes; wave-identity + self-exclusion; multi-handle blocking wait added |
 | 37-04 | [Worker identity and artifacts](./37-04-worker-identity-and-artifacts.md) | todo | 37-02 | Artifact paths, transcript persistence made deliberate, handle-name ergonomics |
@@ -194,3 +194,9 @@ Carried deliberately; each is owned by the task that must answer it.
   `active` is over-determined and would produce the wrong fixture. 37-01 and
   37-03 renamed with the `_opus` suffix. **Ready for handover to
   `docs/prompts/implementation_manager.md`.**
+- **2026-09-07** — 37-01 implemented.  `stopped_at` added to HANDLE_FIELDS,
+  `new_handle()`, `upgrade_handle()`, and epic 10 §6.0.  Claude event log
+  suffix: `.lifecycle.jsonl` (distinct from Codex `.events.jsonl`, Phase 0 §10).
+  No collision-sequencing: log is append-only, `session_id` partitions
+  sessions for reused names.  Log survives `cmd_rm` by default (BRD §6).
+  `UserPromptSubmit` registered in `install-claude-config.sh`.
