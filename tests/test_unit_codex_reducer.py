@@ -240,7 +240,8 @@ class TestLegacyHandleDerivesLikeClaude(unittest.TestCase):
         migrated["updated_at"] = legacy["updated_at"]
         return legacy, migrated
 
-    def _assert_same(self, alive: bool, stored_state: str, mtime_at_stop):
+    def _assert_same(self, alive: bool, stored_state: str, mtime_at_stop,
+                     created_at=None):
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             transcript = tmp / "sid.jsonl"
@@ -250,6 +251,13 @@ class TestLegacyHandleDerivesLikeClaude(unittest.TestCase):
                                         "content": [{"type": "text", "text": "hi"}]}}) + "\n"
             )
             legacy, migrated = self._derive_pair(transcript, stored_state, mtime_at_stop)
+            # Allow the caller to override created_at on both handles so the
+            # activity clock (which now uses created_at as the last fallback
+            # after 37-02 removed the transcript-mtime dependency) doesn't
+            # produce an unexpectedly stale age.
+            if created_at is not None:
+                legacy["created_at"] = created_at
+                migrated["created_at"] = created_at
             with patch.object(lib, "tmux_has_session", return_value=alive), \
                     patch.object(cli, "_reason_context", return_value={}):
                 a = cli._derive_status(legacy, None)
@@ -266,7 +274,13 @@ class TestLegacyHandleDerivesLikeClaude(unittest.TestCase):
         self.assertEqual(result["provider"], lib.PROVIDER_CLAUDE)
 
     def test_running_session_derives_identically(self):
-        result = self._assert_same(alive=True, stored_state="spawning", mtime_at_stop=None)
+        # Use a recent created_at: without a transcript mtime (removed in 37-02)
+        # the activity clock falls to created_at; an 8-month-old timestamp with
+        # stuck_after_s=600 would misfire stuck before the watchdog test can run.
+        from datetime import datetime, timezone
+        recent = datetime.now(timezone.utc).isoformat()
+        result = self._assert_same(alive=True, stored_state="spawning",
+                                   mtime_at_stop=None, created_at=recent)
         self.assertEqual(result["state"], "running")
 
     def test_dead_session_derives_identically(self):

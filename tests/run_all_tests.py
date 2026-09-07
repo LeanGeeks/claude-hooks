@@ -48,6 +48,7 @@ TEST_MODULES = {
     "unit_spawn_producer": "test_unit_spawn_producer",
     "unit_lifecycle_events": "test_unit_lifecycle_events",
     "unit_codex_reducer": "test_unit_codex_reducer",
+    "unit_claude_reducer": "test_unit_claude_reducer",
     "unit_amux_codex_reads": "test_unit_amux_codex_reads",
     "unit_amux_resume": "test_unit_amux_resume",
     "unit_amux_reads": "test_unit_amux_reads",

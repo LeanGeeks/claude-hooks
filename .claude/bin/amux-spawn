@@ -72,6 +72,13 @@ try:
 except Exception:  # noqa: BLE001
     codex_reducer = None
 
+# The pure Claude lifecycle reducer (task 37-02) — same layout, same fail-soft
+# convention.  A missing reducer degrades to stored-state-only (pre-37-01 shape).
+try:
+    import claude_event_reducer as claude_reducer  # noqa: E402
+except Exception:  # noqa: BLE001
+    claude_reducer = None
+
 
 def _eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -1030,12 +1037,13 @@ def _amux_attach(name: str) -> None:
 # reads the output-file for the result. --wait's stdout IS the payload.
 #
 # False-idle guard (FR5 / architecture §6 step 2):
-#   A freshly-created session has state=spawning / mtime_at_stop=None, which the
-#   _derive_status logic already maps to "running" (not "idle") via the
-#   no_stop_yet clause. We add a belt-and-suspenders flag ``seen_non_idle`` that
-#   requires the poll to have observed at least one "running" or "stuck" state
-#   (i.e. the seeded turn started) before we accept "idle". A session whose
-#   handle is still in spawning state can never satisfy --wait.
+#   A freshly-created session has state=spawning with no Stop event recorded yet;
+#   _derive_status maps this to "running" (degradation path: stored_state='spawning'
+#   → running). We add a belt-and-suspenders flag ``seen_non_idle`` that requires
+#   the poll to have observed at least one "running" or "stuck" state (i.e. the
+#   seeded turn started) before we accept "idle". A session still in spawning / with
+#   no Stop event yet will derive as "running" (degradation path: stored_state=
+#   'spawning' → running), so it can never prematurely satisfy --wait.
 
 # Sentinel printed to stdout on timeout (exit 3). Keep it machine-parseable and
 # distinct from any real last_message content (all-caps, no spaces, not natural
@@ -1063,8 +1071,9 @@ def _wait_for_idle(
 
     False-idle guard (Claude): requires seeing at least one non-idle state
     (running or stuck) before accepting idle. A session still in spawning / with
-    no Stop yet will read "running" (active, no_stop_yet) so the first iteration
-    is never mistakenly "idle" — but we enforce this explicitly as a
+    no Stop yet will derive as "running" (degradation path: stored_state='spawning'
+    → running), so the first iteration is never mistakenly "idle" — but we enforce
+    this explicitly as a
     belt-and-suspenders guard (architecture §6 step 2 / FR5).
 
     Codex (task 20-03): completion evidence (``turn.completed``) is itself proof
@@ -1139,7 +1148,7 @@ def _wait_for_idle(
             # Inside the grace window — fall through and poll again.
         else:
             terminated_since = None
-            if state in ("running", "stuck"):
+            if state in ("running", "stuck", "spawning"):
                 seen_non_idle = True
 
             if state == "idle" and (codex or seen_non_idle):
@@ -1648,23 +1657,105 @@ def _age_s(activity_mtime: float | None, handle: dict[str, Any]) -> float | None
     return round(max(0.0, time.time() - mtime), 1)
 
 
-def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
-    """Derive a tracked session's state (architecture §6 derivation rules).
+def _parse_iso_ts(ts_str: str | None) -> float | None:
+    """Parse an ISO-8601 timestamp string to an epoch float, or None."""
+    if not isinstance(ts_str, str) or not ts_str:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(ts_str).timestamp()
+    except (ValueError, TypeError):
+        return None
 
-    Provider dispatch (task 20-03): a Codex handle derives through
-    :func:`_derive_codex_status` (architecture §5 — reducer evidence, event
-    mtime, tmux liveness, exit metadata). Everything below is the Claude path,
-    unchanged: hooks + transcript mtime, precedence terminated -> stuck ->
-    running -> idle. ``stuck`` is derived here and NEVER persisted back to the
-    handle.
+
+def _activity_epoch_claude(
+    handle: dict[str, Any],
+    reduction: dict[str, Any],
+) -> float | None:
+    """Activity epoch for a Claude worker, sourced from the most accurate clock.
+
+    Chain (most to least authoritative):
+
+    1. ``last_event_ts`` from the lifecycle log — the instant the most recent
+       event was appended.
+    2. ``stopped_at`` from the handle — the producer-owned turn-end timestamp
+       (epic 37, task 37-01); accurate for handles written after 37-01.
+    3. ``mtime_at_stop`` from the handle — the legacy transcript-mtime snapshot
+       stored by the Stop hook.  This is a value stored IN the handle, not a
+       live stat of the transcript, so using it here does NOT violate invariant
+       1 (no live transcript reads).
+    4. ``created_at`` — spawn time; last resort for pre-37-01 / no-event handles.
     """
-    if lib.is_codex_handle(handle):
-        return _derive_codex_status(handle, stuck_after_override)
+    # 1. Last event timestamp from the lifecycle log.
+    epoch = _parse_iso_ts(reduction.get("last_event_ts"))
+    if epoch is not None:
+        return epoch
+    # 2. Producer-owned stop timestamp (ISO-8601, epic 37).
+    epoch = _iso_epoch(handle, "stopped_at")
+    if epoch is not None:
+        return epoch
+    # 3. Legacy transcript-mtime snapshot stored in the handle (not a live read).
+    mtime_at_stop = handle.get("mtime_at_stop")
+    if isinstance(mtime_at_stop, (int, float)):
+        return float(mtime_at_stop)
+    # 4. Spawn time.
+    return _iso_epoch(handle, "created_at")
 
+
+def _claude_reduce(handle: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a Claude handle's lifecycle log.  Fail-open on any error."""
+    if claude_reducer is None:
+        # Reducer module unavailable — degrade to empty (stored state wins).
+        return {
+            "state_hint": None, "turn_open": False, "has_stop_event": False,
+            "permission_pending": False, "background_tasks_count": 0,
+            "last_stop_state": None, "last_event_ts": None,
+            "terminated": False, "events": 0, "malformed_lines": 0,
+            "truncated_tail": False, "unknown_event_types": [],
+        }
+    name = str(handle.get("name", ""))
+    try:
+        return claude_reducer.reduce_log(lib.SPAWN_DIR, name)
+    except Exception:  # noqa: BLE001
+        return claude_reducer.empty_reduction()
+
+
+# ── Claude state derivation (task 37-02) ─────────────────────────────────────
+#
+# State is reduced from the lifecycle event log (task 37-01) plus a tmux
+# liveness check.  No transcript file is read, stated, or parsed — its
+# existence, mtime, or contents must not influence any verdict.
+# (architecture §7 invariant 1, state.md §7.)
+#
+# Precedence: terminated → stuck → running → idle.
+#
+#   1. terminated — tmux gone, OR producer recorded session_end.
+#   2. Reduce the log → state_hint (idle / running / terminated / None).
+#      None means "no Stop recorded yet" → degradation path uses stored state.
+#   3. Watchdog: alive + active (running) + age > stuck_after → stuck.
+#      "stuck" is never persisted back to the handle.
+#      A finished worker (state_hint = "idle") is NEVER overwritten by stuck,
+#      regardless of how long it has been sitting with a live pane.
+#
+# Activity age chain: last_event_ts → stopped_at → mtime_at_stop → created_at.
+# (The mtime_at_stop fallback uses the value STORED in the handle, not a live
+# transcript stat — invariant 1 is not violated.)
+
+
+def _derive_claude_status(
+    handle: dict[str, Any],
+    stuck_after_override: int | None,
+) -> dict[str, Any]:
+    """Derive a Claude worker's state (architecture §7 invariant 1, task 37-02).
+
+    Pure derivation: the result is never persisted.  ``stuck`` is computed
+    here and NEVER written back to the handle.  Legacy handles (no event log)
+    degrade to stored-state derivation, which matches the pre-37-01 behaviour
+    except that ``open_turn`` transcript-tail parsing is gone (state.md §9).
+    """
     name = str(handle.get("name", ""))
     stored_state = handle.get("state")
 
-    # stuck_after: per-query override wins; else handle.stuck_after_s; else default.
     stuck_after = stuck_after_override
     if stuck_after is None:
         try:
@@ -1672,14 +1763,7 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
         except (TypeError, ValueError):
             stuck_after = lib.DEFAULT_STUCK_AFTER_S
 
-    # Activity clock. Epic 20 (20-01) made this provider-neutral: ``activity_path``
-    # with ``transcript_path`` as the fallback, so a legacy handle (no
-    # ``activity_path`` key at all) and a migrated Claude handle derive
-    # identically. (Codex handles never reach this point — they dispatch to
-    # _derive_codex_status above.)
-    transcript_path = lib.handle_activity_path(handle)
-
-    # 1) terminated: tmux gone, OR producer already recorded terminated (SessionEnd).
+    # 1) Terminated: tmux gone OR stored terminated (SessionEnd recorded).
     alive = lib.tmux_has_session(name) if name else False
     if not alive or stored_state == "terminated":
         last_state = handle.get("last_state")
@@ -1687,57 +1771,72 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
             "name": name,
             "provider": lib.handle_provider(handle),
             "state": "terminated",
+            "stored_state": stored_state,
             "last_state": last_state,
+            "active": False,
             "stuck_after_s": stuck_after,
+            "activity_age_s": None,
+            "permission_pending": bool(handle.get("permission_pending", False)),
         }
 
-    # 2) active = live background_tasks OR open turn OR no Stop yet (spawning /
-    #    mtime_at_stop absent). The spawning clause keeps a just-launched session
-    #    active without short-circuiting stuck.
-    live_bg = bool(_live_background_tasks(handle))
-    mtime_at_stop = handle.get("mtime_at_stop")
-    no_stop_yet = (stored_state == "spawning") or (mtime_at_stop is None)
+    # 2) Reduce the lifecycle event log.
+    reduction = _claude_reduce(handle)
+    state_hint = reduction.get("state_hint")
+    permission_pending = bool(
+        reduction.get("permission_pending", handle.get("permission_pending", False))
+    )
 
-    # Open-turn detection — cheap gate: only parse the tail when the transcript has
-    # advanced past the last Stop snapshot (SAME fs clock). A bare mtime bump from a
-    # background-completion notification is filtered inside detect_open_turn.
-    open_turn = False
-    current_mtime = lib.transcript_mtime(transcript_path)
-    if current_mtime is not None and isinstance(mtime_at_stop, (int, float)):
-        if current_mtime > mtime_at_stop:
-            open_turn = lib.detect_open_turn(transcript_path)
-
-    active = live_bg or open_turn or no_stop_yet
-
-    # 3) stuck = active AND (now - activity_mtime > stuck_after). Cause-agnostic.
-    #    activity_mtime = transcript mtime if present, else handle.created_at.
-    activity_mtime = current_mtime
-    if activity_mtime is None:
-        activity_mtime = _created_at_epoch(handle)
-    age = None
-    if activity_mtime is not None:
-        age = max(0.0, time.time() - activity_mtime)
-    is_stuck = bool(active and age is not None and age > stuck_after)
-
-    if is_stuck:
-        state = "stuck"
-    elif active:
+    # 3) Base state from event log or degradation path.
+    if state_hint == "terminated":
+        # session_end recorded in the log.
+        state: str = "terminated"
+    elif state_hint == "idle":
+        state = "idle"
+    elif state_hint == "running":
         state = "running"
     else:
-        # 4) idle = not active AND stored state idle.
-        #
-        # This branch is only reached when active==False.  Per spec, idle ⇔
-        # not-active AND stored state == "idle".  Under CC 2.1.185 the
-        # draining Stop always sets state="idle" before the session goes
-        # quiet, so stored_state should always be "idle" here.  However, if
-        # a Stop fires but its state update hasn't been written yet (an
-        # in-flight write race that is normally impossible), stored_state may
-        # still be "running" or "spawning".  In that case we return the stored
-        # intermediate state rather than inventing "idle", because the Stop
-        # that would set idle simply hasn't been processed yet — reporting the
-        # live stored state is less misleading than a premature "idle".
-        state = "idle" if stored_state == "idle" else stored_state or "idle"
+        # state_hint is None: no event log or no Stop yet.
+        # Degradation: use stored state + handle fields (pre-37-01 / legacy handles).
+        if stored_state == "spawning":
+            # Pre-first-Stop: active, not yet idle (matches old no_stop_yet path).
+            state = "running"
+        elif stored_state == "idle":
+            # Check handle's background_tasks for outstanding work.
+            state = "running" if bool(_live_background_tasks(handle)) else "idle"
+        else:
+            state = stored_state or "running"
 
+    if state == "terminated":
+        last_state = handle.get("last_state")
+        return {
+            "name": name,
+            "provider": lib.handle_provider(handle),
+            "state": "terminated",
+            "stored_state": stored_state,
+            "last_state": last_state,
+            "active": False,
+            "stuck_after_s": stuck_after,
+            "activity_age_s": None,
+            "permission_pending": permission_pending,
+        }
+
+    # 4) Activity age (no transcript reads — see _activity_epoch_claude).
+    activity_epoch = _activity_epoch_claude(handle, reduction)
+    age = round(max(0.0, time.time() - activity_epoch), 1) if activity_epoch is not None else None
+
+    # 5) Watchdog: alive + genuinely active + stale → stuck.
+    #    NEVER fires when state is "idle" — a finished worker with a live pane
+    #    is idle, not stuck (the key invariant this task exists to fix).
+    stale_activity = (
+        state == "running" and alive
+        and age is not None and age > stuck_after
+    )
+    if stale_activity:
+        state = "stuck"
+
+    active = state in ("running", "stuck")
+
+    # 6) Build result.
     result: dict[str, Any] = {
         "name": name,
         "provider": lib.handle_provider(handle),
@@ -1745,17 +1844,40 @@ def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> 
         "stored_state": stored_state,
         "active": active,
         "stuck_after_s": stuck_after,
-        "activity_age_s": round(age, 1) if age is not None else None,
+        "activity_age_s": age,
+        "permission_pending": permission_pending,
         "signals": {
-            "live_background_tasks": live_bg,
-            "open_turn": open_turn,
-            "no_stop_yet": no_stop_yet,
+            "tmux_alive": alive,
+            "turn_open": bool(reduction.get("turn_open", False)),
+            "has_stop_event": bool(reduction.get("has_stop_event", False)),
+            "background_tasks_count": int(reduction.get("background_tasks_count", 0)),
+            "permission_pending": permission_pending,
+            "stale_activity": stale_activity,
+            "log_available": bool(reduction.get("events", 0)),
+            # Legacy compatibility aliases (same values, old key names).
+            "live_background_tasks": bool(_live_background_tasks(handle)),
+            "open_turn": bool(reduction.get("turn_open", False)),
         },
     }
-    # Reason-context: best-effort, attached whenever not plainly idle (esp. stuck).
+
+    # Reason-context: best-effort additive diagnostics — never affects the verdict
+    # (architecture §7 invariant 1).  foreground_tool reads the transcript but is
+    # absent when the file does not exist, and does not change "state".
     if state != "idle":
         result["reason_context"] = _reason_context(handle)
+
     return result
+
+
+def _derive_status(handle: dict[str, Any], stuck_after_override: int | None) -> dict[str, Any]:
+    """Derive a tracked session's state (architecture §6 / §7 derivation rules).
+
+    Provider dispatch: Codex → :func:`_derive_codex_status`; Claude →
+    :func:`_derive_claude_status`.
+    """
+    if lib.is_codex_handle(handle):
+        return _derive_codex_status(handle, stuck_after_override)
+    return _derive_claude_status(handle, stuck_after_override)
 
 
 def _iso_epoch(handle: dict[str, Any], key: str) -> float | None:
@@ -1939,7 +2061,14 @@ def cmd_ls(args: argparse.Namespace) -> int:
             except Exception:  # noqa: BLE001
                 state = handle.get("state")
         else:
-            state = "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state")
+            # Task 37-02: Claude rows now use the same derived state as
+            # ``status`` so the fleet-wide view is consistent.  A finished
+            # worker (event log says idle) reads "idle" rather than "stuck".
+            try:
+                derived = _derive_status(handle, None)
+                state = derived.get("state", handle.get("state"))
+            except Exception:  # noqa: BLE001
+                state = "terminated" if (not alive or handle.get("state") == "terminated") else handle.get("state")
         row = {
             "name": name,
             "provider": lib.handle_provider(handle),

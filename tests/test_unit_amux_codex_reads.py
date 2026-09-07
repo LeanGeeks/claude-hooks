@@ -529,9 +529,11 @@ class TestCodexLs(unittest.TestCase):
                 self.assertEqual(rows["rev-123"]["state"], "idle")
                 self.assertFalse(rows["rev-123"]["alive"])
                 self.assertEqual(rows["rev-124"]["state"], "running")
-                # Claude row: the unchanged epic-10 computation.
+                # Claude row: 37-02 uses _derive_status for Claude rows.
+                # A handle with stored_state="spawning" and no event log derives
+                # as "running" (the degradation path maps spawning → running).
                 self.assertEqual(rows["claude-1"]["provider"], "claude")
-                self.assertEqual(rows["claude-1"]["state"], "spawning")
+                self.assertEqual(rows["claude-1"]["state"], "running")
 
     def test_ls_json_terminated_codex_row(self):
         with tempfile.TemporaryDirectory() as d:
