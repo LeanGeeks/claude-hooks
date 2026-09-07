@@ -82,7 +82,7 @@ tasks on it breaks integration:
 | 37-03 | [`watch`: bulk subscribe + digests](./37-03-watch-bulk-subscribe_opus.md) | done | 37-01, 37-02 | One subscription per consumer; two delivery regimes; wave-identity + self-exclusion; multi-handle blocking wait added |
 | 37-04 | [Worker identity and artifacts](./37-04-worker-identity-and-artifacts.md) | done | 37-02 | Artifact paths, transcript persistence made deliberate, handle-name ergonomics |
 | 37-05 | [Integration, installer, docs](./37-05-orchestrator-integration-docs.md) | done | 37-03, 37-04 | Makes the correct pattern the obvious one; retires the anti-pattern |
-| 37-06 | [Live multi-worker verification](./37-06-live-verification_human.md) | todo | 37-05 | Human-in-the-loop; measures against the driving run's baseline |
+| 37-06 | [Live multi-worker verification](./37-06-live-verification_human.md) | blocked | 37-05 | Human-in-the-loop; measures against the driving run's baseline; awaiting human evidence |
 | 37-07 | [Remote event fan-out](./37-07-remote-event-fanout_deferred.md) | deferred | 37-03 | **Not to be executed.** Reasoning recorded so it is not rediscovered |
 
 `deferred` is not a runnable status: 37-07 is never picked up, never assigned an

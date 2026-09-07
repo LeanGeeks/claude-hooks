@@ -156,6 +156,17 @@ class TestReduceEventsSubagentStop(unittest.TestCase):
         r = reducer.reduce_events(events)
         self.assertEqual(r["background_tasks_count"], 2)
 
+    def test_subagent_stop_after_idle_stop_stays_idle(self):
+        """A subagent_stop arriving AFTER an idle stop must not revert to running."""
+        events = [
+            _ev("turn_start"),
+            _ev("stop", state="idle", background_tasks_count=0),
+            _ev("subagent_stop", background_tasks_count=0),
+        ]
+        r = reducer.reduce_events(events)
+        self.assertEqual(r["state_hint"], "idle",
+                         "subagent_stop after idle stop must not revert to running")
+
     def test_stop_after_subagent_stop_can_idle(self):
         """A stop AFTER a subagent_stop(bg=0) → final stop confirms idle."""
         events = [

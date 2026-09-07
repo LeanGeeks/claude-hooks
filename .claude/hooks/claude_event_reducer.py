@@ -176,7 +176,8 @@ def reduce_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             bg = ev.get("background_tasks_count", 0)
             if isinstance(bg, int):
                 out["background_tasks_count"] = bg
-            last_bg_setter = "subagent_stop"
+            if not (last_bg_setter == "stop" and out.get("last_stop_state") == STATE_IDLE):
+                last_bg_setter = "subagent_stop"
 
         elif etype == EVENT_PERMISSION_PROMPT:
             out["permission_pending"] = True
