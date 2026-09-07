@@ -59,6 +59,8 @@ ANTHROPIC_DEFAULT_HAIKU_MODEL  = "glm-5.3-flash"
 ANTHROPIC_SMALL_FAST_MODEL     = "glm-5.3-flash"
 
 [profile.claude-oc]
+GITHUB_MCP_PAT               = "ghp_secret_pat_value"
+CLAUDE_CODE_EXTRA_PATH       = "/opt/tools/bin"
 ANTHROPIC_BASE_URL           = "http://claude-router.localhost"
 ANTHROPIC_DEFAULT_OPUS_MODEL = "ocg-glm-5.2"
 CLAUDE_CODE_EFFORT_LEVEL     = "high"
@@ -98,16 +100,29 @@ class _ProfilesCase(unittest.TestCase):
                 blocks[name] = (provider.strip(), [])
         return blocks
 
-    def _run(self, json_out=False) -> str:
-        buf = io.StringIO()
-        ns = cli.build_parser().parse_args(
-            ["profiles"] + (["--json"] if json_out else [])
-        )
+    def _run(self, json_out=False, no_redact=False) -> str:
+        return self._run_full(json_out=json_out, no_redact=no_redact)[0]
+
+    def _run_full(self, json_out=False, no_redact=False):
+        """Return ``(stdout, stderr)`` for one ``cmd_profiles`` invocation."""
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["profiles"]
+        if json_out:
+            argv.append("--json")
+        if no_redact:
+            argv.append("--no-redact")
+        ns = cli.build_parser().parse_args(argv)
         with patch.object(lib, "PROFILES_TOML", self.path), \
-                contextlib.redirect_stdout(buf):
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
             rc = cli.cmd_profiles(ns)
         self.assertEqual(rc, 0)
-        return buf.getvalue()
+        return out.getvalue(), err.getvalue()
+
+    def _json(self, no_redact=False) -> dict:
+        """``--json`` output as ``{name: env}``."""
+        data = json.loads(self._run(json_out=True, no_redact=no_redact))
+        return {p["name"]: p["env"] for p in data}
 
 
 class TestTierMapOutput(_ProfilesCase):
@@ -176,8 +191,8 @@ class TestTierMapOutput(_ProfilesCase):
         self.assertEqual(self._run().count("\n\n"), 4)
 
 
-class TestJsonUnchanged(_ProfilesCase):
-    def test_json_is_still_name_env_objects(self):
+class TestJsonShape(_ProfilesCase):
+    def test_json_is_name_env_objects_sorted_by_name(self):
         data = json.loads(self._run(json_out=True))
         self.assertEqual(
             [p["name"] for p in data],
@@ -187,6 +202,70 @@ class TestJsonUnchanged(_ProfilesCase):
         self.assertEqual(glm["env"]["ANTHROPIC_MODEL"], "glm-5.3[1m]")
         # [all-profiles] merged in, as before.
         self.assertEqual(glm["env"]["API_TIMEOUT_MS"], "600000")
+
+
+class TestJsonRedaction(_ProfilesCase):
+    """Credentials are redacted by default; --no-redact opts out."""
+
+    def test_auth_token_is_redacted_by_default(self):
+        self.assertEqual(
+            self._json()["claude-glm"]["ANTHROPIC_AUTH_TOKEN"], cli.REDACTED
+        )
+
+    def test_raw_secret_appears_nowhere_in_default_output(self):
+        out = self._run(json_out=True)
+        self.assertNotIn("secret-token-value", out)
+        self.assertNotIn("ghp_secret_pat_value", out)
+
+    def test_no_redact_prints_the_real_values(self):
+        env = self._json(no_redact=True)["claude-glm"]
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], "secret-token-value")
+
+    def test_redaction_hides_values_not_keys(self):
+        """Which vars a profile sets stays visible — only the values go."""
+        self.assertEqual(
+            sorted(self._json()["claude-glm"]),
+            sorted(self._json(no_redact=True)["claude-glm"]),
+        )
+
+    def test_non_secret_values_survive_redaction(self):
+        env = self._json()["claude-glm"]
+        self.assertEqual(env["ANTHROPIC_MODEL"], "glm-5.3[1m]")
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.z.ai/api/anthropic")
+        self.assertEqual(env["API_TIMEOUT_MS"], "600000")
+
+    def test_pat_is_redacted_but_a_path_key_is_not(self):
+        """Segment matching, not substring: PAT != PATH."""
+        env = self._json()["claude-oc"]
+        self.assertEqual(env["GITHUB_MCP_PAT"], cli.REDACTED)
+        self.assertEqual(env["CLAUDE_CODE_EXTRA_PATH"], "/opt/tools/bin")
+
+    def test_no_redact_without_json_warns_and_changes_nothing(self):
+        plain, _ = self._run_full()
+        out, err = self._run_full(no_redact=True)
+        self.assertIn("--no-redact only affects --json", err)
+        self.assertEqual(out, plain)
+
+
+class TestSecretKeyClassifier(unittest.TestCase):
+    """Unit-level: the segment matcher behind redaction."""
+
+    def test_credential_names_match(self):
+        for key in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "GITHUB_MCP_PAT",
+                    "MY_SECRET", "DB_PASSWORD", "SOME_CREDENTIALS", "lowercase_token"):
+            self.assertTrue(cli.is_secret_key(key), key)
+
+    def test_lookalike_names_do_not_match(self):
+        for key in ("PATH", "CLAUDE_CODE_EXTRA_PATH", "MONKEY", "ANTHROPIC_BASE_URL",
+                    "API_TIMEOUT_MS", "ANTHROPIC_DEFAULT_OPUS_MODEL", "KEYBOARD"):
+            self.assertFalse(cli.is_secret_key(key), key)
+
+    def test_redact_env_is_a_copy(self):
+        src = {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_MODEL": "m"}
+        out = cli.redact_env(src)
+        self.assertEqual(src["ANTHROPIC_AUTH_TOKEN"], "t")
+        self.assertEqual(out, {"ANTHROPIC_AUTH_TOKEN": cli.REDACTED,
+                               "ANTHROPIC_MODEL": "m"})
 
 
 class TestNoProfilesFile(unittest.TestCase):

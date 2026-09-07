@@ -74,10 +74,25 @@ the harness default)`.
 
 `amux-spawn profiles --json` emits `[{name, env}]` with each profile's fully
 resolved environment — use it when you need a key the blocks do not show.
+Credential values are replaced with `<redacted>`:
 
-> **`--json` prints resolved env, including `ANTHROPIC_AUTH_TOKEN`.** Never
-> pipe it raw into a transcript, a log, or a prompt. The human output above
-> deliberately shows models only, and is safe to quote.
+```json
+[{"name": "claude-glm", "env": {
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": "<redacted>",
+    "ANTHROPIC_MODEL": "glm-5.3[1m]"}}]
+```
+
+Keys are preserved — only values go — so you can still see *which* vars a
+profile sets. A key is treated as a credential when any underscore-delimited
+segment of its name is one of `TOKEN`, `SECRET`, `KEY`, `PASSWORD`, `PASS`,
+`PAT`, `AUTH`, `CREDENTIAL` (so `GITHUB_MCP_PAT` is redacted and `PATH` is
+not).
+
+`--json --no-redact` prints the real values. Do not use it in an agent
+context: its output is a live credential, and anything you print becomes part
+of a transcript. Both the human output and redacted `--json` are safe to
+quote.
 
 `~/.claude/profiles.toml` is the file you **edit** (see [Editing
 profiles](#editing-profiles)); `amux-spawn profiles` is the file you **read**.
@@ -214,6 +229,8 @@ overwrites. Architecture: `architecture.md` §"Model profiles (epic 13)".
 - **Do not use `-m`.** It is invisible to both the pin check and inheritance.
 - **Do not set `CLAUDE_CODE_EFFORT_LEVEL`** to "help" — it overrides the
   explicit `--effort` of every descendant.
-- **Do not paste `profiles --json` output anywhere.** It contains auth tokens.
+- **Do not reach for `profiles --json --no-redact`.** Plain `--json` redacts
+  credentials and still shows every key; `--no-redact` puts a live token in
+  your transcript.
 - **Do not read `profiles.toml` to discover models.** Use `amux-spawn
   profiles`.

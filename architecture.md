@@ -514,8 +514,11 @@ provider (host of `ANTHROPIC_BASE_URL`, else `anthropic`) and every model tier
 the profile sets, labelled by the alias `--model` accepts. A pinned
 `ANTHROPIC_MODEL` and a `CLAUDE_CODE_EFFORT_LEVEL` are annotated because both
 override what the spawn flags select. Models only — no auth vars — so the
-output is safe to quote; `--json` emits the full resolved env (tokens
-included) and is not. Agent-facing guide:
+output is safe to quote. `--json` emits the full resolved env with credential
+values replaced by `<redacted>` (keys preserved; a key is a credential when an
+underscore-delimited segment of its name is `TOKEN`/`SECRET`/`KEY`/`PASSWORD`/
+`PASS`/`PAT`/`AUTH`/`CREDENTIAL`, so `PATH` is not caught). `--no-redact` opts
+out and is the only unsafe-to-quote form. Agent-facing guide:
 `docs/amux-spawn-model-selection.md`.
 
 ---

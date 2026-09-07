@@ -2810,8 +2810,34 @@ def cmd_rm(args: argparse.Namespace) -> int:
 
 # ── profiles (task 13-02) ─────────────────────────────────────────────────────
 
+# Env keys whose value is a credential rather than configuration. Matched on
+# underscore-delimited segments, not substrings, so PATH is not read as PAT and
+# MONKEY is not read as KEY. Fail-safe direction: a false positive costs one
+# unreadable value, a false negative leaks a token into a transcript.
+_SECRET_KEY_SEGMENTS = frozenset({
+    "TOKEN", "TOKENS", "SECRET", "SECRETS", "KEY", "KEYS", "APIKEY",
+    "PASSWORD", "PASSWD", "PASS", "PAT", "CREDENTIAL", "CREDENTIALS", "AUTH",
+})
+
+REDACTED = "<redacted>"
+
+
+def is_secret_key(key: str) -> bool:
+    """Does *key* name a credential? (segment match, see _SECRET_KEY_SEGMENTS)"""
+    return any(seg in _SECRET_KEY_SEGMENTS for seg in key.upper().split("_"))
+
+
+def redact_env(env: dict[str, str]) -> dict[str, str]:
+    """Copy of *env* with credential values replaced by ``REDACTED``.
+
+    Keys are preserved so the caller can still see *which* vars a profile sets
+    — only the values go. Non-secret keys are untouched.
+    """
+    return {k: (REDACTED if is_secret_key(k) else v) for k, v in env.items()}
+
+
 def cmd_profiles(args: argparse.Namespace) -> int:
-    """``profiles [--json]`` — list available model profiles.
+    """``profiles [--json] [--no-redact]`` — list available model profiles.
 
     Human-readable: one block per profile — ``name  provider`` followed by the
     profile's full tier map (every ``ANTHROPIC_*_MODEL`` it sets), so a caller
@@ -2819,14 +2845,26 @@ def cmd_profiles(args: argparse.Namespace) -> int:
     ``ANTHROPIC_MODEL`` and a ``CLAUDE_CODE_EFFORT_LEVEL`` are called out
     because both override what the spawn flags select.
 
-    ``--json``: array of ``{name, env}`` objects (unchanged).
+    ``--json``: array of ``{name, env}`` objects. Credential values are
+    redacted unless ``--no-redact`` is given — the common case is an agent or
+    a paste, and a profile's env carries auth tokens.
     """
     from urllib.parse import urlparse
 
     profiles = lib.load_profiles()
 
+    no_redact = bool(getattr(args, "no_redact", False))
+    if no_redact and not args.json:
+        # Accepting it silently would imply the human output was withholding
+        # something; it never prints env values at all.
+        _eprint("amux-spawn: warning: --no-redact only affects --json; the "
+                "human output never prints env values")
+
     if args.json:
-        output = [{"name": name, "env": env} for name, env in sorted(profiles.items())]
+        output = [
+            {"name": name, "env": env if no_redact else redact_env(env)}
+            for name, env in sorted(profiles.items())
+        ]
         print(json.dumps(output))
         return 0
 
@@ -2964,7 +3002,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "resolved env vars are exported before spawning")
 
     prof = sub.add_parser("profiles", help="list available model profiles from profiles.toml")
-    prof.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    prof.add_argument("--json", action="store_true",
+                      help="machine-readable JSON output; credential values "
+                           f"are replaced with '{REDACTED}'")
+    prof.add_argument("--no-redact", action="store_true",
+                      help="with --json: print credential values (tokens, "
+                           "keys, passwords) in full instead of redacting them")
 
     rs = sub.add_parser(
         "resume", help="start the next bounded turn on a captured Codex thread",
