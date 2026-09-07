@@ -176,6 +176,18 @@ Carried deliberately; each is owned by the task that must answer it.
   single deletion in the epic and still deserves an explicit decision in the
   implementation report rather than drift.
 
+## Field findings — 2026-09-07, from the consumer project
+
+Reported by the `leads-platform` operator's session after 37-01…37-05 landed and were installed. Neither is a code review; both are observations against real state, recorded so 37-06 can test them.
+
+- **F1 — legacy handles still report `stuck`, against invariant 7.** Five real handles created *before* 37-01 (`leads-platform--005-a|005-b|005-c|005-d|006-c-unit-*`) report `stuck` with the new reducer installed, `006-c` at `activity_age_s: 75918` (21 h). Ground truth: `005-d` and `006-c` had finished and their work is merged; all five tmux sessions are alive. These handles carry no event log, so this exercises the no-log degradation path. [brd.md](./brd.md) §4.2 and [architecture.md](./architecture.md) §7 invariant 7 require such handles to "resolve to a documented, sane state"; `stuck` for a session that finished and merged is not obviously that. **Decide whether this is the intended documented degradation or a gap**, and if intended, say so where an operator will read it.
+
+- **F2 — new-worker behaviour is still unproven, and one attempt to prove it failed for an unrelated reason worth recording.** A throwaway probe spawned into a fresh directory never started: Claude Code's *folder-trust* prompt ("Is this a project you created or one you trust?") blocked it at `stored_state: spawning`, with no Stop event and no event log. **`--yolo` does not bypass that prompt.** Any automated spawn into a directory Claude Code has not seen before will hang there — relevant to 37-06's fixture design, and to any consumer that spawns workers into fresh worktrees. Retest in a trusted directory before concluding anything about the reducer's happy path.
+
+- **Confirmed working:** the reducer is live and its signal vocabulary is in use — `tmux_alive`, `turn_open`, `has_stop_event`, `background_tasks_count`, `permission_pending`, `stale_activity`, `log_available`. `amux-spawn rm` now refuses to reap a running session without `--force`.
+
+- **Scheduling note:** 37-06 is blocked on a live fleet, and the consumer project's epic 039 task 06 (canary wave) wants the same thing. One small real wave could discharge both. Worth coordinating rather than running two.
+
 ## Log
 
 - **2026-09-07** — Epic filed from a post-mortem of the `leads-platform` fleet
