@@ -31,7 +31,7 @@ _amux_spawn_completions() {
 
     # ── Top-level subcommand completion ──────────────────────────────────────
     if [[ $cword -eq 1 ]]; then
-        COMPREPLY=($(compgen -W "spawn a attach status last ls rm resume profiles" -- "$cur"))
+        COMPREPLY=($(compgen -W "spawn a attach status last ls rm resume profiles watch" -- "$cur"))
         return
     fi
 
@@ -65,6 +65,35 @@ _amux_spawn_completions() {
                 "${HOME}/.claude/profiles.toml" 2>/dev/null)
             COMPREPLY=($(compgen -W "$profile_names" -- "$cur"))
         fi
+        return
+    fi
+
+    # ── watch: complete flags ─────────────────────────────────────────────────
+    if [[ "$subcommand" == "watch" ]]; then
+        if [[ "$prev" == "--run-id" || "$prev" == "--since" || \
+              "$prev" == "--debounce" || "$prev" == "--timeout" || \
+              "$prev" == "--stuck-after" || "$prev" == "--dir" ]]; then
+            # Value arguments: no file/name completion; let the user type.
+            return
+        fi
+        if [[ "$prev" == "--handle" || "$prev" == "--exclude" ]]; then
+            local spawn_dir="${HOME}/.amux/spawn"
+            if [[ -d "$spawn_dir" ]]; then
+                local names=()
+                local f
+                for f in "$spawn_dir"/*.json; do
+                    [[ -f "$f" ]] || continue
+                    local base="${f##*/}"
+                    names+=("${base%.json}")
+                done
+                COMPREPLY=($(compgen -W "${names[*]}" -- "$cur"))
+            fi
+            return
+        fi
+        COMPREPLY=($(compgen -W \
+            "--run-id --handle --debounce --since --block --timeout \
+             --stuck-after --dir --exclude --include-self" \
+            -- "$cur"))
         return
     fi
 

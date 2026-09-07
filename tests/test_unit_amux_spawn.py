@@ -426,6 +426,24 @@ class TestRunIdInheritance(unittest.TestCase):
                 # Must be a valid UUID.
                 self.assertEqual(str(uuid.UUID(result)), result)
 
+    def test_new_sentinel_mints_fresh_uuid(self):
+        # --run-id new must return a valid UUID, not the literal string "new".
+        with tempfile.TemporaryDirectory() as d:
+            with _redirect_amux_home(Path(d)):
+                lib.ensure_dirs()
+                result = cli.resolve_run_id("new", None)
+                self.assertNotEqual(result, "new", "'new' sentinel must not be stored literally")
+                self.assertEqual(str(uuid.UUID(result)), result, "result must be a valid UUID")
+
+    def test_new_sentinel_mints_distinct_uuids(self):
+        # Two --run-id new calls must produce two different UUIDs.
+        with tempfile.TemporaryDirectory() as d:
+            with _redirect_amux_home(Path(d)):
+                lib.ensure_dirs()
+                first = cli.resolve_run_id("new", None)
+                second = cli.resolve_run_id("new", None)
+                self.assertNotEqual(first, second, "each 'new' call must produce a distinct UUID")
+
 
 class TestTTYPlainPath(unittest.TestCase):
     """TTY/human path: tracked=False, no handle written, no session_id passed."""

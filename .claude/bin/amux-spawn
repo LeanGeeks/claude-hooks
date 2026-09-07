@@ -190,6 +190,8 @@ def resolve_dir(explicit_dir: str | None, is_tty: bool) -> tuple[str, str | None
 def resolve_run_id(explicit_run_id: str | None, parent_name: str | None) -> str:
     """run_id: ``--run-id`` overrides; else inherit from the parent handle; else
     mint a new one (D-RunId)."""
+    if explicit_run_id == "new":
+        return lib.mint_uuid()
     if explicit_run_id:
         return explicit_run_id
     if parent_name:

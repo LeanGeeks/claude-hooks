@@ -113,6 +113,11 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 | `PermissionRequest` | `*` | `permission_request_hook.py` | Send the request to Telegram via the relay, long-poll for the answer, map it to an allow/deny/stop/whitelist/reply decision. Also handles `AskUserQuestion`. timeout 43200s. |
 | `PostToolUse` | `*` | `posttool_hook.py` | If the request was resolved in the terminal instead, cancel the relay message (strip buttons) so the Telegram prompt goes dead. |
 | `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification — conditional on the session being operator-started (see below). |
+| `Notification` | `permission_prompt` | `spawn_producer_hook.py` | Epic-10 producer: record a `permission_prompt` lifecycle event on the tracked worker's handle and event log; set `permission_pending` on the handle. Handle-gated; no-op for untracked sessions. |
+| `UserPromptSubmit` | `*` | `spawn_producer_hook.py` | Epic-37 turn-start recording: append a `turn_start` event to the tracked worker's lifecycle log so `watch`/`status` can answer "is a turn open" without reading the transcript. Handle-gated; no-op for untracked sessions. |
+| `Stop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: authoritative turn-end. Update handle state to `idle` (clean stop) or `running` (background work outstanding), write `stopped_at`, append `stop` lifecycle event. Handle-gated. |
+| `SubagentStop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: freshness update when a background subagent completes; append `subagent_stop` lifecycle event. Handle-gated. |
+| `SessionEnd` | `*` | `spawn_producer_hook.py` | Epic-10 producer: mark handle `terminated`, append `session_end` lifecycle event. Handle-gated. |
 
 ### permission_state_store.py — cross-hook coordination
 
@@ -374,6 +379,13 @@ Session goes idle ──► Notification(idle_prompt): notification_hook
    → relay → Telegram   (fire-and-forget; no reply consumed today)
 ```
 
+**Precision note (epic 37):** the `session_started_by_agent → silent` branch
+above is **unchanged**. Agent-spawned sessions do not page a human and never
+will. The idle fact is not lost — `spawn_producer_hook` records it as a `stop`
+lifecycle event in the worker's `~/.amux/spawn/<name>.lifecycle.jsonl` at the
+instant `Stop` fires. `notification_hook` does **not** gain a second sink;
+the human Telegram path is byte-identical with what it was before epic 37.
+
 ---
 
 ## Host environment: amux
@@ -409,6 +421,60 @@ each session in **tmux**. Relevant facts:
 This is the substrate the **reply-from-Telegram** feature (task 09) builds on:
 amux's `send` is the only available way to inject a remote reply as a new user
 turn into a running interactive session.
+
+---
+
+## Tracked-worker lifecycle (epic 37)
+
+`amux-spawn spawn` creates a **tracked handle** at
+`~/.amux/spawn/<name>.json`. Epic 10 established this handle as durable state
+for a worker session. Epic 37 adds a companion artifact:
+
+**`~/.amux/spawn/<name>.lifecycle.jsonl`** — append-only, per-session event
+log written by `spawn_producer_hook.py` via `lifecycle_events.py`. One JSON
+line per lifecycle transition:
+
+| Event | Hook | Meaning |
+|-------|------|---------|
+| `turn_start` | `UserPromptSubmit` | A new user turn has been submitted to the worker. |
+| `stop` | `Stop` | Turn ended. `state` is `idle` (clean) or `running` (background work outstanding). Carries `last_message` and `stopped_at`. |
+| `subagent_stop` | `SubagentStop` | A background subagent completed. Freshness update only. |
+| `permission_prompt` | `Notification(permission_prompt)` | Worker is blocked on a permission decision. |
+| `session_end` | `SessionEnd` | Worker process exited. Handle transitions to `terminated`. |
+
+**Key invariants:**
+
+- The log is written *after* the handle update, so a consumer reading the log
+  always finds a handle that matches or supersedes the event it just read.
+- Records are bounded to 4000 bytes (below `PIPE_BUF`) so a single
+  `O_APPEND` write is atomic — no lock, no `fsync` on the session's hot path.
+- The log survives `amux-spawn rm`. Epic 37's BRD §6 requires a run to be
+  reconstructable from the streams after its workers are reaped; removing the
+  log on reap would break that.
+- `session_id` is on every record, so a reused handle name accumulates events
+  from successive sessions in one file and a reader can partition by session.
+- Codex workers keep their own `.events.jsonl` (Codex provider format);
+  `.lifecycle.jsonl` is Claude-only and the two suffixes are deliberately
+  distinct.
+
+**State derivation** is a pure reducer over the event log (`37-02`). No
+status answer may depend on a transcript file's existence, mtime, or
+contents. Transcript-derived diagnostics (e.g. `_reason_context`'s
+`foreground_tool`) may remain as strictly additive context that is absent
+without a transcript; they change no verdict.
+
+**`amux-spawn watch`** (epic 37) is the subscription surface built on top of
+the log. One invocation supervises N workers at once:
+
+```bash
+amux-spawn watch --run-id <run-id> [--debounce 8s] [--since <cursor>]
+amux-spawn watch --handle worker-001 --handle worker-002   # ad-hoc
+amux-spawn watch --run-id <run-id> --block                  # edge-triggered
+```
+
+Streaming mode (default) emits level-triggered JSON digests; block mode
+prints each settled handle and exits 0 when all are done. See
+`docs/amux-spawn-fleet-supervision.md` for the full operator guide.
 
 ---
 
