@@ -1609,5 +1609,142 @@ class TestLiveSpawn(unittest.TestCase):
             subprocess.run(["amux", "rm", name], capture_output=True)
 
 
+# ── Task 37-04: transcript persistence default ───────────────────────────────
+
+
+class TestPersistenceDefault(unittest.TestCase):
+    """Tracked Claude spawns default to CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1.
+
+    BRD §4.4 / task 37-04: CLAUDE_CODE_CHILD_SESSION is ambient and inherited
+    down the process tree.  On the driving run it silently disabled persistence
+    for 26 worker sessions (evidence.md §3).  After 37-02, persistence is an
+    observability choice, and the default for tracked workers is ON.
+
+    The default must take effect for a plain ``amux-spawn spawn`` with no
+    ``--profile`` (the [all-profiles] path does NOT apply without a named profile).
+    """
+
+    def _run_spawn_capture_env(self, tmp: Path, ws: Path, extra_argv=None,
+                               extra_env=None):
+        """Run cmd_spawn (non-TTY/tracked) and capture env at create time."""
+        captured_env: dict = {}
+        live_names: set[str] = set()
+
+        def fake_create(*, name, abs_dir, forward_flags, session_id, prompt):
+            # Capture os.environ snapshot at the instant of amux create.
+            captured_env.update(os.environ.copy())
+            live_names.add(name)
+            return 0, None
+
+        argv = ["spawn", "--dir", str(ws)] + (extra_argv or []) + ["--", "go"]
+        env_patch = extra_env or {}
+        with _redirect_amux_home(tmp), \
+                patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                patch.object(cli.lib, "tmux_has_session",
+                             side_effect=lambda n: n in live_names), \
+                patch.object(cli, "_amux_create_detached", side_effect=fake_create), \
+                patch.dict(os.environ, env_patch), \
+                patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                patch("sys.stderr"):
+            stdin.isatty.return_value = False
+            stdout.isatty.return_value = False
+            rc = cli.main(argv)
+        return rc, captured_env
+
+    def test_plain_spawn_sets_persistence_to_1(self):
+        """A plain tracked spawn with no --profile sets persistence to '1'."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            # Remove the variable if present — simulates a clean environment.
+            clean_env = {"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE": ""}
+            rc, env = self._run_spawn_capture_env(tmp, ws, extra_env=clean_env)
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"), "1",
+                "tracked Claude spawn must set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1",
+            )
+
+    def test_persistence_default_takes_effect_without_profile(self):
+        """The default applies for a plain spawn — [all-profiles] is NOT sufficient
+        because it only applies when --profile is passed.  This test ensures the
+        default is unconditional for tracked Claude workers.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            # Explicitly clear the var so this test doesn't silently pass because
+            # the var was already set in the outer environment.
+            clean_env = {"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE": ""}
+            rc, env = self._run_spawn_capture_env(tmp, ws, extra_env=clean_env)
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"), "1",
+                "default persistence must apply for plain tracked spawn with no --profile",
+            )
+
+    def test_explicit_zero_suppresses_default(self):
+        """A caller that sets CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0 opts out."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            # Caller explicitly opts out.
+            rc, env = self._run_spawn_capture_env(
+                tmp, ws,
+                extra_env={"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE": "0"},
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"), "0",
+                "explicit CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0 must not be overridden",
+            )
+
+    def test_codex_spawn_does_not_set_persistence_var(self):
+        """Codex spawns are unaffected — CLAUDE_* vars have no meaning for Codex."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            # Pre-remove the var to see if the Codex path would incorrectly set it.
+            codex_env: dict = {}
+            live_names: set[str] = set()
+
+            def fake_create_codex(*, name, abs_dir, forward_flags, session_id,
+                                  prompt, provider, event_log, result_path):
+                codex_env.update(os.environ.copy())
+                live_names.add(name)
+                return 0, None
+
+            # Seed an amux sessions dir for Codex artifact allocation.
+            argv = ["spawn", "--provider", "codex", "--dir", str(ws),
+                    "--", "do the thing"]
+            with _redirect_amux_home(tmp), \
+                    patch.object(cli.lib, "resolve_amux_session", return_value=None), \
+                    patch.object(cli.lib, "list_amux_names", return_value=set()), \
+                    patch.object(cli.lib, "tmux_has_session",
+                                 side_effect=lambda n: n in live_names), \
+                    patch.object(cli, "_amux_create_detached",
+                                 side_effect=fake_create_codex), \
+                    patch.object(cli.lib, "allocate_codex_artifacts",
+                                 return_value=("/tmp/test.events.jsonl",
+                                               "/tmp/test.result.md")), \
+                    patch.dict(os.environ, {"CLAUDE_CODE_FORCE_SESSION_PERSISTENCE": ""},
+                               clear=False), \
+                    patch("sys.stdin") as stdin, patch("sys.stdout") as stdout, \
+                    patch("sys.stderr"):
+                stdin.isatty.return_value = False
+                stdout.isatty.return_value = False
+                rc = cli.main(argv)
+            # Codex spawn must not set the Claude persistence var to "1".
+            self.assertNotEqual(
+                codex_env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"), "1",
+                "Codex spawn must not set CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1",
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

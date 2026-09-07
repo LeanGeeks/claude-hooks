@@ -353,6 +353,28 @@ def cmd_spawn(args: argparse.Namespace, claude_flags: list[str], prompt: str | N
 
     stuck_after_s = parse_stuck_after(args.stuck_after)
 
+    # Default transcript persistence for tracked Claude workers (BRD §4.4, task 37-04).
+    #
+    # CLAUDE_CODE_CHILD_SESSION is ambient and inherited down the process tree — on
+    # the driving run it silently disabled persistence for 26 worker sessions, making
+    # the fleet unreconstructable (evidence.md §3).  After 37-02 correctness no
+    # longer depends on the transcript (state.md §7), but persistence is still the
+    # observability default for tracked workers: a tracked worker is something you
+    # are supervising, and transcripts aid post-mortem.
+    #
+    # Trade-off: leaving transcripts on costs disk and was presumably suppressed on
+    # purpose when CLAUDE_CODE_CHILD_SESSION was set.  Setting
+    # Setting CLAUDE_CODE_FORCE_SESSION_PERSISTENCE to any non-empty value (e.g.
+    # '0') before spawning explicitly opts out.
+    #
+    # amux's env allowlist is prefix-based over CLAUDE_* (ANTHROPIC_*/CLAUDE_* —
+    # amux_spawn_lib AMUX_ENV_ALLOWLIST_PREFIXES), so the var reaches the child.
+    # [all-profiles] does NOT reach a spawn without --profile (load_profiles only
+    # builds env for named profile sections); this block is why the default applies
+    # even without a profile.  (state.md open-question §4 resolved here.)
+    if tracked and not codex and not os.environ.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"):
+        os.environ["CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"] = "1"
+
     # Build the amux exec base command (E2: --no-default-model so ANTHROPIC_MODEL
     # governs; E5: --no-attach so every spawn is created detached under the lock).
     # The minted --session-id (tracked only) is a valid UUID; amux routes it to
@@ -1490,6 +1512,8 @@ def _derive_codex_status(handle: dict[str, Any], stuck_after_override: int | Non
             "refused_path": bool(reduction.get("refused_path")),
             "attempt_pending": attempt_pending,
         },
+        # Artifact paths with explicit status (task 37-04 / BRD §4.4).
+        "artifacts": _codex_artifact_report(handle),
     }
 
     if attempt_pending:
@@ -1742,6 +1766,65 @@ def _claude_reduce(handle: dict[str, Any]) -> dict[str, Any]:
 # transcript stat — invariant 1 is not violated.)
 
 
+def _claude_artifact_report(name: str, handle: dict[str, Any]) -> dict[str, Any]:
+    """Artifact status for a Claude handle (task 37-04 / BRD §4.4).
+
+    Distinguishes "no path recorded" (``absent``) from "path recorded but
+    file missing" (``missing``) so absent artifacts fail visibly rather than
+    silently returning None.  Additive diagnostics only — does not affect any
+    state verdict.
+
+    Three entries:
+    - ``transcript``    — the Claude session's JSONL transcript.
+    - ``activity``      — the activity path (``lib.handle_activity_path``), which
+                          is ``activity_path`` if present, else ``transcript_path``
+                          for legacy handles — the same fallback the activity clock
+                          uses, so legacy and migrated handles report identically.
+    - ``lifecycle_log`` — ``<name>.lifecycle.jsonl`` event log (task 37-01).
+    """
+    transcript_path = handle.get("transcript_path") or None
+    # Use handle_activity_path for the "activity" entry so legacy handles
+    # (which have no explicit activity_path key) fall back to transcript_path —
+    # matching how _activity_epoch_claude and handle_activity_path work.
+    activity_path = lib.handle_activity_path(handle)
+    lifecycle_log_path = str(lib.SPAWN_DIR / f"{name}.lifecycle.jsonl") if name else None
+    return {
+        "transcript": {
+            "path": transcript_path,
+            "status": lib.artifact_status(transcript_path),
+        },
+        "activity": {
+            "path": activity_path,
+            "status": lib.artifact_status(activity_path),
+        },
+        "lifecycle_log": {
+            "path": lifecycle_log_path,
+            "status": lib.artifact_status(lifecycle_log_path),
+        },
+    }
+
+
+def _codex_artifact_report(handle: dict[str, Any]) -> dict[str, Any]:
+    """Artifact status for a Codex handle (task 37-04 / BRD §4.4).
+
+    Same rationale as :func:`_claude_artifact_report`.  Two entries:
+    - ``event_log`` — the ``activity_path`` (``codex exec --json`` stream).
+    - ``result``    — the ``result_path`` final-message artifact.
+    """
+    activity_path = handle.get("activity_path") or None
+    result_path = handle.get("result_path") or None
+    return {
+        "event_log": {
+            "path": activity_path,
+            "status": lib.artifact_status(activity_path),
+        },
+        "result": {
+            "path": result_path,
+            "status": lib.artifact_status(result_path),
+        },
+    }
+
+
 def _derive_claude_status(
     handle: dict[str, Any],
     stuck_after_override: int | None,
@@ -1777,6 +1860,7 @@ def _derive_claude_status(
             "stuck_after_s": stuck_after,
             "activity_age_s": None,
             "permission_pending": bool(handle.get("permission_pending", False)),
+            "artifacts": _claude_artifact_report(name, handle),
         }
 
     # 2) Reduce the lifecycle event log.
@@ -1818,6 +1902,7 @@ def _derive_claude_status(
             "stuck_after_s": stuck_after,
             "activity_age_s": None,
             "permission_pending": permission_pending,
+            "artifacts": _claude_artifact_report(name, handle),
         }
 
     # 4) Activity age (no transcript reads — see _activity_epoch_claude).
@@ -1858,6 +1943,10 @@ def _derive_claude_status(
             "live_background_tasks": bool(_live_background_tasks(handle)),
             "open_turn": bool(reduction.get("turn_open", False)),
         },
+        # Artifact paths with explicit status (task 37-04 / BRD §4.4): separate
+        # "no path recorded" from "path recorded but file missing".  Additive —
+        # does not affect any verdict.
+        "artifacts": _claude_artifact_report(name, handle),
     }
 
     # Reason-context: best-effort additive diagnostics — never affects the verdict
@@ -1897,14 +1986,76 @@ def _created_at_epoch(handle: dict[str, Any]) -> float | None:
     return _iso_epoch(handle, "created_at")
 
 
-def _resolve_handle(handle_arg: str) -> tuple[str, dict[str, Any] | None]:
-    """Resolve a queried <handle> (amux session name) to its handle dict.
+def _resolve_handle(handle_arg: str) -> tuple[str, dict[str, Any] | None, str | None]:
+    """Resolve a queried <handle> to its handle dict (task 37-04 ergonomics).
 
-    The queried token is the amux session name (the handle key). Returns
-    ``(name, handle_or_none)`` — fail-soft (None handle when absent/malformed).
+    Three-element return: ``(resolved_name, handle_or_none, error_msg_or_none)``.
+    ``error_msg`` is non-None only for the ambiguous-suffix case; all other
+    "no handle" paths return ``(name, None, None)`` so callers can print their
+    default "no tracked handle found" message.
+
+    Resolution order:
+
+    1. **Exact match** — ``lib.read_handle(name)`` succeeds immediately.
+    2. **Suffix search** — if exact fails, search every handle whose name ends
+       with ``-<query>``.  This is how ``unit-028-pre`` resolves to
+       ``leads-platform-unit-028-pre`` (evidence.md §2, BRD §4.4).
+    3. **Workspace preference** — if multiple suffix matches exist, prefer the
+       one(s) whose name starts with ``<cwd-prefix>-``.  A single workspace
+       candidate wins unambiguously.
+    4. **Ambiguity error** — two or more unresolvable candidates: return
+       ``(name, None, "ambiguous: matches A, B, C")`` so the caller can print
+       an actionable error naming the candidates instead of "no handle found".
     """
     name = handle_arg.strip()
-    return name, lib.read_handle(name)
+
+    # 1. Exact match.
+    handle = lib.read_handle(name)
+    if handle is not None:
+        return name, handle, None
+
+    # 2. Suffix search: find all handles whose name ends with ``-<query>``.
+    #    The workspace prefix is ``<basename(cwd)>`` — the same algorithm 10-01
+    #    uses for naming (D-Name), so the composed name is always
+    #    ``<prefix>-<suffix>``.
+    suffix_pattern = f"-{name}"
+    try:
+        all_handles = lib.list_handles()
+    except Exception:  # noqa: BLE001
+        return name, None, None
+
+    candidates = [
+        h for h in all_handles
+        if isinstance(h.get("name"), str) and h["name"].endswith(suffix_pattern)
+    ]
+
+    if not candidates:
+        return name, None, None
+
+    if len(candidates) == 1:
+        matched = candidates[0]
+        return str(matched["name"]), matched, None
+
+    # 3. Multiple candidates: prefer current workspace (workspace_prefix(cwd)).
+    try:
+        cwd = os.getcwd()
+        cwd_prefix = lib.workspace_prefix(cwd)
+    except Exception:  # noqa: BLE001
+        cwd_prefix = None
+
+    if cwd_prefix:
+        ws_pattern = f"{cwd_prefix}-"
+        ws_candidates = [
+            h for h in candidates if h["name"].startswith(ws_pattern)
+        ]
+        if len(ws_candidates) == 1:
+            matched = ws_candidates[0]
+            return str(matched["name"]), matched, None
+        # Multiple workspace candidates still ambiguous — fall through.
+
+    # 4. Ambiguity: name the candidates so the caller can print an actionable error.
+    candidate_names = ", ".join(str(h["name"]) for h in candidates)
+    return name, None, f"ambiguous handle {name!r}: matches {candidate_names}"
 
 
 def _human_status_line(result: dict[str, Any]) -> str:
@@ -1948,13 +2099,18 @@ def cmd_status(args: argparse.Namespace) -> int:
     stuck_after_override = (
         parse_stuck_after(args.stuck_after) if getattr(args, "stuck_after", None) else None
     )
-    name, handle = _resolve_handle(args.handle)
+    name, handle, resolve_error = _resolve_handle(args.handle)
     if handle is None:
-        result: dict[str, Any] = {"name": name, "state": "unknown", "error": "no handle found"}
+        if resolve_error:
+            _eprint(f"amux-spawn: {resolve_error}")
+            result: dict[str, Any] = {"name": name, "state": "unknown", "error": resolve_error}
+        else:
+            result = {"name": name, "state": "unknown", "error": "no handle found"}
         if args.json:
             print(json.dumps(result))
         else:
-            print(f"{name}: unknown (no tracked handle found)")
+            if not resolve_error:
+                print(f"{name}: unknown (no tracked handle found)")
         return 1
     result = _derive_status(handle, stuck_after_override)
     if args.json:
@@ -1979,12 +2135,17 @@ def cmd_last(args: argparse.Namespace) -> int:
     if not getattr(args, "handle", None):
         _eprint("amux-spawn last: missing <handle>")
         return 2
-    name, handle = _resolve_handle(args.handle)
+    name, handle, resolve_error = _resolve_handle(args.handle)
     if handle is None:
-        if args.json:
-            print(json.dumps({"name": name, "last_message": None, "error": "no handle found"}))
+        if resolve_error:
+            _eprint(f"amux-spawn: {resolve_error}")
+            if args.json:
+                print(json.dumps({"name": name, "last_message": None, "error": resolve_error}))
         else:
-            _eprint(f"amux-spawn last: no tracked handle found for {name}")
+            if args.json:
+                print(json.dumps({"name": name, "last_message": None, "error": "no handle found"}))
+            else:
+                _eprint(f"amux-spawn last: no tracked handle found for {name}")
         return 1
     if lib.is_codex_handle(handle):
         last_message = _final_message(handle)
@@ -2590,9 +2751,12 @@ def cmd_rm(args: argparse.Namespace) -> int:
     ``{name, state_at_rm, killed}`` where ``killed`` is true iff the session
     was live (running/stuck) when reaped.  Exit 0 on success; 1 on error.
     """
-    name, handle = _resolve_handle(args.handle)
+    name, handle, resolve_error = _resolve_handle(args.handle)
     if handle is None:
-        _eprint(f"amux-spawn rm: no tracked handle found for '{name}'")
+        if resolve_error:
+            _eprint(f"amux-spawn: {resolve_error}")
+        else:
+            _eprint(f"amux-spawn rm: no tracked handle found for '{name}'")
         return 1
 
     # Derive state using the same 10-03 logic as ``status``.

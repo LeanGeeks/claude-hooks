@@ -80,7 +80,7 @@ tasks on it breaks integration:
 | 37-01 | [Claude lifecycle event log producer](./37-01-claude-event-log-producer_opus.md) | done | — | Hooks append durable ordered events incl. **turn start**; idle recorded from the producer's `Stop`; bounded records; no consumer change |
 | 37-02 | [Lifecycle reducer and honest status](./37-02-lifecycle-reducer-and-status.md) | done | 37-01 | State read not inferred; transcript dependency removed; `stuck` stops conflating four situations |
 | 37-03 | [`watch`: bulk subscribe + digests](./37-03-watch-bulk-subscribe_opus.md) | done | 37-01, 37-02 | One subscription per consumer; two delivery regimes; wave-identity + self-exclusion; multi-handle blocking wait added |
-| 37-04 | [Worker identity and artifacts](./37-04-worker-identity-and-artifacts.md) | todo | 37-02 | Artifact paths, transcript persistence made deliberate, handle-name ergonomics |
+| 37-04 | [Worker identity and artifacts](./37-04-worker-identity-and-artifacts.md) | done | 37-02 | Artifact paths, transcript persistence made deliberate, handle-name ergonomics |
 | 37-05 | [Integration, installer, docs](./37-05-orchestrator-integration-docs.md) | todo | 37-03, 37-04 | Makes the correct pattern the obvious one; retires the anti-pattern |
 | 37-06 | [Live multi-worker verification](./37-06-live-verification_human.md) | todo | 37-05 | Human-in-the-loop; measures against the driving run's baseline |
 | 37-07 | [Remote event fan-out](./37-07-remote-event-fanout_deferred.md) | deferred | 37-03 | **Not to be executed.** Reasoning recorded so it is not rediscovered |
@@ -161,10 +161,15 @@ Carried deliberately; each is owned by the task that must answer it.
   transcript-derived, so invariant 1 pressures it; the invariant binds *verdicts*
   and an additive diagnostic that is simply absent without a transcript may be
   allowed to stay. Choose, do not let a test decide by accident.
+  **Resolved by 37-02**: kept as strictly additive context from `_reason_context`;
+  absent when no transcript; changes no verdict.
 - **Default for worker transcript persistence** (37-04). Leaving it on costs disk
   and was presumably suppressed deliberately at some point; leaving it off is
   what produced the blackout. The epic makes this safe to choose either way —
   it still has to be chosen.
+  **Resolved by 37-04**: default ON for tracked Claude workers. Rationale: tracked
+  workers are supervised; disk cost acceptable; total observability blackout
+  (evidence.md §3) is not. Opt out with `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=0`.
 - **Whether `open_turn` can be deleted rather than fixed** (37-02). Now
   conditional rather than open-ended: yes, *if and only if* 37-01's turn-start
   event lands and the reduction consumes it (Phase 0 §9). It is still the largest

@@ -99,6 +99,27 @@ def transcript_mtime(transcript_path: str | None) -> float | None:
         return None
 
 
+def artifact_status(path: str | None) -> str:
+    """Return the status of a recorded artifact path (BRD §4.4, task 37-04).
+
+    Three states, separating meanings that ``transcript_mtime`` conflated:
+
+    - ``"absent"``  — no path was recorded (None or empty string).
+    - ``"missing"`` — a path is recorded but the file does not exist.
+    - ``"present"`` — the file exists.
+
+    This distinction is critical for visible failure: a stat against a
+    never-created artifact returning ``None`` was previously indistinguishable
+    from "no path recorded", causing silent false-negatives (evidence.md §2).
+    """
+    if not path:
+        return "absent"
+    try:
+        return "present" if os.path.exists(path) else "missing"
+    except OSError:
+        return "missing"
+
+
 # ── tmux / amux name resolution ───────────────────────────────────────────────
 
 def tmux_session_name(name: str) -> str:

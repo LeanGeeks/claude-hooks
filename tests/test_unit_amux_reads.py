@@ -1153,5 +1153,307 @@ class TestNoTranscriptReadsOnVerdictPath(unittest.TestCase):
         )
 
 
+# ── Task 37-04: artifact status, persistence matrix, handle suffix resolution ──
+
+
+class TestArtifactStatus(unittest.TestCase):
+    """lib.artifact_status distinguishes absent / missing / present (BRD §4.4).
+
+    The key defect this closes: a stat against a never-created transcript returned
+    None, which was indistinguishable from "no path recorded".  Consumers treated
+    both as "no information" and proceeded to a confidently wrong answer
+    (evidence.md §2).
+    """
+
+    def test_absent_none_path(self):
+        """None path → 'absent'."""
+        self.assertEqual(lib.artifact_status(None), "absent")
+
+    def test_absent_empty_path(self):
+        """Empty string path → 'absent'."""
+        self.assertEqual(lib.artifact_status(""), "absent")
+
+    def test_missing_nonexistent_path(self):
+        """A path that is recorded but whose file does not exist → 'missing'."""
+        self.assertEqual(lib.artifact_status("/tmp/__37_04_does_not_exist__.jsonl"), "missing")
+
+    def test_present_existing_file(self):
+        """A path whose file exists → 'present'."""
+        with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
+            self.assertEqual(lib.artifact_status(f.name), "present")
+
+    def test_status_json_includes_artifacts_section(self):
+        """status --json includes an 'artifacts' section with path and status."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_handle("p-2", "/ws/p", "/ws/p/nonexistent.jsonl",
+                             state="idle", background_tasks=[])
+                _write_lifecycle_log(lib.SPAWN_DIR, "p-2", [
+                    _make_lifecycle_event("turn_start", "running", seq=1),
+                    _make_lifecycle_event("stop", "idle", seq=2,
+                                         background_tasks_count=0),
+                ])
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                self.assertIn("artifacts", r, "status must include 'artifacts' section")
+                arts = r["artifacts"]
+                # transcript path is recorded but file does not exist → "missing"
+                self.assertEqual(arts["transcript"]["path"], "/ws/p/nonexistent.jsonl")
+                self.assertEqual(arts["transcript"]["status"], "missing")
+                # lifecycle log was written → "present"
+                self.assertEqual(arts["lifecycle_log"]["status"], "present")
+
+    def test_absent_transcript_path_reported_as_absent(self):
+        """A handle with no transcript_path has artifact status 'absent', not 'missing'."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                # Codex-style handle: no transcript path
+                h = lib.new_handle(
+                    name="p-2", session_id=None, run_id="rid",
+                    abs_dir="/ws/p", transcript_path=None,
+                    stuck_after_s=600,
+                )
+                lib.write_handle("p-2", h)
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                arts = r.get("artifacts", {})
+                # No path recorded → "absent", not "missing"
+                self.assertEqual(arts.get("transcript", {}).get("status"), "absent",
+                                 "no transcript_path must report 'absent', not 'missing'")
+
+    def test_terminated_result_also_includes_artifacts(self):
+        """The 'artifacts' section is present even when state is 'terminated'."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_handle("p-2", "/ws/p", "/ws/p/sid.jsonl",
+                             state="idle", background_tasks=[])
+                # tmux gone → terminated
+                with patch.object(lib, "tmux_has_session", return_value=False):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                self.assertEqual(r["state"], "terminated")
+                self.assertIn("artifacts", r,
+                              "'artifacts' must appear in terminated results too")
+
+
+class TestPersistenceObservabilityMatrix(unittest.TestCase):
+    """State derivation is identical whether or not the transcript file exists.
+
+    After 37-02, persistence is an observability choice — not a correctness one
+    (BRD §4.4 / state.md §7).  This matrix verifies the boundary: the same
+    event log produces the same state regardless of whether the transcript is
+    present, absent, or never recorded.
+    """
+
+    def _idle_handle_with_log(self, tmp: Path, transcript_path: str | None):
+        """Seed an idle handle + event log (no transcript file written).
+
+        When ``transcript_path`` is ``None``, the handle is written with
+        ``transcript_path=None`` (no path recorded at all) so
+        ``artifact_status`` returns "absent", not "missing".
+        """
+        if transcript_path is not None:
+            h = _seed_handle("p-2", "/ws/p", transcript_path,
+                             state="idle", background_tasks=[])
+        else:
+            # Build a handle with no transcript path recorded.
+            h = lib.new_handle(
+                name="p-2",
+                session_id="11111111-2222-3333-4444-555555555555",
+                run_id="rid",
+                abs_dir="/ws/p",
+                transcript_path=None,
+                stuck_after_s=600,
+            )
+            h.update({"state": "idle", "background_tasks": []})
+            lib.write_handle("p-2", h)
+        _write_lifecycle_log(lib.SPAWN_DIR, "p-2", [
+            _make_lifecycle_event("turn_start", "running", seq=1),
+            _make_lifecycle_event("stop", "idle", seq=2, background_tasks_count=0,
+                                  last_message="done"),
+        ])
+        return h
+
+    def test_state_identical_with_transcript_present(self):
+        """Transcript present: state is still derived from event log → idle."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "p" / "sid.jsonl"
+                # Write the transcript file.
+                _write_transcript(tpath, [_assistant_text("done")])
+                self._idle_handle_with_log(tmp, str(tpath))
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                self.assertEqual(r["state"], "idle")
+                self.assertEqual(r["artifacts"]["transcript"]["status"], "present")
+
+    def test_state_identical_with_transcript_missing(self):
+        """Transcript absent: state is still derived from event log → idle.
+
+        This is the exact scenario the driving run hit: 26 workers with no
+        transcripts all reading 'stuck' instead of 'idle'.  After 37-02 the
+        state is correct regardless of transcript existence.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                # transcript_path is recorded but file is NEVER written.
+                self._idle_handle_with_log(tmp, "/ws/p/nonexistent.jsonl")
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                # State must be idle regardless of missing transcript.
+                self.assertEqual(r["state"], "idle",
+                                 "idle state must not depend on transcript file existing")
+                self.assertEqual(r["artifacts"]["transcript"]["status"], "missing",
+                                 "missing transcript must be reported, not silenced")
+
+    def test_state_identical_with_no_transcript_path(self):
+        """No transcript_path at all: state is still derived from event log → idle."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._idle_handle_with_log(tmp, None)
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(lib.read_handle("p-2"), None)
+                self.assertEqual(r["state"], "idle",
+                                 "idle state must not depend on a transcript path being recorded")
+                self.assertEqual(r["artifacts"]["transcript"]["status"], "absent",
+                                 "no transcript_path must report 'absent', not 'missing'")
+
+
+class TestHandleSuffixResolution(unittest.TestCase):
+    """Handle references can be by suffix only (task 37-04 / BRD §4.4).
+
+    A caller that spawned 'unit-028-pre' and receives handle
+    'leads-platform-unit-028-pre' should be able to query by 'unit-028-pre'.
+    """
+
+    def _seed(self, name: str, dir_: str) -> dict:
+        h = lib.new_handle(
+            name=name, session_id="s", run_id="r",
+            abs_dir=dir_, transcript_path="/t.jsonl", stuck_after_s=600,
+        )
+        lib.write_handle(name, h)
+        return h
+
+    def test_exact_name_takes_priority(self):
+        """An exact name resolves directly without suffix search."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._seed("leads-platform-unit-028-pre", "/ws/leads-platform")
+                # Exact match: full handle name.
+                name, handle, err = cli._resolve_handle("leads-platform-unit-028-pre")
+                self.assertIsNotNone(handle)
+                self.assertIsNone(err)
+                self.assertEqual(name, "leads-platform-unit-028-pre")
+
+    def test_suffix_resolves_unambiguous_handle(self):
+        """'unit-028-pre' resolves to 'leads-platform-unit-028-pre'."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._seed("leads-platform-unit-028-pre", "/ws/leads-platform")
+                name, handle, err = cli._resolve_handle("unit-028-pre")
+                self.assertIsNotNone(handle,
+                                     "'unit-028-pre' must resolve to the prefixed handle")
+                self.assertIsNone(err)
+                self.assertEqual(name, "leads-platform-unit-028-pre")
+
+    def test_no_match_returns_none_with_no_error(self):
+        """A suffix with no matching handle returns (name, None, None)."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._seed("proj-worker", "/ws/proj")
+                name, handle, err = cli._resolve_handle("unit-xyzzy")
+                self.assertIsNone(handle)
+                self.assertIsNone(err,
+                                  "no-match must return no error (caller prints default)")
+
+    def test_ambiguous_suffix_returns_actionable_error(self):
+        """Two handles ending in '-worker' produce an error naming both."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._seed("proj-a-worker", "/ws/proj-a")
+                self._seed("proj-b-worker", "/ws/proj-b")
+                name, handle, err = cli._resolve_handle("worker")
+                self.assertIsNone(handle)
+                self.assertIsNotNone(err,
+                                     "ambiguous suffix must produce an error, not None")
+                self.assertIn("proj-a-worker", err,
+                              "error must name the candidates")
+                self.assertIn("proj-b-worker", err,
+                              "error must name the candidates")
+
+    def test_workspace_preference_resolves_ambiguity(self):
+        """When one candidate is in the current workspace, it wins without error."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                ws = tmp / "myproj"
+                ws.mkdir()
+                self._seed("myproj-worker", str(ws))
+                self._seed("otherproj-worker", "/ws/otherproj")
+                # cwd = the myproj workspace → prefix = "myproj" → myproj-worker wins.
+                with patch("os.getcwd", return_value=str(ws)):
+                    name, handle, err = cli._resolve_handle("worker")
+                self.assertIsNotNone(handle,
+                                     "workspace-preferred candidate must resolve without error")
+                self.assertIsNone(err)
+                self.assertEqual(name, "myproj-worker")
+
+    def test_status_cmd_resolves_by_suffix(self):
+        """``status unit-028-pre`` resolves to the prefixed handle in cmd_status."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "p" / "sid.jsonl"
+                _write_transcript(tpath, [_assistant_text("done")])
+                _seed_handle("leads-platform-unit-028-pre", "/ws/leads-platform",
+                             str(tpath), state="idle", background_tasks=[])
+                import io
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    buf = io.StringIO()
+                    with patch("sys.stdout", buf):
+                        rc = cli.main(["status", "unit-028-pre", "--json"])
+                self.assertEqual(rc, 0,
+                                 "'status unit-028-pre' must resolve by suffix and exit 0")
+                data = json.loads(buf.getvalue())
+                self.assertEqual(data["name"], "leads-platform-unit-028-pre")
+
+    def test_ambiguous_suffix_cmd_status_exits_1_with_error(self):
+        """``status worker`` with two candidates exits 1 with an actionable error."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                self._seed("proj-a-worker", "/ws/proj-a")
+                self._seed("proj-b-worker", "/ws/proj-b")
+                import io
+                err_buf = io.StringIO()
+                with patch("sys.stderr", err_buf):
+                    rc = cli.main(["status", "worker", "--json"])
+                self.assertEqual(rc, 1)
+                self.assertIn("proj-a-worker", err_buf.getvalue(),
+                              "stderr must list the ambiguous candidates")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
