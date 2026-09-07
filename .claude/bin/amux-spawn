@@ -2095,6 +2095,379 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── Watch: bulk subscription with debounced digests (task 37-03) ────────────
+#
+# One subscription, N workers. The consumer arms a single persistent stream
+# (intended for Monitor with persistent: true) and is woken with a digest
+# when any subset settles. The driving cost model: each wake-up is a full
+# request at the consumer's context size, so coalescing is correctness.
+#
+# Two delivery regimes (architecture §4):
+#   consumer idle  — deliver promptly; the harness's 200 ms Monitor batch
+#                    covers near-simultaneous events for free.
+#   consumer busy  — debounce: accumulate into one digest rather than a
+#                    backlog of individual wake-ups.
+#
+# Level-triggered: each digest states everything currently settled and
+# unacknowledged. Successive emissions are supersets; reading only the
+# newest is always safe. This makes duplicate and missed deliveries
+# self-healing.
+#
+# Exit codes (block mode only):
+#   0  -> all matched handles settled.
+#   1  -> error.
+#   3  -> timeout expired before all settled.
+
+# Default debounce window in seconds. Long enough that a burst of
+# completions lands as one digest; short enough that an isolated completion
+# is reported promptly.
+WATCH_DEBOUNCE_DEFAULT_S = 8
+
+# Poll interval inside the watch loop. Each iteration re-enumerates
+# matching handles and re-derives state, so it also picks up workers that
+# join the wave after the subscription was armed.
+WATCH_POLL_INTERVAL_S = 0.75
+
+
+def _parse_debounce(raw: str | None) -> float:
+    """Parse a debounce duration (e.g. ``8s``, ``2``, ``0.5``) into seconds."""
+    if not raw:
+        return float(WATCH_DEBOUNCE_DEFAULT_S)
+    raw = raw.strip().lower()
+    mult = 1.0
+    if raw.endswith("s"):
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        raw = raw[:-1]
+        mult = 60.0
+    try:
+        return max(0.0, float(raw) * mult)
+    except ValueError:
+        return float(WATCH_DEBOUNCE_DEFAULT_S)
+
+
+def _watch_enumerate(
+    run_id: str | None,
+    explicit_handles: list[str],
+    exclude: set[str],
+    target_dir: str | None,
+) -> dict[str, dict[str, Any]]:
+    """Enumerate handles matching the subscription filter.
+
+    Re-runs on every poll cycle so workers spawned after the subscription
+    was armed are discovered.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    if explicit_handles:
+        for name in explicit_handles:
+            if name in exclude:
+                continue
+            handle = lib.read_handle(name)
+            if handle is not None:
+                result[name] = handle
+        return result
+    for handle in lib.list_handles():
+        if not isinstance(handle, dict):
+            continue
+        name = str(handle.get("name", ""))
+        if not name or name in exclude:
+            continue
+        if target_dir is not None:
+            hdir = handle.get("dir")
+            if not isinstance(hdir, str) or os.path.abspath(hdir) != target_dir:
+                continue
+        if run_id is not None and handle.get("run_id") != run_id:
+            continue
+        result[name] = handle
+    return result
+
+
+def _is_watch_reportable(state: str, permission_pending: bool) -> bool:
+    """True if a handle's derived state is a terminal/actionable outcome.
+
+    The stream must report every terminal outcome (task spec item 4):
+    settled (idle), terminated, threshold-expired (stuck), and
+    permission-pending (blocked on a permission prompt).
+    """
+    if state in ("idle", "terminated", "stuck"):
+        return True
+    if permission_pending:
+        return True
+    return False
+
+
+def _watch_entry(name: str, result: dict[str, Any], handle: dict[str, Any]) -> dict[str, Any]:
+    """Build one entry for a digest or block-mode emission."""
+    entry: dict[str, Any] = {
+        "name": name,
+        "state": result["state"],
+    }
+    if result.get("permission_pending"):
+        entry["permission_pending"] = True
+    age = result.get("activity_age_s")
+    if age is not None:
+        entry["activity_age_s"] = age
+    if result["state"] == "terminated":
+        ls = result.get("last_state")
+        if ls:
+            entry["last_state"] = ls
+    if result["state"] in ("idle", "terminated"):
+        msg = _final_message(handle)
+        if msg is not None:
+            entry["last_message"] = msg
+    provider = result.get("provider") or lib.handle_provider(handle)
+    if provider != lib.PROVIDER_CLAUDE:
+        entry["provider"] = provider
+    return entry
+
+
+def _emit_digest(
+    seq: int,
+    settled: dict[str, dict[str, Any]],
+    watching: int,
+    pending: int,
+) -> str:
+    """Emit one level-triggered digest to stdout. Returns the cursor."""
+    from datetime import datetime as _dt, timezone as _tz
+    cursor = f"{time.time():.3f}"
+    digest = {
+        "seq": seq,
+        "ts": _dt.now(_tz.utc).isoformat(),
+        "cursor": cursor,
+        "settled": list(settled.values()),
+        "watching": watching,
+        "pending": pending,
+    }
+    print(
+        json.dumps(digest, separators=(",", ":")),
+        flush=True,
+    )
+    return cursor
+
+
+def _emit_block_line(entry: dict[str, Any]) -> None:
+    """Emit one edge-triggered settlement line in block mode."""
+    print(
+        json.dumps(entry, separators=(",", ":")),
+        flush=True,
+    )
+
+
+def _settled_snapshot(
+    handles: dict[str, dict[str, Any]],
+    stuck_after: int | None,
+) -> tuple[dict[str, dict[str, Any]], int]:
+    """Derive status for all handles and partition into settled/pending.
+
+    Returns ``(settled_entries, pending_count)``.
+    """
+    settled: dict[str, dict[str, Any]] = {}
+    pending = 0
+    for name, handle in handles.items():
+        try:
+            result = _derive_status(handle, stuck_after)
+        except Exception:  # noqa: BLE001
+            continue
+        state = result.get("state", "unknown")
+        pp = bool(result.get("permission_pending", False))
+        if _is_watch_reportable(state, pp):
+            settled[name] = _watch_entry(name, result, handle)
+        else:
+            pending += 1
+    return settled, pending
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """``watch`` — bulk subscription with debounced digests (task 37-03).
+
+    One subscription supervises N workers. Intended usage: a single
+    persistent ``Monitor`` running this command for the life of a wave.
+
+    Streaming mode (default): emits level-triggered JSON digests to stdout.
+    Each digest is a superset of the previous; reading only the newest is
+    always safe. Debounce window (``--debounce``) coalesces bursts.
+
+    Block mode (``--block``): prints each handle as it settles
+    (edge-triggered) and exits 0 when all matched handles have settled.
+    Exit 3 on timeout.
+    """
+    run_id: str | None = getattr(args, "run_id", None)
+    explicit_handles: list[str] = getattr(args, "handle", None) or []
+    debounce_s = _parse_debounce(getattr(args, "debounce", None))
+    since_cursor: str | None = getattr(args, "since", None)
+    block_mode = bool(getattr(args, "block", False))
+    timeout_raw: str | None = getattr(args, "timeout", None)
+    stuck_after_raw: str | None = getattr(args, "stuck_after", None)
+    include_self = bool(getattr(args, "include_self", False))
+
+    if not run_id and not explicit_handles:
+        _eprint(
+            "amux-spawn watch: need --run-id or --handle to identify the "
+            "subscription scope"
+        )
+        return 2
+
+    timeout_s: float | None = parse_stuck_after(timeout_raw) if timeout_raw else None
+    stuck_after: int | None = parse_stuck_after(stuck_after_raw) if stuck_after_raw else None
+
+    # Self-exclusion (architecture §5 / state.md §13): a consumer inside its
+    # own subscription wakes itself on every turn-end, which triggers the
+    # harness's rate limiter and switches the supervision channel off.
+    exclude: set[str] = set(getattr(args, "exclude", None) or [])
+    if not include_self:
+        own = lib.resolve_amux_session()
+        if own:
+            exclude.add(own)
+
+    # Optional workspace scope: when explicit handles are given, no dir filter.
+    target_dir: str | None = None
+    if not explicit_handles:
+        if getattr(args, "dir", None):
+            target_dir = os.path.abspath(os.path.expanduser(args.dir))
+
+    # Cursor: epoch float from a previous digest's ``cursor`` field.
+    cursor_ts: float | None = None
+    if since_cursor:
+        try:
+            cursor_ts = float(since_cursor)
+        except ValueError:
+            _eprint(f"amux-spawn watch: invalid --since cursor: {since_cursor!r}")
+            return 2
+
+    deadline: float | None = (time.time() + timeout_s) if timeout_s is not None else None
+
+    # ── State tracking ───────────────────────────────────────────────────
+    last_emitted: dict[str, dict[str, Any]] = {}  # name -> entry at last emission
+    debounce_start: float | None = None  # when the current debounce window opened
+    first_emission = True
+    digest_seq = 0
+    block_reported: set[str] = set()  # names already reported in block mode
+
+    while True:
+        # Timeout check.
+        if deadline is not None and time.time() >= deadline:
+            if block_mode:
+                print(WAIT_TIMEOUT_MARKER, flush=True)
+                _eprint(
+                    f"amux-spawn watch: timed out after {timeout_s}s "
+                    f"(not all handles settled)"
+                )
+                return 3
+            return 0  # streaming: timeout is a clean exit
+
+        # Re-enumerate matching handles (picks up late joiners).
+        handles = _watch_enumerate(run_id, explicit_handles, exclude, target_dir)
+
+        # Derive state for all handles.
+        settled, pending = _settled_snapshot(handles, stuck_after)
+
+        now = time.time()
+
+        if block_mode:
+            # Edge-triggered: print each newly settled handle immediately.
+            for name, entry in sorted(settled.items()):
+                if name not in block_reported:
+                    _emit_block_line(entry)
+                    block_reported.add(name)
+            # All settled: exit.  But only if we have at least one handle
+            # (an empty subscription should keep waiting for handles to appear).
+            if handles and pending == 0:
+                return 0
+        else:
+            # Level-triggered digest with debounce.
+            changed = _settled_fingerprint(settled) != _settled_fingerprint(last_emitted)
+
+            if first_emission:
+                # Late-join convergence: emit immediately on first cycle if
+                # there are settled handles, or if no cursor (fresh arm).
+                if settled and (cursor_ts is None or _has_changes_since(
+                        settled, handles, cursor_ts)):
+                    _emit_digest(digest_seq, settled, len(handles), pending)
+                    digest_seq += 1
+                    last_emitted = dict(settled)
+                    first_emission = False
+                    debounce_start = None
+                elif not settled:
+                    # Nothing to report yet — mark first emission done so
+                    # subsequent changes go through debounce.
+                    first_emission = False
+                else:
+                    # cursor is fresh and nothing changed since it — skip emission.
+                    first_emission = False
+            elif changed:
+                if debounce_start is None:
+                    debounce_start = now
+                # Check if debounce window expired.
+                if now - debounce_start >= debounce_s:
+                    _emit_digest(digest_seq, settled, len(handles), pending)
+                    digest_seq += 1
+                    last_emitted = dict(settled)
+                    debounce_start = None
+            else:
+                # No change — but the debounce window may still be open from a
+                # previous change.  If it expired, emit now.
+                if debounce_start is not None and now - debounce_start >= debounce_s:
+                    _emit_digest(digest_seq, settled, len(handles), pending)
+                    digest_seq += 1
+                    last_emitted = dict(settled)
+                    debounce_start = None
+
+        # Sleep before the next poll.
+        sleep_s = WATCH_POLL_INTERVAL_S
+        if deadline is not None:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                continue  # next iteration will hit the timeout check
+            sleep_s = min(sleep_s, remaining)
+        time.sleep(sleep_s)
+
+
+def _settled_fingerprint(settled: dict[str, dict[str, Any]]) -> dict[str, tuple]:
+    """State-only fingerprint for change detection (excludes transient fields like activity_age_s)."""
+    return {name: (e["state"], e.get("permission_pending", False))
+            for name, e in settled.items()}
+
+
+def _has_changes_since(
+    settled: dict[str, dict[str, Any]],
+    handles: dict[str, dict[str, Any]],
+    cursor_ts: float,
+) -> bool:
+    """True if any settled handle has activity after the cursor timestamp.
+
+    Used for ``--since`` resume: skip the initial emission if nothing changed
+    since the cursor, to avoid a redundant wake-up on a quick reconnect.
+    """
+    for name in settled:
+        handle = handles.get(name)
+        if handle is None:
+            continue
+        # Check the lifecycle log's last event timestamp.
+        if claude_reducer is not None and lib.is_claude_handle(handle):
+            try:
+                reduction = claude_reducer.reduce_log(lib.SPAWN_DIR, name)
+            except Exception:  # noqa: BLE001
+                continue
+            last_ts = _parse_iso_ts(reduction.get("last_event_ts"))
+            if last_ts is not None and last_ts > cursor_ts:
+                return True
+        # Fallback: check handle's updated_at.
+        updated = _iso_epoch(handle, "updated_at")
+        if updated is not None and updated > cursor_ts:
+            return True
+        # For Codex handles, check the activity path mtime.
+        ap = lib.handle_activity_path(handle)
+        if ap:
+            try:
+                mtime = os.path.getmtime(ap)
+                if mtime > cursor_ts:
+                    return True
+            except OSError:
+                pass
+    # If we have settled handles but no timestamps, do not force re-emission.
+    return False
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     """``a|attach [<suffix>]`` — fuzzy-switch to a session in the current workspace.
 
@@ -2441,6 +2814,43 @@ def build_parser() -> argparse.ArgumentParser:
     lsp.add_argument("--dir", default=None, help="filter by an explicit workspace dir")
     lsp.add_argument("--run-id", default=None, help="filter by run_id")
 
+    wp = sub.add_parser(
+        "watch",
+        help="bulk subscription: supervise N workers with debounced digests",
+        epilog=(
+            "Intended usage: a single Monitor with persistent: true running "
+            "this command for the life of a wave. Armed once, stopped with "
+            "TaskStop. Each emission is a level-triggered JSON digest of "
+            "everything settled and unacknowledged."
+        ),
+    )
+    wp.add_argument("--run-id", default=None,
+                    help="subscription key: the run_id shared by the wave's workers")
+    wp.add_argument("--handle", action="append", default=None,
+                    help="explicit handle name(s) to watch (repeatable); "
+                         "alternative to --run-id for ad-hoc subscriptions")
+    wp.add_argument("--debounce", default=None,
+                    help=f"debounce window (default {WATCH_DEBOUNCE_DEFAULT_S}s); "
+                         "e.g. 8s, 2, 0.5")
+    wp.add_argument("--since", default=None,
+                    help="cursor from a previous digest (epoch float); "
+                         "resume without replaying or missing the gap")
+    wp.add_argument("--block", action="store_true",
+                    help="blocking mode: print each handle as it settles "
+                         "(edge-triggered) and exit 0 when all are done; "
+                         "exit 3 on timeout")
+    wp.add_argument("--timeout", default=None,
+                    help="patience limit (e.g. 30m, 2h); streaming: clean exit; "
+                         f"block: print '{WAIT_TIMEOUT_MARKER}' + exit 3")
+    wp.add_argument("--stuck-after", default=None,
+                    help="override the stuck/watchdog threshold for derived state")
+    wp.add_argument("--dir", default=None,
+                    help="filter handles by workspace dir")
+    wp.add_argument("--exclude", action="append", default=None,
+                    help="handle name(s) to exclude (repeatable)")
+    wp.add_argument("--include-self", action="store_true",
+                    help="include the subscriber's own handle (excluded by default)")
+
     rm = sub.add_parser(
         "rm",
         help="reap a tracked session (end-of-life: stop tmux + delete registry handle)",
@@ -2514,6 +2924,9 @@ def main(argv: list[str] | None = None) -> int:
         if subcommand == "last":
             return cmd_last(ns)
         return cmd_ls(ns)
+    if subcommand == "watch":
+        ns = build_parser().parse_args(argv)
+        return cmd_watch(ns)
     if subcommand == "rm":
         ns = build_parser().parse_args(argv)
         return cmd_rm(ns)

@@ -79,7 +79,7 @@ tasks on it breaks integration:
 |---|---|---|---|---|
 | 37-01 | [Claude lifecycle event log producer](./37-01-claude-event-log-producer_opus.md) | done | — | Hooks append durable ordered events incl. **turn start**; idle recorded from the producer's `Stop`; bounded records; no consumer change |
 | 37-02 | [Lifecycle reducer and honest status](./37-02-lifecycle-reducer-and-status.md) | done | 37-01 | State read not inferred; transcript dependency removed; `stuck` stops conflating four situations |
-| 37-03 | [`watch`: bulk subscribe + digests](./37-03-watch-bulk-subscribe_opus.md) | todo | 37-01, 37-02 | One subscription per consumer; two delivery regimes; wave-identity + self-exclusion; multi-handle blocking wait added |
+| 37-03 | [`watch`: bulk subscribe + digests](./37-03-watch-bulk-subscribe_opus.md) | done | 37-01, 37-02 | One subscription per consumer; two delivery regimes; wave-identity + self-exclusion; multi-handle blocking wait added |
 | 37-04 | [Worker identity and artifacts](./37-04-worker-identity-and-artifacts.md) | todo | 37-02 | Artifact paths, transcript persistence made deliberate, handle-name ergonomics |
 | 37-05 | [Integration, installer, docs](./37-05-orchestrator-integration-docs.md) | todo | 37-03, 37-04 | Makes the correct pattern the obvious one; retires the anti-pattern |
 | 37-06 | [Live multi-worker verification](./37-06-live-verification_human.md) | todo | 37-05 | Human-in-the-loop; measures against the driving run's baseline |
