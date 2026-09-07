@@ -509,6 +509,15 @@ flow (env reaches child via tmux `update-environment`, no `ps` leak).
 **Install:** `install-claude-config.sh` copies `shell/profiles.example.toml`
 to `~/.claude/profiles.toml` if the file does not exist (never overwrites).
 
+**Inspection:** `amux-spawn profiles` prints one block per profile — name,
+provider (host of `ANTHROPIC_BASE_URL`, else `anthropic`) and every model tier
+the profile sets, labelled by the alias `--model` accepts. A pinned
+`ANTHROPIC_MODEL` and a `CLAUDE_CODE_EFFORT_LEVEL` are annotated because both
+override what the spawn flags select. Models only — no auth vars — so the
+output is safe to quote; `--json` emits the full resolved env (tokens
+included) and is not. Agent-facing guide:
+`docs/amux-spawn-model-selection.md`.
+
 ---
 
 ## Human roles for AskUserQuestion (epic 15)

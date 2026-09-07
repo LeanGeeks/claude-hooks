@@ -58,6 +58,7 @@ TEST_MODULES = {
     "unit_amux_ergonomics": "test_unit_amux_ergonomics",
     "unit_amux_rm": "test_unit_amux_rm",
     "unit_profile_loader": "test_profile_loader",
+    "unit_amux_profiles_cmd": "test_unit_amux_profiles_cmd",
     "unit_roles_config": "test_unit_roles_config",
     "unit_questions_store": "test_unit_questions_store",
     "unit_questions_mcp": "test_unit_questions_mcp",

@@ -2813,8 +2813,13 @@ def cmd_rm(args: argparse.Namespace) -> int:
 def cmd_profiles(args: argparse.Namespace) -> int:
     """``profiles [--json]`` — list available model profiles.
 
-    Human-readable: name / model / provider table.
-    ``--json``: array of ``{name, env}`` objects.
+    Human-readable: one block per profile — ``name  provider`` followed by the
+    profile's full tier map (every ``ANTHROPIC_*_MODEL`` it sets), so a caller
+    can see what ``--profile X --model <tier>`` actually resolves to. A pinned
+    ``ANTHROPIC_MODEL`` and a ``CLAUDE_CODE_EFFORT_LEVEL`` are called out
+    because both override what the spawn flags select.
+
+    ``--json``: array of ``{name, env}`` objects (unchanged).
     """
     from urllib.parse import urlparse
 
@@ -2829,34 +2834,66 @@ def cmd_profiles(args: argparse.Namespace) -> int:
         print("amux-spawn: no profiles found (missing ~/.claude/profiles.toml or no [profile.*] sections)")
         return 0
 
-    rows: list[tuple[str, str, str]] = []
-    for name, env in sorted(profiles.items()):
-        # Model: ANTHROPIC_MODEL if set, else first of the default model vars.
-        model = (
-            env.get("ANTHROPIC_MODEL")
-            or env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
-            or env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
-            or ""
-        )
-        # Provider: hostname from ANTHROPIC_BASE_URL if set, else "anthropic".
-        base_url = env.get("ANTHROPIC_BASE_URL", "")
-        if base_url:
-            try:
-                provider = urlparse(base_url).hostname or "anthropic"
-            except Exception:  # noqa: BLE001
-                provider = "anthropic"
-        else:
-            provider = "anthropic"
-        rows.append((name, model, provider))
+    # Canonical display order. ANTHROPIC_MODEL first (it is a pin, not a tier);
+    # then the tier aliases --model accepts; then the small/fast slot.
+    tier_rows: tuple[tuple[str, str, str], ...] = (
+        ("ANTHROPIC_MODEL", "model", "ANTHROPIC_MODEL"),
+        ("ANTHROPIC_DEFAULT_FABLE_MODEL", "fable", ""),
+        ("ANTHROPIC_DEFAULT_OPUS_MODEL", "opus", ""),
+        ("ANTHROPIC_DEFAULT_SONNET_MODEL", "sonnet", ""),
+        ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "haiku", ""),
+        ("ANTHROPIC_SMALL_FAST_MODEL", "small-fast", ""),
+    )
 
-    # Format as an aligned table.
-    col_name_w = max(len("NAME"), *(len(r[0]) for r in rows))
-    col_model_w = max(len("MODEL"), *(len(r[1]) for r in rows))
-    fmt = f"{{:<{col_name_w}}}  {{:<{col_model_w}}}  {{}}"
-    print(fmt.format("NAME", "MODEL", "PROVIDER"))
-    print(fmt.format("-" * col_name_w, "-" * col_model_w, "-" * 8))
-    for name, model, provider in rows:
-        print(fmt.format(name, model, provider))
+    def provider_of(env: dict) -> str:
+        base_url = env.get("ANTHROPIC_BASE_URL", "")
+        if not base_url:
+            return "anthropic"
+        try:
+            return urlparse(base_url).hostname or "anthropic"
+        except Exception:  # noqa: BLE001
+            return "anthropic"
+
+    # One label column width across every block so the blocks line up.
+    label_w = max(len(label) for _, label, _ in tier_rows)
+    label_w = max(label_w, len("effort"))
+    name_w = max(len(n) for n in profiles)
+
+    first = True
+    for name, env in sorted(profiles.items()):
+        if not first:
+            print()
+        first = False
+        print(f"{name:<{name_w}}  {provider_of(env)}")
+
+        lines: list[tuple[str, str, str]] = [
+            (label, env[key], note)
+            for key, label, note in tier_rows
+            if env.get(key)
+        ]
+        if not lines:
+            # A profile can legitimately set no model at all (backend-only, or
+            # an empty profile picking up [all-profiles]). Say so rather than
+            # printing a bare name that reads like a formatting bug. Decided on
+            # the model rows alone: a profile that pins only an effort level
+            # still pins no model, and that is the more surprising half.
+            print("  (no model pinned — tiers come from the harness default)")
+
+        effort = env.get("CLAUDE_CODE_EFFORT_LEVEL")
+        if effort:
+            lines.append(
+                ("effort", effort,
+                 "CLAUDE_CODE_EFFORT_LEVEL, overrides --effort")
+            )
+        if not lines:
+            continue
+
+        value_w = max(len(v) for _, v, _ in lines)
+        for label, value, note in lines:
+            if note:
+                print(f"  {label:<{label_w}}  {value:<{value_w}}  ({note})")
+            else:
+                print(f"  {label:<{label_w}}  {value}")
     return 0
 
 

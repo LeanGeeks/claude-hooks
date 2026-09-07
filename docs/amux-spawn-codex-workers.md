@@ -129,7 +129,9 @@ Prefer `--model=X` on `spawn`: the space form's value is captured by the
 optional `<suffix>` positional (pre-existing behavior on the Claude path).
 `amux-spawn --profile` is a Claude `~/.claude/profiles.toml` concept and is
 refused for `--provider codex`; configure Codex's own `~/.codex/config.toml`
-for defaults.
+for defaults. For the Claude path — profiles, `--model` tiers and
+`--effort` — see
+[`amux-spawn-model-selection.md`](./amux-spawn-model-selection.md).
 
 ## YOLO mode — full host access warning
 

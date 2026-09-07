@@ -149,6 +149,20 @@ Override with `--include-self` for testing only.
 | `--handle <name>` | `watch` | none | Watch specific handles (repeatable) |
 | `--force` | `rm` | off | Kill before reaping |
 
+Model selection has its own three flags — use the `--flag=value` form:
+
+| Flag | On | Default | Purpose |
+|------|----|---------|---------|
+| `--profile <name>` | `spawn` | none | Backend (base URL, auth, tier alias map) |
+| `--model=<alias\|id>` | `spawn` | inherited from parent's `--model` | Model tier |
+| `--effort=<level>` | `spawn` | harness default (floats!) | Thinking budget |
+
+An automated spawn should pin both `--model=` and `--effort=`; unpinned, the
+child reads the operator's last interactive `/model`, and amux-spawn warns on
+stderr. `--profile` alone pins neither. See
+[`amux-spawn-model-selection.md`](./amux-spawn-model-selection.md) for the
+full rules, the `--model opus` space-form trap, and `amux-spawn profiles`.
+
 ## What not to do
 
 - **Do not poll.** No `while true; do amux-spawn status ...; done` inside a
@@ -162,3 +176,6 @@ Override with `--include-self` for testing only.
   it keeps emitting.
 - **Do not read transcripts to determine state.** Use `status --json`. State
   is reduced from the event log, not inferred from files.
+- **Do not spawn on an unpinned model or effort.** Pass `--model=<alias>` and
+  `--effort=<level>`; see
+  [`amux-spawn-model-selection.md`](./amux-spawn-model-selection.md).
