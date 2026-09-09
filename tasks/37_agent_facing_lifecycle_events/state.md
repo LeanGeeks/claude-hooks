@@ -84,6 +84,7 @@ tasks on it breaks integration:
 | 37-05 | [Integration, installer, docs](./37-05-orchestrator-integration-docs.md) | done | 37-03, 37-04 | Makes the correct pattern the obvious one; retires the anti-pattern |
 | 37-06 | [Live multi-worker verification](./37-06-live-verification_human.md) | done | 37-05 | All 12 items confirmed; 1 reducer bug found and fixed (`03f7064`) |
 | 37-07 | [Remote event fan-out](./37-07-remote-event-fanout_deferred.md) | deferred | 37-03 | **Not to be executed.** Reasoning recorded so it is not rediscovered |
+| 37-08 | [Field bug report: `terminated` for a live session, digests then silent](./37-08-false-terminated-field-report_bug.md) | todo | 37-02, 37-03 | Consumer report, 2026-09-09: a re-spawned live worker read `terminated`/`active:false`; the level-triggered digest stream never emitted again for it, absorbing its real completion |
 
 `deferred` is not a runnable status: 37-07 is never picked up, never assigned an
 implementer, and is not a blocker for anything. 37-06 is `_human` — human
@@ -187,6 +188,15 @@ Reported by the `leads-platform` operator's session after 37-01…37-05 landed a
 - **Confirmed working:** the reducer is live and its signal vocabulary is in use — `tmux_alive`, `turn_open`, `has_stop_event`, `background_tasks_count`, `permission_pending`, `stale_activity`, `log_available`. `amux-spawn rm` now refuses to reap a running session without `--force`.
 
 - **Scheduling note:** 37-06 is blocked on a live fleet, and the consumer project's epic 039 task 06 (canary wave) wants the same thing. One small real wave could discharge both. Worth coordinating rather than running two.
+
+
+## Field findings — 2026-09-09, from the consumer project
+
+Reported by the `leads-platform` Stage-C fleet controller (generation 11) during a live wave, after 37-01…37-05 were installed. Not a code review; observations against real state. Full write-up in [37-08](./37-08-false-terminated-field-report_bug.md).
+
+- **F3 — a live session read `terminated`, and the subscription then went silent for it permanently.** A worker re-spawned under a previously used handle name was classified `state: terminated`, `active: false` seconds after starting, while its tmux pane was alive (`dead=0`, `claude` running) and its lifecycle log recorded 25 events over the next 22 minutes. Because digests are level-triggered, the terminal class was emitted once and the worker's **actual completion produced no digest at all**; the human operator had to report the idle session. Still true 1 h 39 min later, with the pane alive. The documented `quiet` fallback never engages, because the handle is already terminal. `artifacts` was `null` at spawn and is populated now; `active: false` did not change with it. Consumer-side cursor placement was ruled out with timestamps ([37-08](./37-08-false-terminated-field-report_bug.md) §What I ruled out).
+
+- **F4 — the same handle is absent from `amux-spawn ls` while `status` and `last` answer for it.** Its registry JSON, lifecycle log and tmux session all exist. Unknown whether this is F3 or separate; recorded because a consumer that rebuilds a watch set from `ls` would drop a live worker without noticing.
 
 ## Log
 
