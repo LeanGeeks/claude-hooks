@@ -16,7 +16,20 @@ Add to your Claude Code settings (`~/.claude/settings.json` or project `.claude/
 }
 ```
 
-The script requires Python 3 and uses only the standard library.
+To decorate the subagent rows in the agent panel (ctrl-t) as well, add the companion setting:
+
+```json
+{
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/statusline/subagent.py\""
+  }
+}
+```
+
+The command runs through a shell with `CLAUDE_PROJECT_DIR` set, so the path above resolves wherever the repo is checked out.
+
+Both scripts require Python 3 and use only the standard library. `subagent.py` imports `statusline.py` from its own directory, so keep them side by side.
 
 ## Sample output
 
@@ -36,6 +49,8 @@ The script requires Python 3 and uses only the standard library.
 | Kimi API | `Kimi \| ctx 49% \| $0.07` |
 | Unknown API model | `Kimi \| ctx 49% \| cost ?` |
 | Gemma local | `Gemma local \| ctx 32%` |
+| Effort-capable model | `Opus · xhigh \| ctx 61% \| 5h 43% reset 1:12` |
+| Main thread running an agent | `Opus · high \| agent reviewer \| ctx 22%` |
 
 ## Provider inference
 
@@ -313,6 +328,7 @@ python3 .claude/statusline/test_deepseek_pricing.py -v     # DeepSeek integratio
 python3 .claude/statusline/test_additional_vendor_pricing.py -v  # Fireworks, MiniMax, Kimi
 python3 .claude/statusline/test_hardening.py -v            # review checks (06-03e)
 python3 .claude/statusline/test_glm_quota.py -v            # GLM quota parse/cache (credit + token eras)
+python3 .claude/statusline/test_subagent.py -v             # per-subagent line + effort/agent segments
 ```
 
 `test_hardening.py` covers: dedupe across renders, distinct `session_id` isolation, unknown-provider behavior, state-file content safety (no tokens / prompts / transcripts / commands), suppression for subscription and local billing, no-network guarantee for the cost path, runtime budget, and absence of git information in the rendered line.
@@ -364,6 +380,66 @@ Source: https://platform.kimi.ai/docs/pricing/chat-k25 and /chat-k2 — retrieve
 
 Kimi's pricing page defines two input tiers: cache-miss (token not in cache, billed at standard input rate) and cache-hit (token served from cache at discounted rate). There is no separate cache-write fee — writing tokens to the cache is billed at the cache-miss (input) rate. `cache_write_per_million` is set to the input rate per this official two-tier structure.
 
+## Per-subagent status line
+
+`subagent.py` decorates each subagent row in the agent panel. Claude Code pipes the row
+context as JSON on stdin and expects one `{"id": ..., "content": ...}` JSON object per
+line on stdout; ids not in the current task set are ignored. It ticks ~300 ms after
+agents appear and every 5 s after that, with a 5 s timeout per run.
+
+```
+❯ ● Explore-2      Opus · high     ctx 38%    1m12s   searching for statusline callers
+  ● code-review    Sonnet · ~max   ctx  7%      14s   reviewing the diff for correctness
+    ● Opus · ~high   ctx 62%     done   mapping hook registration
+```
+
+The decoration **replaces the whole row** apart from the leading status glyph, so the
+agent name and description are rendered here too. Metadata comes first at fixed column
+widths and the description takes whatever is left, so only the description ever
+truncates. The row is capped at the `columns` value in the payload.
+
+Cells, left to right:
+
+| Cell | Source | Notes |
+|---|---|---|
+| name | `tasks[].name` | Allocated per agent type (`Explore`, `Explore-2`). Omitted when absent; the column disappears entirely if no agent has one. |
+| model · effort | `tasks[].model`, `tasks[].effort` | Model normalized by `_normalize_model_name()`. `~` marks an inherited effort. Omitted for models without the effort capability. |
+| ctx | `tokenCount` / `contextWindowSize` | Green < 50%, yellow < 80%, red above. `ctx ?%` when the window is unknown. |
+| state | `status`, `startTime` | Elapsed while running; `done` / `failed` / `killed` once settled — the payload carries no `endTime`, so a clock would keep ticking after the agent stopped. |
+| description | `label` (live progress summary), else `description` | Dimmed, truncated with `…`. |
+
+Colour is ANSI, rendered through Claude Code's `Ansi` component. Rows are dimmed unless
+selected or being viewed, so colour mostly reads on the active row. Set
+`CC_STATUS_NO_COLOR=1` or `NO_COLOR` for plain text.
+
+### Effort resolution
+
+A subagent only carries its own `effort` when its agent definition pins one; otherwise
+Claude Code falls back to the session effort, then the model's catalogue default, then
+`high`. `subagent.py` mirrors that chain and marks everything not pinned by the agent
+with `~`:
+
+1. `tasks[].effort` — pinned by the agent definition, rendered plain.
+2. Session effort — read from `~/.cache/claude-statusline/session-{session_key}.json`,
+   which `statusline.py` writes whenever the main payload carries `effort.level`
+   (that value is already fully resolved by the harness).
+3. The model's catalogue `default_effort` (e.g. `claude-opus-4-7` → `xhigh`).
+4. `high`.
+
+Models with no effort capability (Haiku, pre-4.6 Sonnet/Opus, and every non-Claude
+provider) show no effort cell. Unknown `claude-*` ids are assumed capable, so new
+releases keep showing a level instead of silently dropping the cell.
+
+Only `local_agent` rows are decorated — teammates, remote agents, workflows and
+background bash rows keep their default rendering, because Claude Code does not pass
+them to this command.
+
+### Fields not available
+
+The payload has no cost, `agentType` (only the derived `name`), tool-use count, last
+tool name, queued-message count, backgrounded/idle flags, `endTime` or spawn depth. The
+default row's `N queued` counter cannot be reproduced.
+
 ## Extension points
 
 Later tasks should extend `statusline.py` without replacing it:
@@ -375,4 +451,6 @@ Later tasks should extend `statusline.py` without replacing it:
 - **Task 06-03d** ✓ — Fireworks (`glm-5.1`, `minimax-m2p5`), MiniMax (`minimax-m2.7`), Kimi (`kimi-k2.5`, `kimi-k2-0905-preview`) pricing added; tests in `test_additional_vendor_pricing.py`
 - **Task 06-03e** ✓ — review and hardening pass: dedupe / suppression / unknown-pricing / state-file-safety / no-network / no-git-output verified in `test_hardening.py`; cost display contract documented above
 
-The `detect_environment()` / `render_status_line()` split keeps provider detection stable while allowing segment formatters to evolve independently.
+- **Per-subagent status line** ✓ — `subagent.py` decorates agent-panel rows with model, effort, context and elapsed time; `statusline.py` gained `effort` / `agent` segments and publishes the session effort for it to inherit. Tests in `test_subagent.py`.
+
+The `detect_environment()` / `render_status_line()` split keeps provider detection stable while allowing segment formatters to evolve independently. `subagent.py` reuses `_normalize_model_name()` and `_infer_provider_billing()` rather than duplicating provider logic.

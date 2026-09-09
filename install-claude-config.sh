@@ -238,6 +238,7 @@ fi
 log_step "Step 2/5: Installing statusline"
 
 STATUSLINE_INSTALLED=false
+SUBAGENT_STATUSLINE_INSTALLED=false
 if [[ ! -d "$PROJECT_STATUSLINE_DIR" ]]; then
     log_warn "Project statusline directory not found: $PROJECT_STATUSLINE_DIR"
     log_warn "Skipping statusline installation..."
@@ -251,6 +252,18 @@ else
         cp "$STATUSLINE_SCRIPT" "$GLOBAL_STATUSLINE_DIR/statusline.py"
         chmod +x "$GLOBAL_STATUSLINE_DIR/statusline.py"
         log_info "Installed: statusline.py → $GLOBAL_STATUSLINE_DIR/statusline.py"
+
+        # Copy the per-subagent status line. It imports statusline.py from
+        # its own directory, so the two must stay side by side.
+        SUBAGENT_SCRIPT="$PROJECT_STATUSLINE_DIR/subagent.py"
+        if [[ -f "$SUBAGENT_SCRIPT" ]]; then
+            cp "$SUBAGENT_SCRIPT" "$GLOBAL_STATUSLINE_DIR/subagent.py"
+            chmod +x "$GLOBAL_STATUSLINE_DIR/subagent.py"
+            SUBAGENT_STATUSLINE_INSTALLED=true
+            log_info "Installed: subagent.py → $GLOBAL_STATUSLINE_DIR/subagent.py"
+        else
+            log_warn "subagent.py not found in $PROJECT_STATUSLINE_DIR — agent panel rows stay at their defaults"
+        fi
 
         # Copy pricing config alongside the script. statusline.py loads
         # this file relative to its own location; without it every API
@@ -772,6 +785,14 @@ if [[ "$STATUSLINE_INSTALLED" == true ]]; then
     log_info "  - refreshInterval: 30"
 fi
 
+# Merge per-subagent status line configuration (decorates agent panel rows)
+if [[ "$SUBAGENT_STATUSLINE_INSTALLED" == true ]]; then
+    MERGED=$(echo "$MERGED" | jq --arg cmd "python3 $GLOBAL_STATUSLINE_DIR/subagent.py" \
+        '. + {subagentStatusLine: {type: "command", command: $cmd}}')
+    log_info "SubagentStatusLine configuration merged:"
+    log_info "  - command: python3 $GLOBAL_STATUSLINE_DIR/subagent.py"
+fi
+
 # Register context-usage MCP server in ~/.claude.json (not settings.json)
 # Claude Code reads MCP servers from ~/.claude.json (user-scoped) or .mcp.json (project-scoped).
 CONTEXT_MCP_INSTALLED=false
@@ -1026,6 +1047,11 @@ if [[ "$STATUSLINE_INSTALLED" == true ]]; then
 else
     echo "  - statusLine: not installed (missing statusline.py)"
 fi
+if [[ "$SUBAGENT_STATUSLINE_INSTALLED" == true ]]; then
+    echo "  - subagentStatusLine: installed and configured ($GLOBAL_STATUSLINE_DIR/subagent.py)"
+else
+    echo "  - subagentStatusLine: not installed (missing subagent.py)"
+fi
 
 # Show slash-command status
 if [[ "$COMMANDS_INSTALLED" == true ]]; then
@@ -1140,7 +1166,7 @@ echo "  - tmux options (focus-events, tab title): $TMUX_FILE_STATUS ($TMUX_CONF)
 
 echo ""
 log_info "Other settings preserved:"
-jq 'del(.permissions, .hooks, .statusLine, .description, .notes) | keys[]' "$GLOBAL_CONFIG" 2>/dev/null | while read -r key; do
+jq 'del(.permissions, .hooks, .statusLine, .subagentStatusLine, .description, .notes) | keys[]' "$GLOBAL_CONFIG" 2>/dev/null | while read -r key; do
     echo "  - $key"
 done || echo "  (none)"
 

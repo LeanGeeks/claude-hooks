@@ -1134,12 +1134,22 @@ def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
 
     peak_prefix, peak_suffix = format_zai_peak_segments(env)
 
-    # First segment: model + billing hint for plan/subscription providers
+    # First segment: model + effort + billing hint for plan/subscription providers
     model_label = env.model
     if env.provider in ("zai", "ccr") and env.billing == "subscription":
         model_label = f"{model_label} plan"
+    effort = (status_input.get("effort") or {}).get("level")
+    if effort:
+        model_label = f"{model_label} · {effort}"
 
-    parts = [*peak_prefix, model_label, format_context_segment(status_input), *quota_segments, *peak_suffix]
+    # Only present once the main thread is running a named agent.
+    agent_segments = []
+    agent_name = (status_input.get("agent") or {}).get("name")
+    if agent_name:
+        agent_segments.append(f"agent {agent_name}")
+
+    parts = [*peak_prefix, model_label, *agent_segments,
+             format_context_segment(status_input), *quota_segments, *peak_suffix]
     return " | ".join(parts)
 
 
@@ -1184,6 +1194,32 @@ def _build_diagnostic_record(status_input: dict, env: StatusEnvironment) -> dict
     }
 
 
+def _session_state_path(session_key: str) -> str:
+    cache_dir = os.path.expanduser("~/.cache/claude-statusline")
+    return os.path.join(cache_dir, f"session-{session_key}.json")
+
+
+def write_session_effort_state(status_input: dict) -> None:
+    """Publish the resolved effort level for subagent.py to inherit. Never raises.
+
+    A subagent only carries its own effort when its agent definition pins one;
+    otherwise it runs at the session effort. Only this script is handed that
+    value, so it caches it for the per-subagent status line to pick up.
+    """
+    level = (status_input.get("effort") or {}).get("level")
+    if not level:
+        return
+    try:
+        session_key = _safe_session_key(status_input.get("session_id"))
+        _atomic_write_json(_session_state_path(session_key), {
+            "effort": level,
+            "model_id": (status_input.get("model") or {}).get("id", ""),
+            "updated_at": time.time(),
+        })
+    except Exception:
+        pass
+
+
 def maybe_write_diagnostic(status_input: dict, env: StatusEnvironment) -> None:
     """Append one diagnostic record if CC_STATUS_DIAGNOSTIC=1. Never raises."""
     if os.environ.get("CC_STATUS_DIAGNOSTIC", "") != "1":
@@ -1217,6 +1253,7 @@ def main():
         if debug:
             print(f"[CC_STATUS_DEBUG] env: {env}", file=sys.stderr)
 
+        write_session_effort_state(status_input)
         maybe_write_diagnostic(status_input, env)
         print(render_status_line(status_input, env))
     except Exception as exc:

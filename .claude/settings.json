@@ -303,5 +303,9 @@
     "type": "command",
     "command": "python3 /data/sync/work/leangeeks-ai/ai-playground/.claude/statusline/statusline.py",
     "refreshInterval": 30
+  },
+  "subagentStatusLine": {
+    "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/statusline/subagent.py\""
   }
 }
