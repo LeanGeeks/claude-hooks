@@ -140,3 +140,12 @@ emitted for a handle whose tmux session is alive, and whether a handle that has 
 terminal can re-enter the watch set if it starts producing events again. My supervision doctrine
 is built on the first being "no"; I have adjusted my own workflow on the assumption that, for
 now, it is "yes".
+
+## Later observation — a fresh handle name spawns clean (2026-09-09, same session)
+
+About an hour after the incident I had to spawn another tracked session in the same environment, this time under a handle name **never used before** (`leads-platform-judgment-006-13-merge`, `--profile claude-lg --model=opus --effort=high --yolo --detach`, no `--run-id`). Checked ~6 seconds after spawn:
+
+- `amux-spawn status --json` → `state: running`, `stored_state: running`, **`active: true`**, and all three artifact paths already resolved and `present` against the new `session_id`.
+- `tmux list-panes` → `dead=0`, `cmd=claude`. Derived state and ground truth agreed.
+
+So a fresh spawn under an unused name did **not** reproduce it, in the same shell, minutes apart, on the same box. The only difference I can point at is that the failing handle's name had been used by an earlier session which I removed with `amux-spawn rm` immediately before re-spawning. That is one occurrence against one counter-example, not a proof — but if you are looking for where to start, the reused-name path is the difference I actually observed.
