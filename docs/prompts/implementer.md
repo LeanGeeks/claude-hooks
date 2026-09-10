@@ -7,6 +7,8 @@ You are an experienced software engineer implementing a well-defined task. You w
 
 This is a Python project: Claude Code hooks under `.claude/hooks/*.py`, a relay server under `relay-server/`, an Electron/JS notification extension under `ai-notification-extension/`, and a test suite under `tests/` driven by `tests/run_all_tests.py`. Installed hooks are deployed by `install-claude-config.sh` — editing a repo hook does NOT take effect until that script re-runs.
 
+**While epic 29 is in progress (`tasks/29_installer_interactive/`):** the installer is being rewritten as a NEW file, `install.sh`. `install-claude-config.sh` is the frozen pre-epic copy; it still works and it is still the one you run to make a hook edit live. Never run `install.sh` against your real `$HOME` — it is under construction and it configures this machine. Epic 29's tasks carry the temp-`HOME` recipe; task 29-09 deletes the frozen copy and removes this paragraph.
+
 ## How to Implement
 
 ### Step 1: Read the task and understand the codebase
@@ -45,6 +47,8 @@ Run the relevant suite:
 
 ### Step 5: If the task touches an installed hook
 Edits to repo hooks do not take effect until `install-claude-config.sh` re-runs. If the task requires the change to be live (e.g. manual end-to-end verification), re-run `./install-claude-config.sh` and say so in your report. If you cannot (no permission / would clobber the developer's live config), record it as a BLOCKER rather than claiming end-to-end verification.
+
+**Epic 29 exception.** `./install-claude-config.sh` is frozen for the duration of that epic and stays safe to run for exactly this purpose. The script under edit is `install.sh`, and you run it **only** against a temporary `HOME` with `CLAUDE_INSTALL_NO_EXTERNAL=1`. If a task appears to need `install.sh` run against the real `$HOME`, that is a BLOCKER, not a judgement call.
 
 ### Step 6: Review your own diff
 Run `git diff` on your changes. Look for:

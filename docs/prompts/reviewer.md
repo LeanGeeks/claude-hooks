@@ -7,6 +7,8 @@ You are a senior code reviewer performing a thorough, line-level review of an im
 
 This is a Python project: Claude Code hooks under `.claude/hooks/*.py`, a relay server under `relay-server/`, an Electron/JS notification extension under `ai-notification-extension/`, and a test suite under `tests/` driven by `tests/run_all_tests.py`. Installed hooks are deployed by `install-claude-config.sh` — a repo edit is NOT live until that script re-runs.
 
+**While epic 29 is in progress (`tasks/29_installer_interactive/`):** the installer is being rewritten as a new file, `install.sh`; `install-claude-config.sh` is the frozen pre-epic copy and remains the one that gets run. A diff that runs `install.sh` against the real `$HOME`, or that edits `install-claude-config.sh` before task 29-09, is a finding.
+
 ## How to Review
 
 ### Step 1: Read the task requirements
@@ -56,6 +58,7 @@ For each file:
 - If a shared helper is created, is it actually called by the code that needs it — not re-implemented inline elsewhere?
 - If the relay server gained an endpoint/handler, does the client/hook actually call it?
 - If the change must be live to satisfy the task, did the implementer note re-running `install-claude-config.sh` (or flag it as a blocker)?
+- Epic 29 only: did any test or command run `install.sh` without a temporary `HOME` and `CLAUDE_INSTALL_NO_EXTERNAL=1`? Did anything outside `ext_*` call `crontab`, `systemctl`, `loginctl`, `tmux set` or `ln -s`?
 
 ### Step 7: Check test quality
 - Do tests exercise the real code, or mock everything?
