@@ -2033,6 +2033,575 @@ log_step()  {{ echo "[STEP] $1"; }}
                          "Backup must match the pre-run content of ~/.claude.json byte-for-byte")
 
 
+# =============================================================================
+# §6. Executor, module closure, refcounted uninstall (task 29-05)
+# =============================================================================
+
+
+class TestRefcountMatrix(InstallerTestBase):
+    """
+    Refcount matrix: for each shared module, install two owners, uninstall one,
+    assert the module survives; uninstall both, assert the module is removed.
+    """
+
+    # Shared modules and their owners (from MODULE_OWNERS in install.sh)
+    _SHARED_MODULES = {
+        "bash_command_parser.py": ("permission-hooks", "telegram"),
+        "settings_loader.py": ("permission-hooks", "telegram"),
+        "permission_state_store.py": ("permission-hooks", "telegram"),  # also amux, test two
+        "project_key.py": ("permission-hooks", "telegram"),
+        "roles_config.py": ("telegram", "questions"),
+        "amux_spawn_lib.py": ("amux", "profiles"),
+        # settings_writer.py is telegram-only, not shared
+    }
+
+    def _install_features(self, features: list) -> subprocess.CompletedProcess:
+        """Install specific features."""
+        return run_installer(
+            self.tmp_home,
+            extra_args=["--only", ",".join(features)],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+
+    def _uninstall_features(self, features: list) -> subprocess.CompletedProcess:
+        """Uninstall specific features."""
+        return run_installer(
+            self.tmp_home,
+            extra_args=["--uninstall", ",".join(features)],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+
+    def _module_exists(self, module: str) -> bool:
+        """Check if a module exists in the global hooks directory."""
+        return (self.tmp_home / ".claude" / "hooks" / module).exists()
+
+    def test_roles_config_survives_telegram_uninstall_with_questions(self):
+        """
+        Install telegram+questions, uninstall telegram: roles_config.py survives.
+        This is the key test case from the task spec.
+        """
+        # Install both
+        result = self._install_features(["telegram", "questions"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(self._module_exists("roles_config.py"),
+                        "roles_config.py should exist after installing telegram+questions")
+
+        # Uninstall telegram
+        result = self._uninstall_features(["telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # roles_config.py must survive (owned by questions too)
+        self.assertTrue(self._module_exists("roles_config.py"),
+                        "roles_config.py must survive uninstalling telegram (still owned by questions)")
+
+        # questions probe should still return installed
+        self.assertTrue(run_probe(self.tmp_home, "questions"),
+                        "questions must still probe as installed after telegram uninstall")
+
+    def test_amux_spawn_lib_survives_amux_uninstall_with_profiles(self):
+        """
+        Install amux+profiles, uninstall amux: amux_spawn_lib.py survives.
+        """
+        result = self._install_features(["amux", "profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(self._module_exists("amux_spawn_lib.py"),
+                        "amux_spawn_lib.py should exist after installing amux+profiles")
+
+        # Uninstall amux
+        result = self._uninstall_features(["amux"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # amux_spawn_lib.py must survive (owned by profiles too)
+        self.assertTrue(self._module_exists("amux_spawn_lib.py"),
+                        "amux_spawn_lib.py must survive uninstalling amux (still owned by profiles)")
+
+    def test_bash_command_parser_survives_one_owner_uninstall(self):
+        """
+        Install permission-hooks and telegram, uninstall telegram:
+        bash_command_parser.py survives (still owned by permission-hooks).
+        Note: we uninstall telegram (not permission-hooks) because
+        telegram _requires_ permission-hooks — the dependency refusal would
+        block uninstalling permission-hooks while telegram is installed.
+        """
+        result = self._install_features(["permission-hooks", "telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(self._module_exists("bash_command_parser.py"))
+
+        # Uninstall telegram (permission-hooks still installed, owns bash_command_parser.py)
+        result = self._uninstall_features(["telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        self.assertTrue(self._module_exists("bash_command_parser.py"),
+                        "bash_command_parser.py must survive (still owned by permission-hooks)")
+
+    def test_module_removed_when_last_owner_uninstalled(self):
+        """
+        Uninstalling the last owner of a module removes it.
+        Uninstall both telegram and questions at once (questions requires telegram,
+        so they must be uninstalled together).
+        """
+        result = self._install_features(["telegram", "questions"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(self._module_exists("roles_config.py"))
+        self.assertTrue(self._module_exists("questions_store.py"))
+
+        # Uninstall both at once (questions requires telegram — can't uninstall separately)
+        result = self._uninstall_features(["telegram", "questions"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        self.assertFalse(self._module_exists("roles_config.py"),
+                         "roles_config.py must be removed when all owners are uninstalled")
+        self.assertFalse(self._module_exists("questions_store.py"),
+                         "questions_store.py must be removed when its sole owner is uninstalled")
+
+    def test_unique_module_removed_on_uninstall(self):
+        """
+        A module with a single owner is removed when that owner is uninstalled.
+        """
+        # Install questions (exclusively owns questions_store.py, questions_listen_lib.py)
+        result = self._install_features(["questions"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        self.assertTrue(self._module_exists("questions_store.py"))
+        self.assertTrue(self._module_exists("questions_listen_lib.py"))
+
+        # Uninstall questions
+        result = self._uninstall_features(["questions"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        self.assertFalse(self._module_exists("questions_store.py"),
+                         "questions_store.py must be removed (sole owner uninstalled)")
+        self.assertFalse(self._module_exists("questions_listen_lib.py"),
+                         "questions_listen_lib.py must be removed (sole owner uninstalled)")
+
+
+class TestKeepSemantics(InstallerTestBase):
+    """
+    Keep semantics: shared modules refresh, wiring unchanged.
+    """
+
+    def test_keep_refreshes_shared_modules(self):
+        """
+        Install telegram, then install permission-hooks with --only:
+        telegram gets 'keep', its shared modules (bash_command_parser.py etc.)
+        are refreshed, but its wiring (PostToolUse) is unchanged.
+        """
+        # First install telegram
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Verify telegram is installed
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        self.assertIn("PostToolUse", hooks, "telegram PostToolUse should be wired")
+
+        # Record the PostToolUse entry
+        post_tool_use_before = hooks["PostToolUse"]
+
+        # Now install permission-hooks only — telegram should get "keep"
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Check that shared modules still exist (were refreshed)
+        hooks_dir = self.tmp_home / ".claude" / "hooks"
+        self.assertTrue((hooks_dir / "bash_command_parser.py").exists(),
+                        "Shared module must be refreshed during keep")
+        self.assertTrue((hooks_dir / "settings_loader.py").exists(),
+                        "Shared module must be refreshed during keep")
+
+        # Wiring for telegram must be unchanged
+        settings_after = read_settings(self.tmp_home)
+        hooks_after = settings_after.get("hooks", {})
+        self.assertIn("PostToolUse", hooks_after,
+                      "telegram PostToolUse must survive permission-hooks install (keep semantics)")
+        self.assertEqual(post_tool_use_before, hooks_after["PostToolUse"],
+                         "PostToolUse wiring must be identical (keep = no wiring change)")
+
+    def test_keep_plus_update_refreshes_all_modules(self):
+        """
+        Keep + Update: refreshes shared modules. No wiring change for kept feature.
+        """
+        # Install both
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks,telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Now update just permission-hooks — telegram gets keep
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # telegram's wiring should be unchanged
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        self.assertIn("PostToolUse", hooks, "telegram PostToolUse must survive")
+        self.assertIn("PreToolUse", hooks, "permission-hooks PreToolUse must be present")
+
+
+class TestFailureIsolation(InstallerTestBase):
+    """
+    Failure isolation: inject a failing _install, assert others complete,
+    manifest records failed, exit non-zero.
+    """
+
+    def test_failing_feature_does_not_stop_others(self):
+        """
+        Inject a failing feature_telegram_install. Other features must complete,
+        the manifest records telegram as failed, and exit is non-zero.
+        """
+        text = INSTALL_SH.read_text()
+
+        # Patch feature_telegram_install to fail
+        patched = text.replace(
+            'feature_telegram_install() {\n    log_step "Installing: $(feature_telegram_title)"',
+            'feature_telegram_install() {\n    log_step "Installing: $(feature_telegram_title)"\n    return 1  # PATCHED: simulate failure',
+            1,
+        )
+        self.assertIn("PATCHED: simulate failure", patched, "Patch must apply")
+
+        patched_path = self.tmp_home / "install_fail_test.sh"
+        patched_path.write_text(patched)
+        patched_path.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "HOME": str(self.tmp_home),
+            "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+            "CLAUDE_INSTALL_EPIC29_LIVE": "1",
+            "CLAUDE_INSTALL_SCRIPT_DIR": str(REPO),
+        }
+        result = subprocess.run(
+            ["bash", str(patched_path), "--only", "statusline,telegram,permission-hooks"],
+            capture_output=True, text=True,
+            cwd=str(REPO), env=env, timeout=30,
+        )
+
+        # Must exit non-zero (failures present)
+        self.assertNotEqual(result.returncode, 0,
+                            "Run with a failing feature must exit non-zero")
+
+        # The failure message must mention telegram
+        combined = result.stdout + result.stderr
+        self.assertIn("telegram", combined,
+                      "Failure summary must name the failing feature")
+        self.assertIn("FAILURES", combined,
+                      "Summary must include FAILURES section")
+
+        # Other features must have completed
+        manifest = read_manifest(self.tmp_home)
+        features = manifest.get("features", {})
+
+        # statusline should be installed (it runs before telegram)
+        self.assertEqual(features.get("statusline", {}).get("state"), "installed",
+                         "statusline must complete despite telegram failure")
+
+        # permission-hooks should be installed
+        self.assertEqual(features.get("permission-hooks", {}).get("state"), "installed",
+                         "permission-hooks must complete despite telegram failure")
+
+        # telegram should be failed
+        self.assertEqual(features.get("telegram", {}).get("state"), "failed",
+                         "telegram must be recorded as failed in manifest")
+
+    def test_failed_feature_exit_code_is_nonzero(self):
+        """A run where any feature fails exits non-zero."""
+        text = INSTALL_SH.read_text()
+        patched = text.replace(
+            'feature_statusline_install() {\n    # Lifted from STEP 2',
+            'feature_statusline_install() {\n    return 1  # PATCHED: fail\n    # Lifted from STEP 2',
+            1,
+        )
+        self.assertIn("PATCHED: fail", patched)
+
+        patched_path = self.tmp_home / "install_fail2.sh"
+        patched_path.write_text(patched)
+        patched_path.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "HOME": str(self.tmp_home),
+            "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+            "CLAUDE_INSTALL_EPIC29_LIVE": "1",
+            "CLAUDE_INSTALL_SCRIPT_DIR": str(REPO),
+        }
+        result = subprocess.run(
+            ["bash", str(patched_path), "--only", "statusline"],
+            capture_output=True, text=True,
+            cwd=str(REPO), env=env, timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "Run with failing feature must exit non-zero")
+
+
+class TestDataPreservation(InstallerTestBase):
+    """
+    Data preservation: profiles.toml, history.jsonl, state stores survive
+    full uninstall (invariant 10).
+    """
+
+    def test_profiles_toml_survives_full_uninstall(self):
+        """profiles.toml must survive uninstalling everything."""
+        # Install profiles to create profiles.toml
+        result = run_installer(self.tmp_home, extra_args=["--only", "profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        profiles_path = self.tmp_home / ".claude" / "profiles.toml"
+        self.assertTrue(profiles_path.exists(), "Pre-condition: profiles.toml must exist")
+        profiles_content = profiles_path.read_bytes()
+
+        # Uninstall profiles
+        result = run_installer(self.tmp_home, extra_args=["--uninstall", "profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # profiles.toml must survive
+        self.assertTrue(profiles_path.exists(),
+                        "profiles.toml must survive uninstall (user data)")
+        self.assertEqual(profiles_path.read_bytes(), profiles_content,
+                         "profiles.toml must be byte-identical after uninstall")
+
+    def test_history_jsonl_survives_full_uninstall(self):
+        """history.jsonl must survive uninstalling everything."""
+        # Create a fake history.jsonl
+        history_path = self.tmp_home / ".claude" / "history.jsonl"
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        history_content = b'{"event": "test"}\n'
+        history_path.write_bytes(history_content)
+
+        # Install then uninstall a feature
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_installer(self.tmp_home, extra_args=["--uninstall", "statusline"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # history.jsonl must survive
+        self.assertTrue(history_path.exists(),
+                        "history.jsonl must survive uninstall")
+        self.assertEqual(history_path.read_bytes(), history_content,
+                         "history.jsonl must be byte-identical")
+
+    def test_state_store_survives_full_uninstall(self):
+        """State stores under ~/.claude/ must survive uninstalling everything."""
+        # Create fake state stores
+        state_dir = self.tmp_home / ".claude"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        state_files = {
+            "permission_state.json": b'{"auto_allow": true}',
+            "session_yolo.json": b'{"session_id": "test"}',
+        }
+        for name, content in state_files.items():
+            (state_dir / name).write_bytes(content)
+
+        # Install and uninstall
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_installer(self.tmp_home, extra_args=["--uninstall", "statusline"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # State files must survive
+        for name, content in state_files.items():
+            path = state_dir / name
+            self.assertTrue(path.exists(),
+                            f"{name} must survive uninstall")
+            self.assertEqual(path.read_bytes(), content,
+                             f"{name} must be byte-identical")
+
+    def test_projects_dir_survives_full_uninstall(self):
+        """~/.claude/projects/ must survive uninstalling everything."""
+        projects_dir = self.tmp_home / ".claude" / "projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        project_file = projects_dir / "test-project" / "config.json"
+        project_file.parent.mkdir(parents=True, exist_ok=True)
+        project_content = b'{"project": "test"}'
+        project_file.write_bytes(project_content)
+
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_installer(self.tmp_home, extra_args=["--uninstall", "statusline"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        self.assertTrue(project_file.exists(),
+                        "~/.claude/projects/ content must survive uninstall")
+        self.assertEqual(project_file.read_bytes(), project_content)
+
+
+class TestDependencyRefusal(InstallerTestBase):
+    """
+    Dependency refusal: uninstalling a feature that others depend on is refused.
+    """
+
+    def test_uninstall_permission_hooks_with_telegram_in_plan_is_refused(self):
+        """
+        Uninstall permission-hooks while telegram is install/update/keep in the
+        same plan -> refused, names telegram.
+
+        The refusal fires when the DEPENDENT is actively in the plan (not just
+        passively installed from a prior run). This matches the selector's
+        behaviour: it prevents setting a prerequisite to Uninstall when a
+        dependent is Install/Update/Keep in the same plan.
+        """
+        # Install both
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks,telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Try to keep telegram while uninstalling permission-hooks
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "telegram", "--uninstall", "permission-hooks"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+
+        # Must fail
+        self.assertNotEqual(result.returncode, 0,
+                            "Uninstalling permission-hooks with telegram in plan must be refused")
+        combined = result.stdout + result.stderr
+        self.assertIn("telegram", combined,
+                      "Refusal message must name the dependent feature 'telegram'")
+
+    def test_uninstall_profiles_with_amux_in_plan_is_refused(self):
+        """
+        Uninstall profiles while amux is in the plan -> refused, names amux.
+        """
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "profiles,amux"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Try to keep amux while uninstalling profiles
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "amux", "--uninstall", "profiles"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+
+        self.assertNotEqual(result.returncode, 0,
+                            "Uninstalling profiles with amux in plan must be refused")
+        combined = result.stdout + result.stderr
+        self.assertIn("amux", combined,
+                      "Refusal message must name the dependent feature 'amux'")
+
+    def test_uninstall_dependency_alone_succeeds(self):
+        """
+        Uninstalling a dependency when the dependent is passively installed
+        (not in the current plan) succeeds. The user is responsible for the
+        consequences. Shared modules survive via refcount.
+        """
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "telegram,questions"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Uninstall telegram alone — questions is passively installed, not in plan
+        result = run_installer(self.tmp_home,
+                               extra_args=["--uninstall", "telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0,
+                         f"Uninstalling telegram alone should succeed. stderr: {result.stderr[:300]}")
+
+    def test_uninstall_both_dependency_and_dependent_succeeds(self):
+        """
+        Uninstalling both a dependency and its dependent at the same time succeeds.
+        """
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks,telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Uninstall both at once
+        result = run_installer(self.tmp_home,
+                               extra_args=["--uninstall", "permission-hooks,telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0,
+                         f"Uninstalling both dependency and dependent at once should succeed. stderr: {result.stderr[:300]}")
+
+    def test_only_with_uninstall_creates_dependency_refusal(self):
+        """
+        --only telegram --uninstall permission-hooks is refused because
+        telegram requires permission-hooks and telegram is in the plan.
+        """
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks,telegram"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Try --only telegram --uninstall permission-hooks
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "telegram", "--uninstall", "permission-hooks"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+
+        self.assertNotEqual(result.returncode, 0,
+                            "Uninstalling a dependency while keeping the dependent must be refused")
+
+
+class TestFullRoundTrip(InstallerTestBase):
+    """
+    Full round trip: install all, uninstall all, install all again.
+    The third state equals the first.
+    """
+
+    def test_install_uninstall_reinstall_round_trip(self):
+        """
+        Install a set of features, uninstall them all, install them again.
+        settings.json and hooks directory listing must match.
+        """
+        features = "statusline,permission-hooks,profiles,permissions-allowlist"
+        fake_uv_env = _make_fake_uv(self.tmp_home)
+
+        # First install
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", features],
+                               extra_env=fake_uv_env)
+        self.assertEqual(result.returncode, 0,
+                         f"First install must succeed. stderr: {result.stderr[:300]}")
+
+        settings_first = read_settings(self.tmp_home)
+        hooks_dir = self.tmp_home / ".claude" / "hooks"
+        if hooks_dir.exists():
+            hooks_first = sorted(f.name for f in hooks_dir.iterdir())
+        else:
+            hooks_first = []
+
+        # Uninstall all
+        result = run_installer(self.tmp_home,
+                               extra_args=["--uninstall", features],
+                               extra_env=fake_uv_env)
+        self.assertEqual(result.returncode, 0,
+                         f"Uninstall must succeed. stderr: {result.stderr[:300]}")
+
+        # Reinstall
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", features],
+                               extra_env=fake_uv_env)
+        self.assertEqual(result.returncode, 0,
+                         f"Reinstall must succeed. stderr: {result.stderr[:300]}")
+
+        settings_third = read_settings(self.tmp_home)
+        if hooks_dir.exists():
+            hooks_third = sorted(f.name for f in hooks_dir.iterdir())
+        else:
+            hooks_third = []
+
+        # Settings should match (modulo timestamps/backups)
+        # Compare hooks configuration
+        self.assertEqual(
+            settings_first.get("hooks"),
+            settings_third.get("hooks"),
+            "hooks configuration must match between first install and reinstall",
+        )
+
+        # Compare statusLine
+        self.assertEqual(
+            settings_first.get("statusLine"),
+            settings_third.get("statusLine"),
+            "statusLine must match between first install and reinstall",
+        )
+
+        # Hooks directory listing must match
+        self.assertEqual(
+            hooks_first, hooks_third,
+            "hooks directory listing must match between first install and reinstall",
+        )
+
+
 if __name__ == "__main__":
     # When run directly, set CLAUDE_INSTALL_NO_EXTERNAL for convenience
     os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")

@@ -4,7 +4,12 @@
 # See tasks/29_installer_interactive/state.md for the bootstrapping hazard.
 # Task 29-09 collapses this back into install-claude-config.sh.
 
-set -euo pipefail
+set -uo pipefail
+# NOTE: set -e is intentionally NOT set globally for failure isolation (29-05 §2).
+# Each feature_<id>_install / _uninstall is run inside _run_feature_guarded,
+# which uses a subshell with set -e so that the feature's own body stops at its
+# first failure, while the outer loop treats a non-zero return as data (records
+# "failed" in the manifest) and continues to the next feature.
 
 # CLAUDE_INSTALL_SCRIPT_DIR lets the test harness point patched-script copies
 # back at the real repo root so PROJECT_CONFIG and other repo-relative paths
@@ -253,8 +258,29 @@ feature_statusline_install() {
 }
 
 feature_statusline_uninstall() {
-    log_error "feature 'statusline' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_statusline_title)"
+
+    # Remove artifacts
+    rm -f "$GLOBAL_STATUSLINE_DIR/statusline.py"
+    rm -f "$GLOBAL_STATUSLINE_DIR/subagent.py"
+    rm -f "$GLOBAL_STATUSLINE_DIR/pricing.default.json"
+    rmdir "$GLOBAL_STATUSLINE_DIR" 2>/dev/null || true
+    log_info "Removed statusline files from $GLOBAL_STATUSLINE_DIR"
+
+    # Remove slash commands
+    if [[ -d "$GLOBAL_COMMANDS_DIR" ]]; then
+        shopt -s nullglob
+        for cmd in "$GLOBAL_COMMANDS_DIR"/*.md; do
+            rm -f "$cmd"
+            log_info "Removed: $(basename "$cmd") from $GLOBAL_COMMANDS_DIR"
+        done
+        shopt -u nullglob
+        rmdir "$GLOBAL_COMMANDS_DIR" 2>/dev/null || true
+    fi
+
+    # Settings keys removed by _remove_hooks_for_feature (statusLine, subagentStatusLine)
+    UNINSTALL_SETTINGS_KEYS+=" statusLine subagentStatusLine"
+    log_info "Statusline uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -309,8 +335,13 @@ feature_permission_hooks_install() {
 }
 
 feature_permission_hooks_uninstall() {
-    log_error "feature 'permission-hooks' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_permission_hooks_title)"
+
+    # Hooks entries (PreToolUse, PermissionRequest) removed by _remove_hooks_for_feature
+    UNINSTALL_HOOK_EVENTS+=" PreToolUse PermissionRequest"
+
+    # Modules removed by refcounted removal in the executor
+    log_info "Permission hooks uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -420,8 +451,31 @@ feature_telegram_install() {
 }
 
 feature_telegram_uninstall() {
-    log_error "feature 'telegram' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_telegram_title)"
+
+    # Remove .pth file
+    local user_site
+    user_site="$(python3 -m site --user-site 2>/dev/null || true)"
+    if [[ -n "$user_site" && -f "$user_site/claude-relay-server.pth" ]]; then
+        rm -f "$user_site/claude-relay-server.pth"
+        log_info "Removed relay_server .pth from $user_site"
+    fi
+
+    # Remove claude-roles
+    local claude_shell_dir="$HOME/.claude/shell"
+    local user_bin_dir="$HOME/.local/bin"
+    rm -f "$claude_shell_dir/claude-roles"
+    ext_symlink_remove "$user_bin_dir/claude-roles"
+
+    # De-register permissions MCP server
+    _deregister_mcp_server "permissions"
+
+    # Hooks entries (PostToolUse, Notification[idle_prompt]) removed by _remove_hooks_for_feature
+    UNINSTALL_HOOK_EVENTS+=" PostToolUse"
+    UNINSTALL_NOTIFICATION_MATCHERS+=" idle_prompt"
+
+    # Modules removed by refcounted removal in the executor
+    log_info "Telegram uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -479,8 +533,18 @@ feature_profiles_install() {
 }
 
 feature_profiles_uninstall() {
-    log_error "feature 'profiles' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_profiles_title)"
+
+    # Remove shell snippet (never remove profiles.toml — invariant 10)
+    local claude_shell_dir="$HOME/.claude/shell"
+    rm -f "$claude_shell_dir/claude-profiles.bash"
+    log_info "Removed: claude-profiles.bash (profiles.toml preserved — user data)"
+
+    # Remove profiles-autosource bashrc line if present
+    ext_bashrc_remove "profiles-autosource"
+
+    # Modules removed by refcounted removal in the executor
+    log_info "Profiles uninstalled"
 }
 
 # Sub-toggle probe: profiles-autosource
@@ -666,8 +730,34 @@ feature_amux_install() {
 }
 
 feature_amux_uninstall() {
-    log_error "feature 'amux' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_amux_title)"
+
+    local user_bin_dir="$HOME/.local/bin"
+
+    # Remove amux-spawn launcher (never remove /usr/local/bin/amux — invariant 10)
+    rm -f "$user_bin_dir/amux-spawn"
+    log_info "Removed: amux-spawn (note: /usr/local/bin/amux is preserved)"
+
+    # Remove bash completion
+    local user_completions_dir="$HOME/.local/share/bash-completion/completions"
+    rm -f "$user_completions_dir/amux-spawn"
+
+    # Remove amux-spawn.bash shell snippet
+    local claude_shell_dir="$HOME/.claude/shell"
+    rm -f "$claude_shell_dir/amux-spawn.bash"
+
+    # Remove amux-autowrap bashrc line if present
+    ext_bashrc_remove "amux-autowrap"
+
+    # Remove tmux options
+    ext_tmux_remove
+
+    # Hooks entries (Notification[permission_prompt], UserPromptSubmit, Stop, SubagentStop, SessionEnd)
+    UNINSTALL_HOOK_EVENTS+=" UserPromptSubmit Stop SubagentStop SessionEnd"
+    UNINSTALL_NOTIFICATION_MATCHERS+=" permission_prompt"
+
+    # Modules removed by refcounted removal in the executor
+    log_info "amux uninstalled"
 }
 
 # Sub-toggle probe: amux-autowrap
@@ -699,8 +789,25 @@ feature_permissions_allowlist_install() {
 }
 
 feature_permissions_allowlist_uninstall() {
-    log_error "feature 'permissions-allowlist' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_permissions_allowlist_title)"
+
+    # Remove the entries we added (recorded in manifest's added_allow / added_deny).
+    # Read the manifest to find what we added.
+    if [[ -f "$MANIFEST_FILE" ]]; then
+        local added_allow added_deny
+        added_allow=$(jq -r '.features["permissions-allowlist"].added_allow // [] | .[]' "$MANIFEST_FILE" 2>/dev/null || true)
+        added_deny=$(jq -r '.features["permissions-allowlist"].added_deny // [] | .[]' "$MANIFEST_FILE" 2>/dev/null || true)
+
+        if [[ -n "$added_allow" || -n "$added_deny" ]]; then
+            UNINSTALL_PERMISSIONS_REMOVE=true
+            # Store as JSON arrays for the settings write phase
+            UNINSTALL_PERMISSIONS_ALLOW=$(jq '.features["permissions-allowlist"].added_allow // []' "$MANIFEST_FILE" 2>/dev/null || echo '[]')
+            UNINSTALL_PERMISSIONS_DENY=$(jq '.features["permissions-allowlist"].added_deny // []' "$MANIFEST_FILE" 2>/dev/null || echo '[]')
+            log_info "Will remove $(echo "$UNINSTALL_PERMISSIONS_ALLOW" | jq 'length') allow and $(echo "$UNINSTALL_PERMISSIONS_DENY" | jq 'length') deny entries we added"
+        fi
+    fi
+
+    log_info "Permissions allowlist uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -738,8 +845,12 @@ feature_context_mcp_install() {
 }
 
 feature_context_mcp_uninstall() {
-    log_error "feature 'context-mcp' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_context_mcp_title)"
+
+    # De-register context-usage MCP server
+    _deregister_mcp_server "context-usage"
+
+    log_info "context-mcp uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -766,8 +877,11 @@ feature_claude_history_install() {
 }
 
 feature_claude_history_uninstall() {
-    log_error "feature 'claude-history' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_claude_history_title)"
+
+    # Remove claude-history binary (never remove history.jsonl — invariant 10)
+    rm -f "$HOME/.local/bin/claude-history"
+    log_info "claude-history uninstalled (history.jsonl preserved — user data)"
 }
 
 # ---------------------------------------------------------------------------
@@ -848,8 +962,35 @@ feature_questions_install() {
 }
 
 feature_questions_uninstall() {
-    log_error "feature 'questions' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_questions_title)"
+
+    local user_bin_dir="$HOME/.local/bin"
+    local claude_shell_dir="$HOME/.claude/shell"
+    local claude_bin_dir="$HOME/.claude/bin"
+
+    # De-register questions MCP server
+    _deregister_mcp_server "questions"
+
+    # Remove claude-questions
+    rm -f "$claude_shell_dir/claude-questions"
+    ext_symlink_remove "$user_bin_dir/claude-questions"
+
+    # Remove questions-listen
+    rm -f "$claude_bin_dir/questions-listen"
+    ext_symlink_remove "$user_bin_dir/questions-listen"
+
+    # Disable and remove systemd unit
+    local service_name="claude-questions-listen.service"
+    ext_systemd_disable "$service_name"
+    local systemd_user_dir="$HOME/.config/systemd/user"
+    rm -f "$systemd_user_dir/$service_name"
+    ext_systemd_daemon_reload
+
+    # Remove questions-listen bashrc/sub-toggle
+    # (questions-listen sub-toggle is systemd-based, no bashrc line)
+
+    # Modules removed by refcounted removal in the executor
+    log_info "Questions uninstalled"
 }
 
 # Sub-toggle probe: questions-listen (systemd unit enabled)
@@ -882,8 +1023,12 @@ feature_daily_review_install() {
 }
 
 feature_daily_review_uninstall() {
-    log_error "feature 'daily-review' uninstall not implemented until 29-05"
-    return 1
+    log_step "Uninstalling: $(feature_daily_review_title)"
+
+    # Remove cron line
+    ext_cron_remove "daily-review-cron"
+
+    log_info "Daily review uninstalled"
 }
 
 # Sub-toggle probe: daily-review-cron
@@ -2041,7 +2186,15 @@ build_and_write_settings() {
 
     # Start with current global config
     local merged
-    merged=$(jq '.' "$GLOBAL_CONFIG")
+    merged=$(jq '.' "$GLOBAL_CONFIG") || {
+        log_error "Failed to read global config: $GLOBAL_CONFIG"
+        exit 1
+    }
+    if [[ -z "$merged" ]] || ! echo "$merged" | jq empty 2>/dev/null; then
+        log_error "Global config read produced invalid JSON. Restoring from backup..."
+        cp "$BACKUP_FILE" "$GLOBAL_CONFIG"
+        exit 1
+    fi
 
     # permissions-allowlist feature contribution (§7.2 union / overwrite)
     if [[ "${PERMISSIONS_ALLOWLIST_SELECTED:-false}" == true ]]; then
@@ -2115,8 +2268,14 @@ build_and_write_settings() {
         log_info "  - command: python3 $GLOBAL_STATUSLINE_DIR/subagent.py"
     fi
 
+    # Uninstall settings mutations (§4, 29-05)
+    if [[ -n "$UNINSTALL_SETTINGS_KEYS" || -n "$UNINSTALL_HOOK_EVENTS" || -n "$UNINSTALL_NOTIFICATION_MATCHERS" || "$UNINSTALL_PERMISSIONS_REMOVE" == true ]]; then
+        log_info "Applying uninstall settings changes..."
+        merged=$(_apply_uninstall_to_settings "$merged")
+    fi
+
     # Validate merged JSON (§7.3 atomicity — build, validate, write, re-validate)
-    if ! echo "$merged" | jq empty 2>/dev/null; then
+    if [[ -z "$merged" ]] || ! echo "$merged" | jq empty 2>/dev/null; then
         log_error "Merged settings.json is not valid JSON! Restoring from backup..."
         cp "$BACKUP_FILE" "$GLOBAL_CONFIG"
         exit 1
@@ -2132,6 +2291,264 @@ build_and_write_settings() {
         cp "$BACKUP_FILE" "$GLOBAL_CONFIG"
         exit 1
     fi
+}
+
+# =============================================================================
+# §6. EXECUTOR — guarded runner, module closure, dependency refusal
+# =============================================================================
+
+# _run_feature_guarded <function_name> <feature_id>
+# Runs a feature install/uninstall function with failure isolation.
+#
+# Architecture §6.2 requires two properties simultaneously:
+# 1. Inside a feature, the feature's own body stops at its first failure.
+# 2. A failing feature does not abort the outer loop.
+#
+# We achieve this by temporarily enabling set -e around the function call.
+# The `||` after the call prevents set -e from killing the script on failure,
+# but set -e still applies INSIDE the function body because bash restores the
+# -e flag within function scope when it was set before the call.
+#
+# We do NOT use a subshell because feature_*_install functions set global
+# variables (HOOKS_JSON, STATUSLINE_INSTALLED, etc.) that must propagate back.
+_run_feature_guarded() {
+    local fn="$1"
+    local id="$2"
+    local rc=0
+    # Enable set -e so the function body is fail-fast.
+    # The || captures non-zero without aborting the script.
+    # Inside $fn, set -e is inherited so any failing command inside the function
+    # causes the function to return immediately with that failure code.
+    set -e
+    $fn && rc=0 || rc=$?
+    set +e
+    return $rc
+}
+
+# _compute_module_closure
+# Computes the set of modules needed by all features with action install,
+# update, or keep — then copies them fresh. This is the module closure
+# (architecture §6.3, brd D3, invariant 3).
+_compute_and_install_module_closure() {
+    local -A closure_modules=()
+    local id action modules_fn modules mod
+
+    for id in "${FEATURES[@]}"; do
+        action="${FEATURE_ACTIONS[$id]:-skip}"
+        if [[ "$action" == "install" || "$action" == "update" || "$action" == "keep" ]]; then
+            modules_fn="feature_${id//-/_}_modules"
+            if declare -f "$modules_fn" >/dev/null 2>&1; then
+                modules="$($modules_fn)"
+                for mod in $modules; do
+                    closure_modules["$mod"]=1
+                done
+            fi
+        fi
+    done
+
+    if [[ ${#closure_modules[@]} -eq 0 ]]; then
+        log_info "Module closure: empty (no features with install/update/keep)"
+        return 0
+    fi
+
+    mkdir -p "$GLOBAL_HOOKS_DIR"
+    local installed_count=0
+    for mod in "${!closure_modules[@]}"; do
+        if [[ -f "$PROJECT_HOOKS_DIR/$mod" ]]; then
+            cp "$PROJECT_HOOKS_DIR/$mod" "$GLOBAL_HOOKS_DIR/"
+            chmod +x "$GLOBAL_HOOKS_DIR/$mod"
+            installed_count=$((installed_count + 1))
+        else
+            log_warn "Module closure: $mod not found in $PROJECT_HOOKS_DIR"
+        fi
+    done
+    log_info "Module closure: refreshed $installed_count modules"
+}
+
+# _refcounted_module_removal <uninstalled_feature_id>
+# For each module the uninstalled feature owns, checks if any still-installed
+# feature also owns it. Deletes the module only if no owner remains.
+# This is the refcount logic (brd D4, invariant 4).
+#
+# "Still installed" means: the feature is NOT being uninstalled in this run,
+# AND either (a) it is being installed/updated/kept in this run, or (b) its
+# probe returns true (it was installed by a previous run and is not being
+# touched in this run). This handles the case where --uninstall <X> is run
+# alone without --only for other features.
+_refcounted_module_removal() {
+    local uninstalled_id="$1"
+    local modules_fn="feature_${uninstalled_id//-/_}_modules"
+    if ! declare -f "$modules_fn" >/dev/null 2>&1; then
+        return 0
+    fi
+    local modules="$($modules_fn)"
+    [[ -z "$modules" ]] && return 0
+
+    local mod owner_ids owner still_owned
+    for mod in $modules; do
+        owner_ids="${MODULE_OWNERS[$mod]:-}"
+        [[ -z "$owner_ids" ]] && continue
+
+        still_owned=false
+        for owner in $owner_ids; do
+            [[ "$owner" == "$uninstalled_id" ]] && continue
+            # Check if this owner is still installed (not being uninstalled)
+            local owner_action="${FEATURE_ACTIONS[$owner]:-skip}"
+            if [[ "$owner_action" == "uninstall" ]]; then
+                continue  # This owner is also being uninstalled
+            fi
+            # Owner is still installed if: it has an active action in this run,
+            # OR it was previously installed and we're not touching it.
+            if [[ "$owner_action" == "install" || "$owner_action" == "update" || "$owner_action" == "keep" ]]; then
+                still_owned=true
+                break
+            fi
+            # Check if the owner was installed by a previous run (probe or manifest)
+            local owner_probe_fn="feature_${owner//-/_}_probe"
+            if declare -f "$owner_probe_fn" >/dev/null 2>&1 && $owner_probe_fn 2>/dev/null; then
+                still_owned=true
+                break
+            fi
+            # Also check manifest state
+            if [[ -f "$MANIFEST_FILE" ]]; then
+                local manifest_state
+                manifest_state=$(jq -r --arg id "$owner" '.features[$id].state // "skipped"' "$MANIFEST_FILE" 2>/dev/null || echo "skipped")
+                if [[ "$manifest_state" == "installed" ]]; then
+                    still_owned=true
+                    break
+                fi
+            fi
+        done
+
+        if [[ "$still_owned" == false ]]; then
+            if [[ -f "$GLOBAL_HOOKS_DIR/$mod" ]]; then
+                rm -f "$GLOBAL_HOOKS_DIR/$mod"
+                log_info "  Removed module: $mod (no remaining owners)"
+            fi
+        else
+            log_info "  Kept module: $mod (still owned by other features)"
+        fi
+    done
+}
+
+# _check_dependency_refusal
+# Checks that no feature being uninstalled is required by a still-installed
+# feature. Returns 1 and names the dependent if violated (architecture §5.1).
+#
+# A feature is "still installed" if:
+# - It has an active action (install/update/keep) in this run, OR
+# - It is not being uninstalled and its probe returns true (installed by a prior run)
+_check_dependency_refusal() {
+    local id action req_fn reqs req
+    for id in "${FEATURES[@]}"; do
+        action="${FEATURE_ACTIONS[$id]:-skip}"
+        [[ "$action" != "uninstall" ]] && continue
+
+        # Check if any other feature that REQUIRES this one is in the current
+        # plan as install/update/keep. Features passively installed from a prior
+        # run (action=skip) do NOT block the uninstall — the user is responsible
+        # for uninstalling dependents separately or at the same time.
+        #
+        # This matches the selector's behavior (29-06): the selector prevents
+        # setting a prerequisite to Uninstall when a dependent is Install/Update/Keep
+        # in the same plan. The --only/--without paths bypass the selector, so
+        # this check enforces the same constraint.
+        local fid fid_action
+        for fid in "${FEATURES[@]}"; do
+            [[ "$fid" == "$id" ]] && continue
+            fid_action="${FEATURE_ACTIONS[$fid]:-skip}"
+
+            # Only refuse for features actively in the plan
+            [[ "$fid_action" == "install" || "$fid_action" == "update" || "$fid_action" == "keep" ]] || continue
+
+            req_fn="feature_${fid//-/_}_requires"
+            if declare -f "$req_fn" >/dev/null 2>&1; then
+                reqs="$($req_fn)"
+                for req in $reqs; do
+                    if [[ "$req" == "$id" ]]; then
+                        log_error "Cannot uninstall '$id': feature '$fid' requires it and is ${fid_action}"
+                        return 1
+                    fi
+                done
+            fi
+        done
+    done
+    return 0
+}
+
+# _remove_hooks_for_uninstalled_features
+# Removes our hook entries from settings.json for events owned by uninstalled
+# features. Removes Notification entries by matcher for uninstalled features.
+# Also removes top-level settings keys marked for removal.
+_apply_uninstall_to_settings() {
+    local merged="$1"
+    local tmp_merged
+
+    # NOTE: all log_info calls here go to stderr (>&2) because this function's
+    # stdout is captured via $() — any log output on stdout would corrupt the
+    # returned JSON.
+
+    # Remove top-level settings keys
+    for key in $UNINSTALL_SETTINGS_KEYS; do
+        tmp_merged=$(echo "$merged" | jq --arg k "$key" 'del(.[$k])') || true
+        if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
+            merged="$tmp_merged"
+            log_info "  Removed settings key: $key" >&2
+        fi
+    done
+
+    # Remove our hook entries for uninstalled events
+    for event in $UNINSTALL_HOOK_EVENTS; do
+        tmp_merged=$(echo "$merged" | jq \
+            --arg event "$event" \
+            --arg hdir "$GLOBAL_HOOKS_DIR" \
+            '
+            def is_ours: [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
+            if (.hooks // {})[($event)] then
+                .hooks[$event] = [.hooks[$event][] | select(is_ours | not)]
+                | if (.hooks[$event] | length) == 0 then del(.hooks[$event]) else . end
+            else . end
+            ') || true
+        if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
+            merged="$tmp_merged"
+            log_info "  Removed hook entries for event: $event" >&2
+        fi
+    done
+
+    # Remove Notification entries by matcher
+    for matcher in $UNINSTALL_NOTIFICATION_MATCHERS; do
+        tmp_merged=$(echo "$merged" | jq \
+            --arg matcher "$matcher" \
+            --arg hdir "$GLOBAL_HOOKS_DIR" \
+            '
+            def is_ours: [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
+            if (.hooks // {}).Notification then
+                .hooks.Notification = [.hooks.Notification[] | select(
+                    (.matcher // "") != $matcher or (is_ours | not)
+                )]
+                | if (.hooks.Notification | length) == 0 then del(.hooks.Notification) else . end
+            else . end
+            ') || true
+        if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
+            merged="$tmp_merged"
+            log_info "  Removed Notification matcher: $matcher" >&2
+        fi
+    done
+
+    # Remove permissions entries we added
+    if [[ "$UNINSTALL_PERMISSIONS_REMOVE" == true ]]; then
+        tmp_merged=$(echo "$merged" | jq \
+            --argjson remove_allow "$UNINSTALL_PERMISSIONS_ALLOW" \
+            --argjson remove_deny "$UNINSTALL_PERMISSIONS_DENY" \
+            '.permissions.allow = ([.permissions.allow // [] | .[] | select(. as $x | $remove_allow | any(.[]; . == $x) | not)]) |
+             .permissions.deny  = ([.permissions.deny  // [] | .[] | select(. as $x | $remove_deny  | any(.[]; . == $x) | not)])') || true
+        if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
+            merged="$tmp_merged"
+            log_info "  Subtracted permissions entries" >&2
+        fi
+    fi
+
+    echo "$merged"
 }
 
 # =============================================================================
@@ -2178,6 +2595,15 @@ CLAUDE_QUESTIONS_INSTALLED=false
 TMUX_FILE_STATUS="unchanged"
 TMUX_LIVE_STATUS="no running server"
 HOOKS_JSON='{}'
+# Uninstall tracking — populated by feature_<id>_uninstall, consumed by executor
+UNINSTALL_SETTINGS_KEYS=""         # space-separated settings keys to delete
+UNINSTALL_HOOK_EVENTS=""           # space-separated hook events to remove our entries from
+UNINSTALL_NOTIFICATION_MATCHERS="" # space-separated Notification matchers to remove
+UNINSTALL_PERMISSIONS_REMOVE=false # whether to subtract permissions entries
+UNINSTALL_PERMISSIONS_ALLOW='[]'   # JSON array of allow entries to subtract
+UNINSTALL_PERMISSIONS_DENY='[]'    # JSON array of deny entries to subtract
+# Failure tracking — populated by _run_feature_guarded
+declare -a FAILED_FEATURES=()
 PERMISSIONS_ALLOWLIST_SELECTED=false
 # "union" (default) or "overwrite" (today's replace semantics).
 # Set via CLAUDE_INSTALL_PERMISSIONS_MODE env var; wired to the interactive
@@ -2194,7 +2620,11 @@ CLAUDE_JSON_BACKUP_FILE=""
 # Argument parsing
 # =============================================================================
 SELECTED_FEATURES=()   # empty = all features
+UNINSTALL_FEATURES=()  # features to uninstall (via --uninstall)
+WITHOUT_FEATURES=()    # features to exclude (via --without)
 PROBE_FEATURE=""       # non-empty = run probe and exit
+INSTALL_ALL=false      # --all flag
+INSTALL_YES=false      # --yes flag
 
 _parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -2202,6 +2632,24 @@ _parse_args() {
             --only)
                 shift
                 IFS=',' read -ra SELECTED_FEATURES <<< "${1:-}"
+                shift
+                ;;
+            --uninstall)
+                shift
+                IFS=',' read -ra UNINSTALL_FEATURES <<< "${1:-}"
+                shift
+                ;;
+            --without)
+                shift
+                IFS=',' read -ra WITHOUT_FEATURES <<< "${1:-}"
+                shift
+                ;;
+            --all)
+                INSTALL_ALL=true
+                shift
+                ;;
+            --yes|-y)
+                INSTALL_YES=true
                 shift
                 ;;
             --probe)
@@ -2214,7 +2662,6 @@ _parse_args() {
                 ;;
             -*)
                 # Unknown options are silently ignored for now.
-                # Later tasks add --all, --with, --without, --yes, --list, --dry-run.
                 shift
                 [[ $# -gt 0 && "${1:-}" != -* ]] && shift || true
                 ;;
@@ -2253,10 +2700,100 @@ fi
 _check_dependencies
 assert_registry_integrity
 
-# Default feature selection: all features
-if [[ ${#SELECTED_FEATURES[@]} -eq 0 ]]; then
-    SELECTED_FEATURES=("${FEATURES[@]}")
-fi
+# =============================================================================
+# Plan computation — determine action for each feature
+# =============================================================================
+
+# FEATURE_ACTIONS: id → install | update | keep | uninstall | skip
+declare -A FEATURE_ACTIONS
+
+_compute_plan() {
+    local id
+
+    # Default: everything in SELECTED_FEATURES gets "install",
+    # everything else is "skip".
+    for id in "${FEATURES[@]}"; do
+        FEATURE_ACTIONS["$id"]="skip"
+    done
+
+    # --all flag: select all features
+    if [[ "$INSTALL_ALL" == true ]]; then
+        SELECTED_FEATURES=("${FEATURES[@]}")
+    fi
+
+    # Default feature selection: all features if nothing specified
+    if [[ ${#SELECTED_FEATURES[@]} -eq 0 && ${#UNINSTALL_FEATURES[@]} -eq 0 ]]; then
+        SELECTED_FEATURES=("${FEATURES[@]}")
+    fi
+
+    # --without: remove excluded features from selected set
+    if [[ ${#WITHOUT_FEATURES[@]} -gt 0 && ${#SELECTED_FEATURES[@]} -eq 0 ]]; then
+        SELECTED_FEATURES=("${FEATURES[@]}")
+    fi
+    if [[ ${#WITHOUT_FEATURES[@]} -gt 0 ]]; then
+        local new_selected=()
+        local excluded
+        for id in "${SELECTED_FEATURES[@]}"; do
+            excluded=false
+            for wid in "${WITHOUT_FEATURES[@]}"; do
+                [[ "$id" == "$wid" ]] && { excluded=true; break; }
+            done
+            if [[ "$excluded" == false ]]; then
+                new_selected+=("$id")
+            fi
+        done
+        SELECTED_FEATURES=("${new_selected[@]}")
+    fi
+
+    # Determine action for selected features
+    for id in "${SELECTED_FEATURES[@]}"; do
+        local probe_fn="feature_${id//-/_}_probe"
+        if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+            # Already installed — action is "update"
+            FEATURE_ACTIONS["$id"]="update"
+        else
+            FEATURE_ACTIONS["$id"]="install"
+        fi
+    done
+
+    # Mark uninstall features
+    for id in "${UNINSTALL_FEATURES[@]}"; do
+        FEATURE_ACTIONS["$id"]="uninstall"
+    done
+
+    # Features that are installed but not selected get "keep" if any feature
+    # is being installed/updated (to refresh shared modules)
+    local has_install_or_update=false
+    for id in "${FEATURES[@]}"; do
+        local action="${FEATURE_ACTIONS[$id]:-skip}"
+        if [[ "$action" == "install" || "$action" == "update" ]]; then
+            has_install_or_update=true
+            break
+        fi
+    done
+
+    if [[ "$has_install_or_update" == true ]]; then
+        for id in "${FEATURES[@]}"; do
+            if [[ "${FEATURE_ACTIONS[$id]:-skip}" == "skip" ]]; then
+                local probe_fn="feature_${id//-/_}_probe"
+                if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+                    # Installed but not selected — keep (refresh modules, no wiring change)
+                    FEATURE_ACTIONS["$id"]="keep"
+                fi
+            fi
+        done
+    fi
+
+    # Log the plan
+    log_step "Plan:"
+    for id in "${FEATURES[@]}"; do
+        local action="${FEATURE_ACTIONS[$id]:-skip}"
+        [[ "$action" == "skip" ]] && continue
+        local title_fn="feature_${id//-/_}_title"
+        local title="$($title_fn 2>/dev/null || echo "$id")"
+        log_info "  $id: $action — $title"
+    done
+}
 
 # =============================================================================
 # Main execution
@@ -2315,17 +2852,64 @@ BACKUP_FILE="$BACKUP_DIR/settings.json.$(date +%Y%m%d_%H%M%S).bak"
 cp "$GLOBAL_CONFIG" "$BACKUP_FILE"
 log_info "Backup created: $BACKUP_FILE"
 
-# Execute selected features
-log_step "Executing feature installs"
-for id in "${SELECTED_FEATURES[@]}"; do
-    fn="feature_${id//-/_}_install"
-    if declare -f "$fn" >/dev/null 2>&1; then
-        $fn
-        FEATURE_STATE["$id"]="installed"
-    else
-        log_warn "Unknown feature id: $id"
-        FEATURE_STATE["$id"]="skipped"
-    fi
+# Compute the plan
+_compute_plan
+
+# Dependency refusal check (§5)
+if ! _check_dependency_refusal; then
+    exit 1
+fi
+
+# Module closure: refresh all shared modules for install/update/keep features (§3)
+log_step "Computing module closure"
+_compute_and_install_module_closure
+
+# Execute features in registry order (§1)
+log_step "Executing feature actions"
+for id in "${FEATURES[@]}"; do
+    action="${FEATURE_ACTIONS[$id]:-skip}"
+    case "$action" in
+        install|update)
+            fn="feature_${id//-/_}_install"
+            if declare -f "$fn" >/dev/null 2>&1; then
+                if _run_feature_guarded "$fn" "$id"; then
+                    FEATURE_STATE["$id"]="installed"
+                else
+                    log_error "Feature '$id' failed during ${action}"
+                    FEATURE_STATE["$id"]="failed"
+                    FAILED_FEATURES+=("$id")
+                fi
+            else
+                log_warn "Unknown feature id: $id"
+                FEATURE_STATE["$id"]="skipped"
+            fi
+            ;;
+        keep)
+            # No wiring change. Modules already refreshed by _compute_and_install_module_closure.
+            FEATURE_STATE["$id"]="installed"
+            log_info "Keeping: $id (modules refreshed, no wiring change)"
+            ;;
+        uninstall)
+            fn="feature_${id//-/_}_uninstall"
+            if declare -f "$fn" >/dev/null 2>&1; then
+                if _run_feature_guarded "$fn" "$id"; then
+                    # Refcounted module removal
+                    _refcounted_module_removal "$id"
+                    FEATURE_STATE["$id"]="skipped"
+                else
+                    log_error "Feature '$id' failed during uninstall"
+                    FEATURE_STATE["$id"]="failed"
+                    FAILED_FEATURES+=("$id")
+                fi
+            else
+                log_warn "Unknown feature id for uninstall: $id"
+                FEATURE_STATE["$id"]="skipped"
+            fi
+            ;;
+        skip)
+            FEATURE_STATE["$id"]="skipped"
+            ;;
+    esac
 done
 
 # Build and write settings (validate-then-replace)
@@ -2457,6 +3041,26 @@ fi
 
 echo "  - tmux options (focus-events, tab title): $TMUX_FILE_STATUS ($HOME/.tmux.conf); running server: $TMUX_LIVE_STATUS"
 
+# Per-feature action summary
+echo ""
+log_info "Feature actions:"
+for id in "${FEATURES[@]}"; do
+    local_action="${FEATURE_ACTIONS[$id]:-skip}"
+    local_state="${FEATURE_STATE[$id]:-skipped}"
+    [[ "$local_action" == "skip" ]] && continue
+    local_title_fn="feature_${id//-/_}_title"
+    local_title="$($local_title_fn 2>/dev/null || echo "$id")"
+    if [[ "$local_state" == "failed" ]]; then
+        echo "  - $id: $local_action -> FAILED — $local_title"
+    elif [[ "$local_action" == "uninstall" ]]; then
+        echo "  - $id: uninstalled — $local_title"
+    elif [[ "$local_action" == "keep" ]]; then
+        echo "  - $id: kept (modules refreshed) — $local_title"
+    else
+        echo "  - $id: ${local_action}ed — $local_title"
+    fi
+done
+
 echo ""
 log_info "Other settings preserved:"
 jq 'del(.permissions, .hooks, .statusLine, .subagentStatusLine, .description, .notes) | keys[]' \
@@ -2476,4 +3080,16 @@ if [[ "$HOOKS_INSTALLED" == true ]]; then
     else
         log_warn "Hook modules test failed (this may be okay if dependencies are missing)"
     fi
+fi
+
+# Failure summary and exit code (brd D17.1)
+if [[ ${#FAILED_FEATURES[@]} -gt 0 ]]; then
+    echo ""
+    log_error "FAILURES (${#FAILED_FEATURES[@]}):"
+    for fid in "${FAILED_FEATURES[@]}"; do
+        local_title_fn="feature_${fid//-/_}_title"
+        local_title="$($local_title_fn 2>/dev/null || echo "$fid")"
+        echo "  - $fid: $local_title"
+    done
+    exit 1
 fi
