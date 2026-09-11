@@ -13,39 +13,64 @@ issues, and compacts the state store.
 | Run log | `temp/permission-review/<UTC-date>.log` (gitignored) |
 | Queue drained | `~/.claude/permission-queue/<project-key>/` |
 
-## Installing the schedule — a human step
+## Installing the schedule
 
-The repo never writes your crontab. Add the line yourself:
+The installer writes the crontab line for you, behind the `daily-review-cron`
+sub-toggle (epic 29, brd D13). Enable it once the `daily-review` feature is
+installed:
+
+```bash
+./install.sh enable daily-review-cron
+```
+
+The installer writes this line, marked and reversible:
+
+```cron
+15 6 * * * /data/sync/work/leangeeks-ai/claude-hooks/shell/permission-review-daily.sh
+```
+
+using the actual checkout path it was run from. Verify it landed:
+
+```bash
+crontab -l | grep permission-review
+```
+
+Disable with `./install.sh disable daily-review-cron`, which removes the marked
+line and leaves all other crontab entries untouched.
+
+**Manual alternative.** If you prefer to write the crontab yourself:
 
 ```bash
 crontab -e
 ```
 
 ```cron
-15 6 * * * /data/sync/work/leangeeks-ai/claude-hooks/shell/permission-review-daily.sh
+15 6 * * * /path/to/claude-hooks/shell/permission-review-daily.sh
 ```
 
-Verify it landed:
+To run the launcher from a checkout at a non-standard path, either write the
+path directly in the cron line or set `CLAUDE_HOOKS_REPO=<path>` in the line:
 
-```bash
-crontab -l | grep permission-review
+```cron
+15 6 * * * CLAUDE_HOOKS_REPO=/alt/path /alt/path/shell/permission-review-daily.sh
 ```
 
 ### Why the crontab line names the repo path directly
 
-`install-claude-config.sh` ships `shell/` entries two ways: `.bash` snippets are
-copied to `~/.claude/shell/` for the user to `source`, and `claude-history` /
-`claude-roles` are copied there and symlinked into `~/.local/bin`. Neither fits
-this launcher. It is repo-bound by construction — it reads its prompt out of
-`docs/prompts/` and spawns a session whose working directory *is* this checkout
-— so a copy on `PATH` would still have to find the repo, and the only reliable
-way for it to do that from cron's empty environment is a hard-coded path. Naming
-the repo path in the crontab line puts that one path in one place, where the
-person editing the schedule can see it. The checkout is stable on this machine;
-if it ever moves, the crontab line moves with it.
+The installer ships `shell/` entries two ways: `.bash` snippets are copied to
+`~/.claude/shell/` for the user to `source`, and `claude-history` / `claude-roles`
+are copied there and symlinked into `~/.local/bin`. Neither fits this launcher.
+It is repo-bound by construction — it reads its prompt out of `docs/prompts/`
+and spawns a session whose working directory *is* this checkout — so a copy on
+`PATH` would still have to find the repo, and the only reliable way for it to do
+that from cron's empty environment is a hard-coded path. This is why the
+`daily-review` feature installs no files: it only verifies the launcher and
+schedules it. Naming the repo path in the crontab line puts that one path in one
+place, where the person editing the schedule can see it. The checkout is stable
+on this machine; if it ever moves, the crontab line moves with it.
 
-To run the launcher from a repo at a different path, either move the crontab
-line or export `CLAUDE_HOOKS_REPO=<path>` before calling it.
+The `CLAUDE_HOOKS_REPO` override in the cron line above handles a checkout at a
+different path without touching the launcher itself.
 
 ## What the launcher guarantees
 

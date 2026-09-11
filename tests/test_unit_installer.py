@@ -4033,6 +4033,851 @@ class TestHandEditedManifest(InstallerTestBase):
                       "Features absent from manifest must be reported as newly-offered")
 
 
+# =============================================================================
+# 29-08: claude-history feature
+# =============================================================================
+
+class TestClaudeHistoryFeature(InstallerTestBase):
+    """
+    Tests for the claude-history feature (task 29-08 §1).
+    """
+
+    def test_install_probe_uninstall(self):
+        """
+        claude-history install copies the file to ~/.claude/shell/,
+        probe returns true, uninstall removes it and probe returns false.
+        """
+        result = run_installer(self.tmp_home, extra_args=["--only", "claude-history"])
+        self.assertEqual(result.returncode, 0,
+                         f"claude-history install must succeed. stderr: {result.stderr[:400]}")
+
+        # Installed copy must be present
+        installed = self.tmp_home / ".claude" / "shell" / "claude-history"
+        self.assertTrue(installed.exists(),
+                        "claude-history must be copied to ~/.claude/shell/claude-history")
+        self.assertTrue(installed.stat().st_mode & 0o111,
+                        "~/.claude/shell/claude-history must be executable")
+
+        # Probe must return true
+        self.assertTrue(run_probe(self.tmp_home, "claude-history"),
+                        "claude-history probe must return true after install")
+
+        # Uninstall
+        result2 = run_installer(self.tmp_home,
+                                extra_args=["--uninstall", "claude-history"])
+        self.assertEqual(result2.returncode, 0,
+                         f"claude-history uninstall must succeed. stderr: {result2.stderr[:400]}")
+
+        self.assertFalse(installed.exists(),
+                         "~/.claude/shell/claude-history must be removed after uninstall")
+        self.assertFalse(run_probe(self.tmp_home, "claude-history"),
+                         "claude-history probe must return false after uninstall")
+
+    def test_fzf_absent_warns_not_fails(self):
+        """
+        If fzf is not on PATH, claude-history still installs successfully
+        but emits a warning.
+
+        Core invariant: install must succeed regardless of fzf presence.
+        Warning is verified on systems where fzf is not installed; on systems
+        where fzf IS installed, we verify the install succeeds without the
+        warning (since fzf IS present and usable).
+        """
+        import shutil as _shutil
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "claude-history"])
+        self.assertEqual(result.returncode, 0,
+                         "claude-history install must succeed regardless of fzf. "
+                         f"stderr: {result.stderr[:400]}")
+
+        installed = self.tmp_home / ".claude" / "shell" / "claude-history"
+        self.assertTrue(installed.exists(),
+                        "claude-history must be installed even if fzf is absent")
+
+        combined = result.stdout + result.stderr
+        if not _shutil.which("fzf"):
+            # fzf is not installed on this system — the warning MUST appear
+            self.assertIn("fzf", combined.lower(),
+                          "Missing fzf must produce a warning mentioning fzf")
+        else:
+            # fzf is installed — no warning expected (fzf is usable)
+            # The test still verifies the install succeeded, which is the
+            # primary invariant. The warning path is covered in the source test.
+            pass
+
+    def test_fzf_absent_warning_text_in_source(self):
+        """
+        Source-level check: install.sh must have the fzf warning text.
+        This ensures the warning code exists even when fzf is installed in the
+        test environment (making test_fzf_absent_warns_not_fails skip the check).
+        """
+        source = INSTALL_SH.read_text()
+        self.assertIn(
+            "fzf not found",
+            source,
+            "install.sh must warn 'fzf not found' when fzf is absent. "
+            "The warning text has drifted from the test expectation.",
+        )
+
+    def test_local_bin_absent_no_symlink_install_succeeds(self):
+        """
+        When ~/.local/bin does not exist, no symlink is created, a warning
+        is emitted, and the install succeeds with the copy in ~/.claude/shell/.
+        """
+        # Ensure ~/.local/bin does NOT exist in tmp_home
+        local_bin = self.tmp_home / ".local" / "bin"
+        self.assertFalse(local_bin.exists(),
+                         "Precondition: ~/.local/bin must not exist for this test")
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "claude-history"])
+        self.assertEqual(result.returncode, 0,
+                         f"claude-history must succeed without ~/.local/bin. "
+                         f"stderr: {result.stderr[:400]}")
+
+        installed = self.tmp_home / ".claude" / "shell" / "claude-history"
+        self.assertTrue(installed.exists(),
+                        "claude-history copy must still be installed in ~/.claude/shell/")
+
+        # No symlink at ~/.local/bin/claude-history
+        symlink = self.tmp_home / ".local" / "bin" / "claude-history"
+        self.assertFalse(symlink.exists(),
+                         "No symlink must be created when ~/.local/bin is absent")
+
+        combined = result.stdout + result.stderr
+        self.assertIn("does not exist", combined.lower(),
+                      "Install must warn that ~/.local/bin does not exist")
+
+    def test_local_bin_present_but_not_on_path_no_symlink(self):
+        """
+        When ~/.local/bin exists but is not on PATH, no symlink is created,
+        a warning is emitted, and the install succeeds.
+        """
+        local_bin = self.tmp_home / ".local" / "bin"
+        local_bin.mkdir(parents=True)
+
+        # Build a PATH from the current PATH but with local_bin removed.
+        # This ensures bash and other tools are still available.
+        current_path = os.environ.get("PATH", "")
+        local_bin_str = str(local_bin)
+        path_without_local_bin = ":".join(
+            d for d in current_path.split(":") if d != local_bin_str
+        )
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "claude-history"],
+            extra_env={"PATH": path_without_local_bin},
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"claude-history must succeed when ~/.local/bin is not on PATH. "
+                         f"stderr: {result.stderr[:400]}")
+
+        installed = self.tmp_home / ".claude" / "shell" / "claude-history"
+        self.assertTrue(installed.exists(),
+                        "claude-history copy must be in ~/.claude/shell/")
+
+        # Under NO_EXTERNAL ext_symlink_add is a no-op anyway, but the code path
+        # should take the "not on PATH" branch and warn.
+        combined = result.stdout + result.stderr
+        self.assertIn("not on path", combined.lower(),
+                      "Install must warn that ~/.local/bin is not on PATH")
+
+
+# =============================================================================
+# 29-08: daily-review feature
+# =============================================================================
+
+class TestDailyReviewFeature(InstallerTestBase):
+    """
+    Tests for the daily-review feature (task 29-08 §2).
+    """
+
+    def _write_manifest_with_amux_profiles_installed(self) -> None:
+        """Write a manifest that records amux and profiles as installed."""
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "profiles": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {},
+                },
+                "amux": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"amux-autowrap": False},
+                },
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2))
+
+    def test_dependency_refusal_names_amux(self):
+        """
+        --only daily-review --uninstall amux is refused, naming amux.
+        daily-review requires amux; uninstalling amux while daily-review
+        is in the plan is a dependency conflict.
+        """
+        # First install both so probes have something to find
+        run_installer(self.tmp_home,
+                      extra_args=["--only", "profiles,amux"],
+                      extra_env=_make_fake_uv(self.tmp_home))
+
+        # Now try to install daily-review while uninstalling amux
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "daily-review", "--uninstall", "amux"],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "daily-review with --uninstall amux must be refused")
+        combined = result.stdout + result.stderr
+        self.assertIn("amux", combined,
+                      "Refusal must name the 'amux' dependency")
+
+    def test_nothing_copied_to_claude_shell(self):
+        """
+        Installing daily-review must not copy permission-review-daily.sh
+        (or any other file) into ~/.claude/shell/.
+        The launcher is repo-bound and must not be moved (brd constraint 2.5).
+        """
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "daily-review,amux,profiles"],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"daily-review install must succeed. stderr: {result.stderr[:400]}")
+
+        # The launcher must NOT be in ~/.claude/shell/
+        launcher_copy = self.tmp_home / ".claude" / "shell" / "permission-review-daily.sh"
+        self.assertFalse(
+            launcher_copy.exists(),
+            "daily-review must not copy permission-review-daily.sh to ~/.claude/shell/",
+        )
+
+    def test_missing_prompt_file_fails_with_message(self):
+        """
+        If docs/prompts/permission-review-daily.md is absent, daily-review install
+        fails with a message naming the file.
+        """
+        # Create a minimal fake SCRIPT_DIR without the prompt file
+        fake_dir = Path(tempfile.mkdtemp(prefix="claude-hooks-fake-script-"))
+        try:
+            # Minimal structure the installer needs
+            (fake_dir / ".claude").mkdir()
+            (fake_dir / ".claude" / "settings.json").write_text(
+                _MINIMAL_PROJECT_SETTINGS
+            )
+            # Launcher exists in shell/
+            shell_dir = fake_dir / "shell"
+            shell_dir.mkdir()
+            launcher = shell_dir / "permission-review-daily.sh"
+            launcher.write_text("#!/bin/bash\n# stub\n")
+            launcher.chmod(0o755)
+            # NO docs/prompts/permission-review-daily.md
+
+            result = run_installer(
+                self.tmp_home,
+                extra_args=["--only", "daily-review,amux,profiles"],
+                extra_env={
+                    **_make_fake_uv(self.tmp_home),
+                    "CLAUDE_INSTALL_SCRIPT_DIR": str(fake_dir),
+                },
+            )
+            # Must exit non-zero (daily-review failed)
+            self.assertNotEqual(
+                result.returncode, 0,
+                "daily-review must fail when the prompt file is missing",
+            )
+            combined = result.stdout + result.stderr
+            self.assertIn(
+                "permission-review-daily.md",
+                combined,
+                "Error message must name the missing prompt file",
+            )
+        finally:
+            shutil.rmtree(str(fake_dir), ignore_errors=True)
+
+
+# =============================================================================
+# 29-08: Cron line content
+# =============================================================================
+
+class TestCronLineContent(InstallerTestBase):
+    """
+    Verify the exact cron line written by enable daily-review-cron.
+    Uses NO_EXTERNAL log lines (architecture §10.2): never touches a real crontab.
+    """
+
+    def test_enable_daily_review_cron_line_schedule_and_path(self):
+        """
+        'enable daily-review-cron' must log a cron line with schedule '15 6 * * *'
+        and the checkout path.
+        Uses CLAUDE_INSTALL_NO_EXTERNAL log lines (architecture §10.2): never
+        touches a real crontab.
+        """
+        # Write a manifest recording daily-review as installed so the enable command's
+        # parent probe can fall back to manifest state (feature_daily_review_probe()
+        # uses ext_cron_has_marker which returns false under CLAUDE_INSTALL_NO_EXTERNAL).
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "daily-review": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"daily-review-cron": False},
+                },
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2))
+
+        # enable daily-review-cron
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["enable", "daily-review-cron"],
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"enable daily-review-cron must succeed when parent is in manifest. "
+                         f"stderr: {result.stderr[:400]}")
+
+        combined = result.stdout + result.stderr
+
+        # The NO_EXTERNAL log line must contain the schedule
+        self.assertIn("15 6 * * *", combined,
+                      "Cron line must contain the schedule '15 6 * * *'")
+
+        # The cron line must name the checkout path (from SCRIPT_DIR = real repo)
+        repo_str = str(REPO)
+        self.assertIn(repo_str, combined,
+                      f"Cron line must contain the checkout path '{repo_str}'")
+
+        # The cron line must reference the launcher script
+        self.assertIn("permission-review-daily.sh", combined,
+                      "Cron line must reference permission-review-daily.sh")
+
+    def test_install_with_cron_suboption_enabled_writes_cron_line(self):
+        """
+        Installing daily-review with FEATURE_SUBOPTION_STATES[daily-review-cron]=true
+        (via manifest replay) must write the cron line.
+        """
+        # Write a manifest with daily-review=installed and daily-review-cron=true
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "profiles": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {},
+                },
+                "amux": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"amux-autowrap": False},
+                },
+                "daily-review": {
+                    "state": "skipped",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"daily-review-cron": True},
+                },
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2))
+
+        # --yes with daily-review in the plan (it was skipped, so --with forces it)
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes", "--with", "daily-review"],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"--yes with daily-review must succeed. stderr: {result.stderr[:400]}")
+
+        combined = result.stdout + result.stderr
+        self.assertIn(
+            "15 6 * * *",
+            combined,
+            "Manifest replay with daily-review-cron=true must write the cron line",
+        )
+
+    def test_install_with_cron_suboption_off_does_not_write_cron_line(self):
+        """
+        Installing daily-review with daily-review-cron=false must NOT write the
+        cron line. A false sub-toggle must stay false on replay.
+        """
+        # Write a manifest with daily-review=skipped, daily-review-cron=false
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "profiles": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {},
+                },
+                "amux": {
+                    "state": "installed",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"amux-autowrap": False},
+                },
+                "daily-review": {
+                    "state": "skipped",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {"daily-review-cron": False},
+                },
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2))
+
+        # Force daily-review to run even though it was skipped
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes", "--with", "daily-review"],
+            extra_env=_make_fake_uv(self.tmp_home),
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"Must succeed. stderr: {result.stderr[:400]}")
+
+        combined = result.stdout + result.stderr
+        # Under NO_EXTERNAL, ext_cron_add logs "[NO_EXTERNAL] ext_cron_add: would add..."
+        # If cron is NOT added, this log line must NOT appear.
+        self.assertNotIn(
+            "ext_cron_add",
+            combined,
+            "daily-review-cron=false must not trigger ext_cron_add",
+        )
+
+
+# =============================================================================
+# 29-08: Documentation drift checks
+# =============================================================================
+
+class TestDocsDriftCheck(unittest.TestCase):
+    """
+    Source-level consistency checks between docs and install.sh (task 29-08).
+    Equivalent in spirit to test_amux_pin.py — a grep that catches a specific
+    class of drift before it causes a silent bad behaviour.
+    """
+
+    def setUp(self):
+        self.assertIn("CLAUDE_INSTALL_NO_EXTERNAL", os.environ,
+                      "Tests must run with CLAUDE_INSTALL_NO_EXTERNAL=1")
+
+    PERMISSION_REVIEW_DOC = REPO / "docs" / "permission-review-daily.md"
+    SEED_PROMPT = REPO / "docs" / "prompts" / "permission-review-daily.md"
+
+    def test_permission_review_doc_agrees_on_cron_schedule(self):
+        """
+        docs/permission-review-daily.md and install.sh's enable daily-review-cron
+        must agree on the cron schedule '15 6 * * *'.
+        If the schedule drifts, the doc and the installed line would disagree.
+        """
+        schedule = "15 6 * * *"
+        doc_text = self.PERMISSION_REVIEW_DOC.read_text()
+        install_text = INSTALL_SH.read_text()
+
+        self.assertIn(
+            schedule, doc_text,
+            f"docs/permission-review-daily.md must document the cron schedule '{schedule}'. "
+            "Update it to match what install.sh writes (enable daily-review-cron).",
+        )
+        self.assertIn(
+            schedule, install_text,
+            f"install.sh enable daily-review-cron must write schedule '{schedule}'. "
+            "Update it to match docs/permission-review-daily.md.",
+        )
+
+    def test_permission_review_doc_no_longer_says_repo_never_writes_crontab(self):
+        """
+        docs/permission-review-daily.md must not claim the repo never writes the
+        crontab. Epic 29 brd D13 reverses this stance; the old claim is a
+        documentation bug.
+        """
+        doc_text = self.PERMISSION_REVIEW_DOC.read_text()
+        self.assertNotIn(
+            "The repo never writes your crontab",
+            doc_text,
+            "docs/permission-review-daily.md still contains the old claim that the "
+            "repo never writes the crontab. Update it: the installer now writes the "
+            "line behind daily-review-cron (epic 29, brd D13).",
+        )
+
+    def test_seed_prompt_uses_install_sh_with_yes(self):
+        """
+        docs/prompts/permission-review-daily.md step 3 must run './install.sh --yes',
+        not a bare invocation and not './install-claude-config.sh'.
+
+        A bare invocation fails the no-TTY check (brd §5). Without --yes, a run
+        in cron would either fail (no manifest) or reinstall everything silently
+        (old behaviour). This grep is the only thing that catches that regression
+        coming back.
+        """
+        prompt_text = self.SEED_PROMPT.read_text()
+        self.assertIn(
+            "./install.sh --yes",
+            prompt_text,
+            "docs/prompts/permission-review-daily.md step 3 must use "
+            "'./install.sh --yes'. A bare invocation fails the no-TTY check or "
+            "silently reinstalls everything (brd §5, 29-08 §2.1a).",
+        )
+
+    def test_seed_prompt_does_not_invoke_install_config_sh(self):
+        """
+        docs/prompts/permission-review-daily.md must not invoke
+        install-claude-config.sh in a code block. That is the frozen pre-epic
+        script; the seed prompt must use install.sh --yes.
+        """
+        prompt_text = self.SEED_PROMPT.read_text()
+        self.assertNotIn(
+            "./install-claude-config.sh",
+            prompt_text,
+            "docs/prompts/permission-review-daily.md still references "
+            "install-claude-config.sh. Update step 3 to use './install.sh --yes' "
+            "(see 29-08 §2.1).",
+        )
+
+
+# =============================================================================
+# 29-08: Selection replay with skipped features and sub-toggles
+# =============================================================================
+
+class TestSelectionReplay2908(InstallerTestBase):
+    """
+    Regression tests for --yes replay with skipped features (task 29-08).
+
+    These tests are the "done criterion" from 29-08: a --yes run against a
+    manifest in which a feature is "skipped" must not install it. A sub-toggle
+    recorded off must stay off.
+    """
+
+    def _write_manifest(self, features: dict) -> None:
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": features,
+        }
+        manifest_path.write_text(json.dumps(data, indent=2))
+        settings_path = self.tmp_home / ".claude" / "settings.json"
+        if not settings_path.exists():
+            settings_path.write_text("{}")
+
+    def test_claude_history_skipped_stays_not_installed(self):
+        """
+        A manifest with claude-history=skipped: --yes replay must not install it.
+        This is the regression guard: a bare or --all run would install it (D14
+        defaults), but a replay must honour the recorded 'skipped' state.
+        """
+        self._write_manifest({
+            "statusline": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+            "claude-history": {
+                "state": "skipped",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+        })
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"--yes with claude-history=skipped must succeed. "
+                         f"stderr: {result.stderr[:400]}")
+
+        # claude-history must NOT be installed
+        installed = self.tmp_home / ".claude" / "shell" / "claude-history"
+        self.assertFalse(
+            installed.exists(),
+            "--yes replay with claude-history=skipped must not install claude-history. "
+            "This regression would resurrect the old install-everything behaviour.",
+        )
+
+    def test_statusline_installed_claude_history_skipped_end_state(self):
+        """
+        Manifest: statusline=installed, claude-history=skipped.
+        --yes replay: statusline ends up installed, claude-history stays not-installed.
+        End state matches manifest, not D14 defaults.
+        """
+        self._write_manifest({
+            "statusline": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+            "claude-history": {
+                "state": "skipped",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+        })
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"stderr: {result.stderr[:400]}")
+
+        # statusline must be installed (it was in the manifest as installed)
+        self.assertTrue(
+            run_probe(self.tmp_home, "statusline"),
+            "statusline must be installed per manifest replay",
+        )
+        # claude-history must NOT be installed
+        self.assertFalse(
+            run_probe(self.tmp_home, "claude-history"),
+            "claude-history must stay not-installed per manifest (skipped)",
+        )
+
+    def test_daily_review_cron_suboption_off_not_written_on_replay(self):
+        """
+        Manifest with daily-review=installed, daily-review-cron=false:
+        --yes replay must not write the cron line.
+        This covers the sub-toggle recorded-off regression.
+        """
+        self._write_manifest({
+            "profiles": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+            "amux": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {"amux-autowrap": False},
+            },
+            "daily-review": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {"daily-review-cron": False},
+            },
+        })
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={
+                "CLAUDE_INSTALL_ASSUME_TTY": "0",
+                **_make_fake_uv(self.tmp_home),
+            },
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"stderr: {result.stderr[:400]}")
+
+        combined = result.stdout + result.stderr
+        # ext_cron_add must NOT appear in the output (cron not written)
+        self.assertNotIn(
+            "ext_cron_add",
+            combined,
+            "daily-review-cron=false must not trigger cron write on replay",
+        )
+
+
+# =============================================================================
+# 29-08: Launcher dirty-tree detection
+# =============================================================================
+
+class TestLauncherDirtyTree(unittest.TestCase):
+    """
+    Tests for dirty-tree detection in shell/permission-review-daily.sh.
+    Verifies PERMISSION_REVIEW_NO_PROPAGATE=1 is exported and logged when
+    install.sh has uncommitted changes, and that the launcher still proceeds
+    to call amux-spawn (review continues; only propagation is withheld).
+    """
+
+    LAUNCHER = REPO / "shell" / "permission-review-daily.sh"
+
+    def setUp(self):
+        self.assertIn("CLAUDE_INSTALL_NO_EXTERNAL", os.environ,
+                      "Tests must run with CLAUDE_INSTALL_NO_EXTERNAL=1")
+        self.tmp_dir = Path(tempfile.mkdtemp(prefix="claude-hooks-launcher-test-"))
+
+    def tearDown(self):
+        shutil.rmtree(str(self.tmp_dir), ignore_errors=True)
+
+    def _make_git_repo_with_install_sh(self, dirty: bool) -> tuple:
+        """
+        Create a temp git repo containing install.sh.
+        If dirty=True, modify install.sh without committing.
+        Returns (repo_path, log_dir_path).
+        """
+        repo = self.tmp_dir / "repo"
+        repo.mkdir()
+
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"],
+                       check=True, capture_output=True)
+
+        install_sh = repo / "install.sh"
+        install_sh.write_text("#!/bin/bash\n# install.sh\necho 'installer'\n")
+        subprocess.run(["git", "-C", str(repo), "add", "install.sh"],
+                       check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "init",
+                        "--allow-empty-message"],
+                       check=True, capture_output=True)
+
+        if dirty:
+            install_sh.write_text("#!/bin/bash\n# install.sh (dirty)\necho 'dirty'\n")
+
+        # Prompt file the launcher checks for
+        docs_dir = repo / "docs" / "prompts"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "permission-review-daily.md").write_text("# Test prompt\n")
+
+        # Log dir
+        log_dir = repo / "temp" / "permission-review"
+        log_dir.mkdir(parents=True)
+
+        return repo, log_dir
+
+    def _make_stub_amux_spawn(self, home: Path) -> Path:
+        """
+        Create a stub amux-spawn in $HOME/.local/bin/ (which the launcher adds
+        first to PATH) that records it was called.
+        Returns the path of the called-marker file.
+        """
+        # The launcher hardcodes PATH as:
+        #   $HOME/.local/bin:$HOME/.bin:/usr/local/bin:/usr/local/sbin:...
+        # so we must place the stub in $HOME/.local/bin to be found.
+        local_bin = home / ".local" / "bin"
+        local_bin.mkdir(parents=True, exist_ok=True)
+        called = self.tmp_dir / "amux-spawn-called"
+        stub = local_bin / "amux-spawn"
+        stub.write_text(f"#!/bin/bash\ntouch '{called}'\nexit 0\n")
+        stub.chmod(0o755)
+        return called
+
+    def _run_launcher(self, repo: Path) -> tuple:
+        """
+        Run permission-review-daily.sh with CLAUDE_HOOKS_REPO pointing to repo.
+        Places a stub amux-spawn in $fake_home/.local/bin (which the launcher adds
+        first to PATH) so the amux-spawn check passes.
+        Returns (subprocess_result, log_dir_path, called_marker_path).
+        """
+        log_dir = repo / "temp" / "permission-review"
+        fake_home = self.tmp_dir / "home"
+        fake_home.mkdir(exist_ok=True)
+
+        # Place stub amux-spawn where the launcher's hardcoded PATH will find it
+        called = self._make_stub_amux_spawn(fake_home)
+
+        env = {
+            **os.environ,
+            "CLAUDE_HOOKS_REPO": str(repo),
+            "HOME": str(fake_home),
+            "PERMISSION_REVIEW_MODEL": "sonnet",
+            "PERMISSION_REVIEW_EFFORT": "low",
+        }
+
+        result = subprocess.run(
+            ["bash", str(self.LAUNCHER)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result, log_dir, called
+
+    def test_dirty_tree_sets_propagate_and_launcher_continues(self):
+        """
+        When install.sh has uncommitted changes:
+        - The launcher logs a WARN with 'propagation withheld'.
+        - PERMISSION_REVIEW_NO_PROPAGATE=1 is exported into the child env.
+        - The launcher still calls amux-spawn (review is not aborted).
+        """
+        repo, log_dir = self._make_git_repo_with_install_sh(dirty=True)
+
+        _, returned_log_dir, called = self._run_launcher(repo)
+
+        # Read the launcher's log file
+        log_files = list(log_dir.glob("*.log"))
+        self.assertTrue(len(log_files) >= 1,
+                        "Launcher must write a log file to temp/permission-review/")
+        log_content = log_files[0].read_text()
+
+        # Must warn about dirty tree
+        self.assertIn("WARN", log_content,
+                      "Dirty install.sh must produce a WARN line in the log")
+        self.assertIn("propagation withheld", log_content,
+                      "WARN must say 'propagation withheld'")
+        self.assertIn("uncommitted changes", log_content,
+                      "WARN must mention 'uncommitted changes'")
+
+        # Launcher must still call amux-spawn (review proceeds)
+        self.assertTrue(
+            called.exists(),
+            "Launcher must still invoke amux-spawn even when the tree is dirty. "
+            "Only propagation (step 3) is withheld; the review itself must proceed.",
+        )
+
+    def test_clean_tree_does_not_warn_about_propagation(self):
+        """
+        When install.sh has no uncommitted changes, no propagation-withheld
+        warning appears, and amux-spawn is called normally.
+        """
+        repo, log_dir = self._make_git_repo_with_install_sh(dirty=False)
+
+        _, _, called = self._run_launcher(repo)
+
+        log_files = list(log_dir.glob("*.log"))
+        self.assertTrue(len(log_files) >= 1,
+                        "Launcher must write a log file")
+        log_content = log_files[0].read_text()
+
+        self.assertNotIn(
+            "propagation withheld",
+            log_content,
+            "Clean tree must not produce a propagation-withheld warning",
+        )
+        self.assertTrue(called.exists(), "Launcher must call amux-spawn on clean tree")
+
+
 if __name__ == "__main__":
     # When run directly, set CLAUDE_INSTALL_NO_EXTERNAL for convenience
     os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")

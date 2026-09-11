@@ -880,23 +880,71 @@ feature_claude_history_modules()    { echo ""; }
 feature_claude_history_suboptions() { echo ""; }
 
 feature_claude_history_probe() {
-    [[ -f "$HOME/.local/bin/claude-history" ]]
+    # Probe: the installed copy exists in ~/.claude/shell/. The ~/.local/bin symlink
+    # is optional (only created when the dir exists and is on PATH) and is not a
+    # reliable probe target — its absence does not mean the feature is not installed.
+    [[ -f "$HOME/.claude/shell/claude-history" ]]
 }
 
 feature_claude_history_install() {
-    # 29-08 implements this feature. For 29-02 it is a no-op — the feature is
-    # registered in the registry so the registry assertions can verify it, but
-    # the actual install code is deferred to task 29-08.
     log_step "Installing: $(feature_claude_history_title)"
-    log_info "claude-history install deferred to task 29-08 — skipping"
-    return 0
+
+    local claude_history_src="$SCRIPT_DIR/shell/claude-history"
+    local claude_shell_dir="$HOME/.claude/shell"
+    local user_bin_dir="$HOME/.local/bin"
+
+    # Source must exist in the checkout
+    if [[ ! -f "$claude_history_src" ]]; then
+        log_error "claude-history: source not found at $claude_history_src"
+        return 1
+    fi
+
+    # Install copy to ~/.claude/shell/claude-history
+    mkdir -p "$claude_shell_dir"
+    cp "$claude_history_src" "$claude_shell_dir/claude-history"
+    chmod +x "$claude_shell_dir/claude-history"
+    log_info "Installed: claude-history → $claude_shell_dir/claude-history"
+
+    # Symlink into ~/.local/bin only when the dir exists AND is on PATH.
+    # An absent or not-on-PATH ~/.local/bin means the user won't find a dangling
+    # symlink there; warn and proceed — the copy in ~/.claude/shell/ is still useful
+    # (invoke directly, or source from a profile).
+    if [[ -d "$user_bin_dir" ]]; then
+        case ":$PATH:" in
+            *":$user_bin_dir:"*)
+                ext_symlink_add "$claude_shell_dir/claude-history" "$user_bin_dir/claude-history"
+                log_info "  Symlinked: $user_bin_dir/claude-history -> $claude_shell_dir/claude-history"
+                ;;
+            *)
+                log_warn "  $user_bin_dir exists but is not on PATH — not symlinking claude-history"
+                log_warn "  Invoke directly: $claude_shell_dir/claude-history"
+                ;;
+        esac
+    else
+        log_warn "  $user_bin_dir does not exist — claude-history not on PATH"
+        log_warn "  Invoke directly: $claude_shell_dir/claude-history"
+    fi
+
+    # Warn if fzf is missing — --list still works without it
+    if ! command -v fzf >/dev/null 2>&1; then
+        log_warn "fzf not found — claude-history --list works, but the fzf picker requires it"
+        log_warn "  Install fzf (e.g.: sudo apt install fzf) for interactive prompt search"
+    fi
 }
 
 feature_claude_history_uninstall() {
     log_step "Uninstalling: $(feature_claude_history_title)"
 
-    # Remove claude-history binary (never remove history.jsonl — invariant 10)
-    rm -f "$HOME/.local/bin/claude-history"
+    local claude_shell_dir="$HOME/.claude/shell"
+    local user_bin_dir="$HOME/.local/bin"
+
+    # Remove the installed copy (never remove history.jsonl — invariant 10)
+    rm -f "$claude_shell_dir/claude-history"
+    log_info "Removed: $claude_shell_dir/claude-history"
+
+    # Remove symlink if present
+    ext_symlink_remove "$user_bin_dir/claude-history"
+
     log_info "claude-history uninstalled (history.jsonl preserved — user data)"
 }
 
@@ -1032,10 +1080,62 @@ feature_daily_review_probe() {
 }
 
 feature_daily_review_install() {
-    # 29-08 implements this feature. For 29-02 it is a no-op.
     log_step "Installing: $(feature_daily_review_title)"
-    log_info "daily-review install deferred to task 29-08 — skipping"
-    return 0
+
+    local launcher="$SCRIPT_DIR/shell/permission-review-daily.sh"
+    local prompt_file="$SCRIPT_DIR/docs/prompts/permission-review-daily.md"
+
+    # Verify the launcher exists in the checkout and is executable.
+    # The launcher is NOT copied to ~/.claude/shell/ — it is repo-bound by
+    # construction (reads docs/prompts/, logs into temp/), so copying it would
+    # break its REPO_DIR resolution (brd constraint 2.5).
+    if [[ ! -f "$launcher" ]]; then
+        log_error "daily-review: launcher not found at $launcher"
+        log_error "  Expected shell/permission-review-daily.sh in the checkout."
+        return 1
+    fi
+    if [[ ! -x "$launcher" ]]; then
+        log_warn "daily-review: fixing execute bit on $launcher"
+        chmod +x "$launcher"
+    fi
+
+    # Verify the prompt file exists — the launcher reads it at 06:15.
+    # A missing prompt file causes the scheduled run to fail silently with a
+    # FATAL, which is the exact failure mode the launcher's own header was
+    # written to avoid.
+    if [[ ! -f "$prompt_file" ]]; then
+        log_error "daily-review: prompt file not found at $prompt_file"
+        log_error "  The launcher reads this file at 06:15; without it the run fails silently."
+        log_error "  Restore docs/prompts/permission-review-daily.md before enabling this feature."
+        return 1
+    fi
+
+    # amux is required (feature_daily_review_requires() returns "amux"), and the
+    # plan phase promotes it before reaching here. This runtime check is a
+    # belt-and-suspenders guard: if amux-spawn somehow isn't on PATH after
+    # the amux install, report it clearly rather than letting the 06:15 run fail.
+    if ! command -v amux-spawn >/dev/null 2>&1; then
+        log_warn "daily-review: amux-spawn not found on PATH after amux install"
+        log_warn "  The 06:15 launcher requires amux-spawn. Run: ./install.sh --only amux"
+        # Do not return 1 — the amux feature may have installed amux-spawn to a
+        # non-PATH location (e.g., when ~/.local/bin is absent). The feature itself
+        # is verified; the warning documents the runtime dependency.
+    fi
+
+    # This feature installs no files. It only schedules (brd D13, constraint 2.5).
+    log_info "daily-review: verified — no files installed (feature schedules from the checkout)"
+    log_info "  launcher:  $launcher"
+    log_info "  prompt:    $prompt_file"
+    log_info "  Enable the cron line with: ./install.sh enable daily-review-cron"
+
+    # Apply the daily-review-cron sub-toggle when it is enabled in the plan
+    # (manifest replay with cron=true, or the selector with the sub-option checked).
+    # This mirrors the amux-autowrap and profiles-autosource pattern.
+    if [[ "${FEATURE_SUBOPTION_STATES[daily-review-cron]:-false}" == "true" ]]; then
+        ext_cron_add "daily-review-cron" \
+            "15 6 * * * $SCRIPT_DIR/shell/permission-review-daily.sh"
+        log_info "daily-review-cron: enabled (sub-toggle)"
+    fi
 }
 
 feature_daily_review_uninstall() {
@@ -3097,9 +3197,24 @@ _run_subcommand() {
         daily-review-cron)   parent="daily-review" ;;
     esac
 
-    # Verify parent is installed (probe — brd D2, never cascade into installing)
+    # Verify parent is installed.
+    # Primary check: disk probe (brd D2 — never trust only the manifest).
+    # Fallback: manifest state, for features whose probe is gated by
+    # CLAUDE_INSTALL_NO_EXTERNAL (crontab, systemd) — in those environments the
+    # probe always returns false even after a successful install, so without the
+    # manifest fallback enable/disable would be unusable in test environments.
     local probe_fn="feature_${parent//-/_}_probe"
-    if ! declare -f "$probe_fn" >/dev/null 2>&1 || ! $probe_fn 2>/dev/null; then
+    local parent_is_installed=false
+    if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+        parent_is_installed=true
+    elif [[ -f "$MANIFEST_FILE" ]]; then
+        local _manifest_state
+        _manifest_state="$(jq -r --arg id "$parent" \
+            '.features[$id].state // "not-found"' "$MANIFEST_FILE" 2>/dev/null \
+            || echo "not-found")"
+        [[ "$_manifest_state" == "installed" ]] && parent_is_installed=true
+    fi
+    if [[ "$parent_is_installed" == false ]]; then
         log_error "$cmd $toggle: parent feature '$parent' is not installed."
         log_error "  Install it first: ./install.sh --only $parent"
         return 1

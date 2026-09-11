@@ -90,6 +90,19 @@ if ! command -v amux-spawn >/dev/null 2>&1; then
     exit 1
 fi
 
+# Dirty-tree check: if install.sh has uncommitted changes, the installer must
+# not be run unattended — it would execute whatever half-finished edit is in the
+# working tree against the real $HOME. Withhold propagation but proceed with the
+# review (draining the queue and reviewing traffic are still worth doing).
+_dirty="$(git -C "$REPO_DIR" status --porcelain -- install.sh 2>/dev/null || true)"
+if [[ -n "$_dirty" ]]; then
+    export PERMISSION_REVIEW_NO_PROPAGATE=1
+    echo "WARN: install.sh has uncommitted changes — propagation withheld"
+    echo "      The review will run, but step 3 (installer merge) will be skipped."
+    echo "      Commit or stash the install.sh changes to re-enable propagation."
+fi
+unset _dirty
+
 PROMPT="$(cat "$PROMPT_FILE")"
 
 # --dir is mandatory in practice: cron's cwd is $HOME, and amux-spawn keys its

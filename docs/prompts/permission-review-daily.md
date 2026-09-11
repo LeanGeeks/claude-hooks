@@ -248,13 +248,30 @@ Look for exactly four things:
    (brd H6):
 
    ```bash
-   ./install-claude-config.sh
+   ./install.sh --yes
    ```
 
+   **`--yes` is not optional.** It means "re-apply exactly what this machine
+   already chose" — it replays the recorded manifest, including any features
+   recorded as `skipped`. A bare `./install.sh` with no TTY and no manifest
+   selection is a hard error (brd §5), not a fallback to install-everything.
+   Using `--yes` is the only safe form for an unattended run.
+
+   **Before running:** check whether the launcher set
+   `PERMISSION_REVIEW_NO_PROPAGATE=1`. If it did, the installer has uncommitted
+   changes in the working tree and propagation has been withheld. In that case,
+   skip this step entirely and report "propagation withheld — installer has
+   uncommitted changes" instead of the usual two outcomes.
+
    **Name the run in your summary either way** — "installer merged, user-scope
-   patterns are live everywhere" or "no user-scope change, installer not run".
-   Invariant 8: any claim that a pattern is live must say whether the merge ran.
+   patterns are live everywhere", "no user-scope change, installer not run", or
+   "propagation withheld — installer has uncommitted changes". Invariant 8: any
+   claim that a pattern is live must say whether the merge ran.
    If you applied nothing, do not run it.
+
+   **Replay report:** if the installer's summary shows any feature changing
+   state (e.g., a `skipped` feature becoming `installed`), that is a bug in the
+   manifest — say so explicitly rather than accepting the state change.
 
 4. **Push only if the standing repo policy says so.** It does not, by default.
    Leave the commit for the human and say so.
