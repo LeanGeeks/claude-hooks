@@ -42,7 +42,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Dict, Any, List, Tuple
 
-import telegram_permission_router as telegram_router
+# ── Telegram router: optional dependency ────────────────────────────────────
+# The router is owned by the ``telegram`` feature set (architecture §2.1).  On a
+# ``permission-hooks``-only machine the module is absent — guard the import so
+# the hook still loads.  When the router is absent, ``TELEGRAM_ENABLED`` stays
+# ``False`` and the hook behaves identically to "relay configured but unusable":
+# yolo / bypass auto-allow; everything else falls back to the terminal.
+#
+# ``_TELEGRAM_ROUTER_AVAILABLE`` tracks whether the *module* is importable — a
+# separate concern from ``TELEGRAM_ENABLED`` (which tracks whether the relay is
+# reachable).  The flag is only used for log-line disambiguation.
+_TELEGRAM_ROUTER_AVAILABLE = False
+try:
+    import telegram_permission_router as telegram_router
+    _TELEGRAM_ROUTER_AVAILABLE = True
+except ImportError:
+    telegram_router = None  # type: ignore[assignment]
 
 # Import the new modules
 from permission_state_store import (
@@ -61,16 +76,32 @@ from permission_state_store import (
     RESOLUTION_SOURCE_TERMINAL,
     RESOLUTION_SOURCE_TIMEOUT,
 )
-from telegram_permission_router import (
-    load_telegram_config,
-    finalize_message,
-    render_permission_body,
-    send_permission_message,
-    send_question_message,
-    wait_for_relay_answer,
-    relay_answer_to_decision,
-    remove_inline_buttons,
-)
+if _TELEGRAM_ROUTER_AVAILABLE:
+    from telegram_permission_router import (
+        load_telegram_config,
+        finalize_message,
+        render_permission_body,
+        send_permission_message,
+        send_question_message,
+        wait_for_relay_answer,
+        relay_answer_to_decision,
+        remove_inline_buttons,
+    )
+else:
+    # Stubs so the module-level names exist.  Every call site is behind a
+    # ``TELEGRAM_ENABLED`` gate (or the new ordering puts auto-allow first),
+    # so these are never invoked in normal operation.  If one *is* reached by
+    # accident, a clear ``TypeError`` is far better than ``NameError``.
+    def load_telegram_config() -> None:  # noqa: D103
+        pass  # TELEGRAM_ENABLED stays False (its initial value in the router)
+    finalize_message = None
+    render_permission_body = None
+    send_permission_message = None
+    send_question_message = None
+    wait_for_relay_answer = None
+    relay_answer_to_decision = None
+    remove_inline_buttons = None
+
 import session_yolo_store
 
 # ── Epic 26 layer 1: signal handler registry ─────────────────────────────────
@@ -101,7 +132,7 @@ def _on_interrupt(signum, frame):
 
     def _revoke_all():
         for row in rows:
-            if row.telegram_message_id:
+            if row.telegram_message_id and telegram_router is not None:
                 try:
                     telegram_router.revoke_telegram_message(row)
                 except Exception as e:  # noqa: BLE001 — H1
@@ -1514,10 +1545,11 @@ def main():
         # State first, buttons second (invariant 5); fail open (invariant 1).
         try:
             for _row in sweep_orphaned_requests():
-                try:
-                    telegram_router.revoke_telegram_message(_row)
-                except Exception as e:      # noqa: BLE001 — H1
-                    debug_log(f"Sweep: revoke of {_row.telegram_message_id} failed: {e}")
+                if telegram_router is not None:
+                    try:
+                        telegram_router.revoke_telegram_message(_row)
+                    except Exception as e:      # noqa: BLE001 — H1
+                        debug_log(f"Sweep: revoke of {_row.telegram_message_id} failed: {e}")
         except Exception as e:          # noqa: BLE001 — H1 defence in depth
             debug_log(f"Sweep: unexpected error in sweep_orphaned_requests: {type(e).__name__}: {e}")
         session_yolo_store.prune()
@@ -1547,27 +1579,30 @@ def main():
         debug_log(f"Tool input: {json.dumps(tool_input)[:200]}")
         debug_log(f"Permission suggestions: {permission_suggestions}")
 
-        # If Telegram is not enabled, fall back to terminal immediately
-        if not telegram_router.TELEGRAM_ENABLED:
-            debug_log("Telegram not configured, falling back to terminal prompt")
-            error_log(
-                "Telegram disabled; skipping permission-request message. "
-                "Check ~/.config/claude-tg-relay/config.toml exists and server_url is reachable. "
-                "Run `relay-client config init --server-url URL --token TOKEN` then `relay-client bind`."
-            )
-            sys.exit(0)
+        # ── Telegram availability ────────────────────────────────────────────
+        # Determine once whether the relay is usable.  ``telegram_router`` may
+        # be ``None`` (module not installed) or present but disabled (relay
+        # config missing / unreachable).  Both map to the same boolean for
+        # branching; they differ only in the log message.
+        _telegram_enabled = (
+            telegram_router is not None and telegram_router.TELEGRAM_ENABLED
+        )
 
         # AskUserQuestion takes a different shape (questions[] instead of a single
         # tool input) and resolves with `updatedInput.answers` instead of allow/deny.
+        # When Telegram is off, skip — the native terminal UI handles it.
         if tool_name == 'AskUserQuestion':
-            workspace_name = get_workspace_name(cwd)
-            decision = handle_ask_user_question(session_id, cwd, tool_input, workspace_name)
-            output = build_output_decision(decision, request=None)  # type: ignore[arg-type]
-            if output:
-                debug_log(f"AskUserQuestion returning: {json.dumps(output)[:200]}")
-                print(json.dumps(output), flush=True)
+            if _telegram_enabled:
+                workspace_name = get_workspace_name(cwd)
+                decision = handle_ask_user_question(session_id, cwd, tool_input, workspace_name)
+                output = build_output_decision(decision, request=None)  # type: ignore[arg-type]
+                if output:
+                    debug_log(f"AskUserQuestion returning: {json.dumps(output)[:200]}")
+                    print(json.dumps(output), flush=True)
+                else:
+                    debug_log("AskUserQuestion: no Telegram answer; native UI will handle")
             else:
-                debug_log("AskUserQuestion: no Telegram answer; native UI will handle")
+                debug_log("AskUserQuestion: Telegram disabled, native UI will handle")
             sys.exit(0)
 
         # Create request in state store
@@ -1599,6 +1634,9 @@ def main():
         #
         # Both sit AFTER the AskUserQuestion branch above: questions are still
         # forwarded in either mode (they ask for an answer, not a permission).
+        #
+        # Evaluated BEFORE the Telegram-disabled gate so they fire regardless of
+        # relay state — this is the §2 ordering fix (epic 29, task 29-01).
         bypass_mode = permission_mode == 'bypassPermissions'
         if session_yolo_store.is_enabled(session_id) or bypass_mode:
             reason = 'bypassPermissions' if bypass_mode else 'YOLO mode'
@@ -1617,6 +1655,25 @@ def main():
                     'decision': {'behavior': 'allow'},
                 }
             }), flush=True)
+            sys.exit(0)
+
+        # ── Telegram disabled: fall back to terminal ────────────────────────
+        # With no relay and no yolo/bypass, exit without a decision so Claude
+        # Code's own terminal prompt runs.  Distinguish "feature not installed"
+        # from "relay configured but unusable" in the log.
+        if not _telegram_enabled:
+            debug_log("Telegram not available, falling back to terminal prompt")
+            if not _TELEGRAM_ROUTER_AVAILABLE:
+                error_log(
+                    "Telegram feature not installed (telegram_permission_router "
+                    "not found); permission request will use the terminal prompt."
+                )
+            else:
+                error_log(
+                    "Telegram disabled; skipping permission-request message. "
+                    "Check ~/.config/claude-tg-relay/config.toml exists and server_url is reachable. "
+                    "Run `relay-client config init --server-url URL --token TOKEN` then `relay-client bind`."
+                )
             sys.exit(0)
 
         # Get session/workspace info for message

@@ -127,5 +127,19 @@ class TestSessionYoloStore(unittest.TestCase):
             self.assertTrue(self.store.is_enabled(sid), f"{sid} lost to a clobber")
 
 
+    # ── 29-01: yolo is independent of Telegram availability ──────────────
+
+    def test_yolo_semantics_independent_of_telegram(self):
+        """The yolo store is a pure file-backed flag with no Telegram
+        dependency. This test is a documentation guard: even when the
+        Telegram router is absent, is_enabled must still return True for a
+        session that was previously enabled."""
+        self.store.enable("offline-sess")
+        self.assertTrue(self.store.is_enabled("offline-sess"))
+        # Across a fresh reload (simulating a new hook invocation).
+        reloaded = importlib.reload(self.store)
+        self.assertTrue(reloaded.is_enabled("offline-sess"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

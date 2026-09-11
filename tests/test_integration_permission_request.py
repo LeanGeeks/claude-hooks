@@ -4501,5 +4501,276 @@ class TestSignalHandler(unittest.TestCase):
                          "handler must be armed exactly once (3 signals × 1)")
 
 
+# ── 29-01: local-mode (no Telegram) tests ─────────────────────────────────────
+
+class TestImportWithoutTelegramRouter(unittest.TestCase):
+    """The hook must import cleanly when telegram_permission_router and
+    roles_config are both absent (permission-hooks-only machine)."""
+
+    def test_import_succeeds_without_router(self):
+        """Hide telegram_permission_router and roles_config; reimport the hook."""
+        import importlib
+        import shutil
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            hooks_dir = os.path.realpath(
+                str(Path(__file__).parent.parent / ".claude" / "hooks")
+            )
+            for f in os.listdir(hooks_dir):
+                if f in (
+                    "telegram_permission_router.py",
+                    "roles_config.py",
+                    "posttool_hook.py",
+                    "reply_injector.py",
+                ):
+                    continue
+                src = os.path.join(hooks_dir, f)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(tmpdir, f))
+
+            # Replace sys.path: drop every entry where telegram_permission_router
+            # is importable, so the import cannot find the real module.  This
+            # covers both the repo copy and the installed ~/.claude/hooks/ copy.
+            saved_path = sys.path[:]
+            sys.path[:] = [
+                p for p in saved_path
+                if not os.path.isfile(os.path.join(p, "telegram_permission_router.py"))
+            ]
+            sys.path.insert(0, tmpdir)
+
+            # Purge cached modules so the reimport picks up the tmp dir.
+            purged = {}
+            for name in list(sys.modules):
+                if any(k in name for k in (
+                    "telegram_permission_router",
+                    "roles_config",
+                    "permission_request_hook",
+                    "permission_state_store",
+                    "session_yolo_store",
+                    "settings_writer",
+                )):
+                    purged[name] = sys.modules.pop(name)
+
+            try:
+                mod = importlib.import_module("permission_request_hook")
+                self.assertFalse(mod._TELEGRAM_ROUTER_AVAILABLE)
+                self.assertIsNone(mod.telegram_router)
+            finally:
+                # Restore everything.
+                sys.path[:] = saved_path
+                sys.modules.update(purged)
+        finally:
+            shutil.rmtree(tmpdir)
+
+
+class TestLocalModeAutoAllow(unittest.TestCase):
+    """29-01 §2 ordering fix: auto-allow paths fire even when the relay is off.
+
+    Three scenarios: router absent, router present but TELEGRAM_ENABLED=False,
+    and the no-yolo/no-bypass fallback (exit 0, no decision).
+    """
+
+    def _run_main(self, payload, *, yolo=False, bypass=False,
+                  telegram_enabled=False, router_available=True):
+        """Drive main() and return (exit_code, printed_lines, mocks)."""
+        request = _make_request(
+            request_id="local-req",
+            session_id=payload["session_id"],
+            tool_input=payload["tool_input"],
+        )
+        printed = []
+
+        def _set_telegram():
+            if router_available:
+                permission_request_hook.telegram_router.TELEGRAM_ENABLED = telegram_enabled
+            # If router not available, telegram_router is already mocked to None below.
+
+        patches = [
+            patch("permission_request_hook.cleanup_expired_requests"),
+            patch("permission_request_hook.sweep_orphaned_requests", return_value=[]),
+            patch("permission_request_hook.session_yolo_store.prune"),
+            patch("permission_request_hook.session_yolo_store.is_enabled",
+                  return_value=yolo),
+            patch("permission_request_hook.create_request", return_value=request),
+            patch("permission_request_hook.update_request_state"),
+            patch("permission_request_hook.send_permission_message",
+                  return_value=12345),
+            patch("permission_request_hook.wait_for_response",
+                  return_value={"action": "allow"}),
+            patch("permission_request_hook.handle_ask_user_question",
+                  return_value=None),
+            patch("permission_request_hook.time.sleep"),
+            patch("permission_request_hook.load_telegram_config",
+                  side_effect=_set_telegram),
+            patch("sys.stdin", io.StringIO(json.dumps(payload))),
+            patch("builtins.print",
+                  side_effect=lambda *a, **kw: printed.append(a[0] if a else "")),
+        ]
+        if not router_available:
+            patches.append(
+                patch.object(permission_request_hook, "telegram_router", None)
+            )
+            patches.append(
+                patch.object(permission_request_hook, "_TELEGRAM_ROUTER_AVAILABLE", False)
+            )
+
+        mock_refs = {}
+
+        # Enter all patches.
+        entered = []
+        for p in patches:
+            m = p.__enter__()
+            entered.append(p)
+            # Capture interesting mocks by their attribute name.
+            if hasattr(p, "attribute"):
+                if p.attribute == "update_request_state":
+                    mock_refs["update"] = m
+                elif p.attribute == "send_permission_message":
+                    mock_refs["send"] = m
+
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                permission_request_hook.main()
+        finally:
+            for p in reversed(entered):
+                p.__exit__(None, None, None)
+
+        return ctx.exception.code, printed, mock_refs
+
+    @staticmethod
+    def _payload(**overrides):
+        base = {
+            "session_id": "local-session",
+            "cwd": "/tmp/workspace",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+            "permission_suggestions": [],
+            "permission_mode": "",
+        }
+        base.update(overrides)
+        return base
+
+    # ── Router absent ──────────────────────────────────────────────────────
+
+    def test_router_absent_yolo_auto_allows(self):
+        code, printed, mocks = self._run_main(
+            self._payload(), yolo=True, router_available=False,
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(printed, "should have printed an allow decision")
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow",
+        )
+        mocks["update"].assert_called_once()
+        _args, _kwargs = mocks["update"].call_args
+        self.assertEqual(_args[1], RequestState.ALLOW)
+
+    def test_router_absent_bypass_auto_allows(self):
+        code, printed, mocks = self._run_main(
+            self._payload(permission_mode="bypassPermissions"),
+            router_available=False,
+        )
+        self.assertEqual(code, 0)
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow",
+        )
+        mocks["update"].assert_called_once()
+        _args, _kwargs = mocks["update"].call_args
+        self.assertEqual(_args[1], RequestState.ALLOW)
+
+    def test_router_absent_no_yolo_no_bypass_exits_without_decision(self):
+        code, printed, mocks = self._run_main(
+            self._payload(), router_available=False,
+        )
+        self.assertEqual(code, 0)
+        # No JSON output — exit 0 with nothing printed means "use terminal".
+        json_lines = [l for l in printed if l and l.strip().startswith("{")]
+        self.assertEqual(json_lines, [], "should emit no decision JSON")
+        # Invariant 1: no path fabricates a decision — update_request_state must
+        # NOT be called when the hook exits without resolving the request.
+        self.assertEqual(mocks.get("update").call_count, 0)
+
+    # ── Router present, TELEGRAM_ENABLED=False (regression for §2) ─────────
+
+    def test_router_present_disabled_yolo_auto_allows(self):
+        """Regression: this fails on main before the §2 ordering fix."""
+        code, printed, mocks = self._run_main(
+            self._payload(), yolo=True,
+            telegram_enabled=False, router_available=True,
+        )
+        self.assertEqual(code, 0)
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow",
+        )
+        mocks["update"].assert_called_once()
+        _args, _kwargs = mocks["update"].call_args
+        self.assertEqual(_args[1], RequestState.ALLOW)
+
+    def test_router_present_disabled_bypass_auto_allows(self):
+        """Regression: this fails on main before the §2 ordering fix."""
+        code, printed, mocks = self._run_main(
+            self._payload(permission_mode="bypassPermissions"),
+            telegram_enabled=False, router_available=True,
+        )
+        self.assertEqual(code, 0)
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow",
+        )
+        mocks["update"].assert_called_once()
+        _args, _kwargs = mocks["update"].call_args
+        self.assertEqual(_args[1], RequestState.ALLOW)
+
+    # ── AskUserQuestion with Telegram disabled ─────────────────────────────
+
+    def test_ask_user_question_telegram_disabled_falls_back_to_terminal(self):
+        """AskUserQuestion with Telegram off exits 0 with no decision."""
+        code, printed, _mocks = self._run_main(
+            self._payload(
+                tool_name="AskUserQuestion",
+                tool_input={"questions": [{"question": "which?", "options": []}]},
+            ),
+            telegram_enabled=False, router_available=True,
+        )
+        self.assertEqual(code, 0)
+        json_lines = [l for l in printed if l and l.strip().startswith("{")]
+        self.assertEqual(json_lines, [], "should emit no decision JSON")
+
+    # ── Distinct log lines ─────────────────────────────────────────────────
+
+    def test_log_line_router_not_installed(self):
+        """'Not installed' log differs from 'configured but unusable'."""
+        logged = []
+        with patch.object(permission_request_hook, "error_log",
+                          side_effect=lambda m: logged.append(m)):
+            self._run_main(self._payload(), router_available=False)
+        self.assertTrue(
+            any("not installed" in m.lower() or "not found" in m.lower() for m in logged),
+            f"expected 'not installed' log line, got: {logged}",
+        )
+        self.assertFalse(
+            any("relay-client config init" in m for m in logged),
+            "should not advise relay-client config init when module is absent",
+        )
+
+    def test_log_line_relay_configured_but_unusable(self):
+        logged = []
+        with patch.object(permission_request_hook, "error_log",
+                          side_effect=lambda m: logged.append(m)):
+            self._run_main(
+                self._payload(),
+                telegram_enabled=False, router_available=True,
+            )
+        self.assertTrue(
+            any("relay-client config init" in m for m in logged),
+            f"expected relay config advice, got: {logged}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
