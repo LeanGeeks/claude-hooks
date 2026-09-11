@@ -368,8 +368,8 @@ feature_telegram_install() {
         if [[ -d "$user_bin_dir" ]]; then
             case ":$PATH:" in
                 *":$user_bin_dir:"*)
-                    ln -sf "$claude_shell_dir/claude-roles" "$user_bin_dir/claude-roles"
-                    log_info "  Symlinked: $user_bin_dir/claude-roles → $claude_shell_dir/claude-roles"
+                    ext_symlink_add "$claude_shell_dir/claude-roles" "$user_bin_dir/claude-roles"
+                    log_info "  Symlinked: $user_bin_dir/claude-roles -> $claude_shell_dir/claude-roles"
                     ;;
             esac
         fi
@@ -850,8 +850,8 @@ feature_questions_install() {
         if [[ -d "$user_bin_dir" ]]; then
             case ":$PATH:" in
                 *":$user_bin_dir:"*)
-                    ln -sf "$claude_shell_dir/claude-questions" "$user_bin_dir/claude-questions"
-                    log_info "  Symlinked: $user_bin_dir/claude-questions → $claude_shell_dir/claude-questions"
+                    ext_symlink_add "$claude_shell_dir/claude-questions" "$user_bin_dir/claude-questions"
+                    log_info "  Symlinked: $user_bin_dir/claude-questions -> $claude_shell_dir/claude-questions"
                     ;;
             esac
         fi
@@ -867,8 +867,8 @@ feature_questions_install() {
         chmod +x "$claude_bin_dir/questions-listen"
         log_info "Installed: questions-listen → $claude_bin_dir/questions-listen"
         if [[ -d "$user_bin_dir" ]]; then
-            ln -sf "$claude_bin_dir/questions-listen" "$user_bin_dir/questions-listen"
-            log_info "  Symlinked: $user_bin_dir/questions-listen → $claude_bin_dir/questions-listen"
+            ext_symlink_add "$claude_bin_dir/questions-listen" "$user_bin_dir/questions-listen"
+            log_info "  Symlinked: $user_bin_dir/questions-listen -> $claude_bin_dir/questions-listen"
             QUESTIONS_LISTEN_INSTALLED=true
         else
             log_warn "  $user_bin_dir does not exist — questions-listen not on PATH"
@@ -888,7 +888,7 @@ feature_questions_uninstall() {
 
 # Sub-toggle probe: questions-listen (systemd unit enabled)
 feature_questions_listen_probe() {
-    systemctl --user is-enabled "claude-questions-listen.service" >/dev/null 2>&1
+    ext_systemd_is_enabled "claude-questions-listen.service"
 }
 
 # ---------------------------------------------------------------------------
@@ -902,8 +902,10 @@ feature_daily_review_modules()    { echo ""; }
 feature_daily_review_suboptions() { echo "daily-review-cron"; }
 
 feature_daily_review_probe() {
-    # No files installed — check for the cron marker as a proxy
-    crontab -l 2>/dev/null | grep -q "claude-hooks:daily-review" 2>/dev/null
+    # No files installed — the only artifact is the daily-review-cron sub-toggle
+    # line. Use that marker; checking "daily-review" would false-positive against
+    # "daily-review-cron" because ext_cron_has_marker uses substring grep -Fq.
+    ext_cron_has_marker "daily-review-cron"
 }
 
 feature_daily_review_install() {
@@ -920,7 +922,7 @@ feature_daily_review_uninstall() {
 
 # Sub-toggle probe: daily-review-cron
 feature_daily_review_cron_probe() {
-    crontab -l 2>/dev/null | grep -q "# claude-hooks:daily-review-cron" 2>/dev/null
+    ext_cron_has_marker "daily-review-cron"
 }
 
 # =============================================================================
@@ -1132,63 +1134,9 @@ _install_modules() {
 # =============================================================================
 
 _install_tmux_options() {
-    local tmux_conf="$HOME/.tmux.conf"
-    local tmux_marker="# Added by claude-hooks install-claude-config.sh (tmux options for amux-spawned Claude sessions)"
-    local tmux_lines=(
-        "set -g focus-events on"
-        "set -g set-titles on"
-        "set -g set-titles-string '#{pane_title}'"
-    )
-
-    local tmux_missing=() line
-    for line in "${tmux_lines[@]}"; do
-        if [[ -f "$tmux_conf" ]] && grep -Fxq "$line" "$tmux_conf"; then
-            continue
-        fi
-        tmux_missing+=("$line")
-    done
-
-    if [[ ${#tmux_missing[@]} -eq 0 ]]; then
-        log_info "tmux options already present in $tmux_conf — leaving as is"
-        TMUX_FILE_STATUS="already present"
-    else
-        if [[ -f "$tmux_conf" ]]; then
-            mkdir -p "$BACKUP_DIR"
-            local tmux_backup="$BACKUP_DIR/tmux.conf.$(date +%Y%m%d_%H%M%S).bak"
-            cp "$tmux_conf" "$tmux_backup"
-            log_info "Backup created: $tmux_backup"
-        fi
-        {
-            [[ -s "$tmux_conf" ]] && echo ""
-            echo "$tmux_marker"
-            for line in "${tmux_missing[@]}"; do echo "$line"; done
-        } >> "$tmux_conf"
-        log_info "Added ${#tmux_missing[@]} tmux option line(s) to $tmux_conf"
-        TMUX_FILE_STATUS="updated (${#tmux_missing[@]} line(s) added)"
-    fi
-
-    # Apply to running tmux server if present
-    if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
-        declare -A tmux_want=(
-            [focus-events]="on"
-            [set-titles]="on"
-            [set-titles-string]="#{pane_title}"
-        )
-        local tmux_set=0 tmux_already=0 tmux_failed=0 opt cur
-        for opt in focus-events set-titles set-titles-string; do
-            cur="$(tmux show -gv "$opt" 2>/dev/null || true)"
-            if [[ "$cur" == "${tmux_want[$opt]}" ]]; then
-                tmux_already=$((tmux_already + 1))
-            elif tmux set -g "$opt" "${tmux_want[$opt]}" 2>/dev/null; then
-                tmux_set=$((tmux_set + 1))
-            else
-                log_warn "Could not set tmux option '$opt' on the running server"
-                tmux_failed=$((tmux_failed + 1))
-            fi
-        done
-        log_info "Running tmux server: set $tmux_set, already-correct $tmux_already, failed $tmux_failed"
-        TMUX_LIVE_STATUS="set $tmux_set, already $tmux_already, failed $tmux_failed"
-    fi
+    # Delegates to ext_tmux_apply (§8 seam). All tmux-related writes and live
+    # server mutations go through the seam function.
+    ext_tmux_apply
 }
 
 # =============================================================================
@@ -1219,13 +1167,16 @@ RestartSec=5
 WantedBy=default.target
 EOF
     log_info "Installed systemd unit: $systemd_user_dir/$questions_listen_service_name"
-    systemctl --user daemon-reload 2>/dev/null || true
+    # daemon-reload so the new unit is visible; systemctl escapes HOME → via seam.
+    ext_systemd_daemon_reload
 
     # Opt-in check: enable only when config.toml carries [questions_listen] enabled = true
+    # (architecture §8.4: enable and loginctl enable-linger are the sub-toggle
+    # actions. 29-09 will migrate the config.toml check to the manifest sub-toggle flag.)
     local relay_config_toml="$HOME/.config/claude-tg-relay/config.toml"
     local questions_listen_opted_in=false
     if [[ -f "$relay_config_toml" ]]; then
-        if python3 - "$relay_config_toml" << 'PYEOF' 2>/dev/null
+        if python3 - "$relay_config_toml" <<'PYEOF' 2>/dev/null
 import sys, tomllib
 with open(sys.argv[1], "rb") as fh:
     raw = tomllib.load(fh)
@@ -1238,17 +1189,555 @@ PYEOF
     fi
 
     if [[ "$questions_listen_opted_in" == true ]]; then
-        if systemctl --user enable "$questions_listen_service_name" 2>/dev/null; then
-            log_info "Enabled: $questions_listen_service_name"
-            QUESTIONS_LISTEN_SERVICE_ENABLED=true
-        fi
-        if command -v loginctl >/dev/null 2>&1; then
-            loginctl enable-linger "$(id -un)" 2>/dev/null || true
-            log_info "loginctl enable-linger: applied"
-        fi
+        # enable + loginctl enable-linger both escape HOME → via seam.
+        ext_systemd_enable "$questions_listen_service_name"
     else
         log_info "questions-listen not enabled (add [questions_listen] enabled = true to config.toml to opt in)"
     fi
+}
+
+# =============================================================================
+# §8. EXTERNAL-SURFACE SEAM
+# =============================================================================
+# Every function in this section honours CLAUDE_INSTALL_NO_EXTERNAL=1 by
+# logging what it would do and returning success without doing it. This is the
+# safety boundary of the epic (cross-task invariant 5): no code outside these
+# functions may invoke crontab, systemctl, loginctl, "tmux set", ln -s, or
+# another installer script. A source-level grep test in
+# tests/test_unit_installer.py enforces this invariant.
+#
+# Marker format (architecture §8.1):
+#   # claude-hooks:<id>  (install.sh — remove with: disable <id>)
+#   <managed line>
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# §8.2 ~/.bashrc
+# ---------------------------------------------------------------------------
+
+# _bashrc_exclusive_of <id>
+# Returns the marker id that is mutually exclusive with <id>, or empty string.
+_bashrc_exclusive_of() {
+    case "$1" in
+        amux-autowrap)       echo "profiles-autosource" ;;
+        profiles-autosource) echo "amux-autowrap" ;;
+        *)                   echo "" ;;
+    esac
+}
+
+# ext_bashrc_add <marker-id> <line>
+# Appends a marked line to ~/.bashrc. Idempotent (exact-match marker).
+# Backs up before any edit. Enforces mutual exclusion between amux-autowrap
+# and profiles-autosource (architecture §2, §8.2). Absent ~/.bashrc → warn
+# and skip; never creates it (the snippets are bash-only; absent bashrc
+# usually means a different shell).
+ext_bashrc_add() {
+    local id="$1" line="$2"
+    local marker="# claude-hooks:${id}  (install.sh — remove with: disable ${id})"
+    local bashrc="$HOME/.bashrc"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_bashrc_add: would add '${id}' to ~/.bashrc: ${line}"
+        return 0
+    fi
+
+    if [[ ! -f "$bashrc" ]]; then
+        log_warn "ext_bashrc_add: ~/.bashrc absent — skipping '${id}' (different shell?)"
+        return 0
+    fi
+
+    # Idempotency: marker already present
+    if grep -Fxq "$marker" "$bashrc" 2>/dev/null; then
+        log_info "ext_bashrc_add: '${id}' already in ~/.bashrc — no-op"
+        return 0
+    fi
+
+    # Mutual exclusion: remove conflicting marker before adding ours
+    local excl
+    excl="$(_bashrc_exclusive_of "$id")"
+    if [[ -n "$excl" ]]; then
+        local excl_marker="# claude-hooks:${excl}  (install.sh — remove with: disable ${excl})"
+        if grep -Fxq "$excl_marker" "$bashrc" 2>/dev/null; then
+            log_info "ext_bashrc_add: removing conflicting '${excl}' before adding '${id}' (mutual exclusion)"
+            ext_bashrc_remove "$excl"
+        fi
+    fi
+
+    # Backup before edit
+    mkdir -p "$BACKUP_DIR"
+    local bak="$BACKUP_DIR/bashrc.$(date +%Y%m%d_%H%M%S).bak"
+    cp "$bashrc" "$bak"
+    log_info "Backup created: $bak"
+
+    # Append blank separator (if file non-empty), marker, managed line
+    {
+        [[ -s "$bashrc" ]] && echo ""
+        echo "$marker"
+        echo "$line"
+    } >> "$bashrc"
+    log_info "ext_bashrc_add: added '${id}' to ~/.bashrc"
+}
+
+# ext_bashrc_remove <marker-id>
+# Removes the marker and the single managed line following it from ~/.bashrc.
+# No-op (with message) if marker not found. Backs up before edit.
+ext_bashrc_remove() {
+    local id="$1"
+    local marker="# claude-hooks:${id}  (install.sh — remove with: disable ${id})"
+    local bashrc="$HOME/.bashrc"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_bashrc_remove: would remove '${id}' from ~/.bashrc"
+        return 0
+    fi
+
+    if [[ ! -f "$bashrc" ]]; then
+        log_info "ext_bashrc_remove: ~/.bashrc absent — nothing to remove for '${id}'"
+        return 0
+    fi
+
+    if ! grep -Fxq "$marker" "$bashrc" 2>/dev/null; then
+        log_info "ext_bashrc_remove: '${id}' marker not found in ~/.bashrc — no-op"
+        return 0
+    fi
+
+    # Backup before edit
+    mkdir -p "$BACKUP_DIR"
+    cp "$bashrc" "$BACKUP_DIR/bashrc.$(date +%Y%m%d_%H%M%S).bak"
+
+    # Remove the marker line and the managed line following it.
+    # Also strips a preceding blank line if we added one.
+    python3 - "$bashrc" "$marker" <<'PYEOF'
+import sys
+path, marker = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    lines = fh.readlines()
+out = []
+skip_next = False
+for line in lines:
+    if skip_next:
+        skip_next = False
+        continue
+    if line.rstrip('\n') == marker:
+        skip_next = True
+        # Strip preceding blank line added by ext_bashrc_add
+        if out and out[-1] == '\n':
+            out.pop()
+        continue
+    out.append(line)
+with open(path, 'w') as fh:
+    fh.writelines(out)
+PYEOF
+    log_info "ext_bashrc_remove: removed '${id}' from ~/.bashrc"
+}
+
+# ---------------------------------------------------------------------------
+# §8.3 crontab
+# ---------------------------------------------------------------------------
+
+# ext_cron_has_marker <marker-id>
+# Read-only probe: exits 0 if the marker is present in the crontab, 1 otherwise.
+# With CLAUDE_INSTALL_NO_EXTERNAL=1: logs and returns 1 (never ran = not present).
+ext_cron_has_marker() {
+    local id="$1"
+    local marker="# claude-hooks:${id}"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_cron_has_marker: would check crontab for '${id}'"
+        return 1
+    fi
+
+    crontab -l 2>/dev/null | grep -Fq "$marker"
+}
+
+# ext_cron_add <marker-id> <line>
+# Adds a marked cron line. Idempotent. Saves crontab to $BACKUP_DIR first.
+# Handles: no crontab (normal), unrelated lines (preserved), an existing
+# unmarked line whose command matches ours (adopted — marker added above it).
+# Never calls crontab -r under any circumstance.
+ext_cron_add() {
+    local id="$1" line="$2"
+    local marker="# claude-hooks:${id}  (install.sh — remove with: disable ${id})"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_cron_add: would add cron entry '${id}': ${line}"
+        return 0
+    fi
+
+    local current_crontab
+    current_crontab="$(crontab -l 2>/dev/null || true)"
+
+    # Idempotency: marker already present
+    if printf '%s\n' "$current_crontab" | grep -Fxq "$marker"; then
+        log_info "ext_cron_add: '${id}' already in crontab — no-op"
+        return 0
+    fi
+
+    # Backup before any edit
+    mkdir -p "$BACKUP_DIR"
+    local cron_backup="$BACKUP_DIR/crontab.$(date +%Y%m%d_%H%M%S).bak"
+    printf '%s\n' "$current_crontab" > "$cron_backup"
+    log_info "Crontab backup created: $cron_backup"
+
+    # Extract the command part (field 6+) of our desired line for adopt detection.
+    local cmd_part
+    cmd_part="$(printf '%s\n' "$line" | awk '{out=""; for(i=6;i<=NF;i++) out=out (i>6?" ":"") $i; print out}')"
+
+    # Check for an existing unmarked line with matching command (adopt it).
+    if [[ -n "$cmd_part" ]] && printf '%s\n' "$current_crontab" | grep -qF "$cmd_part"; then
+        log_info "ext_cron_add: adopting existing unmarked cron line for '${id}'"
+        # Insert marker before the matching non-comment line.
+        printf '%s\n' "$current_crontab" | python3 -c "
+import sys
+marker, cmd_part = sys.argv[1], sys.argv[2]
+for raw in sys.stdin:
+    s = raw.rstrip('\n')
+    if cmd_part and cmd_part in s and not s.lstrip().startswith('#'):
+        print(marker)
+    print(s)
+" "$marker" "$cmd_part" | crontab -
+    else
+        # Append: existing lines + blank separator + marker + new cron line
+        {
+            printf '%s\n' "$current_crontab"
+            [[ -n "$current_crontab" ]] && echo ""
+            echo "$marker"
+            echo "$line"
+        } | crontab -
+    fi
+    log_info "ext_cron_add: added cron entry '${id}'"
+}
+
+# ext_cron_remove <marker-id>
+# Removes the marker comment line and the cron line following it.
+# No-op if marker not found. Never calls crontab -r.
+ext_cron_remove() {
+    local id="$1"
+    local marker="# claude-hooks:${id}  (install.sh — remove with: disable ${id})"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_cron_remove: would remove cron entry '${id}'"
+        return 0
+    fi
+
+    local current_crontab
+    current_crontab="$(crontab -l 2>/dev/null || true)"
+
+    if ! printf '%s\n' "$current_crontab" | grep -Fxq "$marker"; then
+        log_info "ext_cron_remove: '${id}' marker not found in crontab — no-op"
+        return 0
+    fi
+
+    # Backup before edit
+    mkdir -p "$BACKUP_DIR"
+    printf '%s\n' "$current_crontab" > "$BACKUP_DIR/crontab.$(date +%Y%m%d_%H%M%S).bak"
+
+    # Remove marker line and the cron line following it.
+    # We write the crontab to a temp file (python3 - reads its script from stdin,
+    # so we can't pipe both the script and the data through stdin simultaneously).
+    # Write the filtered result back via crontab - (never crontab -r, even if empty).
+    local _cron_tmp
+    _cron_tmp="$(mktemp)"
+    printf '%s\n' "$current_crontab" > "$_cron_tmp"
+
+    local _filtered
+    _filtered="$(python3 - "$_cron_tmp" "$marker" <<'PYEOF'
+import sys
+path, marker = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    lines = fh.readlines()
+out = []
+skip_next = False
+for line in lines:
+    if skip_next:
+        skip_next = False
+        continue
+    if line.rstrip('\n') == marker:
+        skip_next = True
+        if out and out[-1] == '\n':
+            out.pop()
+        continue
+    out.append(line)
+sys.stdout.write(''.join(out))
+PYEOF
+)"
+    rm -f "$_cron_tmp"
+
+    printf '%s' "$_filtered" | crontab -
+    log_info "ext_cron_remove: removed cron entry '${id}'"
+}
+
+# ---------------------------------------------------------------------------
+# §8 tmux
+# ---------------------------------------------------------------------------
+
+# ext_tmux_apply
+# Writes the amux tmux options to ~/.tmux.conf (persistent) and applies them
+# to any running server (live). Both halves are idempotent.
+# ~/.tmux.conf is under HOME so the file write is safe with a HOME override;
+# "tmux set -g" mutates the running server and is gated by NO_EXTERNAL.
+# NOTE on the legacy marker: machines installed before 29-03 have
+#   "# Added by claude-hooks install-claude-config.sh (...)"
+# as their marker. ext_tmux_remove targets the new marker only; 29-09
+# handles migration of the old one.
+ext_tmux_apply() {
+    local tmux_conf="$HOME/.tmux.conf"
+    local marker="# claude-hooks:amux-tmux-options  (install.sh — remove with: uninstall amux)"
+    local tmux_lines=(
+        "set -g focus-events on"
+        "set -g set-titles on"
+        "set -g set-titles-string '#{pane_title}'"
+    )
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_tmux_apply: would write ~/.tmux.conf and apply live tmux options"
+        TMUX_FILE_STATUS="skipped (no-external)"
+        TMUX_LIVE_STATUS="skipped (no-external)"
+        return 0
+    fi
+
+    # --- Persistent ~/.tmux.conf ---
+    local tmux_missing=() line
+    for line in "${tmux_lines[@]}"; do
+        if [[ -f "$tmux_conf" ]] && grep -Fxq "$line" "$tmux_conf"; then
+            continue
+        fi
+        tmux_missing+=("$line")
+    done
+
+    if [[ ${#tmux_missing[@]} -eq 0 ]]; then
+        log_info "tmux options already present in $tmux_conf — leaving as is"
+        TMUX_FILE_STATUS="already present"
+    else
+        if [[ -f "$tmux_conf" ]]; then
+            mkdir -p "$BACKUP_DIR"
+            local tmux_backup="$BACKUP_DIR/tmux.conf.$(date +%Y%m%d_%H%M%S).bak"
+            cp "$tmux_conf" "$tmux_backup"
+            log_info "Backup created: $tmux_backup"
+        fi
+        {
+            [[ -s "$tmux_conf" ]] && echo ""
+            echo "$marker"
+            for line in "${tmux_missing[@]}"; do echo "$line"; done
+        } >> "$tmux_conf"
+        log_info "Added ${#tmux_missing[@]} tmux option line(s) to $tmux_conf"
+        TMUX_FILE_STATUS="updated (${#tmux_missing[@]} line(s) added)"
+    fi
+
+    # --- Live tmux server (escapes HOME — gated above) ---
+    if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
+        local -A _tmux_want=(
+            [focus-events]="on"
+            [set-titles]="on"
+            [set-titles-string]="#{pane_title}"
+        )
+        local tmux_set=0 tmux_already=0 tmux_failed=0 opt cur
+        for opt in focus-events set-titles set-titles-string; do
+            cur="$(tmux show -gv "$opt" 2>/dev/null || true)"
+            if [[ "$cur" == "${_tmux_want[$opt]}" ]]; then
+                tmux_already=$((tmux_already + 1))
+            elif tmux set -g "$opt" "${_tmux_want[$opt]}" 2>/dev/null; then
+                tmux_set=$((tmux_set + 1))
+            else
+                log_warn "Could not set tmux option '$opt' on the running server"
+                tmux_failed=$((tmux_failed + 1))
+            fi
+        done
+        log_info "Running tmux server: set $tmux_set, already-correct $tmux_already, failed $tmux_failed"
+        TMUX_LIVE_STATUS="set $tmux_set, already $tmux_already, failed $tmux_failed"
+    fi
+}
+
+# ext_tmux_remove
+# Removes the claude-hooks:amux-tmux-options block from ~/.tmux.conf.
+# NOTE: The live 'tmux set -g' options are NOT reverted — a running server's
+# options belong to that server. The uninstall summary should inform the user.
+ext_tmux_remove() {
+    local tmux_conf="$HOME/.tmux.conf"
+    local marker="# claude-hooks:amux-tmux-options  (install.sh — remove with: uninstall amux)"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_tmux_remove: would remove amux-tmux-options block from ~/.tmux.conf"
+        return 0
+    fi
+
+    if [[ ! -f "$tmux_conf" ]]; then
+        log_info "ext_tmux_remove: ~/.tmux.conf absent — nothing to remove"
+        return 0
+    fi
+
+    if ! grep -Fxq "$marker" "$tmux_conf"; then
+        log_info "ext_tmux_remove: amux-tmux-options marker not found in ~/.tmux.conf — no-op"
+        return 0
+    fi
+
+    # Backup before edit
+    mkdir -p "$BACKUP_DIR"
+    cp "$tmux_conf" "$BACKUP_DIR/tmux.conf.$(date +%Y%m%d_%H%M%S).bak"
+
+    # Remove the marker line and all "set -g ..." lines following it.
+    # Also strips a preceding blank separator line added by ext_tmux_apply.
+    python3 - "$tmux_conf" "$marker" <<'PYEOF'
+import sys
+path, marker = sys.argv[1], sys.argv[2]
+with open(path) as fh:
+    lines = fh.readlines()
+out = []
+i = 0
+while i < len(lines):
+    if lines[i].rstrip('\n') == marker:
+        # Skip marker and all following "set -g" lines
+        i += 1
+        while i < len(lines) and lines[i].startswith('set -g'):
+            i += 1
+        # Strip preceding blank separator
+        if out and out[-1] == '\n':
+            out.pop()
+    else:
+        out.append(lines[i])
+        i += 1
+with open(path, 'w') as fh:
+    fh.writelines(out)
+PYEOF
+    log_info "ext_tmux_remove: removed amux-tmux-options block from ~/.tmux.conf"
+    log_info "NOTE: live tmux options (focus-events, set-titles) were not reverted on the running server"
+}
+
+# ---------------------------------------------------------------------------
+# §8.4 systemd
+# ---------------------------------------------------------------------------
+
+# ext_systemd_daemon_reload
+# Runs 'systemctl --user daemon-reload'. Called after writing a unit file.
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL (systemctl escapes HOME).
+ext_systemd_daemon_reload() {
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_systemd_daemon_reload: would run systemctl --user daemon-reload"
+        return 0
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+    log_info "systemctl --user daemon-reload: done"
+}
+
+# ext_systemd_enable <unit>
+# Enables a systemd user unit (without --now) and runs loginctl enable-linger.
+# Called only when the questions-listen sub-toggle is on (architecture §8.4).
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL.
+ext_systemd_enable() {
+    local unit="$1"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_systemd_enable: would enable ${unit} and loginctl enable-linger"
+        return 0
+    fi
+
+    if systemctl --user enable "$unit" 2>/dev/null; then
+        log_info "Enabled: $unit"
+        QUESTIONS_LISTEN_SERVICE_ENABLED=true
+    else
+        log_warn "systemctl --user enable $unit failed"
+    fi
+
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl enable-linger "$(id -un)" 2>/dev/null || true
+        log_info "loginctl enable-linger: applied"
+    fi
+}
+
+# ext_systemd_disable <unit>
+# Disables a systemd user unit.
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL.
+ext_systemd_disable() {
+    local unit="$1"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_systemd_disable: would disable ${unit}"
+        return 0
+    fi
+
+    systemctl --user disable "$unit" 2>/dev/null || true
+    log_info "Disabled: $unit"
+}
+
+# ext_systemd_is_enabled <unit>
+# Read-only probe: exits 0 if the unit is currently enabled, 1 otherwise.
+# With CLAUDE_INSTALL_NO_EXTERNAL=1: logs and returns 1 (never enabled = false).
+ext_systemd_is_enabled() {
+    local unit="$1"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_systemd_is_enabled: would check systemctl --user is-enabled ${unit}"
+        return 1
+    fi
+
+    systemctl --user is-enabled "$unit" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# §8 symlinks
+# ---------------------------------------------------------------------------
+
+# ext_symlink_add <target> <link>
+# Creates a symlink at <link> pointing to <target> (ln -sf).
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL.
+ext_symlink_add() {
+    local target="$1" link="$2"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_symlink_add: would create symlink ${link} -> ${target}"
+        return 0
+    fi
+
+    ln -sf "$target" "$link"
+    log_info "Symlinked: $link -> $target"
+}
+
+# ext_symlink_remove <link>
+# Removes a symlink. No-op if <link> is not a symlink.
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL.
+ext_symlink_remove() {
+    local link="$1"
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_symlink_remove: would remove symlink ${link}"
+        return 0
+    fi
+
+    if [[ -L "$link" ]]; then
+        rm -f "$link"
+        log_info "Removed symlink: $link"
+    else
+        log_info "ext_symlink_remove: ${link} is not a symlink — no-op"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# §8 sub-installer
+# ---------------------------------------------------------------------------
+
+# ext_run_installer <script> [args...]
+# Wraps install-amux.sh. Delegates elevation entirely (install-amux.sh already
+# implements the full privilege ladder including a 900 s interactive wait —
+# brd constraint 2.6). No re-prompt, no output wrapping, no timeout added here.
+# Gated by CLAUDE_INSTALL_NO_EXTERNAL.
+ext_run_installer() {
+    local script="$1"
+    shift
+
+    if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
+        log_info "[NO_EXTERNAL] ext_run_installer: would run ${script} $*"
+        return 0
+    fi
+
+    if [[ ! -x "$script" ]]; then
+        log_error "ext_run_installer: ${script} is not executable"
+        return 1
+    fi
+
+    "$script" "$@"
+    local rc=$?
+    [[ $rc -ne 0 ]] && log_warn "ext_run_installer: ${script} exited with status $rc"
+    return $rc
 }
 
 # =============================================================================
