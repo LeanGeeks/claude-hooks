@@ -530,6 +530,14 @@ feature_profiles_install() {
     else
         log_warn "Shell snippet not found at $profiles_snippet_src — skipping"
     fi
+
+    # Sub-toggle: profiles-autosource (29-06 §1 / brd D16)
+    # Apply the ~/.bashrc line when the sub-toggle is enabled in the plan.
+    if [[ "${FEATURE_SUBOPTION_STATES[profiles-autosource]:-false}" == "true" ]]; then
+        ext_bashrc_add "profiles-autosource" \
+            "source \"$HOME/.claude/shell/claude-profiles.bash\""
+        log_info "profiles-autosource: added source line to ~/.bashrc"
+    fi
 }
 
 feature_profiles_uninstall() {
@@ -673,6 +681,14 @@ feature_amux_install() {
         echo "  │     claude.bashrc.                                                   │"
         echo "  └─────────────────────────────────────────────────────────────────────┘"
         echo ""
+    fi
+
+    # Sub-toggle: amux-autowrap (29-06 §1 / brd D16)
+    # Apply the ~/.bashrc line when the sub-toggle is enabled in the plan.
+    if [[ "${FEATURE_SUBOPTION_STATES[amux-autowrap]:-false}" == "true" ]]; then
+        ext_bashrc_add "amux-autowrap" \
+            "source \"$HOME/.claude/shell/amux-spawn.bash\""
+        log_info "amux-autowrap: added source line to ~/.bashrc"
     fi
 
     # tmux options (focus-events, tab title)
@@ -1036,6 +1052,20 @@ feature_daily_review_cron_probe() {
     ext_cron_has_marker "daily-review-cron"
 }
 
+# ---------------------------------------------------------------------------
+# Sub-toggle display helpers — title and writes for each sub-toggle id.
+# These are NOT features (not in FEATURES[]) but are referenced by the
+# interactive selector renderer and plan renderer.
+# ---------------------------------------------------------------------------
+suboption_profiles_autosource_title()  { echo "auto-source profiles in shell"; }
+suboption_profiles_autosource_writes() { echo "~/.bashrc"; }
+suboption_amux_autowrap_title()        { echo "auto-wrap sessions in amux"; }
+suboption_amux_autowrap_writes()       { echo "~/.bashrc"; }
+suboption_questions_listen_title()     { echo "enable listener daemon"; }
+suboption_questions_listen_writes()    { echo "systemd unit + linger"; }
+suboption_daily_review_cron_title()    { echo "write crontab line"; }
+suboption_daily_review_cron_writes()   { echo "crontab"; }
+
 # =============================================================================
 # §2. MODULE OWNERS AND STARTUP ASSERTIONS
 # =============================================================================
@@ -1181,9 +1211,22 @@ manifest_write() {
                 --argjson added_deny  "${PERMISSIONS_ADDED_DENY:-[]}" \
                 '. + {($id): {state: $state, at: $at, artifacts: [], options: {mode: $mode}, added_allow: $added_allow, added_deny: $added_deny}}')
         else
+            # Build options JSON from sub-toggle states for this feature
+            local opts_json="{}"
+            local sopts_fn="feature_${id//-/_}_suboptions"
+            if declare -f "$sopts_fn" >/dev/null 2>&1; then
+                local sopts; sopts="$($sopts_fn)"
+                local sopt
+                for sopt in $sopts; do
+                    local sopt_val="${FEATURE_SUBOPTION_STATES[$sopt]:-false}"
+                    opts_json="$(echo "$opts_json" | jq \
+                        --arg k "$sopt" --argjson v "$sopt_val" '. + {($k): $v}')"
+                done
+            fi
             features_json=$(echo "$features_json" | jq \
                 --arg id "$id" --arg state "$state" --arg at "$timestamp" \
-                '. + {($id): {state: $state, at: $at, artifacts: [], options: {}}}')
+                --argjson opts "$opts_json" \
+                '. + {($id): {state: $state, at: $at, artifacts: [], options: $opts}}')
         fi
     done
 
@@ -2616,6 +2659,13 @@ PERMISSIONS_ADDED_DENY='[]'
 # Empty until the first _register_mcp_server call.
 CLAUDE_JSON_BACKUP_FILE=""
 
+# Interactive selector state (task 29-06)
+declare -A SELECTOR_ACTION=()        # id → install|skip|update|keep|uninstall
+declare -A SELECTOR_SUBOPT=()        # suboption_id → true|false
+declare -A SELECTOR_IS_INSTALLED=()  # id → true|false (from probe at selector init)
+declare -A FEATURE_SUBOPTION_STATES=() # suboption_id → true|false (post-selector)
+_selector_msg=""                     # message from cycle/toggle helpers, shown on next render
+
 # =============================================================================
 # Argument parsing
 # =============================================================================
@@ -2625,6 +2675,7 @@ WITHOUT_FEATURES=()    # features to exclude (via --without)
 PROBE_FEATURE=""       # non-empty = run probe and exit
 INSTALL_ALL=false      # --all flag
 INSTALL_YES=false      # --yes flag
+DRY_RUN=false          # --dry-run flag (render plan, touch nothing)
 
 _parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -2655,6 +2706,10 @@ _parse_args() {
             --probe)
                 shift
                 PROBE_FEATURE="${1:-}"
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
                 shift
                 ;;
             --)
@@ -2796,6 +2851,480 @@ _compute_plan() {
 }
 
 # =============================================================================
+# §5. INTERACTIVE SELECTOR — task 29-06
+# =============================================================================
+
+# _is_tty
+# Returns 0 if running in a TTY, 1 otherwise.
+# CLAUDE_INSTALL_ASSUME_TTY=1 forces true (for tests).
+# CLAUDE_INSTALL_ASSUME_TTY=0 forces false (for non-interactive CI).
+_is_tty() {
+    case "${CLAUDE_INSTALL_ASSUME_TTY:-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    [[ -t 0 && -t 1 ]]
+}
+
+# _should_use_selector
+# Returns 0 if the interactive selector should run.
+# Requires: TTY available, no --yes, no explicit CLI selection.
+_should_use_selector() {
+    # --yes bypasses the selector
+    [[ "$INSTALL_YES" == false ]] || return 1
+    # Any explicit selection flag bypasses the selector
+    [[ ${#SELECTED_FEATURES[@]} -eq 0 ]] || return 1
+    [[ "$INSTALL_ALL" == false ]] || return 1
+    [[ ${#UNINSTALL_FEATURES[@]} -eq 0 ]] || return 1
+    [[ ${#WITHOUT_FEATURES[@]} -eq 0 ]] || return 1
+    # Must have a TTY
+    _is_tty || return 1
+    return 0
+}
+
+# _selector_init
+# Populate SELECTOR_ACTION and SELECTOR_SUBOPT from probes, manifest, defaults.
+# Per brd D1 / architecture §5.1:
+#   - Probe=installed → Update (regardless of manifest)
+#   - Probe=not-installed, manifest present → use manifest state
+#   - Probe=not-installed, no manifest → use feature_<id>_default()
+_selector_init() {
+    local id probe_fn default_fn ms initial
+    for id in "${FEATURES[@]}"; do
+        probe_fn="feature_${id//-/_}_probe"
+        default_fn="feature_${id//-/_}_default"
+
+        if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+            SELECTOR_IS_INSTALLED["$id"]=true
+            SELECTOR_ACTION["$id"]="update"  # brd D1
+        else
+            SELECTOR_IS_INSTALLED["$id"]=false
+            initial="install"
+            if [[ -f "$MANIFEST_FILE" ]]; then
+                ms="$(jq -r --arg id "$id" '.features[$id].state // "none"' \
+                      "$MANIFEST_FILE" 2>/dev/null || echo "none")"
+                case "$ms" in
+                    installed) initial="install" ;;
+                    skipped)   initial="skip" ;;
+                    *)  # not in manifest or unknown: use feature default
+                        declare -f "$default_fn" >/dev/null 2>&1 \
+                            && initial="$($default_fn)" || initial="install"
+                        ;;
+                esac
+            else
+                declare -f "$default_fn" >/dev/null 2>&1 \
+                    && initial="$($default_fn)" || initial="install"
+            fi
+            SELECTOR_ACTION["$id"]="$initial"
+        fi
+    done
+
+    # Init sub-toggles: probe → manifest options → default false
+    local suboptions_fn subopts subopt_id subopt_probe_fn subopt_val
+    for id in "${FEATURES[@]}"; do
+        suboptions_fn="feature_${id//-/_}_suboptions"
+        declare -f "$suboptions_fn" >/dev/null 2>&1 || continue
+        subopts="$($suboptions_fn)"
+        [[ -z "$subopts" ]] && continue
+
+        for subopt_id in $subopts; do
+            subopt_probe_fn="feature_${subopt_id//-/_}_probe"
+            if declare -f "$subopt_probe_fn" >/dev/null 2>&1 \
+               && $subopt_probe_fn 2>/dev/null; then
+                SELECTOR_SUBOPT["$subopt_id"]=true
+            elif [[ -f "$MANIFEST_FILE" ]]; then
+                subopt_val="$(jq -r \
+                    --arg fid "$id" --arg sub "$subopt_id" \
+                    '.features[$fid].options[$sub] // false' \
+                    "$MANIFEST_FILE" 2>/dev/null || echo "false")"
+                SELECTOR_SUBOPT["$subopt_id"]="$subopt_val"
+            else
+                SELECTOR_SUBOPT["$subopt_id"]=false
+            fi
+        done
+    done
+}
+
+# _selector_cycle <feature_id>
+# Advance to next action in the cycle for this feature.
+# Not-installed: Install ↔ Skip  (brd D1)
+# Installed:     Update → Keep → Uninstall → Update
+_selector_cycle() {
+    local id="$1"
+    local current="${SELECTOR_ACTION[$id]:-install}"
+    if [[ "${SELECTOR_IS_INSTALLED[$id]:-false}" == "true" ]]; then
+        case "$current" in
+            update)    SELECTOR_ACTION["$id"]="keep" ;;
+            keep)      SELECTOR_ACTION["$id"]="uninstall" ;;
+            uninstall) SELECTOR_ACTION["$id"]="update" ;;
+            *)         SELECTOR_ACTION["$id"]="update" ;;
+        esac
+    else
+        case "$current" in
+            install) SELECTOR_ACTION["$id"]="skip" ;;
+            skip)    SELECTOR_ACTION["$id"]="install" ;;
+            *)       SELECTOR_ACTION["$id"]="install" ;;
+        esac
+    fi
+}
+
+# _selector_cycle_by_num <display_num>
+# Cycle the feature at the given 1-based display position.
+# Handles: Keep message, dependency promotion (install), dependency refusal (uninstall).
+# Sets _selector_msg with a one-line status for the next render.
+_selector_cycle_by_num() {
+    local num="$1"
+    local feature_list=("${FEATURES[@]}")
+    local idx=$(( num - 1 ))
+    local nfeatures=${#feature_list[@]}
+
+    if [[ $idx -lt 0 || $idx -ge $nfeatures ]]; then
+        _selector_msg="  Unknown feature number: $num (valid 1–$nfeatures)"
+        return 0
+    fi
+
+    local id="${feature_list[$idx]}"
+    local prev="${SELECTOR_ACTION[$id]:-install}"
+
+    _selector_cycle "$id"
+
+    local new="${SELECTOR_ACTION[$id]}"
+
+    # Keep: print the "what Keep means" message (brd D3, 29-06 §4)
+    if [[ "$new" == "keep" ]]; then
+        _selector_msg="  $id → Keep  (wiring/external unchanged; shared modules still updated)"
+        return 0
+    fi
+
+    # Installing: promote any unmet prerequisites (29-06 §3)
+    if [[ "$new" == "install" ]]; then
+        local req_fn="feature_${id//-/_}_requires"
+        if declare -f "$req_fn" >/dev/null 2>&1; then
+            local reqs; reqs="$($req_fn)"
+            local promoted=()
+            for req in $reqs; do
+                if [[ "${SELECTOR_ACTION[$req]:-skip}" == "skip" ]]; then
+                    SELECTOR_ACTION["$req"]="install"
+                    promoted+=("$req")
+                fi
+            done
+            if [[ ${#promoted[@]} -gt 0 ]]; then
+                _selector_msg="  Promoted prerequisites: ${promoted[*]} (required by $id)"
+                return 0
+            fi
+        fi
+    fi
+
+    # Uninstalling: refuse if a dependent is Install/Update/Keep (29-06 §3)
+    if [[ "$new" == "uninstall" ]]; then
+        local fid fid_action req_fn reqs req
+        for fid in "${FEATURES[@]}"; do
+            [[ "$fid" == "$id" ]] && continue
+            fid_action="${SELECTOR_ACTION[$fid]:-skip}"
+            [[ "$fid_action" == "install" || "$fid_action" == "update" \
+               || "$fid_action" == "keep" ]] || continue
+            req_fn="feature_${fid//-/_}_requires"
+            declare -f "$req_fn" >/dev/null 2>&1 || continue
+            reqs="$($req_fn)"
+            for req in $reqs; do
+                if [[ "$req" == "$id" ]]; then
+                    # Refuse: revert cycle
+                    SELECTOR_ACTION["$id"]="$prev"
+                    _selector_msg="  Cannot uninstall '$id': '$fid' requires it and is $fid_action. Cycle '$fid' to Skip or Uninstall first."
+                    return 0
+                fi
+            done
+        done
+    fi
+
+    _selector_msg=""
+}
+
+# _selector_toggle_suboption_by_num <display_num>
+# Toggle the sub-option for the feature at display position <num>.
+# Enforces mutual exclusion between amux-autowrap and profiles-autosource.
+# Sets _selector_msg with a one-line status.
+_selector_toggle_suboption_by_num() {
+    local num="$1"
+    local feature_list=("${FEATURES[@]}")
+    local idx=$(( num - 1 ))
+    local nfeatures=${#feature_list[@]}
+
+    if [[ $idx -lt 0 || $idx -ge $nfeatures ]]; then
+        _selector_msg="  Unknown feature number: $num"
+        return 0
+    fi
+
+    local feature_id="${feature_list[$idx]}"
+    local suboptions_fn="feature_${feature_id//-/_}_suboptions"
+    if ! declare -f "$suboptions_fn" >/dev/null 2>&1; then
+        _selector_msg="  Feature $num ($feature_id) has no sub-options"
+        return 0
+    fi
+    local subopts; subopts="$($suboptions_fn)"
+    if [[ -z "$subopts" ]]; then
+        _selector_msg="  Feature $num ($feature_id) has no sub-options"
+        return 0
+    fi
+
+    # Require the parent feature to be Install/Update/Keep
+    local feature_action="${SELECTOR_ACTION[$feature_id]:-skip}"
+    if [[ "$feature_action" == "skip" || "$feature_action" == "uninstall" ]]; then
+        _selector_msg="  Enable feature $num ($feature_id) before toggling its sub-options"
+        return 0
+    fi
+
+    local subopt_id="${subopts%% *}"  # first (usually only) sub-option
+    local current="${SELECTOR_SUBOPT[$subopt_id]:-false}"
+
+    if [[ "$current" == "true" ]]; then
+        SELECTOR_SUBOPT["$subopt_id"]=false
+        _selector_msg="  $subopt_id: disabled"
+    else
+        SELECTOR_SUBOPT["$subopt_id"]=true
+        # Mutual exclusion: amux-autowrap ↔ profiles-autosource (architecture §2)
+        local excl=""
+        case "$subopt_id" in
+            amux-autowrap)       excl="profiles-autosource" ;;
+            profiles-autosource) excl="amux-autowrap" ;;
+        esac
+        if [[ -n "$excl" && "${SELECTOR_SUBOPT[$excl]:-false}" == "true" ]]; then
+            SELECTOR_SUBOPT["$excl"]=false
+            _selector_msg="  $subopt_id: enabled  (cleared conflicting $excl — Do NOT source both)"
+        else
+            _selector_msg="  $subopt_id: enabled"
+        fi
+    fi
+}
+
+# _selector_render [changed_msg]
+# Print the full checklist to stdout. Called on every keypress (redrawn).
+_selector_render() {
+    local changed_msg="${1:-}"
+
+    printf "Claude Code configuration — what should this machine run?\n\n"
+
+    local num=0
+    local id suboptions_fn subopts subopt_id
+    for id in "${FEATURES[@]}"; do
+        num=$(( num + 1 ))
+        local action="${SELECTOR_ACTION[$id]:-install}"
+        local title_fn="feature_${id//-/_}_title"
+        local title; title="$($title_fn 2>/dev/null || echo "$id")"
+        local writes_fn="feature_${id//-/_}_writes"
+        local writes=""; declare -f "$writes_fn" >/dev/null 2>&1 && writes="$($writes_fn)"
+
+        local alabel
+        case "$action" in
+            install)   alabel="Install  " ;;
+            skip)      alabel="Skip     " ;;
+            update)    alabel="Update   " ;;
+            keep)      alabel="Keep     " ;;
+            uninstall) alabel="Uninstall" ;;
+            *)         alabel="$action  " ;;
+        esac
+
+        printf " %2d [%s] %s\n" "$num" "$alabel" "$title"
+        [[ -n "$writes" ]] && printf "              writes: %s\n" "$writes"
+        [[ "$action" == "keep" ]] && \
+            printf "              (wiring/external left alone; shared modules still updated)\n"
+
+        # Sub-toggles
+        suboptions_fn="feature_${id//-/_}_suboptions"
+        if declare -f "$suboptions_fn" >/dev/null 2>&1; then
+            subopts="$($suboptions_fn)"
+            for subopt_id in $subopts; do
+                local sstate="${SELECTOR_SUBOPT[$subopt_id]:-false}"
+                local scheck="[ ]"; [[ "$sstate" == "true" ]] && scheck="[x]"
+                local st_fn="suboption_${subopt_id//-/_}_title"
+                local sw_fn="suboption_${subopt_id//-/_}_writes"
+                local stitle="$subopt_id"; declare -f "$st_fn" >/dev/null 2>&1 && stitle="$($st_fn)"
+                local swrites=""; declare -f "$sw_fn" >/dev/null 2>&1 && swrites="$($sw_fn)"
+                printf "     %2da %s %s" "$num" "$scheck" "$stitle"
+                [[ -n "$swrites" ]] && printf "  (writes %s)" "$swrites"
+                printf "\n"
+            done
+        fi
+    done
+
+    printf "\n  <n> cycle state · <n>a toggle sub-option · a all · s skip all\n"
+    printf "  p preview plan · Enter accept · q quit\n"
+    [[ -n "$changed_msg" ]] && printf "\n%s\n" "$changed_msg"
+    printf "\n"
+}
+
+# _render_plan
+# Render the current plan (from FEATURE_ACTIONS) to stdout.
+# Used by: interactive selector 'p' and Enter, --dry-run.
+# Uninstalls are called out separately so they cannot be scanned past.
+_render_plan() {
+    printf "\n  ══════════════════════════════════════════════════\n"
+    printf "  Plan\n"
+    printf "  ══════════════════════════════════════════════════\n"
+
+    local id action has_active=false has_uninstall=false
+    for id in "${FEATURES[@]}"; do
+        action="${FEATURE_ACTIONS[$id]:-skip}"
+        [[ "$action" == "skip" ]] && continue
+        [[ "$action" == "uninstall" ]] && { has_uninstall=true; continue; }
+        has_active=true
+    done
+
+    if [[ "$has_active" == true ]]; then
+        for id in "${FEATURES[@]}"; do
+            action="${FEATURE_ACTIONS[$id]:-skip}"
+            [[ "$action" == "skip" || "$action" == "uninstall" ]] && continue
+            local title_fn="feature_${id//-/_}_title"
+            local title; title="$($title_fn 2>/dev/null || echo "$id")"
+            local writes_fn="feature_${id//-/_}_writes"
+            local writes=""; declare -f "$writes_fn" >/dev/null 2>&1 && writes="$($writes_fn)"
+            local alabel
+            case "$action" in
+                install) alabel="+ install" ;;
+                update)  alabel="~ update " ;;
+                keep)    alabel="  keep   " ;;
+            esac
+            printf "  %s  %s\n" "$alabel" "$title"
+            [[ -n "$writes" ]] && printf "            writes: %s\n" "$writes"
+            # Show active sub-toggles in the plan
+            local suboptions_fn="feature_${id//-/_}_suboptions"
+            if declare -f "$suboptions_fn" >/dev/null 2>&1; then
+                local subopts; subopts="$($suboptions_fn)"
+                local subopt_id
+                for subopt_id in $subopts; do
+                    local sstate="${SELECTOR_SUBOPT[$subopt_id]:-false}"
+                    # Also check FEATURE_SUBOPTION_STATES (set after _apply_selector_to_plan)
+                    [[ "${FEATURE_SUBOPTION_STATES[$subopt_id]:-}" == "true" ]] && sstate=true
+                    [[ "$sstate" == "true" ]] || continue
+                    local sw_fn="suboption_${subopt_id//-/_}_writes"
+                    local swrites=""; declare -f "$sw_fn" >/dev/null 2>&1 && swrites="$($sw_fn)"
+                    printf "            + %s" "$subopt_id"
+                    [[ -n "$swrites" ]] && printf " (writes %s)" "$swrites"
+                    printf "\n"
+                done
+            fi
+        done
+    else
+        printf "  (nothing to do)\n"
+    fi
+
+    if [[ "$has_uninstall" == true ]]; then
+        printf "\n  ── REMOVALS ──────────────────────────────────────\n"
+        for id in "${FEATURES[@]}"; do
+            action="${FEATURE_ACTIONS[$id]:-skip}"
+            [[ "$action" == "uninstall" ]] || continue
+            local title_fn="feature_${id//-/_}_title"
+            local title; title="$($title_fn 2>/dev/null || echo "$id")"
+            printf "  - uninstall  %s\n" "$title"
+        done
+    fi
+
+    printf "  ══════════════════════════════════════════════════\n\n"
+}
+
+# _apply_selector_to_plan
+# Copy SELECTOR_ACTION → FEATURE_ACTIONS and SELECTOR_SUBOPT → FEATURE_SUBOPTION_STATES.
+_apply_selector_to_plan() {
+    local id
+    for id in "${FEATURES[@]}"; do
+        FEATURE_ACTIONS["$id"]="${SELECTOR_ACTION[$id]:-skip}"
+    done
+    local subopt_id
+    for subopt_id in "${!SELECTOR_SUBOPT[@]}"; do
+        FEATURE_SUBOPTION_STATES["$subopt_id"]="${SELECTOR_SUBOPT[$subopt_id]}"
+    done
+}
+
+# run_interactive_selector
+# Show the checklist, collect choices, confirm. On return, FEATURE_ACTIONS is set.
+# On 'q': exit 0 without changing anything.
+run_interactive_selector() {
+    _selector_init
+
+    local changed_msg=""
+
+    while true; do
+        # Reprint: push old output up (SSH-safe; no cursor addressing)
+        printf '\n\n\n'
+        _selector_render "$changed_msg"
+        changed_msg=""
+
+        printf "  > "
+        local input=""
+        IFS= read -r input 2>/dev/null || { printf "\n  EOF\n"; exit 0; }
+
+        case "$input" in
+            q|Q)
+                printf "\n  Quit — no changes made.\n"
+                exit 0
+                ;;
+            a)
+                # All: install (or update if installed)
+                local id
+                for id in "${FEATURES[@]}"; do
+                    if [[ "${SELECTOR_IS_INSTALLED[$id]:-false}" == "true" ]]; then
+                        SELECTOR_ACTION["$id"]="update"
+                    else
+                        SELECTOR_ACTION["$id"]="install"
+                    fi
+                done
+                changed_msg="  All features set to Install/Update"
+                ;;
+            s)
+                # Skip all: skip (or keep if installed)
+                local id
+                for id in "${FEATURES[@]}"; do
+                    if [[ "${SELECTOR_IS_INSTALLED[$id]:-false}" == "true" ]]; then
+                        SELECTOR_ACTION["$id"]="keep"
+                    else
+                        SELECTOR_ACTION["$id"]="skip"
+                    fi
+                done
+                changed_msg="  All features set to Skip/Keep"
+                ;;
+            p|P)
+                # Preview plan without accepting
+                _apply_selector_to_plan
+                _render_plan
+                printf "  Press Enter to continue..."
+                local _dummy=""
+                IFS= read -r _dummy 2>/dev/null || true
+                ;;
+            "")
+                # Enter — show plan, ask for confirmation
+                _apply_selector_to_plan
+                _render_plan
+                printf "  Proceed? [y/N] "
+                local confirm=""
+                IFS= read -r confirm 2>/dev/null || confirm="n"
+                case "$confirm" in
+                    y|Y|yes|YES)
+                        return 0
+                        ;;
+                    *)
+                        changed_msg="  Cancelled — back to selector"
+                        ;;
+                esac
+                ;;
+            *)
+                # Parse <n>  or  <n>a
+                if [[ "$input" =~ ^([0-9]+)a$ ]]; then
+                    _selector_toggle_suboption_by_num "${BASH_REMATCH[1]}"
+                    changed_msg="$_selector_msg"
+                    _selector_msg=""
+                elif [[ "$input" =~ ^([0-9]+)$ ]]; then
+                    _selector_cycle_by_num "${BASH_REMATCH[1]}"
+                    changed_msg="$_selector_msg"
+                    _selector_msg=""
+                else
+                    changed_msg="  Unknown input: '$input'  (enter a number, <n>a, a, s, p, Enter, or q)"
+                fi
+                ;;
+        esac
+    done
+}
+
+# =============================================================================
 # Main execution
 # =============================================================================
 
@@ -2835,6 +3364,51 @@ if ! jq empty "$PROJECT_CONFIG" 2>/dev/null; then
 fi
 log_info "Project config validated: $PROJECT_CONFIG"
 
+# Validate global config if it already exists (don't create it yet — q and
+# --dry-run must leave the machine byte-identical, so we defer creation and
+# backup until after the user confirms the plan).
+if [[ -f "$GLOBAL_CONFIG" ]]; then
+    if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
+        log_error "Global config is not valid JSON: $GLOBAL_CONFIG"
+        exit 1
+    fi
+    log_info "Global config validated: $GLOBAL_CONFIG"
+fi
+
+# Determine and compute the plan (interactive selector or CLI flags)
+if _should_use_selector; then
+    # Interactive path: show the checklist, collect choices, confirm.
+    # run_interactive_selector populates FEATURE_ACTIONS via _apply_selector_to_plan.
+    run_interactive_selector
+elif ! _is_tty && [[ "$INSTALL_YES" == false ]] \
+     && [[ ${#SELECTED_FEATURES[@]} -eq 0 && "$INSTALL_ALL" == false \
+           && ${#UNINSTALL_FEATURES[@]} -eq 0 && ${#WITHOUT_FEATURES[@]} -eq 0 ]]; then
+    # No TTY, no --yes, and no explicit selection flags: error (brd §5, architecture §5.2).
+    # This prevents the "install everything without asking" footgun.
+    log_error "No TTY detected and --yes not set."
+    log_error "  For non-interactive mode: ./install.sh --yes"
+    log_error "  For explicit selection:   ./install.sh --only <features>"
+    log_error "  To install everything:    ./install.sh --all --yes"
+    exit 1
+else
+    # Non-interactive path: use CLI flags to build FEATURE_ACTIONS.
+    _compute_plan
+fi
+
+# Dependency refusal check (§5)
+if ! _check_dependency_refusal; then
+    exit 1
+fi
+
+# --dry-run: render plan and exit 0 without touching anything (architecture §5.3).
+# No manifest written, no backup created, no file changed.
+if [[ "$DRY_RUN" == true ]]; then
+    _render_plan
+    log_info "Dry run: no changes made."
+    exit 0
+fi
+
+# Plan confirmed — now safe to create global config and backup if needed.
 mkdir -p "$BACKUP_DIR"
 
 if [[ ! -f "$GLOBAL_CONFIG" ]]; then
@@ -2846,19 +3420,10 @@ if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
     log_error "Global config is not valid JSON: $GLOBAL_CONFIG"
     exit 1
 fi
-log_info "Global config validated: $GLOBAL_CONFIG"
 
 BACKUP_FILE="$BACKUP_DIR/settings.json.$(date +%Y%m%d_%H%M%S).bak"
 cp "$GLOBAL_CONFIG" "$BACKUP_FILE"
 log_info "Backup created: $BACKUP_FILE"
-
-# Compute the plan
-_compute_plan
-
-# Dependency refusal check (§5)
-if ! _check_dependency_refusal; then
-    exit 1
-fi
 
 # Module closure: refresh all shared modules for install/update/keep features (§3)
 log_step "Computing module closure"

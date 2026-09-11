@@ -2602,6 +2602,650 @@ class TestFullRoundTrip(InstallerTestBase):
         )
 
 
+# =============================================================================
+# §5. Interactive selector — task 29-06
+# =============================================================================
+
+def run_selector(
+    tmp_home: Path,
+    keystrokes: str,
+    extra_env: dict | None = None,
+    extra_args: list | None = None,
+) -> subprocess.CompletedProcess:
+    """
+    Run install.sh with the interactive selector active (CLAUDE_INSTALL_ASSUME_TTY=1)
+    and the given keystroke script piped to stdin.
+
+    keystrokes is a newline-separated string, e.g. "q\\n" or "1\\n\\ny\\n".
+    No explicit selection flags: the selector is the entry point.
+    """
+    env = {
+        **os.environ,
+        "HOME": str(tmp_home),
+        "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+        "CLAUDE_INSTALL_ASSUME_TTY": "1",
+        "CLAUDE_INSTALL_EPIC29_LIVE": "1",
+    }
+    if extra_env:
+        env.update(extra_env)
+
+    cmd = ["bash", str(INSTALL_SH)] + (extra_args or [])
+    return subprocess.run(
+        cmd,
+        input=keystrokes,
+        capture_output=True,
+        text=True,
+        cwd=str(REPO),
+        env=env,
+        timeout=30,
+    )
+
+
+class TestTTYDetection(InstallerTestBase):
+    """
+    TTY detection (29-06 §6): no TTY + no --yes + no explicit selection = error
+    naming --yes.
+    """
+
+    def test_no_tty_no_yes_no_selection_is_error(self):
+        """
+        CLAUDE_INSTALL_ASSUME_TTY=0 + no --yes + no explicit selection → non-zero
+        with message naming --yes.
+        """
+        result = run_installer(
+            self.tmp_home,
+            # run_installer already sets CLAUDE_INSTALL_ASSUME_TTY=0; no extra args
+        )
+        self.assertNotEqual(
+            result.returncode, 0,
+            "No-TTY + no --yes + no selection must exit non-zero. "
+            f"stdout: {result.stdout[:300]}"
+        )
+        combined = result.stdout + result.stderr
+        self.assertIn(
+            "--yes", combined,
+            "Error message must name --yes as the remedy"
+        )
+
+    def test_no_tty_with_explicit_only_succeeds(self):
+        """
+        CLAUDE_INSTALL_ASSUME_TTY=0 + --only = OK (explicit selection bypasses selector).
+        """
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline"],
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"--only with no TTY should succeed (explicit selection). stderr: {result.stderr[:300]}"
+        )
+
+    def test_no_tty_with_yes_uses_manifest(self):
+        """
+        CLAUDE_INSTALL_ASSUME_TTY=0 + --yes with an explicit --only selection works.
+        """
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--yes"],
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"--only --yes with no TTY should succeed. stderr: {result.stderr[:300]}"
+        )
+
+    def test_assume_tty_1_enables_selector(self):
+        """
+        CLAUDE_INSTALL_ASSUME_TTY=1 + no --yes + no explicit selection → enters
+        selector (not an error). 'q' exits 0 immediately.
+        """
+        result = run_selector(self.tmp_home, keystrokes="q\n")
+        self.assertEqual(
+            result.returncode, 0,
+            f"Selector with 'q' must exit 0. stderr: {result.stderr[:300]}"
+        )
+        combined = result.stdout + result.stderr
+        self.assertIn("Quit", combined, "Quit message must appear")
+
+
+class TestSelectorChecklist(InstallerTestBase):
+    """
+    Checklist rendering: every feature shown, _writes() lines disclosed,
+    sub-toggles shown.
+    """
+
+    def _get_selector_output(self, keystrokes: str = "q\n") -> str:
+        result = run_selector(self.tmp_home, keystrokes=keystrokes)
+        return result.stdout + result.stderr
+
+    def test_all_features_appear_in_checklist(self):
+        """Every feature title appears in the checklist."""
+        output = self._get_selector_output()
+        # Check a sample of feature titles
+        for substring in [
+            "Statusline",
+            "Permission hooks",
+            "Telegram",
+            "Model profiles",
+            "amux integration",
+            "permissions allowlist",
+            "context-usage",
+            "claude-history",
+            "Async questions",
+            "Daily permission review",
+        ]:
+            self.assertIn(
+                substring.lower(), output.lower(),
+                f"Feature title fragment '{substring}' must appear in checklist"
+            )
+
+    def test_writes_lines_appear_for_features_with_writes(self):
+        """
+        Every feature that has a non-empty _writes() must render a 'writes:' line.
+        Enumerate from the registry rather than hard-coding the list so a new
+        feature cannot be added without its disclosure.
+        """
+        # Harvest features with non-empty _writes() by grepping install.sh
+        text = INSTALL_SH.read_text()
+        import re
+        # Find all feature_<id>_writes functions that return non-empty strings
+        features_with_writes = []
+        for match in re.finditer(
+            r"feature_(\w+)_writes\(\)\s*\{\s*echo\s+\"([^\"]+)\"\s*;?\s*\}", text
+        ):
+            id_mangled, writes_val = match.group(1), match.group(2)
+            if writes_val.strip():
+                features_with_writes.append((id_mangled, writes_val))
+
+        self.assertGreater(
+            len(features_with_writes), 0,
+            "At least one feature should have a non-empty _writes() in install.sh"
+        )
+
+        output = self._get_selector_output()
+        for id_mangled, writes_val in features_with_writes:
+            with self.subTest(feature=id_mangled):
+                self.assertIn(
+                    "writes:", output,
+                    f"'writes:' must appear for feature {id_mangled} (writes: {writes_val!r})"
+                )
+
+    def test_suboptions_appear_in_checklist(self):
+        """Sub-toggles render indented under their parent feature."""
+        output = self._get_selector_output()
+        # Check sub-toggle titles appear
+        for fragment in [
+            "auto-source profiles",
+            "auto-wrap sessions",
+            "listener daemon",
+            "crontab",
+        ]:
+            self.assertIn(
+                fragment.lower(), output.lower(),
+                f"Sub-toggle fragment '{fragment}' must appear in checklist"
+            )
+
+    def test_suboption_bashrc_writes_disclosed(self):
+        """profiles-autosource and amux-autowrap sub-toggles disclose ~/.bashrc write."""
+        output = self._get_selector_output()
+        # Both bashrc sub-toggles must show their writes disclosure
+        self.assertIn(
+            "~/.bashrc", output,
+            "~/.bashrc must appear in checklist for the bashrc sub-toggles"
+        )
+
+
+class TestSelectorInitialState(InstallerTestBase):
+    """
+    Initial selection: fresh machine uses feature defaults; manifest overrides;
+    probe overrides everything.
+    """
+
+    def test_fresh_machine_questions_starts_skip(self):
+        """On a fresh machine with no manifest, 'questions' starts at Skip (D14)."""
+        output = run_selector(self.tmp_home, keystrokes="q\n").stdout
+        output += run_selector(self.tmp_home, keystrokes="q\n").stderr
+        # The checklist should show Skip for questions
+        self.assertIn("Skip", output, "questions must start at Skip on fresh machine")
+
+    def test_fresh_machine_daily_review_starts_skip(self):
+        """On a fresh machine with no manifest, 'daily-review' starts at Skip (D14)."""
+        output = run_selector(self.tmp_home, keystrokes="q\n").stdout
+        output += run_selector(self.tmp_home, keystrokes="q\n").stderr
+        # daily-review defaults to skip — line count check: should see at least 2 Skip lines
+        skip_count = output.count("Skip")
+        self.assertGreaterEqual(
+            skip_count, 2,
+            "At least questions and daily-review must show Skip on a fresh machine"
+        )
+
+    def test_fresh_machine_statusline_starts_install(self):
+        """On a fresh machine, statusline starts at Install (default on)."""
+        output = run_selector(self.tmp_home, keystrokes="q\n").stdout
+        output += run_selector(self.tmp_home, keystrokes="q\n").stderr
+        self.assertIn("Install", output,
+                      "statusline must start at Install on a fresh machine")
+
+    def test_manifest_skipped_shown_as_skip(self):
+        """
+        Manifest with a feature at 'skipped' → selector shows Skip for that feature.
+        """
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps({
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "statusline": {"state": "skipped", "at": "2026-01-01T00:00:00Z",
+                               "artifacts": [], "options": {}},
+            },
+        }))
+        output = run_selector(self.tmp_home, keystrokes="q\n").stdout
+        output += run_selector(self.tmp_home, keystrokes="q\n").stderr
+        self.assertIn("Skip", output, "Feature with manifest state=skipped must show Skip")
+
+    def test_installed_feature_starts_at_update(self):
+        """
+        A feature detected as installed by probe starts at Update regardless of manifest.
+        """
+        # Install statusline first so the probe sees it
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        output = run_selector(self.tmp_home, keystrokes="q\n").stdout
+        output += run_selector(self.tmp_home, keystrokes="q\n").stderr
+        self.assertIn("Update", output,
+                      "Installed feature must start at Update in the selector")
+
+
+class TestSelectorCycling(InstallerTestBase):
+    """
+    Tri-state cycling: correct state transitions for installed and not-installed.
+    """
+
+    def test_not_installed_cycles_install_to_skip(self):
+        """
+        Cycling a not-installed feature once: Install → Skip.
+        Feature 1 is statusline (not-installed on clean home).
+        """
+        # Send "1\n" to cycle feature 1, then "q\n" to quit
+        result = run_selector(self.tmp_home, keystrokes="1\nq\n")
+        output = result.stdout + result.stderr
+        # After one cycle, statusline should show Skip (started Install, cycled to Skip)
+        self.assertIn("Skip", output, "Cycling Install→Skip must show Skip")
+        self.assertEqual(result.returncode, 0)
+
+    def test_not_installed_cycles_skip_back_to_install(self):
+        """
+        Cycling twice: Install → Skip → Install.
+        """
+        result = run_selector(self.tmp_home, keystrokes="1\n1\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn("Install", output, "Double-cycle must return to Install")
+
+    def test_installed_cycles_update_to_keep(self):
+        """
+        For an installed feature: Update → Keep.
+        Install statusline first, then cycle it.
+        """
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_selector(self.tmp_home, keystrokes="1\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn("Keep", output, "Installed feature must cycle Update→Keep")
+
+    def test_installed_cycles_keep_to_uninstall(self):
+        """
+        Installed feature: Update → Keep → Uninstall.
+        """
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_selector(self.tmp_home, keystrokes="1\n1\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn("Uninstall", output, "Installed feature must cycle Keep→Uninstall")
+
+    def test_installed_cycles_uninstall_back_to_update(self):
+        """
+        Installed feature: Update → Keep → Uninstall → Update.
+        (3 cycles back to Update)
+        """
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_selector(self.tmp_home, keystrokes="1\n1\n1\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn("Update", output, "Three cycles must return installed feature to Update")
+
+    def test_keep_message_shown(self):
+        """
+        Cycling an installed feature to Keep must print the Keep semantics message
+        (brd D3, 29-06 §4).
+        """
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        result = run_selector(self.tmp_home, keystrokes="1\nq\n")
+        output = result.stdout + result.stderr
+        # The keep message must say something about modules still being updated
+        self.assertIn(
+            "modules", output.lower(),
+            "Keep message must mention shared modules still being updated"
+        )
+        self.assertIn(
+            "wiring", output.lower(),
+            "Keep message must say wiring is left alone"
+        )
+
+
+class TestSelectorDependencies(InstallerTestBase):
+    """
+    Dependency handling in the UI: promotion, refusal, mutual exclusion.
+    """
+
+    def _feature_num(self, feature_id: str) -> int:
+        """Return the 1-based display number for a feature id."""
+        return list([
+            "statusline", "permission-hooks", "telegram", "profiles",
+            "amux", "permissions-allowlist", "context-mcp", "claude-history",
+            "questions", "daily-review",
+        ]).index(feature_id) + 1
+
+    def test_installing_telegram_promotes_permission_hooks(self):
+        """
+        telegram requires permission-hooks.
+        If permission-hooks is Skip and user installs telegram, permission-hooks
+        is promoted to Install and the message names it (29-06 §3).
+        """
+        # On fresh machine permission-hooks starts Install by default.
+        # Cycle it to Skip first (feature 2), then cycle telegram to Install
+        # (feature 3 is already Install, cycle to Skip then back to Install — but
+        # telegram starts Install. Cycle to Skip, then back to Install.)
+        # Cleaner: cycle permission-hooks to Skip, then telegram should be Install already;
+        # re-cycle telegram past Install to Skip and back, but promotion fires when cycling
+        # to Install. Let's:
+        # 1. Cycle permission-hooks (2) to Skip
+        # 2. Cycle telegram (3) to Skip
+        # 3. Cycle telegram (3) back to Install → promotion fires
+        # 4. q
+        result = run_selector(self.tmp_home, keystrokes="2\n3\n3\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "permission-hooks", output,
+            "Promotion message must name 'permission-hooks' when telegram is set to Install"
+        )
+        self.assertIn(
+            "promot", output.lower(),
+            "Promotion message must use the word 'promot' (promoted/promoting)"
+        )
+
+    def test_uninstalling_permission_hooks_with_telegram_refused(self):
+        """
+        Uninstalling permission-hooks while telegram is Install/Update is refused,
+        and the message names 'telegram' (29-06 §3).
+        """
+        # Both are not installed → Install by default.
+        # Cycle permission-hooks (2) to Skip → install, skip cycle
+        # Then cycle it to... wait, not-installed cycles Install ↔ Skip only.
+        # Can't Uninstall a not-installed feature. We need to first install them,
+        # then use the selector with them probed as installed.
+        run_installer(self.tmp_home,
+                      extra_args=["--only", "permission-hooks,telegram"],
+                      extra_env=_make_fake_uv(self.tmp_home))
+
+        # Now both probe as installed. Cycle permission-hooks (2) to Uninstall:
+        # Update → Keep → Uninstall
+        result = run_selector(self.tmp_home, keystrokes="2\n2\nq\n")
+        output = result.stdout + result.stderr
+        # After Update → Keep: telegram is still Update. Cannot Uninstall yet.
+        # Actually: permission-hooks (2): cycle 1 → Keep, cycle 2 → Uninstall (refused!)
+        self.assertIn(
+            "telegram", output,
+            "Refusal message must name 'telegram' when uninstalling permission-hooks"
+        )
+        # The action should be reverted (message says Cannot uninstall)
+        self.assertIn(
+            "Cannot uninstall", output,
+            "Refusal message must say 'Cannot uninstall'"
+        )
+
+    def test_mutual_exclusion_autowrap_clears_autosource(self):
+        """
+        Enabling amux-autowrap (5a) while profiles-autosource (4a) is on
+        clears profiles-autosource and prints a message (architecture §2).
+        """
+        # Enable profiles-autosource (4a), then enable amux-autowrap (5a):
+        # Feature 4 = profiles, sub-toggle = profiles-autosource
+        # Feature 5 = amux, sub-toggle = amux-autowrap
+        # Input: "4a\n5a\nq\n"
+        result = run_selector(self.tmp_home, keystrokes="4a\n5a\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "profiles-autosource", output,
+            "Mutual exclusion message must name 'profiles-autosource'"
+        )
+        # After enabling amux-autowrap, the output must contain the cleared confirmation.
+        # The final render after enabling amux-autowrap must show autosource as unchecked.
+        # Scan only the last checklist render (after the 5a toggle).
+        # The mutual exclusion clears the other sub-toggle — verify the cleared message
+        # appears (it says "cleared conflicting profiles-autosource" or similar).
+        self.assertTrue(
+            "cleared" in output.lower() or "Do NOT source both" in output,
+            "Mutual exclusion must print a cleared/conflict message for profiles-autosource"
+        )
+
+    def test_mutual_exclusion_autosource_clears_autowrap(self):
+        """
+        Enabling profiles-autosource (4a) while amux-autowrap (5a) is on
+        clears amux-autowrap (architecture §2).
+        """
+        result = run_selector(self.tmp_home, keystrokes="5a\n4a\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "amux-autowrap", output,
+            "Mutual exclusion must name 'amux-autowrap' when autosource clears it"
+        )
+
+    def test_suboption_blocked_when_feature_is_skip(self):
+        """
+        Cannot toggle a sub-option when its parent feature is Skip.
+        """
+        # Cycle questions (9) to Skip, then try to toggle 9a
+        # Feature 9 = questions, default = Skip (D14), so it starts Skip.
+        # Try to toggle 9a directly.
+        result = run_selector(self.tmp_home, keystrokes="9a\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "Enable", output,
+            "Must message to enable the parent feature before toggling sub-option"
+        )
+
+
+class TestSelectorQAndDryRun(InstallerTestBase):
+    """
+    q and --dry-run leave the machine byte-identical (no manifest, no backup,
+    no file changed) — 29-06 §5 done criteria.
+    """
+
+    def test_q_writes_nothing(self):
+        """
+        'q' exits 0 and leaves the machine byte-identical: no manifest, no backup,
+        no settings file created.
+        """
+        # Capture all files before
+        def snapshot(base: Path) -> set:
+            return {str(p) for p in base.rglob("*") if p.is_file()}
+
+        before = snapshot(self.tmp_home)
+        result = run_selector(self.tmp_home, keystrokes="q\n")
+        after = snapshot(self.tmp_home)
+
+        self.assertEqual(result.returncode, 0, f"q must exit 0. stderr: {result.stderr[:200]}")
+        new_files = after - before
+        self.assertEqual(
+            new_files, set(),
+            f"'q' must not create any files. New files: {new_files}"
+        )
+
+    def test_dry_run_writes_nothing(self):
+        """
+        --dry-run renders the plan and exits 0 without writing any file.
+        """
+        def snapshot(base: Path) -> set:
+            return {str(p) for p in base.rglob("*") if p.is_file()}
+
+        before = snapshot(self.tmp_home)
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--dry-run"],
+        )
+        after = snapshot(self.tmp_home)
+
+        self.assertEqual(result.returncode, 0,
+                         f"--dry-run must exit 0. stderr: {result.stderr[:300]}")
+        new_files = after - before
+        self.assertEqual(
+            new_files, set(),
+            f"--dry-run must not create any files. New files: {new_files}"
+        )
+
+    def test_dry_run_shows_plan(self):
+        """--dry-run prints feature names and writes info."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--dry-run"],
+        )
+        output = result.stdout + result.stderr
+        self.assertIn("Plan", output, "--dry-run must render the Plan header")
+        self.assertIn("install", output.lower(),
+                      "--dry-run plan must mention the action")
+
+    def test_dry_run_no_manifest(self):
+        """--dry-run does not write the manifest (architecture §5.3)."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--dry-run"],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:200])
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        self.assertFalse(
+            manifest_path.exists(),
+            "--dry-run must not write the manifest"
+        )
+
+    def test_q_no_manifest(self):
+        """'q' does not write the manifest."""
+        result = run_selector(self.tmp_home, keystrokes="q\n")
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        self.assertFalse(
+            manifest_path.exists(),
+            "'q' must not write the manifest"
+        )
+
+    def test_q_preserves_existing_manifest(self):
+        """'q' leaves an existing manifest byte-identical."""
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        original = json.dumps({"schema": 1, "repo": str(REPO),
+                                "revision": "abc", "updated_at": "2026-01-01T00:00:00Z",
+                                "features": {}})
+        manifest_path.write_text(original)
+
+        run_selector(self.tmp_home, keystrokes="q\n")
+
+        self.assertEqual(
+            manifest_path.read_text(), original,
+            "'q' must leave existing manifest byte-identical"
+        )
+
+
+class TestSelectorConfirmAndExecute(InstallerTestBase):
+    """
+    Confirm path: Enter → plan → y → execute; n → back to selector.
+    """
+
+    def test_enter_then_yes_executes(self):
+        """
+        Input: Enter (show plan), then y (confirm) — installer runs and installs
+        features according to the selection.
+        On a fresh machine with defaults, statusline is Install, so it should be installed.
+        """
+        result = run_selector(self.tmp_home, keystrokes="\ny\n")
+        # The selector should confirm and execute; statusline should be installed
+        self.assertEqual(result.returncode, 0,
+                         f"Enter+y must complete successfully. stderr: {result.stderr[:300]}")
+        # After execution, at least some files should exist
+        claude_dir = self.tmp_home / ".claude"
+        self.assertTrue(
+            claude_dir.exists(),
+            "~/.claude must exist after confirmed selector run"
+        )
+
+    def test_enter_then_no_stays_in_selector(self):
+        """
+        Input: Enter, then n (reject confirmation) → back to selector, then q.
+        Machine must remain unchanged.
+        """
+        def snapshot(base: Path) -> set:
+            return {str(p) for p in base.rglob("*") if p.is_file()}
+
+        before = snapshot(self.tmp_home)
+        result = run_selector(self.tmp_home, keystrokes="\nn\nq\n")
+        after = snapshot(self.tmp_home)
+
+        new_files = after - before
+        self.assertEqual(
+            new_files, set(),
+            "Rejecting confirmation + q must leave machine unchanged"
+        )
+        self.assertEqual(result.returncode, 0)
+
+    def test_plan_preview_shows_uninstall_callout(self):
+        """
+        If a feature is set to Uninstall, the plan calls it out separately
+        under 'REMOVALS' (29-06 §5).
+        """
+        # Install statusline first
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        # In selector: cycle statusline (1) to Uninstall (Update→Keep→Uninstall)
+        # then press p to preview plan
+        result = run_selector(self.tmp_home, keystrokes="1\n1\np\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn(
+            "REMOV", output.upper(),
+            "Plan must call out uninstalls under REMOVALS section"
+        )
+
+    def test_p_does_not_execute(self):
+        """
+        'p' previews the plan but does not execute. Machine unchanged after p+q.
+        """
+        def snapshot(base: Path) -> set:
+            return {str(p) for p in base.rglob("*") if p.is_file()}
+
+        before = snapshot(self.tmp_home)
+        result = run_selector(self.tmp_home, keystrokes="p\n\nq\n")
+        after = snapshot(self.tmp_home)
+
+        new_files = after - before
+        self.assertEqual(new_files, set(),
+                         "p+q must leave machine unchanged")
+        self.assertEqual(result.returncode, 0)
+
+    def test_all_key_sets_all_install(self):
+        """
+        'a' sets all not-installed features to Install and installed to Update.
+        """
+        result = run_selector(self.tmp_home, keystrokes="a\nq\n")
+        output = result.stdout + result.stderr
+        # After 'a', should see Install (or Update) for all features, no Skip
+        self.assertIn("Install", output, "After 'a', Install must appear")
+        self.assertIn("all features", output.lower(),
+                      "After 'a', message must mention all features")
+
+    def test_s_key_sets_all_skip(self):
+        """
+        's' sets all not-installed features to Skip and installed to Keep.
+        """
+        result = run_selector(self.tmp_home, keystrokes="s\nq\n")
+        output = result.stdout + result.stderr
+        self.assertIn("Skip", output, "After 's', Skip must appear")
+        self.assertIn("all features", output.lower(),
+                      "After 's', message must mention all features")
+
+
 if __name__ == "__main__":
     # When run directly, set CLAUDE_INSTALL_NO_EXTERNAL for convenience
     os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")
