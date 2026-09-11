@@ -41,6 +41,21 @@ def _make_project_tree(home: Path) -> None:
     pass  # The installer reads project files from SCRIPT_DIR (the real repo).
 
 
+def _make_fake_uv(tmp_home: Path) -> dict:
+    """
+    Create a minimal fake 'uv' executable that exits 0, and return an env dict
+    that adds it to the front of PATH. Used by MCP-related tests on machines
+    where uv is not installed.
+    """
+    bin_dir = tmp_home / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    fake_uv = bin_dir / "uv"
+    fake_uv.write_text("#!/bin/bash\nexit 0\n")
+    fake_uv.chmod(0o755)
+    current_path = os.environ.get("PATH", "")
+    return {"PATH": f"{bin_dir}:{current_path}"}
+
+
 def run_installer(
     tmp_home: Path,
     extra_args: list | None = None,
@@ -1297,6 +1312,725 @@ class TestExtSystemd(InstallerTestBase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("NOT_ENABLED", result.stdout + result.stderr)
+
+
+# =============================================================================
+# §7.1 Hook merge — ownership-scoped (task 29-04)
+# =============================================================================
+
+def _settings_with_foreign_hook(event: str, command: str, matcher: str = "*") -> dict:
+    """Return a minimal settings dict with one foreign hook entry for 'event'."""
+    return {
+        "permissions": {"allow": [], "deny": [], "ask": []},
+        "hooks": {
+            event: [{
+                "matcher": matcher,
+                "hooks": [{"type": "command", "command": command}],
+            }]
+        },
+    }
+
+
+def _write_settings(tmp_home: Path, settings: dict) -> None:
+    """Write settings.json into tmp_home/.claude/."""
+    settings_dir = tmp_home / ".claude"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    (settings_dir / "settings.json").write_text(json.dumps(settings, indent=2))
+
+
+class TestHooksMerge(InstallerTestBase):
+    """
+    §7.1: ownership-scoped hook merges — foreign entries survive, our entries
+    are replaced (not duplicated), Notification keyed by matcher.
+    """
+
+    _FOREIGN_CMD = "python3 /usr/local/my-hooks/custom_hook.py"
+
+    # -------------------------------------------------------------------------
+    # Foreign entries survive install of each owning feature
+    # -------------------------------------------------------------------------
+
+    def test_foreign_pretooluse_survives_permission_hooks_install(self):
+        """A hand-added PreToolUse entry survives permission-hooks install."""
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "PreToolUse", self._FOREIGN_CMD))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        pre = hooks.get("PreToolUse", [])
+        commands = [h["command"] for entry in pre for h in entry.get("hooks", [])]
+        self.assertIn(self._FOREIGN_CMD, commands,
+                      "Foreign PreToolUse command must survive install")
+        # Our entry must also be present
+        hooks_dir = str(self.tmp_home / ".claude" / "hooks")
+        our_cmds = [c for c in commands if hooks_dir in c]
+        self.assertGreater(len(our_cmds), 0,
+                           "Our PreToolUse entry must be present after install")
+
+    def test_foreign_pretooluse_survives_update(self):
+        """A foreign PreToolUse entry survives a second (update) run."""
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "PreToolUse", self._FOREIGN_CMD))
+
+        for _ in range(2):
+            result = run_installer(self.tmp_home,
+                                   extra_args=["--only", "permission-hooks"])
+            self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        pre = hooks.get("PreToolUse", [])
+        commands = [h["command"] for entry in pre for h in entry.get("hooks", [])]
+        self.assertIn(self._FOREIGN_CMD, commands,
+                      "Foreign entry must survive a second (update) run")
+        # No duplicate of our entry
+        hooks_dir = str(self.tmp_home / ".claude" / "hooks")
+        our_cmds = [c for c in commands if hooks_dir in c]
+        self.assertEqual(len(our_cmds), 1,
+                         "Our entry must not be duplicated on idempotent reinstall")
+
+    def test_foreign_posttooluse_survives_telegram_install(self):
+        """A hand-added PostToolUse entry survives telegram install."""
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "PostToolUse", self._FOREIGN_CMD))
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        post = hooks.get("PostToolUse", [])
+        commands = [h["command"] for entry in post for h in entry.get("hooks", [])]
+        self.assertIn(self._FOREIGN_CMD, commands,
+                      "Foreign PostToolUse command must survive telegram install")
+
+    def test_foreign_stop_survives_amux_install(self):
+        """A hand-added Stop entry survives amux install."""
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "Stop", self._FOREIGN_CMD))
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        stop = hooks.get("Stop", [])
+        commands = [h["command"] for entry in stop for h in entry.get("hooks", [])]
+        self.assertIn(self._FOREIGN_CMD, commands,
+                      "Foreign Stop command must survive amux install")
+
+    def test_foreign_hooks_for_other_feature_survive_unrelated_install(self):
+        """
+        A foreign Stop entry (amux-owned event) survives permission-hooks install.
+        Since permission-hooks does not own Stop, it must not touch it.
+        """
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "Stop", self._FOREIGN_CMD))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permission-hooks"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        stop = hooks.get("Stop", [])
+        commands = [h["command"] for entry in stop for h in entry.get("hooks", [])]
+        self.assertIn(self._FOREIGN_CMD, commands,
+                      "Stop entry must survive permission-hooks install (it owns PreToolUse, not Stop)")
+
+    # -------------------------------------------------------------------------
+    # Notification shared array — keyed by matcher
+    # -------------------------------------------------------------------------
+
+    def test_notification_only_telegram_sets_idle_prompt(self):
+        """Installing only telegram yields Notification[idle_prompt] only."""
+        result = run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = [e.get("matcher") for e in notifications]
+        self.assertIn("idle_prompt", matchers,
+                      "telegram install must wire Notification[idle_prompt]")
+        self.assertNotIn("permission_prompt", matchers,
+                         "telegram install must NOT wire Notification[permission_prompt]")
+
+    def test_notification_only_amux_sets_permission_prompt(self):
+        """Installing only amux (with profiles) yields Notification[permission_prompt] only."""
+        result = run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = [e.get("matcher") for e in notifications]
+        self.assertIn("permission_prompt", matchers,
+                      "amux install must wire Notification[permission_prompt]")
+        self.assertNotIn("idle_prompt", matchers,
+                         "amux install must NOT wire Notification[idle_prompt]")
+
+    def test_notification_telegram_then_amux_both_matchers(self):
+        """telegram then amux install: both Notification matchers present."""
+        run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        result = run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = {e.get("matcher") for e in notifications}
+        self.assertIn("idle_prompt", matchers,
+                      "idle_prompt must survive amux install")
+        self.assertIn("permission_prompt", matchers,
+                      "permission_prompt must be present after amux install")
+        self.assertEqual(len(notifications), 2,
+                         "Exactly 2 Notification entries expected; no duplicates")
+
+    def test_notification_amux_then_telegram_both_matchers(self):
+        """amux then telegram install: both Notification matchers present (reverse order)."""
+        run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        result = run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = {e.get("matcher") for e in notifications}
+        self.assertIn("idle_prompt", matchers,
+                      "idle_prompt must be present after telegram install")
+        self.assertIn("permission_prompt", matchers,
+                      "permission_prompt must survive telegram install")
+        self.assertEqual(len(notifications), 2,
+                         "Exactly 2 Notification entries expected; no duplicates")
+
+    def test_notification_update_only_one_matcher(self):
+        """Re-installing telegram leaves permission_prompt from amux untouched."""
+        run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        # Re-install telegram again (update)
+        result = run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = [e.get("matcher") for e in notifications]
+        self.assertEqual(matchers.count("idle_prompt"), 1,
+                         "idle_prompt must appear exactly once after multiple telegram installs")
+        self.assertEqual(matchers.count("permission_prompt"), 1,
+                         "permission_prompt must appear exactly once")
+
+    def test_foreign_notification_entry_survives(self):
+        """
+        A foreign Notification entry (command not in GLOBAL_HOOKS_DIR) survives
+        install of both telegram and amux.
+        """
+        foreign_notification = {
+            "permissions": {"allow": [], "deny": [], "ask": []},
+            "hooks": {
+                "Notification": [{
+                    "matcher": "custom_event",
+                    "hooks": [{"type": "command", "command": self._FOREIGN_CMD}],
+                }]
+            },
+        }
+        _write_settings(self.tmp_home, foreign_notification)
+
+        run_installer(self.tmp_home, extra_args=["--only", "telegram"])
+        result = run_installer(self.tmp_home, extra_args=["--only", "amux,profiles"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        notifications = settings.get("hooks", {}).get("Notification", [])
+        matchers = [e.get("matcher") for e in notifications]
+        self.assertIn("custom_event", matchers,
+                      "Foreign Notification[custom_event] must survive all installs")
+        self.assertIn("idle_prompt", matchers)
+        self.assertIn("permission_prompt", matchers)
+
+
+# =============================================================================
+# §7.2 Permissions merge — union and overwrite (task 29-04)
+# =============================================================================
+
+class TestPermissionsMerge(InstallerTestBase):
+    """
+    §7.2: union mode preserves foreign entries and records added set;
+    overwrite mode reports discarded count.
+    """
+
+    _PROJECT_ALLOW = ["Bash(git status:*)", "Bash(git log:*)"]
+
+    def _settings_with_allow(self, allow_list: list) -> dict:
+        return {
+            "permissions": {"allow": allow_list, "deny": [], "ask": []},
+        }
+
+    def test_union_preserves_existing_allow(self):
+        """Union install: pre-existing allow entries survive."""
+        _write_settings(self.tmp_home, self._settings_with_allow(
+            ["MyCustomTool", "AnotherTool"]))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permissions-allowlist"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        allow = settings.get("permissions", {}).get("allow", [])
+        self.assertIn("MyCustomTool", allow,
+                      "Foreign allow entry must survive union install")
+        self.assertIn("AnotherTool", allow,
+                      "Foreign allow entry must survive union install")
+
+    def test_union_adds_project_entries(self):
+        """Union install: project config entries are added."""
+        _write_settings(self.tmp_home, self._settings_with_allow([]))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permissions-allowlist"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        allow = settings.get("permissions", {}).get("allow", [])
+        # The project's .claude/settings.json has entries — at least one should be added
+        self.assertGreater(len(allow), 0,
+                           "Project allow entries must be added by union install")
+
+    def test_union_no_double_add(self):
+        """
+        A pattern present in both project config and existing user config is not
+        duplicated. Running install twice does not duplicate entries.
+        """
+        # Seed settings with one of the project's own allow entries
+        project_settings_path = REPO / ".claude" / "settings.json"
+        project_settings = json.loads(project_settings_path.read_text())
+        first_entry = project_settings["permissions"]["allow"][0]
+        _write_settings(self.tmp_home, self._settings_with_allow([first_entry]))
+
+        # Two consecutive union installs
+        for _ in range(2):
+            result = run_installer(self.tmp_home,
+                                   extra_args=["--only", "permissions-allowlist"])
+            self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        allow = settings.get("permissions", {}).get("allow", [])
+        self.assertEqual(allow.count(first_entry), 1,
+                         f"Entry '{first_entry}' must appear exactly once, not duplicated")
+
+    def test_union_added_set_recorded_in_manifest(self):
+        """Union install records added_allow and added_deny in the manifest."""
+        _write_settings(self.tmp_home, self._settings_with_allow([]))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permissions-allowlist"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        manifest = read_manifest(self.tmp_home)
+        perm_entry = manifest.get("features", {}).get("permissions-allowlist", {})
+        self.assertIn("added_allow", perm_entry,
+                      "Manifest must have added_allow for permissions-allowlist")
+        self.assertIn("added_deny", perm_entry,
+                      "Manifest must have added_deny for permissions-allowlist")
+        self.assertIsInstance(perm_entry["added_allow"], list)
+        self.assertIsInstance(perm_entry["added_deny"], list)
+        # Since we started with empty allow, all project entries are "added"
+        self.assertGreater(len(perm_entry["added_allow"]), 0,
+                           "added_allow should be non-empty when starting from scratch")
+
+    def test_union_added_set_is_subset_of_project_entries(self):
+        """Union added_allow ⊆ project config allow (nothing alien added)."""
+        _write_settings(self.tmp_home, self._settings_with_allow([]))
+
+        run_installer(self.tmp_home, extra_args=["--only", "permissions-allowlist"])
+
+        manifest = read_manifest(self.tmp_home)
+        added_allow = set(
+            manifest.get("features", {}).get("permissions-allowlist", {}).get("added_allow", [])
+        )
+
+        project_settings_path = REPO / ".claude" / "settings.json"
+        project_settings = json.loads(project_settings_path.read_text())
+        project_allow = set(
+            project_settings.get("permissions", {}).get("allow", []) +
+            project_settings.get("allowedTools", [])
+        )
+
+        extra = added_allow - project_allow
+        self.assertEqual(extra, set(),
+                         f"added_allow contains entries not in project config: {extra}")
+
+    def test_union_manifest_mode_recorded(self):
+        """Manifest records the permissions mode used (union by default)."""
+        _write_settings(self.tmp_home, self._settings_with_allow([]))
+
+        run_installer(self.tmp_home, extra_args=["--only", "permissions-allowlist"])
+
+        manifest = read_manifest(self.tmp_home)
+        options = manifest.get("features", {}).get("permissions-allowlist", {}).get("options", {})
+        self.assertEqual(options.get("mode"), "union",
+                         "Manifest must record mode=union for default install")
+
+    def test_overwrite_replaces_permissions(self):
+        """Overwrite mode replaces the allow list with the project's."""
+        _write_settings(self.tmp_home, self._settings_with_allow(
+            ["MyPrivateTool", "AnotherPrivateTool"]))
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permissions-allowlist"],
+            extra_env={"CLAUDE_INSTALL_PERMISSIONS_MODE": "overwrite"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        allow = settings.get("permissions", {}).get("allow", [])
+        self.assertNotIn("MyPrivateTool", allow,
+                         "Foreign entry must be replaced in overwrite mode")
+        self.assertNotIn("AnotherPrivateTool", allow,
+                         "Foreign entry must be replaced in overwrite mode")
+
+    def test_overwrite_reports_discarded_count(self):
+        """Overwrite mode logs the count of discarded existing allow entries."""
+        _write_settings(self.tmp_home, self._settings_with_allow(
+            ["PrettyUnique1", "PrettyUnique2", "PrettyUnique3"]))
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permissions-allowlist"],
+            extra_env={"CLAUDE_INSTALL_PERMISSIONS_MODE": "overwrite"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        combined = result.stdout + result.stderr
+        self.assertIn("discarding", combined.lower(),
+                      "Overwrite mode must report discarded entries in its output")
+        # All three of our unique entries are not in the project config, so they're discarded
+        self.assertIn("3", combined,
+                      "Discarded count (3) must appear in the output")
+
+    def test_legacy_allowedtools_folded_into_union(self):
+        """Legacy allowedTools key is folded into permissions.allow and removed."""
+        settings_dir = self.tmp_home / ".claude"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        (settings_dir / "settings.json").write_text(json.dumps({
+            "allowedTools": ["LegacyTool"],
+        }))
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["--only", "permissions-allowlist"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        settings = read_settings(self.tmp_home)
+        # Legacy key must be gone
+        self.assertNotIn("allowedTools", settings,
+                         "Legacy allowedTools key must be removed by install")
+        # LegacyTool should survive in the union (it was in allowedTools, treated as allow)
+        allow = settings.get("permissions", {}).get("allow", [])
+        self.assertIn("LegacyTool", allow,
+                      "LegacyTool from allowedTools must be preserved in the union")
+
+
+# =============================================================================
+# §4 MCP server helpers — register/de-register (task 29-04)
+# =============================================================================
+
+class TestMCPHelpers(InstallerTestBase):
+    """
+    §4: _register_mcp_server and _deregister_mcp_server via the installer.
+    All tests use CLAUDE_INSTALL_NO_EXTERNAL=1 (MCP writes are HOME-isolated).
+    """
+
+    def _run_mcp_script(
+        self,
+        call: str,
+        extra_setup: str = "",
+        no_external: bool = True,
+    ) -> subprocess.CompletedProcess:
+        """
+        Run a call against the §7 helpers extracted from install.sh in a minimal
+        harness, analogous to run_ext_call for §8 seam tests.
+        """
+        install_text = INSTALL_SH.read_text()
+
+        # Extract §7 helpers section (between the §7 header and the §build section)
+        start = install_text.find("# §7. Settings helpers")
+        end   = install_text.find("build_and_write_settings()")
+        if start == -1 or end == -1:
+            raise ValueError("Could not locate §7 helpers section in install.sh")
+        helpers_section = install_text[start:end]
+
+        no_ext_val = "1" if no_external else "0"
+        script = f"""#!/bin/bash
+set -euo pipefail
+HOME="{self.tmp_home}"
+BACKUP_DIR="{self.tmp_home}/.claude/backups"
+CLAUDE_INSTALL_NO_EXTERNAL="{no_ext_val}"
+UV_AVAILABLE=true
+CLAUDE_JSON_BACKUP_FILE=""
+mkdir -p "$BACKUP_DIR"
+mkdir -p "$HOME/.claude"
+
+log_info()  {{ echo "[INFO] $1"; }}
+log_warn()  {{ echo "[WARN] $1"; }}
+log_error() {{ echo "[ERROR] $1"; }}
+log_step()  {{ echo "[STEP] $1"; }}
+
+{extra_setup}
+
+{helpers_section}
+
+{call}
+"""
+        script_path = self.tmp_home / "_mcp_test.sh"
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(script_path)],
+            capture_output=True, text=True,
+            cwd=str(REPO), timeout=30,
+        )
+
+    def _seed_claude_json(self, data: dict) -> None:
+        """Write known content to tmp_home/.claude.json."""
+        (self.tmp_home / ".claude.json").write_text(json.dumps(data))
+
+    # -------------------------------------------------------------------------
+    # context-mcp feature integration test (uses _register_mcp_server)
+    # -------------------------------------------------------------------------
+
+    def test_context_mcp_install_preserves_foreign_server(self):
+        """Installing context-mcp leaves an unrelated mcpServers entry alone."""
+        self._seed_claude_json({
+            "mcpServers": {
+                "my-custom-server": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["/some/server.js"],
+                    "env": {},
+                }
+            }
+        })
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "context-mcp"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        claude_json = read_claude_json(self.tmp_home)
+        mcp = claude_json.get("mcpServers", {})
+        self.assertIn("my-custom-server", mcp,
+                      "Foreign mcpServers entry must survive context-mcp install")
+
+    def test_context_mcp_install_creates_backup(self):
+        """Installing context-mcp creates a timestamped backup of ~/.claude.json."""
+        self._seed_claude_json({"mcpServers": {"existing": {"type": "stdio"}}})
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "context-mcp"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        backup_dir = self.tmp_home / ".claude" / "backups"
+        backups = list(backup_dir.glob("claude.json.*.bak"))
+        self.assertGreater(len(backups), 0,
+                           "A timestamped backup of ~/.claude.json must exist after install")
+        # Backup content must match the pre-run state
+        pre_run_json = json.loads(backups[0].read_text())
+        self.assertIn("existing", pre_run_json.get("mcpServers", {}),
+                      "Backup must reflect the pre-install state of ~/.claude.json")
+
+    def test_register_deregister_leaves_foreign_server(self):
+        """
+        Direct _register_mcp_server + _deregister_mcp_server: foreign server untouched.
+        """
+        self._seed_claude_json({
+            "mcpServers": {
+                "foreign": {"type": "stdio", "command": "node", "args": []}
+            }
+        })
+
+        # Register a test server
+        result = self._run_mcp_script(
+            '_register_mcp_server "test-srv" "/fake/script.py" "{}"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        claude = json.loads((self.tmp_home / ".claude.json").read_text())
+        self.assertIn("foreign", claude.get("mcpServers", {}))
+        self.assertIn("test-srv", claude.get("mcpServers", {}))
+
+        # De-register the test server
+        result = self._run_mcp_script(
+            '_deregister_mcp_server "test-srv"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+        claude = json.loads((self.tmp_home / ".claude.json").read_text())
+        self.assertIn("foreign", claude.get("mcpServers", {}),
+                      "Foreign server must survive de-registration")
+        self.assertNotIn("test-srv", claude.get("mcpServers", {}),
+                         "Our server must be removed by de-registration")
+
+    def test_deregister_noop_when_server_absent(self):
+        """_deregister_mcp_server is a no-op when the server is not registered."""
+        self._seed_claude_json({"mcpServers": {"other": {}}})
+
+        result = self._run_mcp_script('_deregister_mcp_server "nonexistent"')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no-op", result.stdout + result.stderr)
+
+    def test_backup_created_only_once_per_run(self):
+        """
+        Calling _register_mcp_server twice takes only ONE backup (pre-run state).
+        """
+        original = {"mcpServers": {"orig": {}}}
+        self._seed_claude_json(original)
+
+        result = self._run_mcp_script(
+            '_register_mcp_server "srv1" "/s1.py" "{}" && '
+            '_register_mcp_server "srv2" "/s2.py" "{}"'
+        )
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        backup_dir = self.tmp_home / ".claude" / "backups"
+        backups = list(backup_dir.glob("claude.json.*.bak"))
+        self.assertEqual(len(backups), 1,
+                         "Only one backup must be taken per run (pre-run state)")
+        # That backup reflects the original content
+        backed_up = json.loads(backups[0].read_text())
+        self.assertIn("orig", backed_up.get("mcpServers", {}))
+        self.assertNotIn("srv1", backed_up.get("mcpServers", {}))
+
+    # -------------------------------------------------------------------------
+    # Corrupted merge — restore path (§7.3)
+    # -------------------------------------------------------------------------
+
+    def test_corrupted_settings_merge_restores_backup(self):
+        """
+        If the settings.json merge produces invalid JSON, the backup is restored
+        and the run exits non-zero.
+        """
+        settings_dir = self.tmp_home / ".claude"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        (settings_dir / "settings.json").write_text(json.dumps(
+            {"permissions": {"allow": ["KnownEntry"], "deny": [], "ask": []}}
+        ))
+
+        # Patch build_and_write_settings to produce invalid JSON by corrupting
+        # the initial read of the global config.
+        text = INSTALL_SH.read_text()
+        target = "    # Start with current global config\n    local merged\n    merged=$(jq '.' \"$GLOBAL_CONFIG\")"
+        replacement = "    # Start with current global config\n    local merged\n    merged='THIS IS NOT VALID JSON'  # PATCHED: simulate corrupted merge"
+        patched = text.replace(target, replacement, 1)
+        self.assertIn("PATCHED: simulate corrupted merge", patched,
+                      "Patch must apply; check if build_and_write_settings changed")
+
+        patched_path = self.tmp_home / "install_corrupted.sh"
+        patched_path.write_text(patched)
+        patched_path.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "HOME": str(self.tmp_home),
+            "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+            "CLAUDE_INSTALL_EPIC29_LIVE": "1",
+            "CLAUDE_INSTALL_SCRIPT_DIR": str(REPO),
+        }
+        result = subprocess.run(
+            ["bash", str(patched_path), "--only", "permissions-allowlist"],
+            capture_output=True, text=True,
+            cwd=str(REPO), env=env, timeout=30,
+        )
+
+        # Must exit non-zero
+        self.assertNotEqual(result.returncode, 0,
+                            "Corrupted merge must exit non-zero")
+
+        # settings.json must have the original content (restored from backup)
+        final = json.loads((settings_dir / "settings.json").read_text())
+        allow = final.get("permissions", {}).get("allow", [])
+        self.assertIn("KnownEntry", allow,
+                      "settings.json must be restored from backup after corrupted merge")
+
+    def test_corrupted_claude_json_write_restores_backup_and_exits(self):
+        """
+        If ~/.claude.json write re-validation fails, the backup is restored and
+        the run exits non-zero.
+        """
+        original_mcp = {"mcpServers": {"pre-existing": {"type": "stdio"}}}
+        (self.tmp_home / ".claude.json").write_text(json.dumps(original_mcp))
+
+        # Patch _register_mcp_server to corrupt ~/.claude.json AFTER the mv,
+        # triggering the re-validation failure path.
+        text = INSTALL_SH.read_text()
+        target = "    mv \"$tmp\" \"$claude_json\"\n\n    # Re-validate after write (§7.3 atomicity"
+        replacement = (
+            "    mv \"$tmp\" \"$claude_json\"\n"
+            "    # PATCHED: corrupt after mv to test re-validation restore\n"
+            "    echo 'NOT VALID JSON' > \"$claude_json\"\n\n"
+            "    # Re-validate after write (§7.3 atomicity"
+        )
+        patched = text.replace(target, replacement, 1)
+        self.assertIn("PATCHED: corrupt after mv", patched,
+                      "Patch must apply; check _register_mcp_server write section")
+
+        patched_path = self.tmp_home / "install_corrupt_json.sh"
+        patched_path.write_text(patched)
+        patched_path.chmod(0o755)
+
+        fake_uv_env = _make_fake_uv(self.tmp_home)
+        env = {
+            **os.environ,
+            **fake_uv_env,
+            "HOME": str(self.tmp_home),
+            "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+            "CLAUDE_INSTALL_EPIC29_LIVE": "1",
+            "CLAUDE_INSTALL_SCRIPT_DIR": str(REPO),
+        }
+        result = subprocess.run(
+            ["bash", str(patched_path), "--only", "context-mcp"],
+            capture_output=True, text=True,
+            cwd=str(REPO), env=env, timeout=30,
+        )
+
+        # Must exit non-zero
+        self.assertNotEqual(result.returncode, 0,
+                            "Corrupted ~/.claude.json must exit non-zero")
+
+        # ~/.claude.json must be restored to the pre-run state
+        final = json.loads((self.tmp_home / ".claude.json").read_text())
+        self.assertIn("pre-existing", final.get("mcpServers", {}),
+                      "~/.claude.json must be restored from backup after corrupted write")
+        self.assertNotIn("context-usage", final.get("mcpServers", {}),
+                         "Corrupted context-usage registration must be rolled back")
+
+    def test_claude_json_backup_before_edit(self):
+        """A run that touches ~/.claude.json leaves a timestamped backup of pre-edit content."""
+        # Seed with a recognisable foreign mcpServers entry
+        pre_run_content = {
+            "mcpServers": {
+                "my-foreign-server": {
+                    "type": "stdio",
+                    "command": "node",
+                    "args": ["/my/server.js"],
+                    "env": {"FOO": "bar"},
+                }
+            },
+            "some_user_setting": "preserved",
+        }
+        (self.tmp_home / ".claude.json").write_text(json.dumps(pre_run_content))
+
+        result = run_installer(self.tmp_home, extra_args=["--only", "context-mcp"],
+                               extra_env=_make_fake_uv(self.tmp_home))
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        # Backup must exist
+        backup_dir = self.tmp_home / ".claude" / "backups"
+        backups = list(backup_dir.glob("claude.json.*.bak"))
+        self.assertGreater(len(backups), 0,
+                           "A timestamped backup must be created when ~/.claude.json is modified")
+
+        # Backup content must match the pre-run bytes exactly
+        backup_data = json.loads(backups[0].read_text())
+        self.assertEqual(backup_data, pre_run_content,
+                         "Backup must match the pre-run content of ~/.claude.json byte-for-byte")
 
 
 if __name__ == "__main__":

@@ -378,35 +378,21 @@ feature_telegram_install() {
         log_warn "claude-roles not found at $claude_roles_src — skipping"
     fi
 
-    # permissions MCP server in ~/.claude.json
+    # permissions MCP server in ~/.claude.json — collapsed into the shared helper
     local permissions_mcp_script="$SCRIPT_DIR/permissions-mcp/server.py"
-    local claude_json="$HOME/.claude.json"
-    if [[ "$UV_AVAILABLE" == true && -f "$permissions_mcp_script" ]]; then
-        if [[ ! -f "$claude_json" ]]; then
-            echo '{}' > "$claude_json"
-        fi
-        if jq empty "$claude_json" 2>/dev/null; then
-            jq --arg script "$permissions_mcp_script" --arg repo "$SCRIPT_DIR" \
-                '.mcpServers = (.mcpServers // {}) + {"permissions": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {"CLAUDE_HOOKS_REPO": $repo}}}' \
-                "$claude_json" > "$claude_json.tmp"
-            if jq empty "$claude_json.tmp" 2>/dev/null; then
-                mv "$claude_json.tmp" "$claude_json"
-                log_info "MCP server registered in ~/.claude.json: permissions"
-                PERMISSIONS_MCP_INSTALLED=true
-            else
-                log_warn "Failed to produce valid JSON for ~/.claude.json — permissions MCP server not registered"
-                rm -f "$claude_json.tmp"
-            fi
-        else
-            log_warn "~/.claude.json is not valid JSON — skipping permissions MCP server registration"
+    if [[ -f "$permissions_mcp_script" ]]; then
+        if _register_mcp_server "permissions" "$permissions_mcp_script" \
+                "{\"CLAUDE_HOOKS_REPO\": \"$SCRIPT_DIR\"}"; then
+            PERMISSIONS_MCP_INSTALLED=true
         fi
     fi
 
-    # Build PostToolUse and Notification hook config
+    # Build PostToolUse and Notification[idle_prompt] hook config.
+    # telegram owns PostToolUse and Notification[idle_prompt] only.
+    # Notification[permission_prompt] is owned by amux (architecture §7.1).
     HOOKS_JSON=$(echo "$HOOKS_JSON" | jq \
         --arg posttool_path "$GLOBAL_HOOKS_DIR/posttool_hook.py" \
         --arg notification_path "$GLOBAL_HOOKS_DIR/notification_hook.py" \
-        --arg producer_path "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
         '. + {
             PostToolUse: [{
                 matcher: "*",
@@ -420,20 +406,17 @@ feature_telegram_install() {
                     matcher: "idle_prompt",
                     hooks: [{
                         type: "command",
+                        # CLAUDE_HOOK_DEBUG=1 mirrors PermissionRequest: it logs the
+                        # idle-notification path AND propagates (via inherited env)
+                        # to the detached reply_injector.py it spawns, so the
+                        # reply-from-Telegram chain is observable end-to-end.
                         command: ("CLAUDE_HOOK_DEBUG=1 python3 " + $notification_path)
-                    }]
-                },
-                {
-                    matcher: "permission_prompt",
-                    hooks: [{
-                        type: "command",
-                        command: ("python3 " + $producer_path + " --event Notification")
                     }]
                 }
             ]
         }')
 
-    log_info "Telegram hooks wired (PostToolUse, Notification)"
+    log_info "Telegram hooks wired (PostToolUse, Notification[idle_prompt])"
 }
 
 feature_telegram_uninstall() {
@@ -632,11 +615,23 @@ feature_amux_install() {
     _install_tmux_options
     AMUX_CODEX_STATUS="${AMUX_CODEX_STATUS:-not probed}"
 
-    # Build amux hooks: UserPromptSubmit, Stop, SubagentStop, SessionEnd
+    # Build amux hooks: Notification[permission_prompt], UserPromptSubmit, Stop,
+    # SubagentStop, SessionEnd (architecture §7.1 — amux owns all of these).
+    # Notification[permission_prompt] is amux's share of the shared Notification array;
+    # telegram owns Notification[idle_prompt].
     if [[ "$AMUX_SPAWN_INSTALLED" == true ]]; then
         HOOKS_JSON=$(echo "$HOOKS_JSON" | jq \
             --arg producer_path "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
             '. + {
+                Notification: ((.Notification // []) + [{
+                    matcher: "permission_prompt",
+                    hooks: [{
+                        type: "command",
+                        # Epic-10 producer: sets permission_pending on tracked session handles.
+                        # No-op for plain/human sessions and other repos.
+                        command: ("python3 " + $producer_path + " --event Notification")
+                    }]
+                }]),
                 UserPromptSubmit: [{
                     matcher: "*",
                     hooks: [{
@@ -666,7 +661,7 @@ feature_amux_install() {
                     }]
                 }]
             }')
-        log_info "amux hooks wired (UserPromptSubmit, Stop, SubagentStop, SessionEnd)"
+        log_info "amux hooks wired (Notification[permission_prompt], UserPromptSubmit, Stop, SubagentStop, SessionEnd)"
     fi
 }
 
@@ -727,7 +722,6 @@ feature_context_mcp_probe() {
 feature_context_mcp_install() {
     log_step "Installing: $(feature_context_mcp_title)"
     local context_mcp_script="$SCRIPT_DIR/context-mcp/server.py"
-    local claude_json="$HOME/.claude.json"
 
     if [[ "$UV_AVAILABLE" != true ]]; then
         log_warn "uv not available — skipping context-usage MCP server"
@@ -738,23 +732,8 @@ feature_context_mcp_install() {
         return 0
     fi
 
-    if [[ ! -f "$claude_json" ]]; then
-        echo '{}' > "$claude_json"
-    fi
-    if jq empty "$claude_json" 2>/dev/null; then
-        jq --arg script "$context_mcp_script" \
-            '.mcpServers = (.mcpServers // {}) + {"context-usage": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {}}}' \
-            "$claude_json" > "$claude_json.tmp"
-        if jq empty "$claude_json.tmp" 2>/dev/null; then
-            mv "$claude_json.tmp" "$claude_json"
-            log_info "MCP server registered in ~/.claude.json: context-usage"
-            CONTEXT_MCP_INSTALLED=true
-        else
-            log_warn "Failed to produce valid JSON for ~/.claude.json — context-usage MCP not registered"
-            rm -f "$claude_json.tmp"
-        fi
-    else
-        log_warn "~/.claude.json is not valid JSON — skipping context-usage MCP registration"
+    if _register_mcp_server "context-usage" "$context_mcp_script" "{}"; then
+        CONTEXT_MCP_INSTALLED=true
     fi
 }
 
@@ -816,27 +795,14 @@ feature_questions_install() {
     local claude_bin_dir="$HOME/.claude/bin"
     mkdir -p "$claude_bin_dir"
 
-    # questions MCP server in ~/.claude.json
+    # questions MCP server in ~/.claude.json — collapsed into the shared helper.
+    # IMPORTANT: questions_listen_lib.py and questions-mcp must stay in sync (see
+    # install-claude-config.sh:852). Both are installed in this same function.
     local questions_mcp_script="$SCRIPT_DIR/questions-mcp/server.py"
-    local claude_json="$HOME/.claude.json"
-    if [[ "$UV_AVAILABLE" == true && -f "$questions_mcp_script" ]]; then
-        if [[ ! -f "$claude_json" ]]; then
-            echo '{}' > "$claude_json"
-        fi
-        if jq empty "$claude_json" 2>/dev/null; then
-            jq --arg script "$questions_mcp_script" --arg repo "$SCRIPT_DIR" \
-                '.mcpServers = (.mcpServers // {}) + {"questions": {type: "stdio", command: "uv", args: ["run", "--script", $script], env: {"CLAUDE_HOOKS_REPO": $repo}}}' \
-                "$claude_json" > "$claude_json.tmp"
-            if jq empty "$claude_json.tmp" 2>/dev/null; then
-                mv "$claude_json.tmp" "$claude_json"
-                log_info "MCP server registered in ~/.claude.json: questions"
-                QUESTIONS_MCP_INSTALLED=true
-            else
-                log_warn "Failed to produce valid JSON for ~/.claude.json — questions MCP not registered"
-                rm -f "$claude_json.tmp"
-            fi
-        else
-            log_warn "~/.claude.json is not valid JSON — skipping questions MCP registration"
+    if [[ -f "$questions_mcp_script" ]]; then
+        if _register_mcp_server "questions" "$questions_mcp_script" \
+                "{\"CLAUDE_HOOKS_REPO\": \"$SCRIPT_DIR\"}"; then
+            QUESTIONS_MCP_INSTALLED=true
         fi
     fi
 
@@ -1059,9 +1025,21 @@ manifest_write() {
     local id state
     for id in "${FEATURES[@]}"; do
         state="${FEATURE_STATE[$id]:-skipped}"
-        features_json=$(echo "$features_json" | jq \
-            --arg id "$id" --arg state "$state" --arg at "$timestamp" \
-            '. + {($id): {state: $state, at: $at, artifacts: [], options: {}}}')
+        if [[ "$id" == "permissions-allowlist" && "$state" == "installed" ]]; then
+            # Record union-mode additions so uninstall (29-05) can subtract exactly them.
+            features_json=$(echo "$features_json" | jq \
+                --arg  id           "$id" \
+                --arg  state        "$state" \
+                --arg  at           "$timestamp" \
+                --arg  mode         "${PERMISSIONS_ALLOWLIST_MODE:-union}" \
+                --argjson added_allow "${PERMISSIONS_ADDED_ALLOW:-[]}" \
+                --argjson added_deny  "${PERMISSIONS_ADDED_DENY:-[]}" \
+                '. + {($id): {state: $state, at: $at, artifacts: [], options: {mode: $mode}, added_allow: $added_allow, added_deny: $added_deny}}')
+        else
+            features_json=$(echo "$features_json" | jq \
+                --arg id "$id" --arg state "$state" --arg at "$timestamp" \
+                '. + {($id): {state: $state, at: $at, artifacts: [], options: {}}}')
+        fi
     done
 
     local manifest_tmp
@@ -1741,6 +1719,310 @@ ext_run_installer() {
 }
 
 # =============================================================================
+# §7. Settings helpers — ownership-scoped merge and MCP management
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# §7 / §4 ~/.claude.json backup helpers
+# ---------------------------------------------------------------------------
+
+# _backup_claude_json
+# Takes a timestamped backup of ~/.claude.json into $BACKUP_DIR before the
+# first write of this run. Idempotent — subsequent calls within the same run
+# are no-ops, so the backup always reflects the pre-run state.
+_backup_claude_json() {
+    local claude_json="$HOME/.claude.json"
+    if [[ -n "$CLAUDE_JSON_BACKUP_FILE" ]]; then
+        return 0  # Already backed up this run — use the pre-run state
+    fi
+    if [[ ! -f "$claude_json" ]]; then
+        return 0  # Nothing to back up
+    fi
+    mkdir -p "$BACKUP_DIR"
+    CLAUDE_JSON_BACKUP_FILE="$BACKUP_DIR/claude.json.$(date +%Y%m%d_%H%M%S).bak"
+    cp "$claude_json" "$CLAUDE_JSON_BACKUP_FILE"
+    log_info "Backup created: $CLAUDE_JSON_BACKUP_FILE"
+}
+
+# _restore_claude_json_from_backup
+# Restores ~/.claude.json from the backup taken by _backup_claude_json.
+# No-op if no backup was taken (e.g. no write happened yet this run).
+_restore_claude_json_from_backup() {
+    if [[ -n "$CLAUDE_JSON_BACKUP_FILE" && -f "$CLAUDE_JSON_BACKUP_FILE" ]]; then
+        cp "$CLAUDE_JSON_BACKUP_FILE" "$HOME/.claude.json"
+        log_info "Restored ~/.claude.json from backup: $CLAUDE_JSON_BACKUP_FILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# §4 MCP server registration / de-registration
+# ---------------------------------------------------------------------------
+
+# _register_mcp_server <name> <script> <env_json>
+# Registers (or updates) one MCP server in ~/.claude.json.
+# - uv gate: returns 1 early if uv is not available
+# - backup before first write of the run
+# - atomic tmp→mv write
+# - validate-then-replace; restore from backup on re-validation failure
+# - foreign mcpServers entries are preserved
+_register_mcp_server() {
+    local name="$1"
+    local script="$2"
+    # Avoid ${3:-{}} — when $3 = "{}", the expansion appends a stray "}" producing
+    # invalid JSON "{}}". Use an explicit test instead.
+    local env_json
+    if [[ -n "${3:-}" ]]; then env_json="$3"; else env_json="{}"; fi
+    local claude_json="$HOME/.claude.json"
+
+    if [[ "$UV_AVAILABLE" != true ]]; then
+        log_warn "_register_mcp_server: uv not available — skipping MCP server registration: $name"
+        return 1
+    fi
+
+    # Create if absent
+    if [[ ! -f "$claude_json" ]]; then
+        echo '{}' > "$claude_json"
+    fi
+
+    # Validate existing file
+    if ! jq empty "$claude_json" 2>/dev/null; then
+        log_warn "_register_mcp_server: ~/.claude.json is not valid JSON — skipping: $name"
+        return 1
+    fi
+
+    # Backup before any write (§4 requirement — once per run)
+    _backup_claude_json
+
+    # Build merged content
+    local tmp="$claude_json.tmp.$$"
+    if ! jq --arg name "$name" \
+            --arg script "$script" \
+            --argjson env_json "$env_json" \
+            '.mcpServers = (.mcpServers // {}) + {($name): {type: "stdio", command: "uv", args: ["run", "--script", $script], env: $env_json}}' \
+            "$claude_json" > "$tmp" 2>/dev/null; then
+        log_warn "_register_mcp_server: jq failed producing merged content for: $name"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # Validate output
+    if ! jq empty "$tmp" 2>/dev/null; then
+        log_warn "_register_mcp_server: merged content is not valid JSON — $name not registered"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mv "$tmp" "$claude_json"
+
+    # Re-validate after write (§7.3 atomicity — same discipline as settings.json)
+    if ! jq empty "$claude_json" 2>/dev/null; then
+        log_error "_register_mcp_server: re-validation failed after writing $name. Restoring backup and aborting..."
+        _restore_claude_json_from_backup
+        exit 1
+    fi
+
+    log_info "MCP server registered in ~/.claude.json: $name (uv run --script $script)"
+    return 0
+}
+
+# _deregister_mcp_server <name>
+# Removes one MCP server from ~/.claude.json by key.
+# Foreign mcpServers entries are left untouched.
+# No-op if the server is not registered or ~/.claude.json does not exist.
+_deregister_mcp_server() {
+    local name="$1"
+    local claude_json="$HOME/.claude.json"
+
+    if [[ ! -f "$claude_json" ]]; then
+        log_info "_deregister_mcp_server: ~/.claude.json absent — nothing to remove for: $name"
+        return 0
+    fi
+
+    if ! jq empty "$claude_json" 2>/dev/null; then
+        log_warn "_deregister_mcp_server: ~/.claude.json is not valid JSON — skipping: $name"
+        return 1
+    fi
+
+    # No-op if not registered
+    if ! jq -e --arg name "$name" '.mcpServers[$name]' "$claude_json" >/dev/null 2>&1; then
+        log_info "_deregister_mcp_server: $name not found in ~/.claude.json — no-op"
+        return 0
+    fi
+
+    _backup_claude_json
+
+    local tmp="$claude_json.tmp.$$"
+    if ! jq --arg name "$name" 'del(.mcpServers[$name])' "$claude_json" > "$tmp" 2>/dev/null; then
+        log_warn "_deregister_mcp_server: jq failed removing $name from ~/.claude.json"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! jq empty "$tmp" 2>/dev/null; then
+        log_warn "_deregister_mcp_server: merged content is not valid JSON — $name not removed"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mv "$tmp" "$claude_json"
+
+    if ! jq empty "$claude_json" 2>/dev/null; then
+        log_error "_deregister_mcp_server: re-validation failed after removing $name. Restoring backup and aborting..."
+        _restore_claude_json_from_backup
+        exit 1
+    fi
+
+    log_info "MCP server de-registered from ~/.claude.json: $name"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# §7.1 Hooks merge — ownership-scoped (identifies entries by command)
+# ---------------------------------------------------------------------------
+
+# _merge_hooks_owned <current_settings_json> <hooks_json> <hooks_dir>
+# Merges the per-feature HOOKS_JSON into the existing settings.json hooks,
+# ownership-scoped: an entry is ours if any of its hooks[].command references
+# $hooks_dir.
+#
+# Rules (architecture §7.1):
+# - Install/update: remove ours for the events being installed, append new ones.
+#   Foreign entries in the same array survive in order.
+# - Notification is shared between telegram (idle_prompt) and amux (permission_prompt).
+#   Merge keys on .matcher — never replaces the whole array.
+# - Returns the full settings JSON with merged hooks on stdout.
+_merge_hooks_owned() {
+    local current="$1"   # full settings.json string
+    local new_hooks="$2" # HOOKS_JSON built by feature installs
+    local hooks_dir="$3" # GLOBAL_HOOKS_DIR
+
+    echo "$current" | jq \
+        --argjson nh "$new_hooks" \
+        --arg hdir "$hooks_dir" \
+        '
+        # True if any hooks[].command in this entry references $hdir (= owned by us).
+        def is_ours:
+          [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
+
+        # Merge a simple (non-Notification) event array:
+        # remove our old entries, append the new ones.
+        def merge_event(event_key):
+          if ($nh[event_key] // [] | length) == 0 then .
+          else
+            .hooks[event_key] = (
+              (.hooks[event_key] // [] | map(select(is_ours | not))) +
+              $nh[event_key]
+            )
+          end;
+
+        # Merge Notification, keyed by .matcher.
+        # Keeps: foreign entries (not ours) and our entries for matchers NOT being replaced.
+        # Replaces: our entries for matchers present in $nh.Notification.
+        def merge_notification:
+          if ($nh.Notification // [] | length) == 0 then .
+          else
+            ($nh.Notification | [.[].matcher]) as $our_matchers |
+            .hooks.Notification = (
+              (.hooks.Notification // [] | map(select(
+                (is_ours | not)
+                or
+                ((.matcher // "") as $m | ($our_matchers | any(.[]; . == $m)) | not)
+              ))) +
+              $nh.Notification
+            )
+          end;
+
+        merge_event("PreToolUse") |
+        merge_event("PermissionRequest") |
+        merge_event("PostToolUse") |
+        merge_notification |
+        merge_event("UserPromptSubmit") |
+        merge_event("Stop") |
+        merge_event("SubagentStop") |
+        merge_event("SessionEnd")
+        '
+}
+
+# ---------------------------------------------------------------------------
+# §7.2 Permissions merge — union and overwrite modes
+# ---------------------------------------------------------------------------
+
+# _merge_permissions_union <current_settings_json> <new_allow_json> <new_deny_json> <new_ask_json>
+# Set-union merge: existing entries are preserved; new entries are appended only
+# if not already present. Sets globals PERMISSIONS_ADDED_ALLOW and
+# PERMISSIONS_ADDED_DENY with the actually-added subsets (for the manifest).
+# Also folds in legacy allowedTools / disallowedTools keys.
+# Returns the merged settings JSON on stdout.
+_merge_permissions_union() {
+    local current="$1"
+    local new_allow="$2"
+    local new_deny="$3"
+    local new_ask="$4"
+
+    # Compute added subsets (items in new_* that are not already in existing)
+    PERMISSIONS_ADDED_ALLOW=$(echo "$current" | jq \
+        --argjson na "$new_allow" \
+        '(.allowedTools // .permissions.allow // []) as $existing |
+         $na | map(select(. as $x | $existing | any(.[]; . == $x) | not))')
+
+    PERMISSIONS_ADDED_DENY=$(echo "$current" | jq \
+        --argjson nd "$new_deny" \
+        '(.disallowedTools // .permissions.deny // []) as $existing |
+         $nd | map(select(. as $x | $existing | any(.[]; . == $x) | not))')
+
+    # Produce merged settings with union applied
+    echo "$current" | jq \
+        --argjson added_allow "$PERMISSIONS_ADDED_ALLOW" \
+        --argjson added_deny  "$PERMISSIONS_ADDED_DENY" \
+        --argjson new_ask     "$new_ask" \
+        '(.allowedTools // .permissions.allow // []) as $ex_allow |
+         (.disallowedTools // .permissions.deny // []) as $ex_deny |
+         (.permissions.ask // []) as $ex_ask |
+         ($new_ask | map(select(. as $x | $ex_ask | any(.[]; . == $x) | not))) as $added_ask |
+         del(.allowedTools, .disallowedTools) |
+         . + {permissions: {
+             allow: ($ex_allow + $added_allow),
+             deny:  ($ex_deny  + $added_deny),
+             ask:   ($ex_ask   + $added_ask)
+         }}'
+}
+
+# _merge_permissions_overwrite <current_settings_json> <new_allow_json> <new_deny_json> <new_ask_json>
+# Overwrite mode: replaces the permissions block wholesale (today's semantics).
+# Reports the count of allow entries being discarded before writing.
+# Sets PERMISSIONS_ADDED_ALLOW / PERMISSIONS_ADDED_DENY to empty arrays (nothing
+# to track for uninstall in overwrite mode).
+# Also folds in legacy allowedTools / disallowedTools keys.
+# Returns the merged settings JSON on stdout.
+_merge_permissions_overwrite() {
+    local current="$1"
+    local new_allow="$2"
+    local new_deny="$3"
+    local new_ask="$4"
+
+    # Count entries being discarded (in existing but NOT in new_allow)
+    local discarded_count
+    discarded_count=$(echo "$current" | jq \
+        --argjson na "$new_allow" \
+        '(.allowedTools // .permissions.allow // []) |
+         map(select(. as $x | $na | any(.[]; . == $x) | not)) | length')
+
+    if [[ "$discarded_count" -gt 0 ]]; then
+        log_warn "permissions-allowlist overwrite: discarding $discarded_count existing allow entries not in project config" >&2
+    fi
+
+    PERMISSIONS_ADDED_ALLOW='[]'
+    PERMISSIONS_ADDED_DENY='[]'
+
+    echo "$current" | jq \
+        --argjson allowed    "$new_allow" \
+        --argjson disallowed "$new_deny" \
+        --argjson ask        "$new_ask" \
+        'del(.allowedTools, .disallowedTools) |
+         . + {permissions: {allow: $allowed, deny: $disallowed, ask: $ask}}'
+}
+
+# =============================================================================
 # Settings build and write (validate-then-replace discipline)
 # =============================================================================
 
@@ -1761,19 +2043,42 @@ build_and_write_settings() {
     local merged
     merged=$(jq '.' "$GLOBAL_CONFIG")
 
-    # permissions-allowlist feature contribution
+    # permissions-allowlist feature contribution (§7.2 union / overwrite)
     if [[ "${PERMISSIONS_ALLOWLIST_SELECTED:-false}" == true ]]; then
-        merged=$(echo "$merged" | jq \
-            --argjson allowed "$allowed_tools" \
-            --argjson disallowed "$disallowed_tools" \
-            --argjson ask "$ask_tools" \
-            'del(.allowedTools, .disallowedTools) | . + {permissions: {allow: $allowed, deny: $disallowed, ask: $ask}}')
+        if [[ "${PERMISSIONS_ALLOWLIST_MODE:-union}" == "overwrite" ]]; then
+            merged=$(_merge_permissions_overwrite "$merged" "$allowed_tools" "$disallowed_tools" "$ask_tools")
+            # Reset globals: _merge_permissions_overwrite sets them inside a subshell
+            # so they are lost; explicitly set them in the parent scope.
+            PERMISSIONS_ADDED_ALLOW='[]'
+            PERMISSIONS_ADDED_DENY='[]'
+            log_info "Permissions merged (overwrite): $allowed_count allow, $disallowed_count deny, $ask_count ask entries"
+        else
+            # Compute added subsets in parent scope BEFORE calling the merge function
+            # in a subshell. Bash subshells cannot propagate variable assignments back
+            # to the parent, so PERMISSIONS_ADDED_ALLOW / PERMISSIONS_ADDED_DENY must
+            # be set here, not inside _merge_permissions_union.
+            PERMISSIONS_ADDED_ALLOW=$(echo "$merged" | jq \
+                --argjson na "$allowed_tools" \
+                '(.allowedTools // .permissions.allow // []) as $existing |
+                 $na | map(select(. as $x | $existing | any(.[]; . == $x) | not))')
+            PERMISSIONS_ADDED_DENY=$(echo "$merged" | jq \
+                --argjson nd "$disallowed_tools" \
+                '(.disallowedTools // .permissions.deny // []) as $existing |
+                 $nd | map(select(. as $x | $existing | any(.[]; . == $x) | not))')
+            merged=$(_merge_permissions_union "$merged" "$allowed_tools" "$disallowed_tools" "$ask_tools")
+            local added_allow_count added_deny_count
+            added_allow_count=$(echo "$PERMISSIONS_ADDED_ALLOW" | jq 'length')
+            added_deny_count=$(echo "$PERMISSIONS_ADDED_DENY" | jq 'length')
+            log_info "Permissions merged (union): +${added_allow_count} allow, +${added_deny_count} deny added"
+        fi
     fi
 
-    # hooks contribution (built up by permission-hooks, telegram, amux features)
+    # hooks contribution — ownership-scoped merge (§7.1).
+    # This replaces the old '. + {hooks: $hooks}' wholesale write.
+    # Foreign hook entries (command does not reference GLOBAL_HOOKS_DIR) survive.
     if [[ -n "$HOOKS_JSON" && "$HOOKS_JSON" != '{}' ]]; then
-        merged=$(echo "$merged" | jq --argjson hooks "$HOOKS_JSON" '. + {hooks: $hooks}')
-        log_info "Hooks configuration merged"
+        merged=$(_merge_hooks_owned "$merged" "$HOOKS_JSON" "$GLOBAL_HOOKS_DIR")
+        log_info "Hooks configuration merged (ownership-scoped)"
         if echo "$HOOKS_JSON" | jq -e '.PreToolUse' >/dev/null 2>&1; then
             log_info "  - PreToolUse: python3 $GLOBAL_HOOKS_DIR/pretool_hook.py"
         fi
@@ -1784,7 +2089,7 @@ build_and_write_settings() {
             log_info "  - PostToolUse: python3 $GLOBAL_HOOKS_DIR/posttool_hook.py"
         fi
         if echo "$HOOKS_JSON" | jq -e '.Notification' >/dev/null 2>&1; then
-            log_info "  - Notification (idle_prompt + permission_prompt)"
+            log_info "  - Notification (matchers: $(echo "$HOOKS_JSON" | jq -r '[.Notification // [] | .[].matcher] | join(", ")'))"
         fi
         if echo "$HOOKS_JSON" | jq -e '.Stop' >/dev/null 2>&1; then
             log_info "  - UserPromptSubmit/Stop/SubagentStop/SessionEnd → spawn_producer_hook.py"
@@ -1810,10 +2115,9 @@ build_and_write_settings() {
         log_info "  - command: python3 $GLOBAL_STATUSLINE_DIR/subagent.py"
     fi
 
-    # Validate merged JSON
+    # Validate merged JSON (§7.3 atomicity — build, validate, write, re-validate)
     if ! echo "$merged" | jq empty 2>/dev/null; then
-        log_error "Merged config is not valid JSON!"
-        log_error "Restoring from backup..."
+        log_error "Merged settings.json is not valid JSON! Restoring from backup..."
         cp "$BACKUP_FILE" "$GLOBAL_CONFIG"
         exit 1
     fi
@@ -1822,10 +2126,9 @@ build_and_write_settings() {
     echo "$merged" | jq '.' > "$GLOBAL_CONFIG"
     log_info "Global config updated: $GLOBAL_CONFIG"
 
-    # Final validation
+    # Re-validate after write
     if ! jq empty "$GLOBAL_CONFIG" 2>/dev/null; then
-        log_error "Final validation failed!"
-        log_error "Restoring from backup..."
+        log_error "settings.json re-validation failed after write! Restoring from backup..."
         cp "$BACKUP_FILE" "$GLOBAL_CONFIG"
         exit 1
     fi
@@ -1876,6 +2179,16 @@ TMUX_FILE_STATUS="unchanged"
 TMUX_LIVE_STATUS="no running server"
 HOOKS_JSON='{}'
 PERMISSIONS_ALLOWLIST_SELECTED=false
+# "union" (default) or "overwrite" (today's replace semantics).
+# Set via CLAUDE_INSTALL_PERMISSIONS_MODE env var; wired to the interactive
+# selector in 29-06.
+PERMISSIONS_ALLOWLIST_MODE="${CLAUDE_INSTALL_PERMISSIONS_MODE:-union}"
+# Tracks what a union install added so uninstall (29-05) can subtract exactly it.
+PERMISSIONS_ADDED_ALLOW='[]'
+PERMISSIONS_ADDED_DENY='[]'
+# Path to the timestamped backup of ~/.claude.json taken before any write this run.
+# Empty until the first _register_mcp_server call.
+CLAUDE_JSON_BACKUP_FILE=""
 
 # =============================================================================
 # Argument parsing
