@@ -3246,6 +3246,793 @@ class TestSelectorConfirmAndExecute(InstallerTestBase):
                       "After 's', message must mention all features")
 
 
+# =============================================================================
+# 29-07: Flag parsing errors
+# =============================================================================
+
+class TestFlagParsingErrors(InstallerTestBase):
+    """
+    The three error combinations from brd §5 / architecture §5.2:
+      1. No TTY and no --yes → error (already covered by TestTTYDetection)
+      2. --yes with neither manifest nor explicit selection → error
+      3. --only naming an unknown feature id → error listing valid ids
+    """
+
+    def test_yes_without_manifest_or_selection_is_error(self):
+        """--yes with no manifest and no explicit selection exits non-zero."""
+        # tmp_home is clean — no manifest
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "--yes without manifest or selection must exit non-zero. "
+                            f"stdout: {result.stdout[:300]}")
+        combined = result.stdout + result.stderr
+        # Message must be actionable
+        self.assertIn("manifest", combined.lower(),
+                      "Error must mention 'manifest'")
+        self.assertIn("--all", combined,
+                      "Error must suggest --all as an alternative")
+
+    def test_yes_with_manifest_succeeds(self):
+        """--yes with an existing manifest replays it without error."""
+        # First install to create a manifest
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        manifest = self.tmp_home / ".claude" / "install-manifest.json"
+        self.assertTrue(manifest.exists(), "First run must create manifest")
+
+        # Now --yes alone should work (replay mode)
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--yes with manifest must succeed. "
+                         f"stderr: {result.stderr[:300]}")
+
+    def test_yes_with_explicit_all_needs_no_manifest(self):
+        """--yes --all succeeds even on a clean machine with no manifest."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--all", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--all --yes must succeed with no manifest. "
+                         f"stderr: {result.stderr[:300]}")
+
+    def test_yes_with_explicit_only_needs_no_manifest(self):
+        """--yes --only <id> succeeds without a manifest."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--only --yes must succeed with no manifest. "
+                         f"stderr: {result.stderr[:300]}")
+
+    def test_only_unknown_feature_is_error(self):
+        """--only with an unknown feature id exits non-zero and lists valid ids."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "nonexistent-feature"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "--only unknown-id must exit non-zero")
+        combined = result.stdout + result.stderr
+        self.assertIn("nonexistent-feature", combined,
+                      "Error must echo the bad id")
+        # Must list some valid ids
+        self.assertIn("statusline", combined,
+                      "Error must list valid feature ids")
+
+    def test_with_unknown_feature_is_error(self):
+        """--with with an unknown feature id exits non-zero."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--all", "--with", "bogus-feature"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertNotEqual(result.returncode, 0,
+                            "--with unknown-id must exit non-zero")
+        self.assertIn("bogus-feature", result.stdout + result.stderr)
+
+    def test_only_with_dependency_promotes_prerequisite(self):
+        """--only telegram promotes permission-hooks (its prerequisite)."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "telegram", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--only telegram must succeed. "
+                         f"stderr: {result.stderr[:300]}")
+        settings = read_settings(self.tmp_home)
+        hooks = settings.get("hooks", {})
+        # permission-hooks wires PreToolUse; telegram alone doesn't — so if
+        # PreToolUse is present, the prerequisite was promoted.
+        self.assertIn(
+            "PreToolUse", hooks,
+            "PreToolUse must be wired when telegram is selected (permission-hooks promoted)"
+        )
+
+
+# =============================================================================
+# 29-07: --help and --list work without jq
+# =============================================================================
+
+class TestHelpAndListWithoutJq(InstallerTestBase):
+    """
+    --help and --list must succeed even when jq is not on PATH
+    (architecture §9: arg parsing precedes the jq dependency check).
+    """
+
+    def _env_without_jq(self) -> dict:
+        """
+        Return an env dict where jq is shadowed by a stub that exits 127.
+        We prepend a fake-bin dir containing a jq that always exits non-zero,
+        rather than removing PATH entries (which would also remove bash/python3).
+        The important property is that the installer's _check_dependencies fails
+        on jq — tests using this env verify that --help / --list exit before
+        that check fires.
+        """
+        fake_bin = self.tmp_home / "fake-bin-nojq"
+        fake_bin.mkdir(exist_ok=True)
+        fake_jq = fake_bin / "jq"
+        fake_jq.write_text("#!/bin/sh\nexit 127\n")
+        fake_jq.chmod(0o755)
+        original_path = os.environ.get("PATH", "")
+        return {"PATH": f"{fake_bin}:{original_path}"}
+
+    def test_help_exits_zero_without_jq(self):
+        """--help exits 0 even when jq is absent from PATH."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--help"],
+            extra_env=self._env_without_jq(),
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--help must exit 0 even without jq. "
+                         f"stderr: {result.stderr[:300]}")
+        combined = result.stdout + result.stderr
+        self.assertIn("--yes", combined, "--help output must mention --yes")
+        self.assertIn("--list", combined, "--help output must mention --list")
+        self.assertIn("enable", combined, "--help output must describe enable subcommand")
+
+    def test_list_exits_zero_without_jq(self):
+        """--list exits 0 even when jq is absent from PATH."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--list"],
+            extra_env=self._env_without_jq(),
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--list must exit 0 even without jq. "
+                         f"stderr: {result.stderr[:300]}")
+        combined = result.stdout + result.stderr
+        # Must show every feature id
+        for fid in (
+            "statusline", "permission-hooks", "telegram", "profiles",
+            "amux", "permissions-allowlist", "context-mcp", "claude-history",
+            "questions", "daily-review",
+        ):
+            self.assertIn(fid, combined, f"--list must show feature '{fid}'")
+        # Must show sub-toggle ids
+        for stid in ("amux-autowrap", "profiles-autosource",
+                     "questions-listen", "daily-review-cron"):
+            self.assertIn(stid, combined, f"--list must show sub-toggle '{stid}'")
+
+    def test_list_shows_detected_state(self):
+        """--list reports 'yes' for features that are installed."""
+        # Install statusline
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+
+        result = run_installer(self.tmp_home, extra_args=["--list"])
+        self.assertEqual(result.returncode, 0)
+        # The output must say 'yes' somewhere for statusline
+        combined = result.stdout + result.stderr
+        # statusline row should contain 'yes'
+        for line in combined.splitlines():
+            if "statusline" in line and "↳" not in line:
+                self.assertIn("yes", line,
+                              f"--list must show 'yes' for installed statusline. "
+                              f"Row: {line!r}")
+                break
+        else:
+            self.fail("--list output must contain a row for 'statusline'")
+
+    def test_list_does_not_write_anything(self):
+        """--list is read-only: no manifest, no backup, no settings change."""
+        def snapshot(base: Path) -> set:
+            return {str(p) for p in base.rglob("*") if p.is_file()}
+
+        before = snapshot(self.tmp_home)
+        result = run_installer(self.tmp_home, extra_args=["--list"])
+        after = snapshot(self.tmp_home)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(before, after, "--list must write no files")
+
+
+# =============================================================================
+# 29-07: --dry-run byte-identity
+# =============================================================================
+
+class TestDryRunByteIdentity(InstallerTestBase):
+    """
+    --dry-run renders the plan and exits 0 without writing anything at all —
+    no manifest, no backup, no settings file, no external surface.
+    Asserted by snapshotting the whole tmp_home tree before and after.
+    """
+
+    def _snapshot(self, base: Path) -> dict:
+        """Return {relative_path_str: file_bytes} for every file under base."""
+        result = {}
+        for p in base.rglob("*"):
+            if p.is_file():
+                result[str(p.relative_to(base))] = p.read_bytes()
+        return result
+
+    def test_dry_run_clean_home_byte_identity(self):
+        """--dry-run on a clean home writes nothing."""
+        before = self._snapshot(self.tmp_home)
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--all", "--dry-run"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        after = self._snapshot(self.tmp_home)
+        self.assertEqual(result.returncode, 0,
+                         f"--dry-run must exit 0. stderr: {result.stderr[:300]}")
+        self.assertEqual(before, after,
+                         "--dry-run must leave the machine byte-identical. "
+                         f"New files: {set(after) - set(before)}")
+
+    def test_dry_run_after_install_byte_identity(self):
+        """--dry-run after an install run writes nothing (no new backup)."""
+        # First install creates a manifest and settings
+        run_installer(self.tmp_home, extra_args=["--only", "statusline"])
+        before = self._snapshot(self.tmp_home)
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes", "--dry-run"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        after = self._snapshot(self.tmp_home)
+        self.assertEqual(result.returncode, 0,
+                         f"--dry-run must exit 0. stderr: {result.stderr[:300]}")
+        self.assertEqual(before, after,
+                         "--dry-run on installed machine must write nothing. "
+                         f"Changed/new files: {set(after) - set(before)}")
+
+    def test_dry_run_shows_plan(self):
+        """--dry-run outputs a plan that mentions the features to be installed."""
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline,permission-hooks", "--dry-run"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("statusline", combined,
+                      "--dry-run must mention statusline in plan output")
+        self.assertIn("permission-hooks", combined,
+                      "--dry-run must mention permission-hooks in plan output")
+
+
+# =============================================================================
+# 29-07: enable / disable subcommands
+# =============================================================================
+
+def _install_with_suboption(tmp_home: Path, feature: str, suboption: str) -> None:
+    """
+    Helper: install <feature> then enable <suboption> via the enable subcommand.
+    Requires CLAUDE_INSTALL_NO_EXTERNAL=1 (set by test setUp).
+    """
+    run_installer(tmp_home, extra_args=["--only", feature])
+    run_installer(tmp_home, extra_args=["enable", suboption])
+
+
+class TestEnableDisableSubcommands(InstallerTestBase):
+    """
+    Tests for the enable / disable subcommands (brd D15, architecture §9).
+    Each sub-toggle: parent-not-installed refusal, idempotency, whole-HOME diff.
+    Mutual exclusion: amux-autowrap ↔ profiles-autosource.
+    """
+
+    # ------------------------------------------------------------------
+    # Unknown toggle id
+    # ------------------------------------------------------------------
+
+    def test_enable_unknown_id_is_error(self):
+        """enable with an unknown toggle id exits non-zero and lists valid ids."""
+        result = run_installer(self.tmp_home, extra_args=["enable", "no-such-toggle"])
+        self.assertNotEqual(result.returncode, 0,
+                            "enable unknown-id must exit non-zero")
+        combined = result.stdout + result.stderr
+        self.assertIn("no-such-toggle", combined)
+        # Must list valid ids
+        self.assertIn("amux-autowrap", combined)
+
+    def test_disable_unknown_id_is_error(self):
+        """disable with an unknown toggle id exits non-zero."""
+        result = run_installer(self.tmp_home, extra_args=["disable", "no-such-toggle"])
+        self.assertNotEqual(result.returncode, 0,
+                            "disable unknown-id must exit non-zero")
+
+    # ------------------------------------------------------------------
+    # Parent-not-installed refusal
+    # ------------------------------------------------------------------
+
+    def test_enable_questions_listen_without_questions_fails(self):
+        """enable questions-listen when questions is not installed exits non-zero."""
+        result = run_installer(self.tmp_home, extra_args=["enable", "questions-listen"])
+        self.assertNotEqual(result.returncode, 0,
+                            "enable questions-listen must fail when questions is not installed")
+        combined = result.stdout + result.stderr
+        self.assertIn("questions", combined.lower(),
+                      "Error must name the parent feature 'questions'")
+
+    def test_enable_amux_autowrap_without_amux_fails(self):
+        """enable amux-autowrap when amux is not installed exits non-zero."""
+        result = run_installer(self.tmp_home, extra_args=["enable", "amux-autowrap"])
+        self.assertNotEqual(result.returncode, 0,
+                            "enable amux-autowrap must fail when amux is not installed")
+        combined = result.stdout + result.stderr
+        self.assertIn("amux", combined.lower())
+
+    def test_enable_profiles_autosource_without_profiles_fails(self):
+        """enable profiles-autosource when profiles is not installed exits non-zero."""
+        result = run_installer(self.tmp_home,
+                               extra_args=["enable", "profiles-autosource"])
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("profiles", combined.lower())
+
+    def test_enable_daily_review_cron_without_daily_review_fails(self):
+        """enable daily-review-cron when daily-review is not installed exits non-zero."""
+        result = run_installer(self.tmp_home,
+                               extra_args=["enable", "daily-review-cron"])
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("daily-review", combined.lower())
+
+    # ------------------------------------------------------------------
+    # questions-listen enable/disable (parent installed)
+    # ------------------------------------------------------------------
+
+    def test_enable_questions_listen_with_questions_installed(self):
+        """
+        enable questions-listen with questions installed exits 0 and
+        records the sub-toggle in the manifest.
+        """
+        # Install questions (which requires telegram, which requires permission-hooks)
+        run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram,questions", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertTrue(run_probe(self.tmp_home, "questions"),
+                        "questions must be installed before enable")
+
+        result = run_installer(self.tmp_home,
+                               extra_args=["enable", "questions-listen"])
+        self.assertEqual(result.returncode, 0,
+                         "enable questions-listen must succeed when questions is installed. "
+                         f"stderr: {result.stderr[:300]}")
+
+        # Manifest must record the sub-toggle as true
+        manifest = read_manifest(self.tmp_home)
+        q_opts = manifest.get("features", {}).get("questions", {}).get("options", {})
+        self.assertEqual(q_opts.get("questions-listen"), True,
+                         "Manifest must record questions-listen = true")
+
+    def test_enable_questions_listen_changes_nothing_else(self):
+        """
+        enable questions-listen changes only the manifest's sub-toggle field
+        and the systemd surface — nothing else in $HOME moves.
+        CLAUDE_INSTALL_NO_EXTERNAL=1 gates the systemd call, so the only
+        expected change is the manifest.
+        """
+        run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram,questions", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+
+        def snapshot(base: Path) -> dict:
+            return {
+                str(p.relative_to(base)): p.read_bytes()
+                for p in base.rglob("*") if p.is_file()
+            }
+
+        before = snapshot(self.tmp_home)
+        result = run_installer(self.tmp_home,
+                               extra_args=["enable", "questions-listen"])
+        self.assertEqual(result.returncode, 0)
+        after = snapshot(self.tmp_home)
+
+        changed = {k for k in after if after[k] != before.get(k)}
+        new_files = set(after) - set(before)
+        # Only the manifest may have changed; no new files
+        self.assertEqual(new_files, set(),
+                         "enable questions-listen must create no new files. "
+                         f"New: {new_files}")
+        # All changes must be to the manifest
+        non_manifest_changes = {
+            k for k in changed
+            if "install-manifest.json" not in k
+        }
+        self.assertEqual(non_manifest_changes, set(),
+                         "enable questions-listen must change nothing except the manifest. "
+                         f"Changed: {non_manifest_changes}")
+
+    def test_enable_questions_listen_idempotent(self):
+        """enable questions-listen twice is a no-op on the second call."""
+        run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram,questions", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        run_installer(self.tmp_home, extra_args=["enable", "questions-listen"])
+
+        def snapshot(base: Path) -> dict:
+            return {
+                str(p.relative_to(base)): p.read_bytes()
+                for p in base.rglob("*") if p.is_file()
+            }
+
+        before = snapshot(self.tmp_home)
+        result = run_installer(self.tmp_home, extra_args=["enable", "questions-listen"])
+        after = snapshot(self.tmp_home)
+
+        self.assertEqual(result.returncode, 0)
+        # No changes expected (already enabled)
+        changed = {k for k in after if after[k] != before.get(k)}
+        new_files = set(after) - set(before)
+        self.assertEqual(new_files, set(),
+                         "Second enable questions-listen must create no new files")
+        self.assertEqual(changed, set(),
+                         "Second enable questions-listen must change no files")
+        combined = result.stdout + result.stderr
+        self.assertIn("already", combined.lower(),
+                      "Second enable must say 'already enabled'")
+
+    # ------------------------------------------------------------------
+    # amux-autowrap ↔ profiles-autosource mutual exclusion
+    # ------------------------------------------------------------------
+
+    def test_enable_amux_autowrap_with_profiles_autosource_on_flips_both(self):
+        """
+        enable amux-autowrap when profiles-autosource is already enabled:
+        - amux-autowrap gets enabled
+        - profiles-autosource gets disabled
+        - manifest records both flips
+        """
+        # Install profiles and amux
+        run_installer(
+            self.tmp_home,
+            extra_args=["--only", "profiles,amux", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        # Create .bashrc so ext_bashrc_add can work
+        bashrc = self.tmp_home / ".bashrc"
+        bashrc.write_text("# test bashrc\n")
+
+        # Enable profiles-autosource first
+        result1 = run_installer(self.tmp_home,
+                                extra_args=["enable", "profiles-autosource"])
+        self.assertEqual(result1.returncode, 0,
+                         f"enable profiles-autosource failed: {result1.stderr[:200]}")
+
+        manifest_after_enable = read_manifest(self.tmp_home)
+        pa_opt = (manifest_after_enable.get("features", {})
+                  .get("profiles", {}).get("options", {})
+                  .get("profiles-autosource"))
+        self.assertEqual(pa_opt, True,
+                         "profiles-autosource must be True after enable")
+
+        # Now enable amux-autowrap — must flip profiles-autosource off
+        result2 = run_installer(self.tmp_home, extra_args=["enable", "amux-autowrap"])
+        self.assertEqual(result2.returncode, 0,
+                         f"enable amux-autowrap failed: {result2.stderr[:200]}")
+
+        manifest_final = read_manifest(self.tmp_home)
+        aa_opt = (manifest_final.get("features", {})
+                  .get("amux", {}).get("options", {})
+                  .get("amux-autowrap"))
+        pa_opt_final = (manifest_final.get("features", {})
+                        .get("profiles", {}).get("options", {})
+                        .get("profiles-autosource"))
+        self.assertEqual(aa_opt, True,
+                         "amux-autowrap must be True in manifest after enable")
+        self.assertEqual(pa_opt_final, False,
+                         "profiles-autosource must be False in manifest after mutual exclusion")
+
+        # Message must mention the mutual exclusion
+        combined = result2.stdout + result2.stderr
+        self.assertIn("profiles-autosource", combined,
+                      "enable amux-autowrap must report disabling profiles-autosource")
+
+    # ------------------------------------------------------------------
+    # disable subcommand
+    # ------------------------------------------------------------------
+
+    def test_disable_already_disabled_is_noop(self):
+        """disable on a toggle that is already disabled is a no-op."""
+        run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram,questions", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        # questions-listen starts disabled — disabling again is a no-op
+        result = run_installer(self.tmp_home,
+                               extra_args=["disable", "questions-listen"])
+        self.assertEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("already", combined.lower(),
+                      "disable on already-disabled must say 'already disabled'")
+
+
+# =============================================================================
+# 29-07: --yes replay
+# =============================================================================
+
+class TestYesReplay(InstallerTestBase):
+    """
+    --yes replays the manifest exactly (brd §6.3, architecture §5.2).
+    Tests:
+      - Full replay: --all --yes, then --yes → identical manifest
+      - Partial replay: --only statusline --yes, then --yes → nine others not installed
+      - Skipped feature stays skipped
+      - Newly-offered feature reported, not installed
+    """
+
+    def test_all_yes_then_yes_alone_is_noop(self):
+        """
+        After --all --yes, a second --yes run (manifest replay) produces
+        an identical manifest — every feature still installed, no re-work visible.
+        """
+        # First run: install everything
+        result1 = run_installer(
+            self.tmp_home,
+            extra_args=["--all", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result1.returncode, 0,
+                         f"--all --yes must succeed. stderr: {result1.stderr[:300]}")
+        manifest1 = read_manifest(self.tmp_home)
+        self.assertNotEqual(manifest1, {}, "First run must write manifest")
+
+        # Second run: replay — manifest must be byte-identical
+        result2 = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result2.returncode, 0,
+                         f"--yes replay must succeed. stderr: {result2.stderr[:300]}")
+        manifest2 = read_manifest(self.tmp_home)
+
+        # Feature states must be identical
+        f1 = manifest1.get("features", {})
+        f2 = manifest2.get("features", {})
+        for fid in f1:
+            s1 = f1[fid].get("state")
+            s2 = f2.get(fid, {}).get("state")
+            self.assertEqual(s1, s2,
+                             f"Feature '{fid}' state must be preserved by replay: "
+                             f"{s1!r} → {s2!r}")
+
+    def test_partial_replay_does_not_install_unselected_features(self):
+        """
+        --only statusline --yes, then --yes alone: the nine other features must
+        remain not installed. This is the assertion that protects the unattended
+        daily-review path from silently installing declined features.
+        """
+        # Install only statusline
+        result1 = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "statusline", "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result1.returncode, 0)
+        manifest1 = read_manifest(self.tmp_home)
+        self.assertIsNotNone(manifest1, "First run must create manifest")
+
+        # Replay
+        result2 = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result2.returncode, 0,
+                         f"Replay must succeed. stderr: {result2.stderr[:300]}")
+        manifest2 = read_manifest(self.tmp_home)
+
+        # All features except statusline must be 'skipped' after the replay
+        features = manifest2.get("features", {})
+        for fid in ("permission-hooks", "telegram", "profiles", "amux",
+                    "permissions-allowlist", "context-mcp", "claude-history",
+                    "questions", "daily-review"):
+            state = features.get(fid, {}).get("state", "absent")
+            self.assertEqual(
+                state, "skipped",
+                f"Feature '{fid}' must stay skipped after partial replay. "
+                f"Got: {state!r}. "
+                f"Replay must never install what the user did not choose.",
+            )
+
+    def test_skipped_feature_stays_skipped_on_replay(self):
+        """
+        A manifest with questions=skipped: --yes replay leaves questions skipped.
+        """
+        # Install everything except questions (which defaults to skip anyway)
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only",
+                        "statusline,permission-hooks,profiles,permissions-allowlist",
+                        "--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+
+        manifest = read_manifest(self.tmp_home)
+        questions_state = manifest.get("features", {}).get("questions", {}).get("state")
+        # questions not selected → should be skipped in manifest
+        self.assertEqual(questions_state, "skipped",
+                         "Unselected questions must be recorded as skipped")
+
+        # Replay — questions must stay skipped
+        result2 = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result2.returncode, 0)
+        manifest2 = read_manifest(self.tmp_home)
+        q_state2 = manifest2.get("features", {}).get("questions", {}).get("state")
+        self.assertEqual(q_state2, "skipped",
+                         "questions must remain skipped after --yes replay")
+
+    def test_newly_offered_feature_reported_not_installed(self):
+        """
+        A feature present in FEATURES but absent from the manifest is reported
+        as newly-offered by a --yes run, not silently installed.
+        """
+        # Build a manifest that omits 'statusline' entirely
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write a manifest with only permission-hooks
+        manifest_data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": {
+                "permission-hooks": {
+                    "state": "skipped",
+                    "at": "2026-01-01T00:00:00Z",
+                    "artifacts": [],
+                    "options": {},
+                },
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest_data, indent=2))
+
+        # Also need settings.json to exist for the installer
+        claude_dir = self.tmp_home / ".claude"
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text("{}")
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0,
+                         "--yes with partial manifest must succeed. "
+                         f"stderr: {result.stderr[:400]}")
+
+        combined = result.stdout + result.stderr
+        # Must report newly-offered features (those not in the manifest)
+        self.assertIn("newly-offered", combined.lower(),
+                      "--yes must report features absent from manifest as newly-offered")
+        # statusline was not in the manifest — must NOT be installed
+        self.assertFalse(run_probe(self.tmp_home, "statusline"),
+                         "statusline absent from manifest must not be installed by replay")
+
+
+# =============================================================================
+# 29-07: Hand-edited manifest edge cases
+# =============================================================================
+
+class TestHandEditedManifest(InstallerTestBase):
+    """
+    Resilience against a manifest that has been hand-edited.
+    An unknown feature id in the manifest must not crash the installer.
+    A missing feature id must be reported as newly-offered.
+    """
+
+    def _write_manifest(self, features: dict) -> None:
+        manifest_path = self.tmp_home / ".claude" / "install-manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "schema": 1,
+            "repo": str(REPO),
+            "revision": "test",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "features": features,
+        }
+        manifest_path.write_text(json.dumps(data, indent=2))
+        # Also create a settings.json so the installer doesn't abort on missing config
+        settings_path = self.tmp_home / ".claude" / "settings.json"
+        if not settings_path.exists():
+            settings_path.write_text("{}")
+
+    def test_unknown_feature_id_in_manifest_does_not_crash(self):
+        """
+        A manifest with a feature id that doesn't exist in FEATURES
+        must not crash the installer.
+        """
+        self._write_manifest({
+            "statusline": {
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+            "defunct-feature-xyz": {  # unknown id — should be ignored
+                "state": "installed",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+        })
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        # Must not crash (exit 1 is OK for other reasons, but must not be unhandled)
+        self.assertNotIn(
+            "unbound variable",
+            result.stdout + result.stderr,
+            "Unknown manifest feature id must not cause an unbound variable error",
+        )
+
+    def test_missing_known_id_reported_as_newly_offered(self):
+        """
+        A manifest that omits a known feature id causes that feature to be
+        reported as newly-offered on a --yes run.
+        """
+        # Manifest with only permission-hooks; statusline and others are absent
+        self._write_manifest({
+            "permission-hooks": {
+                "state": "skipped",
+                "at": "2026-01-01T00:00:00Z",
+                "artifacts": [],
+                "options": {},
+            },
+        })
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--yes"],
+            extra_env={"CLAUDE_INSTALL_ASSUME_TTY": "0"},
+        )
+        self.assertEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("newly-offered", combined.lower(),
+                      "Features absent from manifest must be reported as newly-offered")
+
+
 if __name__ == "__main__":
     # When run directly, set CLAUDE_INSTALL_NO_EXTERNAL for convenience
     os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")

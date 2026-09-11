@@ -2672,12 +2672,27 @@ _selector_msg=""                     # message from cycle/toggle helpers, shown 
 SELECTED_FEATURES=()   # empty = all features
 UNINSTALL_FEATURES=()  # features to uninstall (via --uninstall)
 WITHOUT_FEATURES=()    # features to exclude (via --without)
+WITH_FEATURES=()       # features to add to selection (via --with)
 PROBE_FEATURE=""       # non-empty = run probe and exit
 INSTALL_ALL=false      # --all flag
 INSTALL_YES=false      # --yes flag
+INSTALL_HELP=false     # --help flag
+INSTALL_LIST=false     # --list flag
 DRY_RUN=false          # --dry-run flag (render plan, touch nothing)
+SUBCOMMAND=""          # enable | disable subcommand
+SUBCOMMAND_ARG=""      # sub-toggle id argument to subcommand
+
+# Canonical sub-toggle ids (used for validation and enable/disable dispatch).
+VALID_SUBOPTIONS=(amux-autowrap profiles-autosource questions-listen daily-review-cron)
 
 _parse_args() {
+    # Consume positional subcommand first (enable / disable), before option parsing.
+    if [[ $# -ge 2 && ( "${1:-}" == "enable" || "${1:-}" == "disable" ) ]]; then
+        SUBCOMMAND="$1"
+        SUBCOMMAND_ARG="$2"
+        return 0
+    fi
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --only)
@@ -2693,6 +2708,12 @@ _parse_args() {
             --without)
                 shift
                 IFS=',' read -ra WITHOUT_FEATURES <<< "${1:-}"
+                shift
+                ;;
+            --with)
+                shift
+                # --with can be repeated; each call adds one feature id
+                WITH_FEATURES+=("${1:-}")
                 shift
                 ;;
             --all)
@@ -2712,11 +2733,19 @@ _parse_args() {
                 DRY_RUN=true
                 shift
                 ;;
+            --help|-h)
+                INSTALL_HELP=true
+                shift
+                ;;
+            --list)
+                INSTALL_LIST=true
+                shift
+                ;;
             --)
                 shift; break
                 ;;
             -*)
-                # Unknown options are silently ignored for now.
+                # Unknown options: silently skip flag and its argument if present.
                 shift
                 [[ $# -gt 0 && "${1:-}" != -* ]] && shift || true
                 ;;
@@ -2727,13 +2756,466 @@ _parse_args() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# --help renderer (works without jq)
+# ---------------------------------------------------------------------------
+_show_help() {
+    cat <<'EOF'
+Usage: install.sh [OPTIONS]
+       install.sh enable  <toggle-id>
+       install.sh disable <toggle-id>
+
+OPTIONS
+  --all               install every feature; sub-toggles at their defaults
+  --only a,b,c        install exactly these features (comma-separated ids)
+  --with x            add feature x to the selection (repeatable)
+  --without y         remove feature y from the selection
+  --yes               non-interactive; replay the manifest or apply explicit selection
+  --list              print feature table with detected state, then exit 0
+  --dry-run           render the plan and exit 0 without writing anything
+  --help              show this help and exit 0
+
+--yes SEMANTICS (load-bearing for the daily-review cron job):
+  With a manifest: replay the recorded selection exactly. Features recorded as
+  "skipped" stay skipped; a recorded skip is a decision, not an oversight.
+  New features not yet in the manifest are reported as newly-offered but not
+  installed. --with / --without adjust the replayed selection.
+  Without a manifest AND without an explicit selection (--all, --only, etc.):
+  this is an error, not a silent install-everything fallback.
+
+SUBCOMMANDS
+  enable  <toggle-id>  enable a sub-toggle (parent feature must be installed)
+  disable <toggle-id>  disable a sub-toggle
+
+  Valid toggle ids:
+    amux-autowrap       source amux-spawn.bash in ~/.bashrc (excl. profiles-autosource)
+    profiles-autosource source claude-profiles.bash in ~/.bashrc (excl. amux-autowrap)
+    questions-listen    systemd user unit enable + linger (via loginctl)
+    daily-review-cron   write the 06:15 crontab line
+
+EXAMPLES
+  install.sh                            # interactive checklist
+  install.sh --all --yes                # install everything non-interactively
+  install.sh --yes                      # replay manifest (requires existing manifest)
+  install.sh --only statusline --yes    # install only statusline, non-interactively
+  install.sh --yes --with telegram      # replay manifest, also install telegram
+  install.sh --list                     # show current detected state (no jq needed)
+  install.sh enable questions-listen    # enable the listener daemon
+  install.sh disable amux-autowrap      # disable amux auto-wrap in ~/.bashrc
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# --list renderer (works without jq — probes that use jq return "no" gracefully)
+# ---------------------------------------------------------------------------
+_show_list() {
+    printf "Feature table — detected state on this machine\n\n"
+    printf "  %-30s  %-10s  %-9s  %s\n" "Feature id" "Installed" "Default" "Writes outside ~/.claude"
+    printf "  %-30s  %-10s  %-9s  %s\n" "----------" "---------" "-------" "------------------------"
+
+    local id
+    for id in "${FEATURES[@]}"; do
+        local probe_fn="feature_${id//-/_}_probe"
+        local default_fn="feature_${id//-/_}_default"
+        local writes_fn="feature_${id//-/_}_writes"
+
+        local installed="no"
+        if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+            installed="yes"
+        fi
+        local default=""; declare -f "$default_fn" >/dev/null 2>&1 && default="$($default_fn)"
+        local writes=""; declare -f "$writes_fn" >/dev/null 2>&1 && writes="$($writes_fn)"
+
+        printf "  %-30s  %-10s  %-9s  %s\n" "$id" "$installed" "$default" "$writes"
+
+        # Sub-toggles
+        local suboptions_fn="feature_${id//-/_}_suboptions"
+        if declare -f "$suboptions_fn" >/dev/null 2>&1; then
+            local subopts; subopts="$($suboptions_fn)"
+            local subopt_id
+            for subopt_id in $subopts; do
+                local subopt_probe_fn="feature_${subopt_id//-/_}_probe"
+                local sub_installed="no"
+                if declare -f "$subopt_probe_fn" >/dev/null 2>&1 \
+                   && $subopt_probe_fn 2>/dev/null; then
+                    sub_installed="yes"
+                fi
+                local sw_fn="suboption_${subopt_id//-/_}_writes"
+                local swrites=""; declare -f "$sw_fn" >/dev/null 2>&1 && swrites="$($sw_fn)"
+                printf "  %-30s  %-10s  %-9s  %s\n" \
+                    "  ↳ $subopt_id" "$sub_installed" "off" "$swrites"
+            done
+        fi
+    done
+    printf "\n"
+}
+
+# ---------------------------------------------------------------------------
+# Feature id validation (must run after _parse_args, before dependency checks)
+# ---------------------------------------------------------------------------
+_validate_feature_ids() {
+    local id fid found
+    for id in "${SELECTED_FEATURES[@]}" "${WITHOUT_FEATURES[@]}" "${WITH_FEATURES[@]}"; do
+        [[ -z "$id" ]] && continue
+        found=false
+        for fid in "${FEATURES[@]}"; do
+            [[ "$fid" == "$id" ]] && { found=true; break; }
+        done
+        if [[ "$found" == false ]]; then
+            log_error "--only/--with/--without: unknown feature id '$id'"
+            log_error "Valid feature ids: ${FEATURES[*]}"
+            exit 1
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# --yes pre-condition check (architecture §5.2)
+# ---------------------------------------------------------------------------
+_check_yes_preconditions() {
+    [[ "$INSTALL_YES" == true ]] || return 0
+
+    # --yes is fine when there is an explicit selection
+    if [[ ${#SELECTED_FEATURES[@]} -gt 0 || "$INSTALL_ALL" == true \
+          || ${#UNINSTALL_FEATURES[@]} -gt 0 ]]; then
+        return 0
+    fi
+
+    # --yes with --with but no other selection: the WITH list is the selection
+    if [[ ${#WITH_FEATURES[@]} -gt 0 ]]; then
+        return 0
+    fi
+
+    # No explicit selection: manifest is required
+    if [[ ! -f "$MANIFEST_FILE" ]]; then
+        log_error "--yes requires either a manifest (~/.claude/install-manifest.json)"
+        log_error "or an explicit selection (--all, --only, --with, etc.)."
+        log_error ""
+        log_error "Running --yes with no manifest and no selection would fall back to"
+        log_error "installing everything, which this flag exists to prevent."
+        log_error "(The daily-review cron job depends on this being an error, not a"
+        log_error " silent fallback — see brd §6.3, architecture §5.2.)"
+        log_error ""
+        log_error "Options:"
+        log_error "  To install everything:   ./install.sh --all --yes"
+        log_error "  To replay the manifest:  ./install.sh --yes  (requires a manifest)"
+        log_error "  To install specific:     ./install.sh --only statusline --yes"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Manifest replay — builds FEATURE_ACTIONS from a manifest (--yes path)
+# ---------------------------------------------------------------------------
+_compute_plan_manifest_replay() {
+    # Replay the recorded selection exactly (architecture §5.2, brd §6.3).
+    # - state=installed  → probe then install or update
+    # - state=skipped    → skip (a recorded skip is a decision)
+    # - state=failed     → skip (treat as if skipped)
+    # - absent from manifest → newly-offered: report, skip for this run
+    # --with adjustments are applied after the replay.
+    # --without adjustments are applied after --with.
+    # Sub-toggle states are replayed from manifest options.
+
+    local id state
+    for id in "${FEATURES[@]}"; do
+        FEATURE_ACTIONS["$id"]="skip"
+    done
+
+    local -a newly_offered=()
+
+    for id in "${FEATURES[@]}"; do
+        state=$(jq -r --arg id "$id" '.features[$id].state // "absent"' \
+                "$MANIFEST_FILE" 2>/dev/null || echo "absent")
+
+        case "$state" in
+            installed)
+                local probe_fn="feature_${id//-/_}_probe"
+                if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+                    FEATURE_ACTIONS["$id"]="update"
+                else
+                    FEATURE_ACTIONS["$id"]="install"
+                fi
+                ;;
+            skipped|failed)
+                FEATURE_ACTIONS["$id"]="skip"
+                ;;
+            absent|*)
+                # Not in manifest — newly-offered feature
+                newly_offered+=("$id")
+                FEATURE_ACTIONS["$id"]="skip"
+                ;;
+        esac
+    done
+
+    # Report newly-offered features (do not install them silently)
+    if [[ ${#newly_offered[@]} -gt 0 ]]; then
+        log_warn "Newly-offered features (not in manifest — not installed by this run):"
+        for id in "${newly_offered[@]}"; do
+            local default_fn="feature_${id//-/_}_default"
+            local default="install"
+            declare -f "$default_fn" >/dev/null 2>&1 && default="$($default_fn)"
+            log_warn "  $id  (default: $default)  — add with: ./install.sh --yes --with $id"
+        done
+    fi
+
+    # Replay sub-toggle states from manifest options
+    for id in "${FEATURES[@]}"; do
+        local sopts_fn="feature_${id//-/_}_suboptions"
+        declare -f "$sopts_fn" >/dev/null 2>&1 || continue
+        local sopts; sopts="$($sopts_fn)"
+        local sopt sopt_val
+        for sopt in $sopts; do
+            sopt_val=$(jq -r --arg fid "$id" --arg sub "$sopt" \
+                '.features[$fid].options[$sub] // false' \
+                "$MANIFEST_FILE" 2>/dev/null || echo "false")
+            FEATURE_SUBOPTION_STATES["$sopt"]="$sopt_val"
+        done
+    done
+
+    # --with: promote listed features into the plan
+    for id in "${WITH_FEATURES[@]}"; do
+        local probe_fn="feature_${id//-/_}_probe"
+        if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+            FEATURE_ACTIONS["$id"]="update"
+        else
+            FEATURE_ACTIONS["$id"]="install"
+        fi
+        log_info "  --with: adding $id to replay plan"
+    done
+
+    # --without: demote listed features back to skip
+    for id in "${WITHOUT_FEATURES[@]}"; do
+        FEATURE_ACTIONS["$id"]="skip"
+        log_info "  --without: skipping $id in replay plan"
+    done
+
+    # Promote installed-but-not-selected features to "keep" for module closure
+    # (brd D3: shared modules always refreshed — architecture §6.3)
+    local has_active=false
+    for id in "${FEATURES[@]}"; do
+        local action="${FEATURE_ACTIONS[$id]:-skip}"
+        [[ "$action" == "install" || "$action" == "update" ]] && { has_active=true; break; }
+    done
+
+    if [[ "$has_active" == true ]]; then
+        for id in "${FEATURES[@]}"; do
+            if [[ "${FEATURE_ACTIONS[$id]:-skip}" == "skip" ]]; then
+                local probe_fn="feature_${id//-/_}_probe"
+                if declare -f "$probe_fn" >/dev/null 2>&1 && $probe_fn 2>/dev/null; then
+                    FEATURE_ACTIONS["$id"]="keep"
+                fi
+            fi
+        done
+    fi
+
+    log_step "Plan (manifest replay):"
+    for id in "${FEATURES[@]}"; do
+        local action="${FEATURE_ACTIONS[$id]:-skip}"
+        [[ "$action" == "skip" ]] && continue
+        local title_fn="feature_${id//-/_}_title"
+        local title; title="$($title_fn 2>/dev/null || echo "$id")"
+        log_info "  $id: $action — $title"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Manifest sub-toggle update (used by enable/disable subcommands)
+# ---------------------------------------------------------------------------
+_manifest_update_suboption() {
+    local parent="$1"
+    local toggle="$2"
+    local value="$3"   # "true" or "false"
+
+    if [[ ! -f "$MANIFEST_FILE" ]]; then
+        log_warn "_manifest_update_suboption: no manifest — cannot persist $toggle=$value"
+        return 0
+    fi
+    if ! jq empty "$MANIFEST_FILE" 2>/dev/null; then
+        log_warn "_manifest_update_suboption: manifest is invalid JSON — skipping"
+        return 0
+    fi
+
+    local val_json; [[ "$value" == "true" ]] && val_json="true" || val_json="false"
+    local tmp; tmp="$(dirname "$MANIFEST_FILE")/install-manifest.json.tmp"
+
+    if ! jq --arg parent "$parent" --arg toggle "$toggle" --argjson val "$val_json" \
+            '.features[$parent].options[$toggle] = $val' \
+            "$MANIFEST_FILE" > "$tmp" 2>/dev/null; then
+        log_warn "_manifest_update_suboption: jq failed for $toggle"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! jq empty "$tmp" 2>/dev/null; then
+        log_warn "_manifest_update_suboption: output is invalid JSON — not writing"
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$MANIFEST_FILE"
+    log_info "Manifest updated: $toggle = $value"
+}
+
+# ---------------------------------------------------------------------------
+# enable / disable subcommand runner (architecture §9, brd D15)
+# ---------------------------------------------------------------------------
+
+# _suboption_is_enabled_per_manifest <parent_feature> <toggle_id>
+# Returns 0 if the manifest records the sub-toggle as true, 1 otherwise.
+# Used as a fallback when the real probe cannot determine state (e.g.,
+# ext_systemd_is_enabled returns false under CLAUDE_INSTALL_NO_EXTERNAL=1).
+_suboption_is_enabled_per_manifest() {
+    local parent="$1" toggle="$2"
+    [[ -f "$MANIFEST_FILE" ]] || return 1
+    local val
+    val=$(jq -r --arg fid "$parent" --arg sub "$toggle" \
+        '.features[$fid].options[$sub] // false' "$MANIFEST_FILE" 2>/dev/null \
+        || echo "false")
+    [[ "$val" == "true" ]]
+}
+
+_run_subcommand() {
+    local cmd="$SUBCOMMAND"         # enable | disable
+    local toggle="$SUBCOMMAND_ARG"  # amux-autowrap | profiles-autosource | …
+
+    # Validate toggle id
+    local found=false v
+    for v in "${VALID_SUBOPTIONS[@]}"; do
+        [[ "$v" == "$toggle" ]] && { found=true; break; }
+    done
+    if [[ "$found" == false ]]; then
+        log_error "$cmd: unknown toggle id '$toggle'"
+        log_error "Valid toggle ids: ${VALID_SUBOPTIONS[*]}"
+        return 1
+    fi
+
+    # Map toggle to parent feature id
+    local parent
+    case "$toggle" in
+        amux-autowrap)       parent="amux" ;;
+        profiles-autosource) parent="profiles" ;;
+        questions-listen)    parent="questions" ;;
+        daily-review-cron)   parent="daily-review" ;;
+    esac
+
+    # Verify parent is installed (probe — brd D2, never cascade into installing)
+    local probe_fn="feature_${parent//-/_}_probe"
+    if ! declare -f "$probe_fn" >/dev/null 2>&1 || ! $probe_fn 2>/dev/null; then
+        log_error "$cmd $toggle: parent feature '$parent' is not installed."
+        log_error "  Install it first: ./install.sh --only $parent"
+        return 1
+    fi
+
+    # Probe current sub-toggle state.
+    # For sub-toggles that escape HOME (systemd, crontab) and are gated by
+    # CLAUDE_INSTALL_NO_EXTERNAL, the probe may return false even when the
+    # toggle was previously enabled. Fall back to manifest state in that case.
+    local subopt_probe_fn="feature_${toggle//-/_}_probe"
+    local currently_enabled=false
+    if declare -f "$subopt_probe_fn" >/dev/null 2>&1 && $subopt_probe_fn 2>/dev/null; then
+        currently_enabled=true
+    elif _suboption_is_enabled_per_manifest "$parent" "$toggle"; then
+        currently_enabled=true
+    fi
+
+    if [[ "$cmd" == "enable" ]]; then
+        if [[ "$currently_enabled" == true ]]; then
+            log_info "$toggle is already enabled — no-op"
+            # Do NOT rewrite manifest — it already has the correct value.
+            return 0
+        fi
+
+        case "$toggle" in
+            amux-autowrap)
+                # Check if mutually-exclusive profiles-autosource is active.
+                # Consult both probe (real bashrc) and manifest (no-external environments).
+                local excl_was_on=false
+                if feature_profiles_autosource_probe 2>/dev/null \
+                   || _suboption_is_enabled_per_manifest "profiles" "profiles-autosource"; then
+                    excl_was_on=true
+                fi
+
+                ext_bashrc_add "amux-autowrap" \
+                    "source \"$HOME/.claude/shell/amux-spawn.bash\""
+                log_info "amux-autowrap: enabled"
+
+                if [[ "$excl_was_on" == true ]]; then
+                    log_info "profiles-autosource: disabled (mutual exclusion with amux-autowrap)"
+                    _manifest_update_suboption "profiles" "profiles-autosource" "false"
+                fi
+                ;;
+            profiles-autosource)
+                local excl_was_on=false
+                if feature_amux_autowrap_probe 2>/dev/null \
+                   || _suboption_is_enabled_per_manifest "amux" "amux-autowrap"; then
+                    excl_was_on=true
+                fi
+
+                ext_bashrc_add "profiles-autosource" \
+                    "source \"$HOME/.claude/shell/claude-profiles.bash\""
+                log_info "profiles-autosource: enabled"
+
+                if [[ "$excl_was_on" == true ]]; then
+                    log_info "amux-autowrap: disabled (mutual exclusion with profiles-autosource)"
+                    _manifest_update_suboption "amux" "amux-autowrap" "false"
+                fi
+                ;;
+            questions-listen)
+                ext_systemd_enable "claude-questions-listen.service"
+                log_info "questions-listen: enabled"
+                ;;
+            daily-review-cron)
+                ext_cron_add "daily-review-cron" \
+                    "15 6 * * * $SCRIPT_DIR/shell/permission-review-daily.sh"
+                log_info "daily-review-cron: enabled"
+                ;;
+        esac
+
+        _manifest_update_suboption "$parent" "$toggle" "true"
+
+    else  # disable
+        if [[ "$currently_enabled" == false ]]; then
+            log_info "$toggle is already disabled — no-op"
+            # Do NOT rewrite manifest — it already has the correct value.
+            return 0
+        fi
+
+        case "$toggle" in
+            amux-autowrap)
+                ext_bashrc_remove "amux-autowrap"
+                log_info "amux-autowrap: disabled"
+                ;;
+            profiles-autosource)
+                ext_bashrc_remove "profiles-autosource"
+                log_info "profiles-autosource: disabled"
+                ;;
+            questions-listen)
+                ext_systemd_disable "claude-questions-listen.service"
+                log_info "questions-listen: disabled"
+                ;;
+            daily-review-cron)
+                ext_cron_remove "daily-review-cron"
+                log_info "daily-review-cron: disabled"
+                ;;
+        esac
+
+        _manifest_update_suboption "$parent" "$toggle" "false"
+    fi
+}
+
 _parse_args "$@"
 
 # =============================================================================
-# --probe dispatch: run a feature probe and exit
+# Early exits that work without jq (argument parsing above; no deps needed yet).
 # =============================================================================
+
+# --help
+if [[ "$INSTALL_HELP" == true ]]; then
+    _show_help
+    exit 0
+fi
+
+# --probe dispatch: run a feature probe and exit
 if [[ -n "$PROBE_FEATURE" ]]; then
-    # Minimal re-init for probes: just need the feature probe functions
     fn="feature_${PROBE_FEATURE//-/_}_probe"
     if declare -f "$fn" >/dev/null 2>&1; then
         if $fn; then
@@ -2749,11 +3231,34 @@ if [[ -n "$PROBE_FEATURE" ]]; then
     fi
 fi
 
+# --list: works without jq (probes that require jq silently return "no")
+if [[ "$INSTALL_LIST" == true ]]; then
+    _show_list
+    exit 0
+fi
+
+# Validate --only / --with / --without feature ids (no jq needed)
+_validate_feature_ids
+
 # =============================================================================
 # Startup: dependency checks and registry assertions
 # =============================================================================
 _check_dependencies
 assert_registry_integrity
+
+# =============================================================================
+# enable / disable subcommand dispatch (requires jq for manifest update)
+# =============================================================================
+if [[ -n "$SUBCOMMAND" ]]; then
+    manifest_read
+    if ! _run_subcommand; then
+        exit 1
+    fi
+    exit 0
+fi
+
+# --yes pre-condition check (brd §5, architecture §5.2)
+_check_yes_preconditions
 
 # =============================================================================
 # Plan computation — determine action for each feature
@@ -2800,6 +3305,15 @@ _compute_plan() {
         SELECTED_FEATURES=("${new_selected[@]}")
     fi
 
+    # --with: add extra features to the selection
+    for id in "${WITH_FEATURES[@]}"; do
+        local already_in=false
+        for sel in "${SELECTED_FEATURES[@]}"; do
+            [[ "$sel" == "$id" ]] && { already_in=true; break; }
+        done
+        [[ "$already_in" == false ]] && SELECTED_FEATURES+=("$id")
+    done
+
     # Determine action for selected features
     for id in "${SELECTED_FEATURES[@]}"; do
         local probe_fn="feature_${id//-/_}_probe"
@@ -2809,6 +3323,36 @@ _compute_plan() {
         else
             FEATURE_ACTIONS["$id"]="install"
         fi
+    done
+
+    # Dependency promotion: features selected for install may have prerequisites
+    # that are currently "skip". Promote those to "install" (architecture §5.1,
+    # 29-06 §3). Loop until no more promotions needed (transitive deps).
+    local promoted_any=true
+    while [[ "$promoted_any" == true ]]; do
+        promoted_any=false
+        for id in "${FEATURES[@]}"; do
+            local action="${FEATURE_ACTIONS[$id]:-skip}"
+            [[ "$action" == "install" || "$action" == "update" ]] || continue
+            local req_fn="feature_${id//-/_}_requires"
+            declare -f "$req_fn" >/dev/null 2>&1 || continue
+            local reqs; reqs="$($req_fn)"
+            local req
+            for req in $reqs; do
+                if [[ "${FEATURE_ACTIONS[$req]:-skip}" == "skip" ]]; then
+                    # Promote prerequisite
+                    local req_probe_fn="feature_${req//-/_}_probe"
+                    if declare -f "$req_probe_fn" >/dev/null 2>&1 \
+                       && $req_probe_fn 2>/dev/null; then
+                        FEATURE_ACTIONS["$req"]="update"
+                    else
+                        FEATURE_ACTIONS["$req"]="install"
+                    fi
+                    log_info "  Promoted prerequisite: $req (required by $id)"
+                    promoted_any=true
+                fi
+            done
+        done
     done
 
     # Mark uninstall features
@@ -3382,7 +3926,8 @@ if _should_use_selector; then
     run_interactive_selector
 elif ! _is_tty && [[ "$INSTALL_YES" == false ]] \
      && [[ ${#SELECTED_FEATURES[@]} -eq 0 && "$INSTALL_ALL" == false \
-           && ${#UNINSTALL_FEATURES[@]} -eq 0 && ${#WITHOUT_FEATURES[@]} -eq 0 ]]; then
+           && ${#UNINSTALL_FEATURES[@]} -eq 0 && ${#WITHOUT_FEATURES[@]} -eq 0 \
+           && ${#WITH_FEATURES[@]} -eq 0 ]]; then
     # No TTY, no --yes, and no explicit selection flags: error (brd §5, architecture §5.2).
     # This prevents the "install everything without asking" footgun.
     log_error "No TTY detected and --yes not set."
@@ -3390,6 +3935,13 @@ elif ! _is_tty && [[ "$INSTALL_YES" == false ]] \
     log_error "  For explicit selection:   ./install.sh --only <features>"
     log_error "  To install everything:    ./install.sh --all --yes"
     exit 1
+elif [[ "$INSTALL_YES" == true \
+        && ${#SELECTED_FEATURES[@]} -eq 0 && "$INSTALL_ALL" == false \
+        && ${#UNINSTALL_FEATURES[@]} -eq 0 \
+        && -f "$MANIFEST_FILE" ]]; then
+    # --yes with manifest and no explicit selection: manifest replay mode.
+    # _check_yes_preconditions already guaranteed manifest exists in this case.
+    _compute_plan_manifest_replay
 else
     # Non-interactive path: use CLI flags to build FEATURE_ACTIONS.
     _compute_plan
