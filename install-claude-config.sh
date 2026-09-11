@@ -1,4 +1,9 @@
 #!/bin/bash
+# FROZEN for epic 29 (tasks/29_installer_interactive/). This is the pre-epic
+# installer, kept working and unmodified so that the documented workflow
+# ("re-run ./install-claude-config.sh to make a hook edit live") stays safe
+# while install.sh is under construction. Edit install.sh, not this file.
+# Task 29-09 deletes this copy.
 # Installs Claude Code configuration globally
 # - Copies hooks from .claude/hooks/ to ~/.claude/hooks/
 # - Copies statusline from .claude/statusline/ to ~/.claude/statusline/

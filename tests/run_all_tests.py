@@ -36,6 +36,7 @@ os.environ.setdefault("CLAUDE_MANUAL_CONFIRM_LOG", str(_tmp_store / "bash_manual
 
 # Test modules
 TEST_MODULES = {
+    "unit_installer": "test_unit_installer",
     "unit_decision": "test_unit_decision_mapper",
     "unit_state": "test_unit_state_store",
     "unit_whitelist": "test_unit_whitelist",
