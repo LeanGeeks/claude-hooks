@@ -15,7 +15,7 @@
 > - the launcher must export `CLAUDE_HOOKS_REPO=<path to claude-hooks>` so the
 >   snippets below can import `project_key` and `permission_queue`;
 > - proposals in another workspace carry scope **`workspace`**, so **skip step 3's
->   `install-claude-config.sh` merge entirely** — that merge exists only to push
+>   `install.sh --yes` merge entirely** — that merge exists only to push
 >   *user*-scope patterns from the claude-hooks repo into the global settings
 >   file. Step 4 (compaction) is also claude-hooks' job alone: the state store is
 >   one user-scoped file for the whole machine, and two schedulers compacting it
@@ -119,7 +119,7 @@ Judge it, in this order:
 4. **Tightness.** Would a narrower pattern cover the same evidence? If so,
    apply the narrower one and say in the commit message that you tightened it.
 5. **Scope.** In *this* repo (claude-hooks), `.claude/settings.json` **is** the
-   user-scoped allowlist: `install-claude-config.sh` copies its permissions over
+   user-scoped allowlist: `install.sh` copies its permissions over
    the global `~/.claude/settings.json` on every install. So a `user`-scope
    proposal is applied here, and it needs step 3's merge to reach other
    workspaces. In any other repo, `.claude/settings.json` is workspace scope and

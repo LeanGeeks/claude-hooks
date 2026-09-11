@@ -19,7 +19,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 INSTALL_SH = REPO / "install.sh"
-FROZEN_SCRIPT = REPO / "install-claude-config.sh"
 
 # Minimal settings.json that satisfies the installer's project-config check.
 _MINIMAL_PROJECT_SETTINGS = json.dumps(
@@ -73,9 +72,6 @@ def run_installer(
         "HOME": str(tmp_home),
         "CLAUDE_INSTALL_NO_EXTERNAL": "1",
         "CLAUDE_INSTALL_ASSUME_TTY": "0",
-        # Prevent the real-$HOME guard from firing (tmp_home != real HOME anyway,
-        # but set it explicitly in case getent behaves oddly in CI).
-        "CLAUDE_INSTALL_EPIC29_LIVE": "1",
     }
     if extra_env:
         env.update(extra_env)
@@ -145,114 +141,78 @@ class InstallerTestBase(unittest.TestCase):
 
 
 # =============================================================================
-# Source tests — install-claude-config.sh must keep the FROZEN header
+# Source tests — exactly one installer must exist, guard must be gone
 # =============================================================================
 
-class TestFrozenHeader(unittest.TestCase):
-    """Source test: install-claude-config.sh still carries the FROZEN header."""
+class TestSingleInstaller(unittest.TestCase):
+    """Source test: exactly one installer (install.sh) and no frozen copy."""
 
     def setUp(self):
         self.assertIn("CLAUDE_INSTALL_NO_EXTERNAL", os.environ,
                       "Tests must run with CLAUDE_INSTALL_NO_EXTERNAL=1")
 
-    def test_frozen_header_present(self):
-        """install-claude-config.sh must have the FROZEN header from §0."""
-        text = FROZEN_SCRIPT.read_text()
-        self.assertIn(
-            "FROZEN for epic 29",
-            text,
-            "install-claude-config.sh is missing the FROZEN header. "
-            "A later task in the epic must not have started editing it. "
-            "See tasks/29_installer_interactive/state.md.",
-        )
-
-    def test_frozen_script_exists(self):
-        """install-claude-config.sh must still exist alongside install.sh."""
-        self.assertTrue(
-            FROZEN_SCRIPT.is_file(),
-            f"install-claude-config.sh not found at {FROZEN_SCRIPT}",
-        )
+    def test_install_sh_exists(self):
+        """install.sh must exist."""
         self.assertTrue(
             INSTALL_SH.is_file(),
             f"install.sh not found at {INSTALL_SH}",
         )
 
+    def test_frozen_script_deleted(self):
+        """install-claude-config.sh must NOT exist (deleted in task 29-09)."""
+        frozen = REPO / "install-claude-config.sh"
+        self.assertFalse(
+            frozen.exists(),
+            "install-claude-config.sh still exists — it should have been deleted in 29-09. "
+            "Run: git rm install-claude-config.sh",
+        )
 
-# =============================================================================
-# Real-$HOME guard
-# =============================================================================
+    def test_no_epic29_guard_in_install_sh(self):
+        """The TEMPORARY real-$HOME guard must have been removed from install.sh."""
+        text = INSTALL_SH.read_text()
+        self.assertNotIn(
+            "TEMPORARY — remove in 29-09",
+            text,
+            "install.sh still has the epic-29 bootstrapping guard. "
+            "Remove the _guard_real_home function and its call.",
+        )
+        self.assertNotIn(
+            "CLAUDE_INSTALL_EPIC29_LIVE",
+            text,
+            "install.sh still references CLAUDE_INSTALL_EPIC29_LIVE. "
+            "The guard and override must be removed entirely.",
+        )
 
-class TestRealHomeGuard(unittest.TestCase):
-    """install.sh refuses to run against the real $HOME without override."""
+    def test_dry_run_against_real_home_succeeds(self):
+        """--dry-run must exit 0 when run against the real $HOME (guard is gone).
 
-    def setUp(self):
-        self.assertIn("CLAUDE_INSTALL_NO_EXTERNAL", os.environ,
-                      "Tests must run with CLAUDE_INSTALL_NO_EXTERNAL=1")
+        This is the done-criterion from tasks/29_installer_interactive/29-09-migration-and-docs.md:
+        'A run against the real $HOME is no longer refused — assert this by running
+        --dry-run with HOME unset from the harness override and checking the exit status.'
+        """
+        real_home = str(Path.home())
+        env = {
+            **os.environ,
+            "HOME": real_home,
+            "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+            "CLAUDE_INSTALL_ASSUME_TTY": "0",
+        }
+        # Ensure no leftover override from old tests.
+        env.pop("CLAUDE_INSTALL_EPIC29_LIVE", None)
 
-    def test_guard_fires_on_real_home(self):
-        """With HOME=real home and no CLAUDE_INSTALL_EPIC29_LIVE, install.sh exits non-zero."""
-        real_home = Path.home()
-        tmp_dir = Path(tempfile.mkdtemp(prefix="claude-hooks-guard-test-"))
-        try:
-            env = {
-                **os.environ,
-                "HOME": str(real_home),
-                "CLAUDE_INSTALL_NO_EXTERNAL": "1",
-                # Do NOT set CLAUDE_INSTALL_EPIC29_LIVE — that's what triggers the guard
-            }
-            if "CLAUDE_INSTALL_EPIC29_LIVE" in env:
-                del env["CLAUDE_INSTALL_EPIC29_LIVE"]
-
-            result = subprocess.run(
-                ["bash", str(INSTALL_SH)],
-                capture_output=True,
-                text=True,
-                cwd=str(REPO),
-                env=env,
-                timeout=10,
-            )
-            self.assertNotEqual(
-                result.returncode, 0,
-                "install.sh must exit non-zero when run against real $HOME without override. "
-                f"stdout: {result.stdout[:200]}",
-            )
-            # Verify the error message names the alternatives
-            self.assertIn(
-                "install-claude-config.sh",
-                result.stderr + result.stdout,
-                "Guard message should name ./install-claude-config.sh as an alternative",
-            )
-            # Belt-and-braces: verify nothing was written to tmp_dir
-            # (tmp_dir never got HOME pointed at it so this is trivially true,
-            # but it's a named checkpoint so a future refactor of this test can't
-            # accidentally miss the assertion)
-            self.assertEqual(
-                list(tmp_dir.iterdir()),
-                [],
-                "No files should have been written to tmp_dir",
-            )
-        finally:
-            shutil.rmtree(str(tmp_dir), ignore_errors=True)
-
-    def test_override_allows_run(self):
-        """CLAUDE_INSTALL_EPIC29_LIVE=1 overrides the guard."""
-        tmp_home = Path(tempfile.mkdtemp(prefix="claude-hooks-guard-override-"))
-        try:
-            result = run_installer(
-                tmp_home,
-                extra_env={"CLAUDE_INSTALL_EPIC29_LIVE": "1"},
-            )
-            # We expect it to run (not fail with the guard message).
-            # It may fail for other reasons (missing project files in edge cases),
-            # but if it fails it must NOT be the guard message.
-            if result.returncode != 0:
-                self.assertNotIn(
-                    "under construction",
-                    result.stderr + result.stdout,
-                    "With CLAUDE_INSTALL_EPIC29_LIVE=1, the guard should not fire",
-                )
-        finally:
-            shutil.rmtree(str(tmp_home), ignore_errors=True)
+        result = subprocess.run(
+            ["bash", str(INSTALL_SH), "--all", "--dry-run"],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO),
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            "--dry-run against real $HOME must exit 0 after guard removal.\n"
+            f"stderr: {result.stderr[:500]}\nstdout: {result.stdout[:500]}",
+        )
 
 
 # =============================================================================
@@ -2312,8 +2272,8 @@ class TestFailureIsolation(InstallerTestBase):
         """A run where any feature fails exits non-zero."""
         text = INSTALL_SH.read_text()
         patched = text.replace(
-            'feature_statusline_install() {\n    # Lifted from STEP 2',
-            'feature_statusline_install() {\n    return 1  # PATCHED: fail\n    # Lifted from STEP 2',
+            'feature_statusline_install() {\n    # Status line installation',
+            'feature_statusline_install() {\n    return 1  # PATCHED: fail\n    # Status line installation',
             1,
         )
         self.assertIn("PATCHED: fail", patched)

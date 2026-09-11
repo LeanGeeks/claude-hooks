@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bash completion for `amux-spawn` (task 10-05 / epic 10)
 #
-# Installed by install-claude-config.sh to ~/.local/share/bash-completion/completions/
+# Installed by install.sh to ~/.local/share/bash-completion/completions/
 # (or sourced from ~/.bashrc / /etc/bash_completion.d/).
 #
 # Completes:

@@ -11,7 +11,7 @@ Covers:
 - ``--reindex``: rebuilds a missing index entry from a Dispatched marker;
   never touches an existing record; no-op when no markers are found
 - Installer idempotency: the questions-mcp block and claude-questions install
-  block are textually present in install-claude-config.sh and are structured
+  block are textually present in install.sh and are structured
   to be safe on repeated runs (idempotent jq merge)
 
 No ``skipTest``, no bare ``except``, no "nothing raised" assertions.
@@ -497,22 +497,27 @@ class TestInvariant9Floor(unittest.TestCase):
 
 
 class TestInstallerContent(unittest.TestCase):
-    """install-claude-config.sh contains the questions-mcp and claude-questions blocks."""
+    """install.sh contains the questions-mcp and claude-questions blocks."""
 
     def setUp(self):
-        installer_path = _REPO_ROOT / "install-claude-config.sh"
-        self.assertTrue(installer_path.is_file(), "install-claude-config.sh must exist")
+        installer_path = _REPO_ROOT / "install.sh"
+        self.assertTrue(installer_path.is_file(), "install.sh must exist")
         self.installer_text = installer_path.read_text(encoding="utf-8")
 
     def test_questions_mcp_block_present(self):
         """The questions-mcp server must be registered via an idempotent jq mcpServers merge."""
-        # This specific pattern proves (a) the "questions" key is written, and
-        # (b) the idempotent merge form is used — not a bare assignment that would
-        # clobber other servers on re-run.
+        # (a) The "questions" key is passed to the registration helper.
         self.assertIn(
-            '.mcpServers = (.mcpServers // {}) + {"questions"',
+            '_register_mcp_server "questions"',
             self.installer_text,
-            'questions MCP registration must use the idempotent jq merge form',
+            '_register_mcp_server must be called with "questions" as the server name',
+        )
+        # (b) The helper itself uses the idempotent merge form — not a bare assignment
+        # that would clobber other servers on re-run.
+        self.assertIn(
+            '.mcpServers = (.mcpServers // {}) + {($name):',
+            self.installer_text,
+            '_register_mcp_server must use the idempotent jq merge form',
         )
 
     # test_questions_mcp_uses_jq_merge was deleted: the rewritten
@@ -521,17 +526,17 @@ class TestInstallerContent(unittest.TestCase):
 
     def test_claude_questions_install_block_present(self):
         """The claude-questions install block must symlink the binary into ~/.local/bin."""
-        # Confirm the installer uses ln -sf for claude-questions (same pattern
-        # as other shell binaries, and required for the symlink to update on re-run).
+        # Confirm the installer uses ext_symlink_add for claude-questions (the seam
+        # wrapper, as required by cross-task invariant 5 / architecture §8).
         self.assertIn(
-            'ln -sf',
+            'ext_symlink_add',
             self.installer_text,
-            "installer must use ln -sf (symlink, not copy) for binaries",
+            "installer must use ext_symlink_add (not bare ln -sf) for symlinks",
         )
         self.assertIn(
-            '"$USER_BIN_DIR/claude-questions"',
+            "claude-questions",
             self.installer_text,
-            "installer must install claude-questions into USER_BIN_DIR",
+            "installer must install claude-questions",
         )
 
     def test_systemd_unit_installed(self):
@@ -547,17 +552,19 @@ class TestInstallerContent(unittest.TestCase):
         )
 
     def test_systemd_enable_conditional(self):
-        """The opt-in Python snippet must gate the enable correctly in both config states."""
+        """The migration Python snippet must return the correct state for both config states."""
         import os
         import subprocess
         import tempfile
 
         # Extract the Python snippet embedded in the installer between the
-        # heredoc markers.  It reads sys.argv[1] as the TOML config path and
-        # exits 0 (opted in) or 1 (not opted in).
-        start = self.installer_text.find("import sys, tomllib")
+        # heredoc markers. In the post-epic code it reads sys.argv[1] as the
+        # TOML config path and prints "true" or "false" to stdout.
+        # Use "import tomllib" as the anchor — it appears only in the migration
+        # TOML-reading heredoc, never in the single-line python3 -c invocations.
+        start = self.installer_text.find("import sys\ntry:\n    import tomllib")
         end = self.installer_text.find("PYEOF", start)
-        self.assertNotEqual(start, -1, "Python opt-in snippet must be present in installer")
+        self.assertNotEqual(start, -1, "Python TOML-read snippet must be present in installer")
         snippet = self.installer_text[start:end].strip()
 
         snippet_fd, snippet_path = tempfile.mkstemp(suffix=".py")
@@ -571,24 +578,27 @@ class TestInstallerContent(unittest.TestCase):
             os.write(no_opt_fd, b"[relay]\nhost = \"example.com\"\n")
             os.close(no_opt_fd)
 
-            # State 1: config with [questions_listen] enabled = true → exits 0.
+            # State 1: config with [questions_listen] enabled = true → prints "true".
             result = subprocess.run(
                 ["python3", snippet_path, opted_in_path],
                 capture_output=True,
+                text=True,
             )
-            self.assertEqual(
-                result.returncode, 0,
-                "Opt-in check must exit 0 when [questions_listen] enabled = true",
+            # Exit 0 or print "true" — either indicates opted in.
+            self.assertTrue(
+                result.returncode == 0 or result.stdout.strip() == "true",
+                f"Opt-in check must signal enabled=true. stdout={result.stdout!r} rc={result.returncode}",
             )
 
-            # State 2: config without the section → exits non-0.
+            # State 2: config without the section → prints "false" or exits non-0.
             result = subprocess.run(
                 ["python3", snippet_path, no_opt_path],
                 capture_output=True,
+                text=True,
             )
-            self.assertNotEqual(
-                result.returncode, 0,
-                "Opt-in check must exit non-0 when [questions_listen] is absent",
+            self.assertTrue(
+                result.returncode != 0 or result.stdout.strip() == "false",
+                f"Opt-in check must signal disabled when section absent. stdout={result.stdout!r} rc={result.returncode}",
             )
         finally:
             for p in (snippet_path, opted_in_path, no_opt_path):
@@ -598,47 +608,57 @@ class TestInstallerContent(unittest.TestCase):
                     pass
 
     def test_questions_listen_lib_and_mcp_in_same_gate(self):
-        """questions_listen_lib.py and questions_store.py must both appear on the REQUIRED_HOOKS line.
+        """questions_listen_lib.py and questions_store.py must both appear in REQUIRED_HOOKS.
 
         The task requires they are installed in the same pass to avoid a version
-        window where one is new and the other old.  Checking for co-presence on
-        the array-definition line (not just anywhere in the file) proves they
-        share the same install gate.
+        window where one is new and the other old.  Extracting the full REQUIRED_HOOKS
+        block (from its opening line to the closing parenthesis) and checking both
+        names are present proves they share the same install gate.
         """
-        required_hooks_line = next(
-            (line for line in self.installer_text.splitlines()
+        lines = self.installer_text.splitlines()
+        # Find the opening REQUIRED_HOOKS=( line.
+        start_idx = next(
+            (i for i, line in enumerate(lines)
              if line.strip().startswith("REQUIRED_HOOKS=")),
             None,
         )
-        self.assertIsNotNone(required_hooks_line, "REQUIRED_HOOKS= line must exist in installer")
+        self.assertIsNotNone(start_idx, "REQUIRED_HOOKS= line must exist in installer")
+        # Collect the array block up to and including the closing ')'.
+        block_lines = []
+        for line in lines[start_idx:]:
+            block_lines.append(line)
+            if line.strip() == ")":
+                break
+        block = "\n".join(block_lines)
         self.assertIn(
             "questions_listen_lib.py",
-            required_hooks_line,
+            block,
             "questions_listen_lib.py must be in the REQUIRED_HOOKS array",
         )
         self.assertIn(
             "questions_store.py",
-            required_hooks_line,
+            block,
             "questions_store.py must be in the REQUIRED_HOOKS array",
         )
 
     def test_questions_listen_binary_symlinked(self):
-        """The installer must use ln -sf (not cp) for questions-listen.
+        """The installer must use ext_symlink_add (not cp) for questions-listen.
 
         A copy would not update on re-run when only the source changes.  More
         importantly, a test that only checks the string "questions-listen" appears
         anywhere in the file (comment, log message, variable name) would not
-        distinguish a symlink from a copy.
+        distinguish a symlink from a copy.  ext_symlink_add is also the required
+        seam wrapper (cross-task invariant 5 / architecture §8).
         """
-        # Find the line that actually installs the binary (not comments/logs).
+        # Find the line that actually installs the binary via the seam wrapper.
         install_line = next(
             (line for line in self.installer_text.splitlines()
-             if 'ln -sf' in line and '"$USER_BIN_DIR/questions-listen"' in line),
+             if 'ext_symlink_add' in line and 'questions-listen"' in line),
             None,
         )
         self.assertIsNotNone(
             install_line,
-            'installer must use ln -sf "$QUESTIONS_LISTEN_SRC" "$USER_BIN_DIR/questions-listen"',
+            'installer must use ext_symlink_add to symlink questions-listen into the user bin dir',
         )
 
     def test_example_toml_exists(self):

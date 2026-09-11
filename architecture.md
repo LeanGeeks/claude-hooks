@@ -50,7 +50,7 @@ relay HTTP API itself.
 questions-mcp/
   server.py                      questions MCP server: ask + notify tools (uv --script, registered user-scoped)
   questions_mcp_lib.py           ask/notify logic: role resolution, write-then-send, index write
-install-claude-config.sh         merges permissions + wires hooks into global settings.json
+install.sh                       interactive installer — selects features, merges permissions, wires hooks (see docs/installer.md)
 shell/
   profiles.example.toml          shipped template for ~/.claude/profiles.toml
   amux-spawn.bash                shell integration: auto-generates aliases from profiles
@@ -105,7 +105,7 @@ tests/                           unit + integration tests (run_all_tests.py)
 ## Client-side hook events
 
 Hooks are wired into the **global** `~/.claude/settings.json` by
-`install-claude-config.sh` (never in project settings, to avoid double-firing):
+`install.sh` (never in project settings, to avoid double-firing):
 
 | Event | Matcher | Script | Role |
 |-------|---------|--------|------|
@@ -411,7 +411,7 @@ each session in **tmux**. Relevant facts:
   `--no-default-model`, env propagation via `update-environment`, and
   `--session-id` kept out of `CC_FLAGS`. Install it with **`./install-amux.sh`**
   (clone → branch → verify → `/usr/local/bin/amux`, CLI only) **before**
-  `install-claude-config.sh`; the two are coupled only at runtime, since
+  `install.sh`; the two are coupled only at runtime, since
   `amux-spawn` resolves `amux` from `PATH`. Details and the pinned commit:
   [tasks/12_amux_extensions.md](./tasks/12_amux_extensions.md). Note the fork
   does **not** bump `CC_VERSION` — `amux --version` still prints `0.3.0`, so the
@@ -506,7 +506,7 @@ effects. `resolve_profile(name)` returns the merged env dict; `amux-spawn`
 exports those vars into its own process before the create-detached-under-lock
 flow (env reaches child via tmux `update-environment`, no `ps` leak).
 
-**Install:** `install-claude-config.sh` copies `shell/profiles.example.toml`
+**Install:** `install.sh` copies `shell/profiles.example.toml`
 to `~/.claude/profiles.toml` if the file does not exist (never overwrites).
 
 **Inspection:** `amux-spawn profiles` prints one block per profile — name,

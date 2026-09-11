@@ -57,7 +57,7 @@ except Exception:  # noqa: BLE001
 # Make the ``relay_server`` package importable regardless of how this hook is
 # launched. Resolution order:
 #   1. Already importable — pip-installed, or via a user-site ``.pth`` written by
-#      install-claude-config.sh. Nothing to do.
+#      install.sh. Nothing to do.
 #   2. ``CLAUDE_RELAY_SERVER_PATH`` env var pointing at the ``relay-server`` dir.
 #   3. Walk up from this file looking for a ``relay-server/relay_server`` package
 #      (covers running hooks straight from a repo checkout, at any depth).

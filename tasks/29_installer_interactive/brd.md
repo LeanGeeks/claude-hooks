@@ -1,6 +1,6 @@
 # Epic 29 — Interactive installer
 
-**Status:** todo · **Owner:** Anton · **Created:** 2026-08-27 · **Rev:** 1
+**Status:** done · **Owner:** Anton · **Created:** 2026-08-27 · **Rev:** 1
 
 > Rev 0 was a deliberate one-fact stub. Rev 1 fills in everything it listed as
 > *"not yet written"*: the interaction model, how choices are persisted and

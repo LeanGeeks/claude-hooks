@@ -103,24 +103,21 @@ questions-listen --status     # print state without holding the lock
 The installer creates `~/.config/systemd/user/claude-questions-listen.service`.
 It is **not** enabled automatically.  To opt in:
 
-1. Add to `~/.config/claude-tg-relay/config.toml`:
+```bash
+./install.sh enable questions-listen
+```
 
-   ```toml
-   [questions_listen]
-   enabled = true
-   ```
+This enables the unit and runs `loginctl enable-linger` so it survives logout.
+Then start it:
 
-2. Re-run `./install-claude-config.sh`.  The installer enables the unit and
-   runs `loginctl enable-linger` so it survives logout.
+```
+systemctl --user start claude-questions-listen
+```
 
-3. Start it:
-
-   ```
-   systemctl --user start claude-questions-listen
-   ```
-
-The binary exits 0 immediately when `enabled` is absent or false — installing
-the unit without the opt-in changes nothing.
+The `[questions_listen] enabled` key in `~/.config/claude-tg-relay/config.toml`
+was the pre-epic opt-in mechanism. It is now inert — the sub-toggle in the
+installer manifest is the setting. Machines upgraded from the old installer will
+have the key migrated automatically on the next `./install.sh` run.
 
 ---
 
@@ -150,7 +147,7 @@ That is it.  Four lines and a working `ask` call.
 ### 3. Install
 
 ```
-./install-claude-config.sh
+./install.sh --yes
 ```
 
 The installer registers the `questions` MCP server and installs the listener

@@ -829,7 +829,7 @@ _PAREN_TOOL_RE = re.compile(r"^(?P<tool>[A-Za-z][A-Za-z0-9_.-]*)\((?P<inner>.+)\
 H6_NOTE = (
     "H6: user-scope patterns live in the claude-hooks repo's .claude/settings.json. "
     "That is live in the claude-hooks workspace immediately, but it does NOT reach "
-    "any other workspace until install-claude-config.sh re-runs its merge into "
+    "any other workspace until install.sh --yes re-runs its merge into "
     "~/.claude/settings.json (the daily reviewer runs it when it applies user-scope "
     "changes)."
 )

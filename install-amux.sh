@@ -12,7 +12,7 @@
 # them (see tasks/12_amux_extensions.md "Deployment"). Only `amux serve` needs
 # amux-server.py; if you want it, run ../amux/install.sh instead.
 #
-# Run this BEFORE ./install-claude-config.sh. The two are only coupled at
+# Run this BEFORE ./install.sh. The two are only coupled at
 # runtime — amux-spawn resolves `amux` from PATH — but installing amux first
 # means the claude-hooks run finishes in a working, verified state.
 
@@ -569,5 +569,5 @@ if [[ "$VERIFY_FAILED" == true ]]; then
 fi
 
 echo "Next step:"
-echo "  ./install-claude-config.sh    # hooks, amux-spawn launcher, tmux options"
+echo "  ./install.sh    # hooks, amux-spawn launcher, tmux options (see docs/installer.md)"
 echo ""

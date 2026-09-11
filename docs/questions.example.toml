@@ -9,7 +9,7 @@
 # Contract for adopters: docs/questions-contract.md
 # Agent-facing prose to adapt into CLAUDE.md: docs/questions-prompt-example.md
 #
-# After editing, run install-claude-config.sh once to register the MCP server.
+# After editing, run ./install.sh once to register the MCP server.
 # Then run: claude-questions  (from this workspace directory) to verify.
 
 [questions]

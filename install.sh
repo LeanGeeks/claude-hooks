@@ -1,8 +1,6 @@
 #!/bin/bash
-# install.sh — Epic 29 working script.
-# This is the WORKING copy being restructured. install-claude-config.sh is FROZEN.
-# See tasks/29_installer_interactive/state.md for the bootstrapping hazard.
-# Task 29-09 collapses this back into install-claude-config.sh.
+# install.sh — Interactive installer for claude-hooks.
+# See docs/installer.md for the full reference (features, CLI, uninstall, seam).
 
 set -uo pipefail
 # NOTE: set -e is intentionally NOT set globally for failure isolation (29-05 §2).
@@ -40,34 +38,6 @@ log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "${BLUE}[STEP]${NC} $1"; }
-
-# =============================================================================
-# §0.1 REAL-$HOME GUARD — TEMPORARY — remove in 29-09.
-# Guards the developer's machine while install.sh is under construction.
-# See tasks/29_installer_interactive/state.md.
-# =============================================================================
-_guard_real_home() {
-    if [[ -n "${CLAUDE_INSTALL_EPIC29_LIVE:-}" ]]; then
-        return 0
-    fi
-    local real_home
-    real_home="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6 || true)"
-    if [[ -n "$real_home" && "$HOME" == "$real_home" ]]; then
-        log_error "install.sh is under construction (epic 29) and refuses to run"
-        log_error "against the real \$HOME without an explicit override."
-        log_error ""
-        log_error "Two alternatives:"
-        log_error "  (1) Run against a temporary HOME with CLAUDE_INSTALL_NO_EXTERNAL=1:"
-        log_error "      HOME=/tmp/test-home CLAUDE_INSTALL_NO_EXTERNAL=1 ./install.sh"
-        log_error "  (2) To make a hook edit live, use the frozen copy instead:"
-        log_error "      ./install-claude-config.sh"
-        log_error ""
-        log_error "To override (29-10 live verification only):"
-        log_error "  CLAUDE_INSTALL_EPIC29_LIVE=1 ./install.sh"
-        exit 1
-    fi
-}
-_guard_real_home
 
 # =============================================================================
 # Housekeeping functions (always run, never a toggle)
@@ -195,7 +165,7 @@ feature_statusline_probe() {
 }
 
 feature_statusline_install() {
-    # Lifted from STEP 2 of install-claude-config.sh
+    # Status line installation (from the pre-epic script's STEP 2)
     log_step "Installing: $(feature_statusline_title)"
 
     if [[ ! -d "$PROJECT_STATUSLINE_DIR" ]]; then
@@ -964,7 +934,7 @@ feature_questions_probe() {
 }
 
 feature_questions_install() {
-    # Lifted from the questions section of STEP 5 in install-claude-config.sh
+    # Questions feature installation (from the pre-epic script's STEP 5)
     log_step "Installing: $(feature_questions_title)"
     _install_modules "$(feature_questions_modules)" || return 0
 
@@ -974,8 +944,9 @@ feature_questions_install() {
     mkdir -p "$claude_bin_dir"
 
     # questions MCP server in ~/.claude.json — collapsed into the shared helper.
-    # IMPORTANT: questions_listen_lib.py and questions-mcp must stay in sync (see
-    # install-claude-config.sh:852). Both are installed in this same function.
+    # IMPORTANT: questions_listen_lib.py and questions-mcp must stay in sync
+    # (a state where one is new and the other is old silently drops index fields).
+    # Both are installed in this same function.
     local questions_mcp_script="$SCRIPT_DIR/questions-mcp/server.py"
     if [[ -f "$questions_mcp_script" ]]; then
         if _register_mcp_server "questions" "$questions_mcp_script" \
@@ -1436,29 +1407,82 @@ EOF
     # daemon-reload so the new unit is visible; systemctl escapes HOME → via seam.
     ext_systemd_daemon_reload
 
-    # Opt-in check: enable only when config.toml carries [questions_listen] enabled = true
-    # (architecture §8.4: enable and loginctl enable-linger are the sub-toggle
-    # actions. 29-09 will migrate the config.toml check to the manifest sub-toggle flag.)
-    local relay_config_toml="$HOME/.config/claude-tg-relay/config.toml"
-    local questions_listen_opted_in=false
-    if [[ -f "$relay_config_toml" ]]; then
-        if python3 - "$relay_config_toml" <<'PYEOF' 2>/dev/null
-import sys, tomllib
-with open(sys.argv[1], "rb") as fh:
-    raw = tomllib.load(fh)
-section = raw.get("questions_listen", {})
-sys.exit(0 if section.get("enabled") else 1)
-PYEOF
-        then
-            questions_listen_opted_in=true
+    # Determine whether to enable the unit.
+    # Priority order (highest wins):
+    #   1. FEATURE_SUBOPTION_STATES[questions-listen] already set (manifest replay or
+    #      interactive selector populated it before _install ran) → use it directly.
+    #   2. No manifest entry yet (first run from pre-epic install): check config.toml
+    #      [questions_listen] enabled for a one-time migration seed, then announce
+    #      the key is now inert.
+    #   3. Neither → default to false (user must opt in with: install.sh enable questions-listen).
+    local enable_unit=false
+
+    local manifest_had_questions_listen=false
+    if [[ -f "$MANIFEST_FILE" ]]; then
+        local _ql_manifest_val
+        _ql_manifest_val="$(jq -r '.features.questions.options["questions-listen"] // "absent"' \
+            "$MANIFEST_FILE" 2>/dev/null || echo "absent")"
+        if [[ "$_ql_manifest_val" != "absent" ]]; then
+            manifest_had_questions_listen=true
+            [[ "$_ql_manifest_val" == "true" ]] && enable_unit=true
         fi
     fi
 
-    if [[ "$questions_listen_opted_in" == true ]]; then
+    # Also honour FEATURE_SUBOPTION_STATES if it was pre-populated by the
+    # selector or --yes manifest replay (those paths set it before install runs).
+    if [[ "${FEATURE_SUBOPTION_STATES[questions-listen]:-}" == "true" ]]; then
+        enable_unit=true
+        manifest_had_questions_listen=true   # treat as if already decided
+    elif [[ "${FEATURE_SUBOPTION_STATES[questions-listen]:-}" == "false" \
+            && "$manifest_had_questions_listen" == false ]]; then
+        # Explicit false from selector/plan — do not fall through to config.toml.
+        manifest_had_questions_listen=true
+    fi
+
+    if [[ "$manifest_had_questions_listen" == false ]]; then
+        # First-run migration: read config.toml once, seed the sub-toggle state, and
+        # tell the user the key is now inert (architecture §8.4, task 29-09 §2).
+        local relay_config_toml="$HOME/.config/claude-tg-relay/config.toml"
+        if [[ -f "$relay_config_toml" ]]; then
+            local _toml_result
+            _toml_result="$(python3 - "$relay_config_toml" <<'PYEOF' 2>/dev/null
+import sys
+try:
+    import tomllib
+except ImportError:
+    sys.exit(2)
+try:
+    with open(sys.argv[1], "rb") as fh:
+        raw = tomllib.load(fh)
+except Exception:
+    sys.exit(2)
+section = raw.get("questions_listen", {})
+print("true" if section.get("enabled") else "false")
+PYEOF
+            )" || _toml_result=""
+
+            if [[ "$_toml_result" == "true" || "$_toml_result" == "false" ]]; then
+                [[ "$_toml_result" == "true" ]] && enable_unit=true
+                log_info "Migration: [questions_listen] enabled = $_toml_result found in config.toml"
+                log_info "  Seeding questions-listen sub-toggle to ${enable_unit}."
+                log_warn "  The [questions_listen] enabled key in config.toml is now inert."
+                if [[ "$enable_unit" == true ]]; then
+                    log_warn "  The sub-toggle is managed by: ./install.sh enable questions-listen"
+                else
+                    log_warn "  To enable the listener: ./install.sh enable questions-listen"
+                fi
+            fi
+        fi
+    fi
+
+    # Seed FEATURE_SUBOPTION_STATES so manifest_write records the correct value.
+    FEATURE_SUBOPTION_STATES["questions-listen"]="$enable_unit"
+
+    if [[ "$enable_unit" == true ]]; then
         # enable + loginctl enable-linger both escape HOME → via seam.
         ext_systemd_enable "$questions_listen_service_name"
     else
-        log_info "questions-listen not enabled (add [questions_listen] enabled = true to config.toml to opt in)"
+        log_info "questions-listen not enabled (run: ./install.sh enable questions-listen)"
     fi
 }
 
@@ -1742,10 +1766,10 @@ PYEOF
 # to any running server (live). Both halves are idempotent.
 # ~/.tmux.conf is under HOME so the file write is safe with a HOME override;
 # "tmux set -g" mutates the running server and is gated by NO_EXTERNAL.
-# NOTE on the legacy marker: machines installed before 29-03 have
-#   "# Added by claude-hooks install-claude-config.sh (...)"
-# as their marker. ext_tmux_remove targets the new marker only; 29-09
-# handles migration of the old one.
+# NOTE on the legacy marker: machines installed before 29-03 (epic 29 task 3)
+# have "# Added by claude-hooks install-claude-config.sh (...)" as their marker.
+# ext_tmux_remove targets the new marker only; the old marker is left in place
+# and must be removed by hand if desired.
 ext_tmux_apply() {
     local tmux_conf="$HOME/.tmux.conf"
     local marker="# claude-hooks:amux-tmux-options  (install.sh — remove with: uninstall amux)"
@@ -2902,6 +2926,8 @@ EXAMPLES
   install.sh --list                     # show current detected state (no jq needed)
   install.sh enable questions-listen    # enable the listener daemon
   install.sh disable amux-autowrap      # disable amux auto-wrap in ~/.bashrc
+
+For full documentation, see: docs/installer.md
 EOF
 }
 
@@ -4264,8 +4290,7 @@ if [[ "$QUESTIONS_LISTEN_INSTALLED" == true ]]; then
         echo "    systemd unit enabled — start with: systemctl --user start claude-questions-listen"
     else
         echo "    systemd unit installed but NOT enabled"
-        echo "    To opt in: add [questions_listen] enabled = true to ~/.config/claude-tg-relay/config.toml"
-        echo "    Then re-run install.sh to enable the unit"
+        echo "    To enable: ./install.sh enable questions-listen"
     fi
 else
     echo "  - questions-listen: not installed"

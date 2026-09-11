@@ -6,55 +6,25 @@ fresh-context agent and carries its own "read first" refs, done criteria and
 tests. This file owns **cross-task invariants**, **ordering**, and one safety
 rule that applies to every task in the epic.
 
-## ⚠ The bootstrapping hazard — read before spawning anything
+## The bootstrapping hazard — resolved in task 29-09
 
-The committed installer is safe to run; the **half-finished** one is not, and the
-project's standing instructions cannot tell them apart. `implementer.md` §Step 5
-and `reviewer.md` §Step 6 both tell agents to re-run `install-claude-config.sh`
-to make a hook edit live — correct advice in every other epic, and in this one it
-points straight at the script being rewritten. An agent running a partial
-registry migration against the real `$HOME` can drop hook wiring from
-`~/.claude/settings.json`, remove a module a still-installed feature imports, or
-corrupt `~/.claude.json` (which the pre-epic script never backs up — 29-04 §4).
-The failure is quiet: the file still validates as JSON, and the symptom arrives
-later, in a live session, as a permission prompt that no longer routes.
+**This hazard no longer exists.** Task 29-09 collapsed the two-installer setup
+back into a single `install.sh`, removed the real-`$HOME` guard, and deleted the
+frozen `install-claude-config.sh`. The section below is kept as a historical
+record of the mitigation that made the rest of the epic safe to develop.
 
-This repo is self-hosting. The hooks in `~/.claude/hooks/` are what the agent's
-own session runs on, so a bad run breaks the thing that would fix it.
+**What it was (historical).** During epic 29 the installer was being rewritten
+as `install.sh` while `install-claude-config.sh` was frozen as the safe-to-run
+copy. `implementer.md` §Step 5 and `reviewer.md` §Step 6 both pointed at
+`install-claude-config.sh`; `install.sh` additionally refused to run against the
+real `$HOME` without `CLAUDE_INSTALL_EPIC29_LIVE=1`. Both safeguards were removed
+when 29-09 landed.
 
-**The structural mitigation — 29-02 §0, do not skip it.** The first commit of
-29-02 copies the script to `install.sh` and **freezes**
-`install-claude-config.sh`. From then on:
-
-- All epic work happens in `install.sh`. `install-claude-config.sh` is not edited
-  by any task before 29-09.
-- The documented command therefore stays safe. An agent that follows
-  `implementer.md` verbatim, a reviewer following `reviewer.md:58`, and the
-  06:15 daily-review job all keep running a script that works.
-- Task line-number citations into `install-claude-config.sh` (29-03 `:536-602`,
-  29-04 `:646-794`, 29-08 `:451`) stay valid for the whole epic instead of
-  rotting the moment 29-02 lands.
-- `install.sh` additionally refuses to run against the real `$HOME` unless
-  `CLAUDE_INSTALL_EPIC29_LIVE=1` (29-02 §0.1). 29-09 §6 removes the guard and
-  collapses the two files back into one.
-
-**Rule for every task in this epic, no exceptions:**
-
-- Agents run `install.sh` **only** against a temporary `HOME`, with
-  `CLAUDE_INSTALL_NO_EXTERNAL=1` set (architecture §10.1).
-- No agent runs `install.sh` against the real `$HOME`. If a task seems to require
-  it, that is a **BLOCKER** for the user, per
-  `docs/prompts/implementation_manager.md` §59-68 — the same class as "needs the
-  live relay".
-- Running the **frozen** `./install-claude-config.sh` against the real `$HOME`
-  stays permitted and is the right thing to do when a task needs a hook edit
-  live — 29-01 is the case that needs it.
-- 29-10 is where the real machine gets touched by the new script, by a human,
-  deliberately.
-
-`implementer.md:8`/§Step 5 and `reviewer.md:8`/§Step 6 now carry this rule
-directly, so it survives a manager that forgets to relay it. Pass it along
-anyway, alongside the task file.
+**Current rule (post-29-09).** `install.sh` is the one installer. Agents refresh
+installed hooks with `./install.sh --yes` (manifest replay). `--all` must never
+be run by an agent on a developer's machine — it installs every feature regardless
+of what the developer previously chose. See `docs/installer.md` for the full CLI
+reference and `docs/prompts/implementer.md` §Step 5 for the agent rule.
 
 ## No Phase 0
 
@@ -86,8 +56,8 @@ handover and are not updated during execution. Update the table, per
 | 29-05 | [Executors and uninstall](./29-05-executors-and-uninstall_opus.md) | done | 29-02, 29-03, 29-04 | **opus.** Executor loop with failure isolation (scoped `set -e`), module closure (always-refresh for install/update/keep), refcounted uninstall (MODULE_OWNERS probe+manifest check), 10 `_uninstall` functions, dependency refusal (plan-scoped), `--uninstall`/`--without`/`--all`/`--yes` flags. 19 new tests (105 total in `unit_installer`), all passing. |
 | 29-06 | [Interactive selector](./29-06-interactive-selector.md) | done | 29-02, 29-05 | TTY detection, tri-state cycling, dependency promotion/refusal, disclosure lines, mutual exclusion (amux-autowrap↔profiles-autosource), `--dry-run`, `q` byte-identical. 36 new tests (141 total). |
 | 29-07 | [CLI and subcommands](./29-07-cli-and-subcommands.md) | done | 29-02, 29-03, 29-05 | `--help`, `--list`, `--with`, `--yes` manifest replay, `enable`/`disable` subcommands, dependency promotion in `_compute_plan`, `_validate_feature_ids`, `_check_yes_preconditions`. 31 new tests (172 total), all passing. |
-| 29-08 | [New toggles](./29-08-new-toggles.md) | todo | 29-02, 29-03, 29-05 | `claude-history` and daily permission review. The latter installs **no files** — it only schedules. Reverses a documented stance in `docs/permission-review-daily.md`. |
-| 29-09 | [Migration and docs](./29-09-migration-and-docs.md) | todo | 29-01 … 29-08 | The once-only path every existing user walks. Validate against the **real** pre-epic script — 29-02 §0 leaves it frozen in the tree for exactly this. Also owns the cutover (§6): remove the guard, collapse the two scripts, strip the epic-29 paragraphs from `implementer.md` / `reviewer.md`. |
+| 29-08 | [New toggles](./29-08-new-toggles.md) | done | 29-02, 29-03, 29-05 | `claude-history` and daily permission review. The latter installs **no files** — it only schedules. Reverses a documented stance in `docs/permission-review-daily.md`. Enable command's parent probe now falls back to manifest state (for NO_EXTERNAL environments). 20 new tests (192 total). |
+| 29-09 | [Migration and docs](./29-09-migration-and-docs.md) | done | 29-01 … 29-08 | Migration from pre-epic install, config.toml opt-in retired, docs/installer.md created, guard removed, `install-claude-config.sh` deleted, all references updated to `install.sh`, epic-29 paragraphs stripped from `implementer.md` / `reviewer.md`. |
 | 29-10 | [Live verification](./29-10-live-verification_human.md) | blocked | 29-09 | **human** — the four surfaces no automated test may touch, plus the migration path on a real machine. |
 
 ## Dependency graph

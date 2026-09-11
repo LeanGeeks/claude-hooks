@@ -56,7 +56,7 @@ Fail-OPEN: any error exits 0 so the session is never disrupted; but a handle is
 never silently corrupted (writes are atomic tmp+rename via the shared lib, and we
 read-modify-write the existing handle so unrelated fields are preserved).
 
-Registered user-global by ``install-claude-config.sh`` so it fires in any
+Registered user-global by ``install.sh`` so it fires in any
 workspace (D-Hooks / spike Q7).
 """
 

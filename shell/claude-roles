@@ -29,7 +29,7 @@ from pathlib import Path
 # ── Import roles_config — installed path first, then repo checkout ─────────────
 #
 # Resolution mirrors telegram_permission_router.py:53:
-#   1. ~/.claude/hooks/roles_config.py  (after install-claude-config.sh)
+#   1. ~/.claude/hooks/roles_config.py  (after install.sh --yes)
 #   2. Walk up from this script's location for .claude/hooks/roles_config.py
 #      (repo checkout at any depth; works when running shell/claude-roles
 #      straight from the repo root or a subdirectory)
@@ -63,7 +63,7 @@ def _load_roles_config():
 rc = _load_roles_config()
 if rc is None:
     print(
-        "error: roles_config.py not found — run install-claude-config.sh first",
+        "error: roles_config.py not found — run install.sh --yes first",
         file=sys.stderr,
     )
     sys.exit(1)

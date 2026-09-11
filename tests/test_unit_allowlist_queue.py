@@ -555,7 +555,7 @@ class TestUserScope(AllowlistQueueTestCase):
         self.assertEqual(result["action"], "queued")
         hooks_key = project_key.resolve_project_key(str(self.hooks_repo))
         self.assertEqual(result["target_project_key"], hooks_key)
-        self.assertTrue(any("install-claude-config.sh" in note for note in result["notes"]))
+        self.assertTrue(any("install.sh --yes" in note for note in result["notes"]))
 
         entries = self.queue_entries(hooks_key)
         self.assertEqual(len(entries), 1)
@@ -579,7 +579,7 @@ class TestUserScope(AllowlistQueueTestCase):
         settings = json.loads((self.hooks_repo / ".claude" / "settings.json").read_text())
         self.assertIn("Bash(shellcheck:*)", settings["permissions"]["allow"])
         # The H6 note rides along even on the direct-write path.
-        self.assertTrue(any("install-claude-config.sh" in note for note in result["notes"]))
+        self.assertTrue(any("install.sh --yes" in note for note in result["notes"]))
 
     def test_user_scope_ignores_target_workspace_and_says_so(self):
         other = self.make_repo("some-project")

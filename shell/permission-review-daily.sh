@@ -86,7 +86,7 @@ fi
 
 if ! command -v amux-spawn >/dev/null 2>&1; then
     echo "FATAL: amux-spawn not on PATH ($PATH)"
-    echo "       run ./install-claude-config.sh to place it in ~/.local/bin"
+    echo "       run ./install.sh --yes to place it in ~/.local/bin"
     exit 1
 fi
 

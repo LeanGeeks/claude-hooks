@@ -54,7 +54,7 @@ from typing import Any
 # ── Module loading — installed path first, then repo checkout ──────────────────
 #
 # Resolution mirrors telegram_permission_router.py and claude-roles:
-#   1. ~/.claude/hooks/  (after install-claude-config.sh)
+#   1. ~/.claude/hooks/  (after install.sh --yes)
 #   2. Walk up from this script for .claude/hooks/  (repo checkout)
 
 
@@ -80,7 +80,7 @@ try:
     import roles_config as rc
 except ImportError as _import_err:
     print(
-        f"error: {_import_err} — run install-claude-config.sh first",
+        f"error: {_import_err} — run install.sh --yes first",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -636,7 +636,7 @@ def _format_workspace(
         lines.append("  [questions]: not configured — no queue, no listener, no change to any behaviour")
         lines.append(
             "  To adopt: add a [questions] section to .claude/roles.toml and"
-            " run install-claude-config.sh"
+            " run install.sh --yes"
         )
         return lines
 
@@ -821,7 +821,7 @@ def main() -> int:
                     "\n  listener not enabled — "
                     "add [questions_listen] enabled = true to "
                     "~/.config/claude-tg-relay/config.toml and re-run "
-                    "install-claude-config.sh"
+                    "install.sh --yes"
                 )
         return 0
 

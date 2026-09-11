@@ -33,10 +33,12 @@ os.environ.setdefault("CLAUDE_PERMISSION_AUDIT_FILE", str(_tmp_store / "permissi
 os.environ.setdefault("CLAUDE_PERMISSION_DEBUG_LOG", str(_tmp_store / "permission_state_debug.log"))
 os.environ.setdefault("CLAUDE_PERMISSION_ARCHIVE_FILE", str(_tmp_store / "permission_requests.archive.jsonl"))
 os.environ.setdefault("CLAUDE_MANUAL_CONFIRM_LOG", str(_tmp_store / "bash_manual_confirm.log"))
+os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")
 
 # Test modules
 TEST_MODULES = {
     "unit_installer": "test_unit_installer",
+    "installer_migration": "test_installer_migration",
     "unit_decision": "test_unit_decision_mapper",
     "unit_state": "test_unit_state_store",
     "unit_whitelist": "test_unit_whitelist",

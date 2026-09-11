@@ -65,7 +65,7 @@ If the Implementer reports BLOCKERS (requirements it could not implement due to 
 3. If you cannot resolve it, ask the user for the missing information
 4. Once resolved, re-spawn the Implementer with the additional context — do NOT ask it to "continue from where it left off" as agents have no memory of prior runs; give it the full task plus the new context
 
-Common blocker classes in this project: a live Telegram bot token / chat id, the relay server (`ssh anton@h02.activecdn.net`, docker compose at `~/.bin/claude-hooks/relay-server`), or anything requiring `install-claude-config.sh` to have re-run so that edited hooks take effect. If a task can only be verified end-to-end against one of these, treat the missing access as a BLOCKER rather than faking it.
+Common blocker classes in this project: a live Telegram bot token / chat id, the relay server (`ssh anton@h02.activecdn.net`, docker compose at `~/.bin/claude-hooks/relay-server`), or anything requiring `install.sh --yes` to have re-run so that edited hooks take effect. If a task can only be verified end-to-end against one of these, treat the missing access as a BLOCKER rather than faking it.
 
 ## Agent Output Protocol
 

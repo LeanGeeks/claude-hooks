@@ -328,7 +328,7 @@ Look at the `artifacts.lifecycle_log` block in the output:
   but the hook has not fired yet (spawning state).
 - `status: "absent"` — the session has a handle but the event log was never
   written. This means either the session has not started its first turn yet,
-  or the producer hook is not registered (run `install-claude-config.sh` and
+  or the producer hook is not registered (run `install.sh --yes` and
   restart the session).
 
 The `state` field in the same output is the authoritative reduced state from
@@ -348,7 +348,7 @@ print('Stop:', bool(hooks.get('Stop')))
 "
 ```
 
-Both should print `True`. If not, run `./install-claude-config.sh` and
+Both should print `True`. If not, run `./install.sh --yes` and
 restart any affected Claude sessions (editing the repo hooks does not take
 effect until the installer re-runs).
 

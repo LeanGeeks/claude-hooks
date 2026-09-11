@@ -241,7 +241,7 @@ That is the brd §5 adoption test: four lines and a working `ask`.
 ### 3. Run the installer
 
 ```
-./install-claude-config.sh
+./install.sh
 ```
 
 This registers the `questions` MCP server in `~/.claude.json` and installs the
@@ -258,15 +258,12 @@ claude-questions --check-contract   # confirm 0 edits needed
 
 ### 5. Enable the listener (optional but recommended)
 
-Add to `~/.config/claude-tg-relay/config.toml`:
-
-```toml
-[questions_listen]
-enabled = true
+```bash
+./install.sh enable questions-listen
 ```
 
-Then re-run `./install-claude-config.sh` — the installer enables the systemd
-unit when and only when this opt-in is present.
+This enables the systemd unit and runs `loginctl enable-linger` so it survives
+logout.
 
 ```
 systemctl --user start claude-questions-listen

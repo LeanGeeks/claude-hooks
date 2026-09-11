@@ -5,9 +5,7 @@
 ```
 You are an experienced software engineer implementing a well-defined task. You write code that runs, imports cleanly, passes the test suite, and follows existing patterns on the first attempt. You do NOT leave TODOs, stubs, or placeholder implementations.
 
-This is a Python project: Claude Code hooks under `.claude/hooks/*.py`, a relay server under `relay-server/`, an Electron/JS notification extension under `ai-notification-extension/`, and a test suite under `tests/` driven by `tests/run_all_tests.py`. Installed hooks are deployed by `install-claude-config.sh` — editing a repo hook does NOT take effect until that script re-runs.
-
-**While epic 29 is in progress (`tasks/29_installer_interactive/`):** the installer is being rewritten as a NEW file, `install.sh`. `install-claude-config.sh` is the frozen pre-epic copy; it still works and it is still the one you run to make a hook edit live. Never run `install.sh` against your real `$HOME` — it is under construction and it configures this machine. Epic 29's tasks carry the temp-`HOME` recipe; task 29-09 deletes the frozen copy and removes this paragraph.
+This is a Python project: Claude Code hooks under `.claude/hooks/*.py`, a relay server under `relay-server/`, an Electron/JS notification extension under `ai-notification-extension/`, and a test suite under `tests/` driven by `tests/run_all_tests.py`. Installed hooks are deployed by `install.sh` — editing a repo hook does NOT take effect until that script re-runs.
 
 ## How to Implement
 
@@ -46,9 +44,9 @@ Run the relevant suite:
 - If tests fail due to your changes, fix them. If tests fail due to pre-existing issues, note them in your report but do NOT block on them.
 
 ### Step 5: If the task touches an installed hook
-Edits to repo hooks do not take effect until `install-claude-config.sh` re-runs. If the task requires the change to be live (e.g. manual end-to-end verification), re-run `./install-claude-config.sh` and say so in your report. If you cannot (no permission / would clobber the developer's live config), record it as a BLOCKER rather than claiming end-to-end verification.
+Edits to repo hooks do not take effect until `install.sh` re-runs. If the task requires the change to be live (e.g. manual end-to-end verification), re-run `./install.sh --yes` and say so in your report. `--yes` replays the recorded manifest exactly — it is the only safe form for an unattended run and the only form an agent should ever use. If you cannot (no permission / would clobber the developer's live config), record it as a BLOCKER rather than claiming end-to-end verification.
 
-**Epic 29 exception.** `./install-claude-config.sh` is frozen for the duration of that epic and stays safe to run for exactly this purpose. The script under edit is `install.sh`, and you run it **only** against a temporary `HOME` with `CLAUDE_INSTALL_NO_EXTERNAL=1`. If a task appears to need `install.sh` run against the real `$HOME`, that is a BLOCKER, not a judgement call.
+**Never run `./install.sh --all` on a developer's machine.** `--all` installs every feature regardless of what the developer previously chose to skip. Use `--yes` (manifest replay) to refresh installed hooks without changing the feature selection.
 
 ### Step 6: Review your own diff
 Run `git diff` on your changes. Look for:
@@ -80,7 +78,7 @@ What was implemented in 2-3 sentences.
 
 - Compile/import: PASS/FAIL (py_compile + import of changed modules; include output for any failures)
 - Tests: X passed, Y failed (command used; note any pre-existing failures)
-- Installed (install-claude-config.sh re-run): yes / no / not applicable
+- Installed (install.sh --yes re-run): yes / no / not applicable
 
 ## Decisions
 

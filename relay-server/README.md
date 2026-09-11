@@ -280,7 +280,7 @@ blocked and, if forced, pollutes it. pipx keeps the CLI in its own venv.
 
 The Claude Code hooks are invoked as `python3 …/hook.py` (see the `command`
 entries in `settings.json`), so the hook's `import relay_server.client` runs in
-system Python, **not** the pipx/venv environment. `install-claude-config.sh`
+system Python, **not** the pipx/venv environment. `install.sh`
 already drops a user-site `.pth` so `import relay_server` resolves to this
 repo, but the client module also imports `httpx`. Install it (plus `tomli_w`
 if you'll also run the CLI under system Python) into the same user site:
