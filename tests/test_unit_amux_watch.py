@@ -1034,6 +1034,10 @@ class TestIsWatchReportable(unittest.TestCase):
     def test_spawning_not_reportable(self):
         self.assertFalse(cli._is_watch_reportable("spawning", False))
 
+    def test_error_reportable(self):
+        # Task 38: a derivation failure is a reportable outcome, never a drop.
+        self.assertTrue(cli._is_watch_reportable("error", False))
+
 
 class TestWatchEnumerate(unittest.TestCase):
     """_watch_enumerate filters correctly."""
@@ -1070,6 +1074,246 @@ class TestWatchEnumerate(unittest.TestCase):
                 result = cli._watch_enumerate(None, ["w1"], set(), None)
                 self.assertIn("w1", result)
                 self.assertNotIn("w2", result)
+
+
+# ── Derivation errors are reported, not dropped (task 38) ────────────────────
+
+
+def _seed_error_wave(tmp: Path, run_id: str) -> None:
+    """Seed a three-handle wave: two healthy idlers, one that will fail."""
+    for name, msg in (("w-broken", "done-broken"),
+                      ("w-ok-1", "done-1"),
+                      ("w-ok-2", "done-2")):
+        _seed_handle(name, run_id=run_id, state="idle", last_message=msg)
+        _write_lifecycle_events(tmp, name, [
+            _turn_start_event(seq=1),
+            _stop_event(seq=2, state="idle"),
+        ])
+
+
+def _raising_derive(broken_name: str):
+    """Wrap the real _derive_status so exactly one handle raises."""
+    orig_derive = cli._derive_status
+
+    def wrapper(handle, stuck_after_override):
+        if handle.get("name") == broken_name:
+            raise RuntimeError("boom: transcript unreadable")
+        return orig_derive(handle, stuck_after_override)
+
+    return wrapper
+
+
+class TestWatchDerivationErrorReported(unittest.TestCase):
+    """A handle whose derivation raises is REPORTED, not dropped (task 38).
+
+    The stream's contract is "silence means nothing happened" — a swallowed
+    derivation failure manufactures silence. The errored handle must land
+    in ``settled`` with its name and an identifying error, in both emission
+    modes, and the digest arithmetic must still account for every watched
+    handle: ``len(settled) + pending == watching``.
+    """
+
+    def test_digest_reports_errored_handle(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_error_wave(tmp, "rid-err")
+
+                call_count = [0]
+                base_time = time.time()
+
+                def advancing_time():
+                    call_count[0] += 1
+                    return base_time + call_count[0] * 0.1
+
+                stdout = io.StringIO()
+                ns = _make_watch_args(run_id="rid-err", timeout="1s",
+                                      debounce="0")
+
+                with patch.object(lib, "tmux_has_session",
+                                  return_value=True), \
+                        patch("time.sleep"), \
+                        patch("time.time", side_effect=advancing_time), \
+                        patch("sys.stdout", stdout), \
+                        patch.object(cli, "_derive_status",
+                                     side_effect=_raising_derive("w-broken")), \
+                        patch.object(lib, "resolve_amux_session",
+                                     return_value=None):
+                    rc = cli.cmd_watch(ns)
+
+                self.assertEqual(rc, 0)
+                lines = [l for l in stdout.getvalue().strip().split("\n") if l]
+                self.assertGreaterEqual(len(lines), 1)
+                digest = json.loads(lines[0])
+                by_name = {e["name"]: e for e in digest["settled"]}
+
+                # The errored handle is in settled, named and identified —
+                # not silently absent, not in pending.
+                self.assertIn("w-broken", by_name)
+                err_entry = by_name["w-broken"]
+                self.assertEqual(err_entry["state"], "error")
+                self.assertTrue(err_entry.get("error"))
+                self.assertIn("RuntimeError", err_entry["error"])
+                self.assertIn("boom", err_entry["error"])
+
+                # The other handles are still reported with their real states.
+                self.assertEqual(by_name["w-ok-1"]["state"], "idle")
+                self.assertEqual(by_name["w-ok-2"]["state"], "idle")
+
+                # The arithmetic invariant: nothing vanished.
+                self.assertEqual(digest["watching"], 3)
+                self.assertEqual(
+                    len(digest["settled"]) + digest["pending"],
+                    digest["watching"],
+                    "arithmetic broken: a handle was dropped from both "
+                    "partitions")
+
+    def test_block_mode_reports_errored_handle(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_error_wave(tmp, "rid-err-block")
+
+                stdout = io.StringIO()
+                ns = _make_watch_args(run_id="rid-err-block", block=True,
+                                      timeout="5s", debounce="0")
+
+                with patch.object(lib, "tmux_has_session",
+                                  return_value=True), \
+                        patch("time.sleep"), \
+                        patch("sys.stdout", stdout), \
+                        patch.object(cli, "_derive_status",
+                                     side_effect=_raising_derive("w-broken")), \
+                        patch.object(lib, "resolve_amux_session",
+                                     return_value=None):
+                    rc = cli.cmd_watch(ns)
+
+                # The errored handle counts as settled, so block mode exits 0
+                # instead of timing out on it.
+                self.assertEqual(rc, 0)
+                lines = [l for l in stdout.getvalue().strip().split("\n") if l]
+                self.assertEqual(len(lines), 3)
+                by_name = {json.loads(l)["name"]: json.loads(l)
+                           for l in lines}
+
+                err_entry = by_name["w-broken"]
+                self.assertEqual(err_entry["state"], "error")
+                self.assertTrue(err_entry.get("error"))
+                self.assertIn("RuntimeError", err_entry["error"])
+                # The other handles still come out with their real states.
+                self.assertEqual(by_name["w-ok-1"]["state"], "idle")
+                self.assertEqual(by_name["w-ok-2"]["state"], "idle")
+
+    def test_error_entry_superseded_when_derivation_recovers(self):
+        """A later successful derivation supersedes the error entry (§2.4).
+
+        The error state enters ``_settled_fingerprint`` like any other
+        state, so a transient failure (e.g. a read race) that heals on the
+        next poll changes the fingerprint and the corrected entry is
+        emitted — no special code needed.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_error_wave(tmp, "rid-err-fix")
+
+                poll_count = [0]
+                base_time = time.time()
+                raising = [True]
+                # Capture the real implementation BEFORE it is patched —
+                # inside the patch, cli._derive_status is this wrapper.
+                orig_derive = cli._derive_status
+                flaky = _raising_derive("w-broken")
+
+                def flaky_then_healthy(handle, stuck_after_override):
+                    if raising[0]:
+                        return flaky(handle, stuck_after_override)
+                    return orig_derive(handle, stuck_after_override)
+
+                def mock_time():
+                    return base_time + poll_count[0] * 0.5
+
+                orig_snapshot = cli._settled_snapshot
+
+                def counting_snapshot(handles, sa):
+                    poll_count[0] += 1
+                    # From poll 3 on, the transient failure is gone.
+                    if poll_count[0] >= 3:
+                        raising[0] = False
+                    return orig_snapshot(handles, sa)
+
+                stdout = io.StringIO()
+                ns = _make_watch_args(run_id="rid-err-fix", timeout="10s",
+                                      debounce="0")
+
+                with patch.object(lib, "tmux_has_session",
+                                  return_value=True), \
+                        patch("time.sleep"), \
+                        patch("time.time", side_effect=mock_time), \
+                        patch("sys.stdout", stdout), \
+                        patch.object(cli, "_settled_snapshot",
+                                     side_effect=counting_snapshot), \
+                        patch.object(cli, "_derive_status",
+                                     side_effect=flaky_then_healthy), \
+                        patch.object(lib, "resolve_amux_session",
+                                     return_value=None):
+                    cli.cmd_watch(ns)
+
+                lines = [l for l in stdout.getvalue().strip().split("\n") if l]
+                self.assertGreaterEqual(len(lines), 2)
+                first = json.loads(lines[0])
+                last = json.loads(lines[-1])
+                first_by_name = {e["name"]: e for e in first["settled"]}
+                last_by_name = {e["name"]: e for e in last["settled"]}
+                # First digest reports the error; the corrected digest
+                # supersedes it with the real state.
+                self.assertEqual(first_by_name["w-broken"]["state"], "error")
+                self.assertEqual(last_by_name["w-broken"]["state"], "idle")
+                # Superset property holds across the correction.
+                self.assertLessEqual(
+                    set(first_by_name), set(last_by_name))
+
+
+class TestSettledSnapshotPartitionsDerivationError(unittest.TestCase):
+    """Direct partition test: _settled_snapshot reports a raising handle."""
+
+    def test_error_handle_lands_in_settled_not_pending(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                _seed_handle("s-broken", run_id="rid-part", state="idle",
+                             last_message="done-broken")
+                _write_lifecycle_events(tmp, "s-broken", [
+                    _turn_start_event(seq=1),
+                    _stop_event(seq=2, state="idle"),
+                ])
+                _seed_handle("s-idle", run_id="rid-part", state="idle",
+                             last_message="done-idle")
+                _write_lifecycle_events(tmp, "s-idle", [
+                    _turn_start_event(seq=1),
+                    _stop_event(seq=2, state="idle"),
+                ])
+                handles = cli._watch_enumerate("rid-part", [], set(), None)
+                self.assertEqual(len(handles), 2)
+
+                with patch.object(cli, "_derive_status",
+                                  side_effect=_raising_derive("s-broken")), \
+                        patch.object(lib, "tmux_has_session",
+                                     return_value=True):
+                    settled, pending = cli._settled_snapshot(handles, None)
+
+                self.assertIn("s-broken", settled)
+                self.assertEqual(settled["s-broken"]["state"], "error")
+                self.assertEqual(settled["s-broken"]["name"], "s-broken")
+                self.assertIn("RuntimeError", settled["s-broken"]["error"])
+                self.assertEqual(settled["s-idle"]["state"], "idle")
+                self.assertEqual(pending, 0)
+                # Arithmetic invariant at the partition level.
+                self.assertEqual(len(settled) + pending, len(handles))
 
 
 # ── Existing --wait/--notify unchanged ───────────────────────────────────────

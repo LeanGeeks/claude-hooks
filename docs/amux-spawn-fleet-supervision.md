@@ -145,7 +145,9 @@ The digest JSON has this shape:
     {"name": "myproject-worker-001", "state": "idle",
      "last_message": "Task 001 complete. Output written to…"},
     {"name": "myproject-worker-003", "state": "terminated",
-     "last_state": "running"}
+     "last_state": "running"},
+    {"name": "myproject-worker-004", "state": "error",
+     "error": "OSError: lifecycle log unreadable"}
   ],
   "watching": 5,
   "pending": 2
@@ -153,9 +155,18 @@ The digest JSON has this shape:
 ```
 
 - `settled` — every handle that has reached a terminal state since the
-  subscription was armed (or since `--since <cursor>` if resuming).
+  subscription was armed (or since `--since <cursor>` if resuming), plus
+  any handle whose status could not be derived (`state: "error"`).
 - `pending` — count of handles still running.
 - `cursor` — pass as `--since` to resume without replaying already-seen entries.
+
+The arithmetic always adds up: `len(settled) + pending == watching` in
+every digest. Silence means nothing happened, and a count mismatch is
+impossible by construction — a handle whose status cannot be derived is
+reported as a `state: "error"` entry, never dropped from the stream. A
+transient failure that heals on a later poll (e.g. a read race) changes
+the digest like any other state change, and the corrected entry
+supersedes the error entry.
 
 ### Late join and resume
 
@@ -201,6 +212,9 @@ amux-spawn spawn build-003 --run-id "$RUN_ID" --dir /repo -- \
 #   - state == "idle"        → worker finished; read last_message or status
 #   - state == "terminated"  → worker crashed; investigate before retrying
 #   - state == "stuck"       → threshold exceeded; worker may be wedged
+#   - state == "error"       → status could not be derived; the handle's
+#                              evidence is broken — investigate, do not
+#                              treat as pending
 #   - permission_pending == true  → worker blocked on a permission prompt;
 #                                   decide via Telegram or amux send
 ```
@@ -282,14 +296,16 @@ multiple `--handle` arguments to a single `watch` invocation.
 
 ### Filtering for success only
 
-Acting only on `state == "idle"` and ignoring `terminated`, `stuck`, and
-`permission_pending` leaves the orchestrator silent for anything that went
-wrong. A crashed worker reads `terminated`, a wedged worker reads `stuck`,
-and a blocked worker carries `permission_pending: true` — none of which
-reach `idle`. Ignoring the other terminal states is what makes a crashloop
-invisible for hours.
+Acting only on `state == "idle"` and ignoring `terminated`, `stuck`,
+`error`, and `permission_pending` leaves the orchestrator silent for
+anything that went wrong. A crashed worker reads `terminated`, a wedged
+worker reads `stuck`, a handle whose status cannot be derived reads
+`error`, and a blocked worker carries `permission_pending: true` — none
+of which reach `idle`. Ignoring the other terminal states is what makes
+a crashloop invisible for hours.
 
-`watch` emits on **every** terminal outcome. Treat each one explicitly.
+`watch` emits on **every** terminal outcome, including derivation
+failures. Treat each one explicitly.
 
 ---
 
@@ -370,9 +386,10 @@ An orchestrator role prompt should state:
    do not re-arm after each notification, do not block."
 
 4. **All terminal outcomes:** "A digest entry with `state: terminated`,
-   `state: stuck`, or `permission_pending: true` requires attention just as
-   `state: idle` does. Silence means nothing has settled, not that everything
-   is fine."
+   `state: stuck`, `state: error`, or `permission_pending: true` requires
+   attention just as `state: idle` does. Silence means nothing has settled,
+   not that everything is fine — the counts always account for every
+   watched handle (`len(settled) + pending == watching`)."
 
 5. **Cost awareness:** "Each notification is a full request at current context
    size. Prefer larger debounce windows later in a run when context is large,

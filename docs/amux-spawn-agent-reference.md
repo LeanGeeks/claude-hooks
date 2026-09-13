@@ -49,19 +49,25 @@ Each notification is a JSON digest on one line:
      "activity_age_s": 12.3,
      "last_message": "Done. Output at output/a.md"},
     {"name": "proj-worker-b", "state": "terminated",
-     "last_message": "Working on task b..."}
+     "last_message": "Working on task b..."},
+    {"name": "proj-worker-c", "state": "error",
+     "error": "OSError: lifecycle log unreadable"}
   ],
   "watching": 5,
-  "pending": 3
+  "pending": 2
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `settled` | All handles that reached a terminal state (cumulative, not incremental) |
+| `settled` | All handles that reached a terminal state, plus any whose status could not be derived (`state: "error"`) — cumulative, not incremental |
 | `pending` | Count of handles still running |
 | `watching` | Total handles in the subscription |
 | `cursor` | Pass as `--since` to resume without replay |
+
+In every digest, `len(settled) + pending == watching`. A handle is never
+dropped from the stream: one whose status cannot be derived is reported
+as a `state: "error"` entry instead of vanishing between the counts.
 
 ### Acting on a digest
 
@@ -72,6 +78,7 @@ For each entry in `settled`:
 | `idle` | Finished, nothing outstanding | Read `last_message`; process result |
 | `terminated` | Session died or was killed | Investigate; retry if appropriate |
 | `stuck` | Exceeded activity threshold | Query `amux-spawn status <name> --json` and check `signals.turn_open` — if true, may be legitimately busy; if false, likely wedged |
+| `error` | The worker's status could not be derived — something is wrong with this handle's evidence | Investigate (`amux-spawn status <name> --json`, check the lifecycle log); do not treat as pending |
 | any + `permission_pending: true` | Blocked on a permission prompt | Approve via Telegram or `amux send` |
 
 When all handles have settled (`pending: 0`), stop the monitor with
@@ -169,7 +176,7 @@ full rules, the `--model opus` space-form trap, and `amux-spawn profiles`.
   Monitor. Use `watch`.
 - **Do not use one watcher per worker.** Use one `watch --run-id` for the
   wave.
-- **Do not filter for idle only.** `terminated`, `stuck`, and
+- **Do not filter for idle only.** `terminated`, `stuck`, `error`, and
   `permission_pending` all require action. Ignoring them makes failures
   invisible.
 - **Do not re-arm the monitor after each notification.** It is persistent;

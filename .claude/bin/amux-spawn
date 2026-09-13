@@ -2348,11 +2348,15 @@ def _watch_enumerate(
 def _is_watch_reportable(state: str, permission_pending: bool) -> bool:
     """True if a handle's derived state is a terminal/actionable outcome.
 
-    The stream must report every terminal outcome (task spec item 4):
+    The stream must report every terminal outcome (task 37-03 item 4):
     settled (idle), terminated, threshold-expired (stuck), and
-    permission-pending (blocked on a permission prompt).
+    permission-pending (blocked on a permission prompt). Task 38 adds the
+    derivation-failure outcome (``error``): a handle whose status could
+    not be derived is reported to the subscriber, never dropped — a drop
+    would break the ``len(settled) + pending == watching`` arithmetic and
+    manufacture silence.
     """
-    if state in ("idle", "terminated", "stuck"):
+    if state in ("idle", "terminated", "stuck", "error"):
         return True
     if permission_pending:
         return True
@@ -2379,6 +2383,27 @@ def _watch_entry(name: str, result: dict[str, Any], handle: dict[str, Any]) -> d
         if msg is not None:
             entry["last_message"] = msg
     provider = result.get("provider") or lib.handle_provider(handle)
+    if provider != lib.PROVIDER_CLAUDE:
+        entry["provider"] = provider
+    return entry
+
+
+def _watch_error_entry(
+    name: str,
+    handle: dict[str, Any],
+    exc: Exception,
+) -> dict[str, Any]:
+    """Build the reportable entry for a handle whose derivation raised.
+
+    Task 38: the entry always identifies the failure — the exception type
+    name is included even when ``str(exc)`` is empty, so the subscriber
+    can act on the entry alone. Shaped like any other digest entry
+    (``name`` + ``state``), with the error detail in ``error``.
+    """
+    msg = str(exc).strip()
+    error = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    entry: dict[str, Any] = {"name": name, "state": "error", "error": error}
+    provider = lib.handle_provider(handle)
     if provider != lib.PROVIDER_CLAUDE:
         entry["provider"] = provider
     return entry
@@ -2422,6 +2447,18 @@ def _settled_snapshot(
 ) -> tuple[dict[str, dict[str, Any]], int]:
     """Derive status for all handles and partition into settled/pending.
 
+    A handle whose derivation raises is REPORTED, not dropped (task 38):
+    it lands in ``settled`` as a ``state: "error"`` entry naming the
+    exception, so the arithmetic invariant ``len(settled) + pending ==
+    len(handles)`` holds unconditionally and a subscriber can never
+    mistake a swallowed derivation failure for silence. The blanket
+    ``except Exception`` is deliberate — catch-broadly-and-report is the
+    right shape here; narrowing it would reintroduce the swallow for
+    whatever exception class was left out. ``_is_watch_reportable``
+    treats ``error`` as reportable, so the entry flows to both emission
+    paths (streaming digests and ``--block`` lines) with no separate
+    handling.
+
     Returns ``(settled_entries, pending_count)``.
     """
     settled: dict[str, dict[str, Any]] = {}
@@ -2429,7 +2466,8 @@ def _settled_snapshot(
     for name, handle in handles.items():
         try:
             result = _derive_status(handle, stuck_after)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            settled[name] = _watch_error_entry(name, handle, exc)
             continue
         state = result.get("state", "unknown")
         pp = bool(result.get("permission_pending", False))
