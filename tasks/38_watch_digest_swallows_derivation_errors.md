@@ -1,6 +1,6 @@
 # Task 38 — `watch` digest silently drops a handle whose status derivation raises (bug)
 
-**Status:** todo · **Type:** bug · **Created:** 2026-09-13 · **Rev:** 1
+**Status:** done · **Type:** bug · **Created:** 2026-09-13 · **Rev:** 2
 **Priority:** high — the supervision stream manufactures silence; measured
 2 h 09 m 38 s of lost detectability on a real fleet, against a <10 min target
 **Suggested worker:** one implement → review → fix loop; small and
@@ -171,3 +171,56 @@ above.
    implementation report.
 3. Suite green with counts, output read and summarised (not just exit code).
 4. Implementation log in `agents_output/task38_implementation_report.md`.
+
+---
+
+## 6. Implementation log (rev 2 — landed)
+
+**Status:** done · **Landed:** 2026-09-13 · **Baseline commit:** `9cad056`
+**Not installed.** `./install.sh` was not run; the copy tested is the repo
+working tree. The installed copy at `~/.local/bin/amux-spawn` still carries
+the swallow until someone reinstalls.
+
+### 6.1 What changed
+
+Landed as `1d797fd` (5 files, +499/−20): `.claude/bin/amux-spawn`,
+`tests/test_unit_amux_watch.py`, `docs/amux-spawn-agent-reference.md`,
+`docs/amux-spawn-fleet-supervision.md`, this file.
+
+1. **`_settled_snapshot`** — the `except Exception` branch no longer
+   `continue`s. It builds a reportable entry via the new `_watch_error_entry`:
+   `{"name": ..., "state": "error", "error": "<Type>: <message>"}` (bare type
+   name when the message is empty) and stores it in `settled`. The blanket
+   `except Exception` is kept — catch-broadly-and-report, not narrowed.
+2. **`_is_watch_reportable`** — `error` added to the reportable set, so the
+   entry flows to both streaming digests and `--block` lines with zero
+   block-mode-specific handling (an errored handle unblocks a `--block` wait
+   with exit 0 instead of hanging it).
+3. **Supersession** — no code needed: `error` enters `_settled_fingerprint`
+   like any state, so a later poll that derives successfully re-emits the
+   corrected entry. Test-proven.
+4. **Arithmetic invariant** — `len(settled) + pending == watching` is now
+   unconditional (every handle is stored or counted) and asserted by tests.
+5. **Docs** — both digest docs document the `error` state ("status could not
+   be derived — investigate, do not treat as pending") and the invariant; the
+   fleet-supervision digest example's pre-existing arithmetic mismatch
+   corrected (`pending: 1` → `2`, review pass 1 MEDIUM).
+6. **`enumerated` field** — deliberately not added (§2 decision): `watching`
+   already is the enumerated count at every emit site.
+
+Out-of-scope surfaces (reducer, `_derive_claude_status`, stuck invariant,
+enumeration/`run_id` filtering, `ls`) untouched — verified hunk-by-hunk in
+review.
+
+### 6.2 Verification
+
+- All 5 new tests watched failing on the unfixed code first (`Ran 40 tests
+  ... FAILED (failures=4, errors=1)` with the swallow restored via /tmp-copy
+  mutation testing; repo tree untouched throughout).
+- Module suite: 35 → **40 tests, OK**.
+- Full suite: baseline 1921 ran OK skipped=1 → **1926 ran, OK, skipped=1**
+  (`test_headless_spawn`), exit 0, read in full.
+- Review pass 1: **PASS** (1 MEDIUM — fixed; 3 LOW — accepted, see
+  `agents_output/task38_review_report.md`). Review pass 2: **PASS**, no new
+  issues (`agents_output/task38_review_report_2.md`).
+- Reports: `agents_output/task38_{implementation,fix,review,review_2,commit}_report.md`.
