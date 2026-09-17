@@ -2532,6 +2532,12 @@ _compute_and_install_module_closure() {
         return 0
     fi
 
+    # The closure is non-empty, so this run is about to put hook modules on
+    # disk. That -- not merely being invoked -- is what makes a TOML parser a
+    # hard requirement. An uninstall-only run lands in the early return above
+    # and never gets here.
+    _require_toml_parser
+
     mkdir -p "$GLOBAL_HOOKS_DIR"
     local installed_count=0
     for mod in "${!closure_modules[@]}"; do
@@ -2768,20 +2774,14 @@ _check_dependencies() {
         exit 1
     fi
 
-    # TOML parser. tomllib is stdlib only from 3.11; on 3.9/3.10 the hooks fall
-    # back to the 'tomli' backport. Without either, every hook that reads a
-    # .toml config (profiles, roles, questions, relay) dies at import time --
-    # and an import-time failure takes the whole hook down, not just the
-    # TOML-reading part of it.
+    # Not fatal here -- see _require_toml_parser for why this only hard-fails on
+    # a run that installs modules. This is the early heads-up.
     if ! python3 -c "import importlib.util as u, sys; sys.exit(0 if (u.find_spec('tomllib') or u.find_spec('tomli')) else 1)" 2>/dev/null; then
-        log_error "python3 is $py_version and has no TOML parser available."
-        log_error "  Interpreter: $py_path"
-        log_error "  tomllib is stdlib only from Python 3.11; on $py_version the hooks need 'tomli'."
-        log_error "  Install it with:  sudo apt install python3-tomli"
-        log_error "               or:  python3 -m pip install --user tomli"
-        log_error "  Alternatively, run the hooks on Python 3.11+, which needs no backport."
-        exit 1
+        log_warn "python3 is $py_version and has no TOML parser — the hooks cannot run."
+        log_warn "  Interpreter: $py_path"
+        log_warn "  Install 'tomli' (or use Python 3.11+) before installing anything."
     fi
+
     if command -v uv &> /dev/null; then
         UV_AVAILABLE=true
     else
@@ -2789,6 +2789,42 @@ _check_dependencies() {
         log_warn "uv not found — the context-usage and permissions MCP servers will not be installed."
         log_warn "Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
     fi
+}
+
+# A TOML parser is needed to *run* the hooks, not to manage them. tomllib is
+# stdlib only from 3.11; on 3.9/3.10 the hooks fall back to the 'tomli'
+# backport. Without either, every hook that reads a .toml config (profiles,
+# roles, questions, relay) dies at import time -- and an import-time failure
+# takes the whole hook down, not just the TOML-reading part of it.
+#
+# Deliberately not in _check_dependencies: that runs on every invocation,
+# including `--uninstall` and `disable`, and refusing to *remove* hooks because
+# the interpreter cannot *run* them leaves a user whose PATH moved after install
+# with tracebacking hooks and no way to take them out. Called from
+# _compute_and_install_module_closure instead, once the closure is known to be
+# non-empty -- the first moment the run is about to put a module on disk, and
+# still before any cp. Note that reaching the closure is not enough on its own:
+# an uninstall-only run gets there too and finds the closure empty.
+#
+# _check_dependencies warns about a missing parser so an interactive run says so
+# up front rather than after the whole checklist; only this is fatal.
+_require_toml_parser() {
+    if python3 -c "import importlib.util as u, sys; sys.exit(0 if (u.find_spec('tomllib') or u.find_spec('tomli')) else 1)" 2>/dev/null; then
+        return 0
+    fi
+
+    local py_version py_path
+    py_version="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")"
+    py_path="$(command -v python3)"
+
+    log_error "python3 is $py_version and has no TOML parser available."
+    log_error "  Interpreter: $py_path"
+    log_error "  tomllib is stdlib only from Python 3.11; on $py_version the hooks need 'tomli'."
+    log_error "  Install it with:  sudo apt install python3-tomli"
+    log_error "               or:  python3 -m pip install --user tomli"
+    log_error "  Alternatively, run the hooks on Python 3.11+, which needs no backport."
+    log_error "  Nothing has been installed. './install.sh --uninstall <feature>' still works."
+    exit 1
 }
 
 # =============================================================================
@@ -4174,6 +4210,7 @@ cp "$GLOBAL_CONFIG" "$BACKUP_FILE"
 log_info "Backup created: $BACKUP_FILE"
 
 # Module closure: refresh all shared modules for install/update/keep features (§3)
+# Also where the TOML gate fires, once the closure is known to be non-empty.
 log_step "Computing module closure"
 _compute_and_install_module_closure
 

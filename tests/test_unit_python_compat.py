@@ -30,8 +30,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+
+from test_unit_installer import run_installer
 
 REPO = Path(__file__).resolve().parent.parent
 HOOKS_DIR = REPO / ".claude" / "hooks"
@@ -160,6 +163,56 @@ def _find_old_interpreter():
     return None
 
 
+def _find_interpreter_without_toml():
+    """A pre-3.11 interpreter with neither tomllib nor tomli, or None.
+
+    Set CLAUDE_HOOKS_NO_TOML_PYTHON to point at one explicitly. A uv-managed
+    3.9/3.10 is the easy source: bare, so it has no backport installed.
+    """
+    candidates = []
+    explicit = os.environ.get("CLAUDE_HOOKS_NO_TOML_PYTHON")
+    if explicit:
+        candidates.append(explicit)
+    for name in ("python3.9", "python3.10"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(found)
+    if shutil.which("uv"):
+        for version in ("3.9", "3.10"):
+            try:
+                out = subprocess.run(
+                    ["uv", "python", "find", version],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out.returncode == 0 and out.stdout.strip():
+                candidates.append(out.stdout.strip())
+
+    probe = (
+        "import importlib.util as u, sys;"
+        "sys.exit(0 if not (u.find_spec('tomllib') or u.find_spec('tomli')) else 1)"
+    )
+    for path in candidates:
+        try:
+            probed = subprocess.run([path, "-c", probe], capture_output=True, timeout=60)
+            if probed.returncode == 0:
+                return path
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def _path_with_python3(interpreter: str, bin_dir: Path) -> dict:
+    """PATH env override that makes bare `python3` resolve to `interpreter`."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "python3"
+    if shim.exists() or shim.is_symlink():
+        shim.unlink()
+    shim.symlink_to(interpreter)
+    return {"PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+
+
 # =============================================================================
 # The installer gate
 # =============================================================================
@@ -169,6 +222,16 @@ class TestInstallerVersionGate(unittest.TestCase):
 
     def setUp(self):
         self.src = INSTALL_SH.read_text()
+
+    def _function_body(self, name: str) -> str:
+        """The body of a top-level shell function, comment lines stripped."""
+        m = re.search(r"\n%s\(\) \{\n(.*?)\n\}\n" % re.escape(name),
+                      self.src, re.DOTALL)
+        self.assertIsNotNone(m, f"{name} not found in install.sh")
+        return "\n".join(
+            line for line in m.group(1).splitlines()
+            if not line.lstrip().startswith("#")
+        )
 
     def test_min_python_is_declared(self):
         self.assertRegex(
@@ -190,6 +253,43 @@ class TestInstallerVersionGate(unittest.TestCase):
         # without either they traceback on every fire.
         self.assertIn("u.find_spec('tomllib') or u.find_spec('tomli')", self.src)
         self.assertIn("pip install --user tomli", self.src)
+
+    def test_toml_gate_is_not_fatal_in_check_dependencies(self):
+        """
+        The hard TOML failure must not sit in _check_dependencies.
+
+        _check_dependencies runs on every invocation, uninstall included.
+        Refusing to *remove* hooks because the interpreter cannot *run* them
+        strands a user whose PATH moved after install. The fatal check belongs
+        to the module closure, which an uninstall-only run never enters.
+        """
+        deps = self._function_body("_check_dependencies")
+        self.assertNotIn(
+            "_require_toml_parser", deps,
+            "_check_dependencies must not hard-fail on a missing TOML parser",
+        )
+        # It should still say something -- just not exit.
+        self.assertIn("u.find_spec('tomllib') or u.find_spec('tomli')", deps)
+        self.assertIn("has no TOML parser", deps)
+        self.assertNotIn("has no TOML parser available", deps)
+
+        closure = self._function_body("_compute_and_install_module_closure")
+        self.assertIn(
+            "_require_toml_parser", closure,
+            "the module closure must require a TOML parser before copying modules",
+        )
+        # ... and only after the empty-closure early return, or an uninstall-only
+        # run (which reaches the closure and finds it empty) would still be gated.
+        self.assertGreater(
+            closure.index("_require_toml_parser"),
+            closure.index("Module closure: empty"),
+            "the TOML gate must sit after the empty-closure early return",
+        )
+        self.assertLess(
+            closure.index("_require_toml_parser"),
+            closure.index('cp "$PROJECT_HOOKS_DIR/$mod"'),
+            "the TOML gate must fire before any module is copied",
+        )
 
     def test_dependency_check_runs_before_install(self):
         self.assertIn("\n_check_dependencies\n", self.src)
@@ -304,6 +404,62 @@ class TestImportUnderOldInterpreter(unittest.TestCase):
             result.returncode, 0,
             f"hook modules failed to import under {interpreter}:\n{result.stdout}",
         )
+
+
+class TestTomlGateScope(unittest.TestCase):
+    """
+    The TOML gate blocks installing, never managing.
+
+    Needs a real interpreter with no TOML parser, so it skips on a machine that
+    has none. `uv python find 3.10` supplies one on most dev boxes.
+    """
+
+    def setUp(self):
+        self.interpreter = _find_interpreter_without_toml()
+        if self.interpreter is None:
+            self.skipTest("no pre-3.11 interpreter without a TOML parser available")
+        self.tmp_home = Path(tempfile.mkdtemp(prefix="toml-gate-"))
+        self.crippled = _path_with_python3(
+            self.interpreter, self.tmp_home / "no-toml-bin"
+        )
+
+    def tearDown(self):
+        shutil.rmtree(str(self.tmp_home), ignore_errors=True)
+
+    def test_install_is_refused_and_copies_nothing(self):
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram", "--yes"],
+            extra_env=self.crippled,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout[-2000:])
+        self.assertIn("has no TOML parser available", result.stdout + result.stderr)
+        hooks = self.tmp_home / ".claude" / "hooks"
+        self.assertFalse(
+            hooks.exists() and any(hooks.iterdir()),
+            "a refused install must not leave hook modules behind",
+        )
+
+    def test_uninstall_still_works(self):
+        installed = run_installer(
+            self.tmp_home,
+            extra_args=["--only", "permission-hooks,telegram", "--yes"],
+        )
+        self.assertEqual(installed.returncode, 0, installed.stdout[-2000:])
+        router = self.tmp_home / ".claude" / "hooks" / "telegram_permission_router.py"
+        self.assertTrue(router.exists(), "setup failed: telegram was not installed")
+
+        result = run_installer(
+            self.tmp_home,
+            extra_args=["--uninstall", "telegram", "--yes"],
+            extra_env=self.crippled,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            "uninstall must not be blocked by a missing TOML parser:\n"
+            + result.stdout[-2000:],
+        )
+        self.assertFalse(router.exists(), "telegram was not actually removed")
 
 
 if __name__ == "__main__":

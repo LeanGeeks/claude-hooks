@@ -23,16 +23,27 @@ can replay it.
 
 ## Prerequisites
 
-`_check_dependencies` enforces these before any feature runs, and exits 1 with
-an actionable message if one is missing. `--probe` and `--list` run before the
-check, so they still work on an unsupported interpreter.
+`_check_dependencies` enforces most of these before any feature runs, and exits
+1 with an actionable message if one is missing. `--probe` and `--list` run
+before the check, so they still work on an unsupported interpreter.
 
-| Requirement | Why |
-| --- | --- |
-| `jq` | settings.json merging |
-| `python3` >= 3.9 | the floor the hook modules are written to (`MIN_PYTHON_MINOR` in install.sh) |
-| a TOML parser | stdlib `tomllib` on 3.11+, otherwise the `tomli` backport |
-| `uv` (optional) | only the context-usage and permissions MCP servers |
+| Requirement | Why | Enforced |
+| --- | --- | --- |
+| `jq` | settings.json merging | every run |
+| `python3` >= 3.9 | the floor the hook modules are written to (`MIN_PYTHON_MINOR` in install.sh) | every run |
+| a TOML parser | stdlib `tomllib` on 3.11+, otherwise the `tomli` backport | runs that install modules |
+| `uv` (optional) | only the context-usage and permissions MCP servers | warning only |
+
+The TOML parser is the odd one out: it is needed to *run* the hooks, not to
+manage them, so `_check_dependencies` only warns about it and the hard failure
+lives in `_compute_and_install_module_closure` — raised once the closure is
+known to be non-empty, and still before the first `cp`. Uninstalling is
+therefore always possible. That matters because the interpreter is resolved
+through `PATH` at hook-fire time (below): it can move *after* a successful
+install, and a user whose hooks have started tracebacking must be able to take
+them out without first installing a package. Note that merely reaching the
+closure is not the test — an uninstall-only run gets there too and finds it
+empty.
 
 ### Which python3?
 
@@ -53,6 +64,9 @@ never touch TOML — surfacing as a raw traceback in the user's session. The
 modules fall back to `tomli` on 3.9/3.10, and the gate above makes a missing
 parser an install-time error instead of a runtime one.
 
+### The closing import check
+
+
 After installing, the closing "Testing hook installation..." step imports every
 module *this run* copied into `~/.claude/hooks/` — both the ones a feature
 install shipped and the ones the module closure refreshed — and reports any that
@@ -60,6 +74,13 @@ fail. It deliberately does not glob the directory, which would also pick up
 stale or user-authored files the installer does not own. A failure there is
 fatal and exits 1: those hooks are already wired into `settings.json` and will
 traceback on every fire.
+
+One consequence worth knowing, since the usual workflow is `git pull` followed
+by an install run: the closure refreshes *every* module belonging to a feature
+that is being installed, updated, or kept, so a narrow command like
+`./install.sh --only statusline` can exit 1 over a module owned by a different
+feature. That is not a misfire — the closure really did just overwrite that file
+from the repo, so the user's hooks really are broken on disk.
 
 ---
 
