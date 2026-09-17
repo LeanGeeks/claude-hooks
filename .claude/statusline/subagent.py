@@ -35,6 +35,7 @@ from statusline import (  # noqa: E402  (path shim must run first)
     cache_state,
     detect_cache_ttl,
     last_activity_epoch,
+    read_cache_ttl,
 )
 
 
@@ -186,15 +187,50 @@ def agent_transcript_path(transcript_path: Optional[str],
     return None
 
 
+# Enough siblings to find one that has answered, few enough to stay cheap.
+_COHORT_SAMPLE = 3
+
+
+def cohort_ttl(agent_path: str, limit: int = _COHORT_SAMPLE) -> Optional[int]:
+    """The TTL this session's *other* subagents are recording, or None.
+
+    A subagent does not run on the session's TTL. Claude Code grants the 1h
+    window per query source against an allowlist the main thread is on and the
+    subagent sources are not, so a session caches for 1h while every agent it
+    spawns caches for 5m (`CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` and the
+    `subagentPromptCacheTtl` setting move it). Inheriting the session's value
+    reads an hour of life into a cache that has five minutes of it — so until
+    an agent has usage of its own, its siblings are the evidence for what it
+    will record.
+    """
+    directory = os.path.dirname(agent_path)
+    try:
+        siblings = [entry for entry in os.scandir(directory)
+                    if entry.name.startswith("agent-") and entry.name.endswith(".jsonl")
+                    and entry.path != agent_path and entry.is_file()]
+        siblings.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
+    except (OSError, ValueError):
+        return None
+    for entry in siblings[:limit]:
+        ttl = detect_cache_ttl(entry.path)
+        if ttl:
+            return ttl
+    return None
+
+
 def format_cache(task: dict, transcript_path: Optional[str], session_id: Optional[str],
-                 session_ttl: Optional[int], now: float) -> tuple:
-    """Prompt cache cell: ('warm', '58m', colour), or three Nones when unknown."""
+                 now: float) -> tuple:
+    """Prompt cache cell: ('warm', '4m', colour), or three Nones when unknown."""
     path = agent_transcript_path(transcript_path, session_id, task.get("id"))
     if path is None:
         return None, None, None
-    # An agent that has not answered yet has recorded no usage of its own; it
-    # runs under the session's TTL until it does.
-    ttl = detect_cache_ttl(path) or session_ttl
+    ttl, recorded = read_cache_ttl(path)
+    if ttl is None:
+        ttl = cohort_ttl(path)
+    if ttl is None and not recorded:
+        # Spawned, but nothing has answered yet here or in the cohort: there is
+        # no cache to describe, and a placeholder would only flip a moment later.
+        return None, None, None
     state = cache_state(last_activity_epoch(path), ttl, now)
     return state if state else (None, None, None)
 
@@ -341,10 +377,6 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
     session_effort = read_session_effort(payload.get("session_id"))
     transcript_path = payload.get("transcript_path")
     session_id = payload.get("session_id")
-    # One read for the whole panel: every agent that has not answered yet
-    # inherits it.
-    session_ttl = (detect_cache_ttl(transcript_path)
-                   if isinstance(transcript_path, str) else None)
 
     # Pass 1 — plain cells, so column widths ignore the escape codes.
     cells = []
@@ -355,7 +387,7 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
         context_pct, context_code = format_context(task)
         state, state_code = format_state(task, now)
         cache_word, cache_age, cache_code = format_cache(
-            task, transcript_path, session_id, session_ttl, now)
+            task, transcript_path, session_id, now)
         cells.append({
             "id": task["id"],
             "name": str(task.get("name") or ""),

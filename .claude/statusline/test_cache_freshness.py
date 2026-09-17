@@ -269,11 +269,34 @@ class RowRenderingTest(unittest.TestCase):
         row = self.rows([self.task("a1", status="completed")])[0]
         self.assertIn("cold 2h15m", row)
 
-    def test_an_agent_with_no_usage_yet_inherits_the_session_ttl(self):
-        # Just spawned: attachments written, nothing answered. Under the 5m
-        # default this would read cold; the session runs on the 1h TTL.
-        self.agent("a1", [json.dumps({"type": "attachment"})], age_seconds=610)
-        self.assertIn("warm 49m", self.rows([self.task("a1")])[0])
+    def test_a_spawning_agent_never_inherits_the_sessions_hour(self):
+        """The session caches for 1h; the agents it spawns cache for 5m.
+
+        Regression: reading the session's TTL into a just-spawned row showed
+        `warm 59m` on spawn, then dropped to `warm 4m` the moment the agent
+        answered and its own usage could be read.
+        """
+        self.agent("done", [usage_line(ephemeral_5m=1759)], age_seconds=60)
+        self.agent("fresh", [json.dumps({"type": "attachment"})], age_seconds=30)
+        row = self.rows([self.task("fresh")])[0]
+        self.assertIn("warm 4m", row)          # 5m window, 30s in
+        self.assertNotIn("59m", row)
+
+    def test_a_spawning_agent_reads_the_ttl_its_siblings_record(self):
+        # Sibling evidence, not a guess: whatever the other agents in this
+        # session recorded is what this one will record.
+        self.agent("done", [usage_line(ephemeral_1h=954)], age_seconds=60)
+        self.agent("fresh", [json.dumps({"type": "attachment"})], age_seconds=610)
+        self.assertIn("warm 49m", self.rows([self.task("fresh")])[0])
+
+    def test_the_first_agent_of_a_session_waits_for_its_own_usage(self):
+        # Nothing has answered yet anywhere, so there is no evidence to read —
+        # and no number is better than the session's wrong one.
+        self.agent("only", [json.dumps({"type": "attachment"})], age_seconds=30)
+        row = self.rows([self.task("only")])[0]
+        self.assertNotIn("warm", row)
+        self.assertNotIn("cold", row)
+        self.assertNotIn("idle", row)
 
     def test_an_agent_on_a_provider_without_ttl_buckets_shows_idle_time(self):
         zero = json.dumps({"type": "assistant", "message": {"usage": {
@@ -365,9 +388,19 @@ class MainStatusLineTest(unittest.TestCase):
         self.assertEqual(self.render({"model": {"id": "claude-opus-5",
                                                 "display_name": "Opus"}}), "Opus | ctx ?")
 
-    def test_an_unreadable_ttl_still_reports_when_the_session_last_moved(self):
-        write(self.transcript, [json.dumps({"type": "attachment"})], age_seconds=740)
+    def test_a_provider_without_ttl_buckets_still_reports_when_it_last_moved(self):
+        zero = json.dumps({"type": "assistant", "message": {"usage": {
+            "cache_read_input_tokens": 184768,
+            "cache_creation": {"ephemeral_1h_input_tokens": 0,
+                               "ephemeral_5m_input_tokens": 0}}}})
+        write(self.transcript, [zero], age_seconds=740)
         self.assertEqual(self.render(self.payload()), "Opus | ctx 61% | idle 12m")
+
+    def test_a_session_that_has_not_called_the_api_has_nothing_to_report(self):
+        # Transcript open, no request made: there is no cache yet, and `idle 0s`
+        # would only flip to a real reading seconds later.
+        write(self.transcript, [json.dumps({"type": "attachment"})], age_seconds=5)
+        self.assertEqual(self.render(self.payload()), "Opus | ctx 61%")
 
     def test_the_segment_makes_no_network_calls(self):
         """Block the network, then render: the cache segment is a local read."""

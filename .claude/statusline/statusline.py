@@ -1121,10 +1121,11 @@ def format_zai_peak_segments(env: StatusEnvironment,
 # and every subagent appends to its own transcript as it works, and the file's
 # mtime tracks the last entry to within ~100 ms. That is the clock this uses.
 #
-# The TTL is not a constant either: 1h for allowlisted models on a subscription,
-# 5m otherwise, dropping back to 5m in overage, and a subagent can be given its
-# own override. So it is read back from the usage the last call recorded rather
-# than assumed.
+# The TTL is not a constant either: 1h for allowlisted query sources on a
+# subscription, 5m otherwise, dropping back to 5m in overage, and an agent can be
+# given its own override — the main thread caches for an hour while the agents it
+# spawns cache for five minutes. So it is read back from the usage the last call
+# recorded rather than assumed.
 # ---------------------------------------------------------------------------
 
 _CACHE_TTL_1H = 3600
@@ -1188,28 +1189,38 @@ def _scan_for_ttl(lines: list) -> tuple:
     return None, undecided
 
 
-def detect_cache_ttl(path: str) -> Optional[int]:
-    """How long the last call's cache entry lives, in seconds, or None.
+def read_cache_ttl(path: str) -> tuple:
+    """(ttl in seconds or None, whether any API call is recorded at all).
 
     A turn that only read the cache writes neither counter, so walk back until
     one of them is decisive rather than reading the last entry alone. A provider
     that never attributes a bucket at all writes zeros on every single turn,
     which the larger read would never rescue — so stop once the tail has said
     that clearly enough.
+
+    The second value separates "this provider does not report a lifetime" from
+    "nothing has happened here yet": the first is worth reporting as idle time,
+    the second is a transcript with no clock in it.
     """
     if not path:
-        return None
+        return None, False
     try:
         size = os.path.getsize(path)
     except (OSError, ValueError):
-        return None
+        return None, False
+    undecided = 0
     for limit in _TRANSCRIPT_TAIL_LIMITS:
         ttl, undecided = _scan_for_ttl(_read_transcript_tail(path, limit))
         if ttl is not None:
-            return ttl
+            return ttl, True
         if undecided >= _UNDECIDED_TURNS_GIVE_UP or size <= limit:
             break
-    return None
+    return None, undecided > 0
+
+
+def detect_cache_ttl(path: str) -> Optional[int]:
+    """How long the last call's cache entry lives, in seconds, or None."""
+    return read_cache_ttl(path)[0]
 
 
 def last_activity_epoch(path: str) -> Optional[float]:
@@ -1261,7 +1272,11 @@ def format_cache_segment(status_input: dict) -> list:
     path = status_input.get("transcript_path")
     if not isinstance(path, str):
         return []
-    state = cache_state(last_activity_epoch(path), detect_cache_ttl(path))
+    ttl, recorded = read_cache_ttl(path)
+    if ttl is None and not recorded:
+        # A session that has not called the API yet has no cache to report on.
+        return []
+    state = cache_state(last_activity_epoch(path), ttl)
     return [f"{state[0]} {state[1]}"] if state else []
 
 

@@ -53,6 +53,7 @@ Both scripts require Python 3 and use only the standard library. `subagent.py` i
 | Effort-capable model | `Opus · xhigh \| ctx 61% \| 5h 43% reset 1:12` |
 | Main thread running an agent | `Opus · high \| agent reviewer \| ctx 22%` |
 | Prompt cache still warm | `Opus · high \| ctx 61% \| warm 58m \| 5h 43% reset 1:12` |
+| Session open, nothing sent yet | `Opus · high \| ctx ?` |
 | Session idle past its cache | `Opus · high \| ctx 61% \| cold 2h30m \| 5h 43% reset 1:12` |
 | Provider that reports no cache TTL | `GLM-5.3 plan \| ctx 58% \| idle 12m \| 5h 1% resets in 4d` |
 
@@ -393,8 +394,8 @@ line on stdout; ids not in the current task set are ignored. It ticks ~300 ms af
 agents appear and every 5 s after that, with a 5 s timeout per run.
 
 ```
-❯ ● Explore-2      Opus · high     ctx 38%    1m12s   warm   57m   searching for statusline callers
-  ● code-review    Sonnet · ~max   ctx  7%      14s   warm   59m   reviewing the diff for correctness
+❯ ● Explore-2      Opus · high     ctx 38%    1m12s   warm    4m   searching for statusline callers
+  ● code-review    Sonnet · ~max   ctx  7%      14s   warm    2m   reviewing the diff for correctness
     ● Opus · ~high   ctx 62%     done   cold 2h15m   mapping hook registration
 ```
 
@@ -460,12 +461,23 @@ the transcripts on disk:
   whole clock.
 - The TTL is read back from the last recorded `usage`, never assumed: a non-zero
   `cache_creation.ephemeral_1h_input_tokens` means the 1h window, `ephemeral_5m` the 5m
-  one. It is not a constant — 1h applies to allowlisted models on a subscription, drops
-  back to 5m in overage, and a subagent can be handed its own override — so reading each
-  agent's own usage is what keeps the countdown honest. A turn that only *read* the cache
+  one. It is not a constant — 1h applies to allowlisted *query sources* on a
+  subscription, drops back to 5m in overage, and an agent can be handed its own
+  override — so reading each agent's own usage is what keeps the countdown honest. A turn that only *read* the cache
   records neither counter, so the lookup walks back until one is decisive.
-- An agent that has not answered yet has no usage of its own and inherits the session's
-  TTL, which is read once per tick.
+- **A subagent does not run on the session's TTL.** The 1h window is granted per query
+  source against an allowlist the main thread is on and the subagent sources are not, so
+  a session caches for 1h while every agent it spawns caches for 5m (`yRn`/`GAn` in the
+  2.1.274 bundle; `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL` and the `subagentPromptCacheTtl`
+  setting move it). Reading the session's value into an agent row put an hour of life on
+  a cache with five minutes of it, until the agent answered and the row dropped from
+  `warm 59m` to `warm 4m` in one tick.
+- So an agent that has not answered yet takes the TTL its **siblings** in the same
+  session are recording — evidence rather than inheritance, sampled from the three most
+  recently written `agent-*.jsonl` beside it. The first agent of a session has no cohort
+  to read, so its cell stays blank until its own first answer lands.
+- A transcript that records no API call at all gets no cell rather than `idle 0s`: that
+  is a session or agent with no cache yet, not a provider declining to report one.
 - Where no TTL can be read at all, the cell falls back to `idle <age>`: it reports the
   clock without claiming a cache state. Non-Anthropic providers land here — a GLM
   session records large `cache_read_input_tokens` with `ephemeral_1h`/`ephemeral_5m`
