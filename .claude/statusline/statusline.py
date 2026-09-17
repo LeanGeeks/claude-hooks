@@ -1115,6 +1115,157 @@ def format_zai_peak_segments(env: StatusEnvironment,
 
 
 # ---------------------------------------------------------------------------
+# Prompt cache freshness
+#
+# Neither payload carries a timestamp for the last API call, but every session
+# and every subagent appends to its own transcript as it works, and the file's
+# mtime tracks the last entry to within ~100 ms. That is the clock this uses.
+#
+# The TTL is not a constant either: 1h for allowlisted models on a subscription,
+# 5m otherwise, dropping back to 5m in overage, and a subagent can be given its
+# own override. So it is read back from the usage the last call recorded rather
+# than assumed.
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL_1H = 3600
+_CACHE_TTL_5M = 300
+
+# Two passes: the small read covers the common case, the large one rescues a
+# transcript whose tail is one enormous tool result.
+_TRANSCRIPT_TAIL_LIMITS = (64 * 1024, 512 * 1024)
+
+# A handful of cache-read-only turns is normal and worth reading past; this many
+# in a row means the provider does not report buckets at all, and the larger read
+# would only cost time.
+_UNDECIDED_TURNS_GIVE_UP = 20
+
+
+def _read_transcript_tail(path: str, limit: int) -> list:
+    """Return the last complete JSONL lines of a transcript, oldest first."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            chunk = f.read()
+    except (OSError, ValueError):
+        return []
+    if size > limit:
+        # The read almost certainly began mid-line; that fragment is not JSON.
+        _, _, chunk = chunk.partition(b"\n")
+    return chunk.decode("utf-8", "replace").splitlines()
+
+
+def _ttl_from_usage(usage: dict) -> Optional[int]:
+    creation = usage.get("cache_creation")
+    if not isinstance(creation, dict):
+        return None
+    if creation.get("ephemeral_1h_input_tokens"):
+        return _CACHE_TTL_1H
+    if creation.get("ephemeral_5m_input_tokens"):
+        return _CACHE_TTL_5M
+    return None
+
+
+def _scan_for_ttl(lines: list) -> tuple:
+    """(ttl, turns that recorded usage but no bucket) over a tail, newest first."""
+    undecided = 0
+    for line in reversed(lines):
+        if '"usage"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        message = entry.get("message") if isinstance(entry, dict) else None
+        usage = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        ttl = _ttl_from_usage(usage)
+        if ttl is not None:
+            return ttl, undecided
+        undecided += 1
+    return None, undecided
+
+
+def detect_cache_ttl(path: str) -> Optional[int]:
+    """How long the last call's cache entry lives, in seconds, or None.
+
+    A turn that only read the cache writes neither counter, so walk back until
+    one of them is decisive rather than reading the last entry alone. A provider
+    that never attributes a bucket at all writes zeros on every single turn,
+    which the larger read would never rescue — so stop once the tail has said
+    that clearly enough.
+    """
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+    except (OSError, ValueError):
+        return None
+    for limit in _TRANSCRIPT_TAIL_LIMITS:
+        ttl, undecided = _scan_for_ttl(_read_transcript_tail(path, limit))
+        if ttl is not None:
+            return ttl
+        if undecided >= _UNDECIDED_TURNS_GIVE_UP or size <= limit:
+            break
+    return None
+
+
+def last_activity_epoch(path: str) -> Optional[float]:
+    """When this transcript was last written — the last thing its author did."""
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except (OSError, ValueError):
+        return None
+
+
+def format_cache_age(seconds: float) -> str:
+    """Coarse duration for the cache cell: 45s, 58m, 2h15m."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def cache_state(last_activity: Optional[float], ttl: Optional[int],
+                now_epoch: Optional[float] = None) -> Optional[tuple]:
+    """(word, duration, colour) for the prompt cache, or None with no clock.
+
+    Warm counts down what is left; once expired the countdown is meaningless,
+    so a cold entry reports how long it has been idle instead. Without a TTL
+    there is no state to claim — GLM and other non-Anthropic providers report
+    cache reads but never attribute a 5m/1h bucket — so that case reports the
+    one fact there is: how long since the last thing happened.
+    """
+    if last_activity is None:
+        return None
+    now = time.time() if now_epoch is None else now_epoch
+    if not ttl:
+        return "idle", format_cache_age(now - last_activity), "2"
+    remaining = last_activity + ttl - now
+    if remaining <= 0:
+        return "cold", format_cache_age(now - last_activity), "2"
+    # Warn inside the last tenth of the window, but never on less than a minute
+    # of warning — a 5m TTL would otherwise flip to yellow at 30s.
+    warn_at = max(60.0, ttl * 0.1)
+    return "warm", format_cache_age(remaining), ("33" if remaining < warn_at else "32")
+
+
+def format_cache_segment(status_input: dict) -> list:
+    """['warm 58m'] / ['cold 2h15m'] / ['idle 12m'] — this session's cache life."""
+    path = status_input.get("transcript_path")
+    if not isinstance(path, str):
+        return []
+    state = cache_state(last_activity_epoch(path), detect_cache_ttl(path))
+    return [f"{state[0]} {state[1]}"] if state else []
+
+
+# ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
@@ -1149,7 +1300,8 @@ def render_status_line(status_input: dict, env: StatusEnvironment) -> str:
         agent_segments.append(f"agent {agent_name}")
 
     parts = [*peak_prefix, model_label, *agent_segments,
-             format_context_segment(status_input), *quota_segments, *peak_suffix]
+             format_context_segment(status_input), *format_cache_segment(status_input),
+             *quota_segments, *peak_suffix]
     return " | ".join(parts)
 
 

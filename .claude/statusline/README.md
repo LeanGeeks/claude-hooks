@@ -1,6 +1,7 @@
 # Claude Code Status Line
 
-Provider-aware one-line status showing model, context usage, rate limits, and cost.
+Provider-aware one-line status showing model, context usage, prompt-cache freshness,
+rate limits, and cost.
 
 ## Quick setup
 
@@ -51,6 +52,9 @@ Both scripts require Python 3 and use only the standard library. `subagent.py` i
 | Gemma local | `Gemma local \| ctx 32%` |
 | Effort-capable model | `Opus · xhigh \| ctx 61% \| 5h 43% reset 1:12` |
 | Main thread running an agent | `Opus · high \| agent reviewer \| ctx 22%` |
+| Prompt cache still warm | `Opus · high \| ctx 61% \| warm 58m \| 5h 43% reset 1:12` |
+| Session idle past its cache | `Opus · high \| ctx 61% \| cold 2h30m \| 5h 43% reset 1:12` |
+| Provider that reports no cache TTL | `GLM-5.3 plan \| ctx 58% \| idle 12m \| 5h 1% resets in 4d` |
 
 ## Provider inference
 
@@ -329,6 +333,7 @@ python3 .claude/statusline/test_additional_vendor_pricing.py -v  # Fireworks, Mi
 python3 .claude/statusline/test_hardening.py -v            # review checks (06-03e)
 python3 .claude/statusline/test_glm_quota.py -v            # GLM quota parse/cache (credit + token eras)
 python3 .claude/statusline/test_subagent.py -v             # per-subagent line + effort/agent segments
+python3 .claude/statusline/test_cache_freshness.py -v      # prompt-cache cell (both lines)
 ```
 
 `test_hardening.py` covers: dedupe across renders, distinct `session_id` isolation, unknown-provider behavior, state-file content safety (no tokens / prompts / transcripts / commands), suppression for subscription and local billing, no-network guarantee for the cost path, runtime budget, and absence of git information in the rendered line.
@@ -388,9 +393,9 @@ line on stdout; ids not in the current task set are ignored. It ticks ~300 ms af
 agents appear and every 5 s after that, with a 5 s timeout per run.
 
 ```
-❯ ● Explore-2      Opus · high     ctx 38%    1m12s   searching for statusline callers
-  ● code-review    Sonnet · ~max   ctx  7%      14s   reviewing the diff for correctness
-    ● Opus · ~high   ctx 62%     done   mapping hook registration
+❯ ● Explore-2      Opus · high     ctx 38%    1m12s   warm   57m   searching for statusline callers
+  ● code-review    Sonnet · ~max   ctx  7%      14s   warm   59m   reviewing the diff for correctness
+    ● Opus · ~high   ctx 62%     done   cold 2h15m   mapping hook registration
 ```
 
 The decoration **replaces the whole row** apart from the leading status glyph, so the
@@ -406,6 +411,7 @@ Cells, left to right:
 | model · effort | `tasks[].model`, `tasks[].effort` | Model normalized by `_normalize_model_name()`. `~` marks an inherited effort. Omitted for models without the effort capability. |
 | ctx | `tokenCount` / `contextWindowSize` | Green < 50%, yellow < 80%, red above. `ctx ?%` when the window is unknown. |
 | state | `status`, `startTime` | Elapsed while running; `done` / `failed` / `killed` once settled — the payload carries no `endTime`, so a clock would keep ticking after the agent stopped. |
+| cache | the agent's own transcript | `warm <left>` while the agent's prompt cache is still live, `cold <idle>` once it has expired, `idle <age>` where the TTL is unknowable. Green, yellow inside the last tenth of the window (never less than a minute of warning), dim otherwise. Blank when the transcript cannot be found; the column disappears when no agent has one. |
 | description | `label` (live progress summary), else `description` | Dimmed, truncated with `…`. |
 
 Colour is ANSI, rendered through Claude Code's `Ansi` component. Rows are dimmed unless
@@ -438,7 +444,44 @@ them to this command.
 
 The payload has no cost, `agentType` (only the derived `name`), tool-use count, last
 tool name, queued-message count, backgrounded/idle flags, `endTime` or spawn depth. The
-default row's `N queued` counter cannot be reproduced.
+default row's `N queued` counter cannot be reproduced. Claude Code 2.1.274 does send
+`type`, `cwd` and `tokenSamples` (a 16-deep ring buffer of `tokenCount`, one sample per
+tick — about 80 s of history), none of which this script uses.
+
+## Prompt cache freshness
+
+Neither payload carries a timestamp for the last API call, so both scripts read it off
+the transcripts on disk:
+
+- Each subagent appends to `<project>/<session>/subagents/agent-<id>.jsonl` as it works
+  (`tasks[].id` *is* the agent id), and the main session to `<project>/<session>.jsonl`,
+  which arrives in both payloads as `transcript_path`. Claude Code writes both live —
+  file mtime tracks the last entry to within ~100 ms — so one `stat()` per row is the
+  whole clock.
+- The TTL is read back from the last recorded `usage`, never assumed: a non-zero
+  `cache_creation.ephemeral_1h_input_tokens` means the 1h window, `ephemeral_5m` the 5m
+  one. It is not a constant — 1h applies to allowlisted models on a subscription, drops
+  back to 5m in overage, and a subagent can be handed its own override — so reading each
+  agent's own usage is what keeps the countdown honest. A turn that only *read* the cache
+  records neither counter, so the lookup walks back until one is decisive.
+- An agent that has not answered yet has no usage of its own and inherits the session's
+  TTL, which is read once per tick.
+- Where no TTL can be read at all, the cell falls back to `idle <age>`: it reports the
+  clock without claiming a cache state. Non-Anthropic providers land here — a GLM
+  session records large `cache_read_input_tokens` with `ephemeral_1h`/`ephemeral_5m`
+  both zero on every turn, so its cache lifetime is genuinely unknowable from the
+  transcript, and guessing 5m would be worse than saying nothing.
+
+Caveats: agents spawned as forks run with `skipTranscript` and have no file at all, so
+their cell stays blank. The mtime is the last *write*, which for the main session
+includes queued input and attachments — it can read slightly fresher than the last API
+call, never staler. The countdown is only as current as the tick: subagent rows refresh
+every 5 s while any agent row exists, and the main line follows `statusLine.refreshInterval`
+(seconds) plus event-driven updates.
+
+Cost per row per tick is one `stat()` plus a bounded tail read — 64 KB, and 512 KB only
+when that was not decisive: measured at ~0.3 ms against a 20 MB transcript, ~3 ms where
+no TTL is recorded at all.
 
 ## Extension points
 
@@ -452,5 +495,6 @@ Later tasks should extend `statusline.py` without replacing it:
 - **Task 06-03e** ✓ — review and hardening pass: dedupe / suppression / unknown-pricing / state-file-safety / no-network / no-git-output verified in `test_hardening.py`; cost display contract documented above
 
 - **Per-subagent status line** ✓ — `subagent.py` decorates agent-panel rows with model, effort, context and elapsed time; `statusline.py` gained `effort` / `agent` segments and publishes the session effort for it to inherit. Tests in `test_subagent.py`.
+- **Prompt cache freshness** ✓ — both lines report how much prompt-cache life is left (`warm 58m` / `cold 2h15m`, or `idle 12m` where the provider reports no TTL), read from transcript mtime plus the TTL recorded in the last `usage`. Shared helpers (`detect_cache_ttl()`, `last_activity_epoch()`, `cache_state()`) live in `statusline.py`; tests in `test_cache_freshness.py`.
 
 The `detect_environment()` / `render_status_line()` split keeps provider detection stable while allowing segment formatters to evolve independently. `subagent.py` reuses `_normalize_model_name()` and `_infer_provider_billing()` rather than duplicating provider logic.

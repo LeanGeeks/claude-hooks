@@ -4,14 +4,15 @@ Claude Code per-subagent status line.
 
 Reads the agent-panel row context as JSON on stdin and prints one JSON object
 per line — {"id": ..., "content": ...} — decorating each subagent row in the
-agent panel (ctrl-t) with model, effort, context usage and elapsed time.
+agent panel (ctrl-t) with model, effort, context usage, elapsed time and how
+much prompt-cache life the agent has left.
 
 Claude Code replaces the *whole* row with this content apart from the leading
 status glyph, so the agent name and description are rendered here too.
 
 Layout (metadata first, description last so only the description truncates):
 
-    Explore-2      Opus · high     ctx 38%    1m12s   searching for callers
+    Explore-2      Opus · high     ctx 38%    1m12s   warm 58m   searching for callers
 
 Set CC_STATUS_DEBUG=1 to emit diagnostic output on stderr.
 Set CC_STATUS_NO_COLOR=1 (or NO_COLOR) to emit plain text.
@@ -31,6 +32,9 @@ from statusline import (  # noqa: E402  (path shim must run first)
     _normalize_model_name,
     _pricing_key,
     _safe_session_key,
+    cache_state,
+    detect_cache_ttl,
+    last_activity_epoch,
 )
 
 
@@ -119,6 +123,80 @@ def read_session_effort(session_id: Optional[str]) -> Optional[str]:
     except (OSError, json.JSONDecodeError, ValueError, AttributeError):
         return None
     return level if level in _EFFORT_LEVELS else None
+
+
+# ---------------------------------------------------------------------------
+# Agent transcripts
+#
+# A subagent's own transcript lives beside the session's, and its mtime is the
+# only record of when the agent last did anything — the payload carries no
+# endTime and no last-activity field. Claude Code writes it as the agent works,
+# so the file is current to within ~100 ms.
+# ---------------------------------------------------------------------------
+
+# Both ids are Claude Code's own, but they arrive as payload data and are about
+# to become path segments, so they are checked rather than trusted.
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Workflow-spawned agents sit under subagents/<workflow>/<run>/, so the walk
+# goes deep enough for those and no further.
+_MAX_NESTED_DEPTH = 3
+
+
+def _session_dir_name(transcript_path: str, session_id: Optional[str]) -> Optional[str]:
+    """The per-session directory beside the transcript: its own id."""
+    candidate = str(session_id or "").strip()
+    if not _ID_RE.match(candidate):
+        # Served/remote sessions report a session_id the filesystem never saw
+        # (`served:…`), so fall back to the name the transcript itself carries.
+        base = os.path.basename(transcript_path)
+        candidate = base[:-6] if base.endswith(".jsonl") else ""
+    return candidate if _ID_RE.match(candidate) else None
+
+
+def agent_transcript_path(transcript_path: Optional[str],
+                          session_id: Optional[str],
+                          task_id: Optional[str]) -> Optional[str]:
+    """Locate <project>/<session>/subagents/[<nested>/]agent-<id>.jsonl."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    if not _ID_RE.match(str(task_id or "")):
+        return None
+    session = _session_dir_name(transcript_path, session_id)
+    if session is None:
+        return None
+    base = os.path.join(os.path.dirname(transcript_path), session, "subagents")
+    name = f"agent-{task_id}.jsonl"
+
+    base_depth = base.rstrip(os.sep).count(os.sep)
+    try:
+        flat = os.path.join(base, name)
+        if os.path.exists(flat):
+            return flat
+        for root, dirs, files in os.walk(base):
+            if name in files:
+                return os.path.join(root, name)
+            if root.count(os.sep) - base_depth >= _MAX_NESTED_DEPTH:
+                dirs[:] = []
+    except (OSError, ValueError):
+        # A path the OS rejects is one more agent without a transcript, not a
+        # reason to drop every row's decoration.
+        pass
+    # Forks run with skipTranscript, so having no file at all is normal.
+    return None
+
+
+def format_cache(task: dict, transcript_path: Optional[str], session_id: Optional[str],
+                 session_ttl: Optional[int], now: float) -> tuple:
+    """Prompt cache cell: ('warm', '58m', colour), or three Nones when unknown."""
+    path = agent_transcript_path(transcript_path, session_id, task.get("id"))
+    if path is None:
+        return None, None, None
+    # An agent that has not answered yet has recorded no usage of its own; it
+    # runs under the session's TTL until it does.
+    ttl = detect_cache_ttl(path) or session_ttl
+    state = cache_state(last_activity_epoch(path), ttl, now)
+    return state if state else (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +339,12 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
         env.get("ANTHROPIC_AUTH_TOKEN", "").strip() or None,
     )
     session_effort = read_session_effort(payload.get("session_id"))
+    transcript_path = payload.get("transcript_path")
+    session_id = payload.get("session_id")
+    # One read for the whole panel: every agent that has not answered yet
+    # inherits it.
+    session_ttl = (detect_cache_ttl(transcript_path)
+                   if isinstance(transcript_path, str) else None)
 
     # Pass 1 — plain cells, so column widths ignore the escape codes.
     cells = []
@@ -270,6 +354,8 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
         model, effort, effort_code = format_model(task, provider, session_effort)
         context_pct, context_code = format_context(task)
         state, state_code = format_state(task, now)
+        cache_word, cache_age, cache_code = format_cache(
+            task, transcript_path, session_id, session_ttl, now)
         cells.append({
             "id": task["id"],
             "name": str(task.get("name") or ""),
@@ -279,6 +365,9 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
             "context_code": context_code,
             "state": state,
             "state_code": state_code,
+            "cache_word": cache_word,
+            "cache_age": cache_age,
+            "cache_code": cache_code,
             "description": str(task.get("label") or task.get("description") or ""),
         })
     if not cells:
@@ -292,6 +381,14 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
     for c in cells:
         value = "?" if c["context_pct"] is None else str(c["context_pct"])
         c["context"] = f"ctx {value:>{pct_width}}%"
+
+    # The whole cache column is dropped when nothing is known — an agent panel
+    # full of forks should not carry an empty column.
+    age_width = max((len(c["cache_age"]) for c in cells if c["cache_age"]), default=0)
+    for c in cells:
+        c["cache"] = (f"{c['cache_word']} {c['cache_age']:>{age_width}}"
+                      if c["cache_age"] else "")
+    cache_width = max(len(c["cache"]) for c in cells)
 
     try:
         budget = int(payload.get("columns"))
@@ -310,6 +407,8 @@ def build_rows(payload: dict, env: dict, now: Optional[float] = None) -> list:
         fixed.append(paint(c["context"], c["context_code"], colored))
         if state_width:
             fixed.append(paint(c["state"].rjust(state_width), c["state_code"], colored))
+        if cache_width:
+            fixed.append(paint(c["cache"].ljust(cache_width), c["cache_code"], colored))
         prefix = _GAP.join(fixed)
 
         remaining = budget - visible_width(prefix) - len(_GAP)
