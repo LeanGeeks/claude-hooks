@@ -290,6 +290,15 @@ if you'll also run the CLI under system Python) into the same user site:
 python3 -m pip install --user --break-system-packages httpx tomli_w
 ```
 
+On system Python older than 3.11, add `tomli` as well — `client.py` reads the
+config with stdlib `tomllib` where available and falls back to that backport
+below 3.11:
+
+```bash
+python3 -c 'import sys; print(sys.version_info >= (3, 11))'   # False? add tomli
+python3 -m pip install --user --break-system-packages tomli
+```
+
 Skip this and the hook's import fails silently — the relay disables itself and
 you get no Telegram prompts even though the CLI's `whoami` works fine.
 

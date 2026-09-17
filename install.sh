@@ -322,7 +322,10 @@ feature_telegram_writes()     { echo "python user-site .pth, ~/.local/bin/claude
 feature_telegram_default()    { echo "install"; }
 feature_telegram_requires()   { echo "permission-hooks"; }
 feature_telegram_modules()    {
-    echo "bash_command_parser.py settings_loader.py permission_state_store.py project_key.py telegram_permission_router.py posttool_hook.py notification_hook.py reply_injector.py settings_writer.py roles_config.py"
+    # amux_spawn_lib.py is shared with the amux/profiles features, but
+    # notification_hook.py imports it unconditionally (lib.read_handle), so
+    # telegram must ship it too or the Notification hook cannot import.
+    echo "bash_command_parser.py settings_loader.py permission_state_store.py project_key.py telegram_permission_router.py posttool_hook.py notification_hook.py reply_injector.py settings_writer.py roles_config.py amux_spawn_lib.py"
 }
 feature_telegram_suboptions() { echo ""; }
 
@@ -571,10 +574,12 @@ feature_amux_install() {
 
         # Sanity import check
         if [[ "$HOOKS_INSTALLED" == true ]]; then
-            if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); import amux_spawn_lib, codex_event_reducer" 2>/dev/null; then
+            local _import_err
+            if _import_err="$(python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); import amux_spawn_lib, codex_event_reducer" 2>&1)"; then
                 log_info "  amux_spawn_lib + codex_event_reducer importable from $GLOBAL_HOOKS_DIR"
             else
-                log_warn "  amux_spawn_lib / codex_event_reducer not importable — amux-spawn may fail"
+                log_warn "  amux_spawn_lib / codex_event_reducer not importable — amux-spawn will fail:"
+                log_warn "    $(printf '%s' "$_import_err" | tail -n 1)"
             fi
         fi
 
@@ -1144,6 +1149,12 @@ suboption_daily_review_cron_writes()   { echo "crontab"; }
 # Map from module basename to the space-separated list of feature ids that own it.
 # Used for dependency-closure install and refcounted uninstall (brd D4).
 # Must cover exactly REQUIRED_HOOKS — asserted at startup.
+#
+# The owner list must also be the exact set of features whose _modules() ships
+# the module. Closure install reads feature_<id>_modules; refcounted uninstall
+# reads this map. Let them drift and uninstalling one owner deletes a module a
+# still-installed feature imports — covered by
+# TestModuleOwnersMatchFeatureLists in tests/test_unit_installer.py.
 declare -A MODULE_OWNERS=(
     [bash_command_parser.py]="permission-hooks telegram"
     [settings_loader.py]="permission-hooks telegram"
@@ -1158,7 +1169,7 @@ declare -A MODULE_OWNERS=(
     [reply_injector.py]="telegram"
     [settings_writer.py]="telegram"
     [roles_config.py]="telegram questions"
-    [amux_spawn_lib.py]="amux profiles"
+    [amux_spawn_lib.py]="amux profiles telegram"
     [lifecycle_events.py]="amux"
     [claude_event_reducer.py]="amux"
     [codex_event_reducer.py]="amux"
@@ -1362,6 +1373,9 @@ _install_modules() {
         cp "$PROJECT_HOOKS_DIR/$mod" "$GLOBAL_HOOKS_DIR/"
         chmod +x "$GLOBAL_HOOKS_DIR/$mod"
         log_info "  Installed module: $mod"
+        # Remember it for the closing import smoke test. Duplicates are fine:
+        # several features share modules, and the test de-dupes.
+        INSTALLED_MODULES+=("$mod")
     done
     return 0
 }
@@ -2525,6 +2539,11 @@ _compute_and_install_module_closure() {
             cp "$PROJECT_HOOKS_DIR/$mod" "$GLOBAL_HOOKS_DIR/"
             chmod +x "$GLOBAL_HOOKS_DIR/$mod"
             installed_count=$((installed_count + 1))
+            # A "keep" feature never reaches _install_modules, so the closure is
+            # the only place its modules get recorded for the smoke test. A keep
+            # run still copies them fresh from the repo, which is exactly when a
+            # newly broken module would ship unnoticed.
+            INSTALLED_MODULES+=("$mod")
         else
             log_warn "Module closure: $mod not found in $PROJECT_HOOKS_DIR"
         fi
@@ -2722,6 +2741,12 @@ _apply_uninstall_to_settings() {
 # Dependency checks
 # =============================================================================
 
+# Oldest Python the hook modules run on. The hooks are invoked as bare
+# "python3" (see the settings.json commands built above), so the interpreter
+# checked here is the one Claude Code will actually use at hook-fire time --
+# a pyenv/conda/venv shim on PATH is what counts, not /usr/bin/python3.
+MIN_PYTHON_MINOR=9
+
 _check_dependencies() {
     if ! command -v jq &> /dev/null; then
         log_error "jq is required but not installed. Install with: sudo apt install jq"
@@ -2729,6 +2754,32 @@ _check_dependencies() {
     fi
     if ! command -v python3 &> /dev/null; then
         log_error "python3 is required but not installed."
+        exit 1
+    fi
+
+    local py_version py_path
+    py_version="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")"
+    py_path="$(command -v python3)"
+
+    if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, $MIN_PYTHON_MINOR) else 1)" 2>/dev/null; then
+        log_error "python3 is $py_version, but the hooks require 3.$MIN_PYTHON_MINOR or newer."
+        log_error "  Interpreter: $py_path"
+        log_error "  Hooks run as bare 'python3', so a pyenv/conda/venv shim on PATH is what counts here."
+        exit 1
+    fi
+
+    # TOML parser. tomllib is stdlib only from 3.11; on 3.9/3.10 the hooks fall
+    # back to the 'tomli' backport. Without either, every hook that reads a
+    # .toml config (profiles, roles, questions, relay) dies at import time --
+    # and an import-time failure takes the whole hook down, not just the
+    # TOML-reading part of it.
+    if ! python3 -c "import importlib.util as u, sys; sys.exit(0 if (u.find_spec('tomllib') or u.find_spec('tomli')) else 1)" 2>/dev/null; then
+        log_error "python3 is $py_version and has no TOML parser available."
+        log_error "  Interpreter: $py_path"
+        log_error "  tomllib is stdlib only from Python 3.11; on $py_version the hooks need 'tomli'."
+        log_error "  Install it with:  sudo apt install python3-tomli"
+        log_error "               or:  python3 -m pip install --user tomli"
+        log_error "  Alternatively, run the hooks on Python 3.11+, which needs no backport."
         exit 1
     fi
     if command -v uv &> /dev/null; then
@@ -2744,6 +2795,10 @@ _check_dependencies() {
 # Global state variables (set by feature installs)
 # =============================================================================
 HOOKS_INSTALLED=false
+# Hook modules copied into GLOBAL_HOOKS_DIR this run, appended by _install_modules.
+declare -a INSTALLED_MODULES=()
+# Set by the closing import smoke test; forces a non-zero exit.
+HOOK_IMPORT_FAILED=false
 STATUSLINE_INSTALLED=false
 SUBAGENT_STATUSLINE_INSTALLED=false
 COMMANDS_INSTALLED=false
@@ -4329,13 +4384,44 @@ echo ""
 log_info "Backup location: $BACKUP_FILE"
 log_info "To restore: cp \"$BACKUP_FILE\" \"$GLOBAL_CONFIG\""
 
-if [[ "$HOOKS_INSTALLED" == true ]]; then
+# Gated on INSTALLED_MODULES alone, not on HOOKS_INSTALLED: that flag is only
+# raised by the permission-hooks install, so a keep-path run (which refreshes
+# every module through the closure without re-running any feature install)
+# would otherwise skip the test entirely.
+if [[ ${#INSTALLED_MODULES[@]} -gt 0 ]]; then
     echo ""
     log_info "Testing hook installation..."
-    if python3 -c "import sys; sys.path.insert(0, '$GLOBAL_HOOKS_DIR'); from bash_command_parser import BashCommandParser; import amux_spawn_lib, codex_event_reducer; print('Hook modules loaded successfully')" 2>/dev/null; then
+    # Import exactly the modules this run installed -- not a fixed list (a
+    # partial --only install legitimately lacks some) and not a glob of the
+    # hooks dir (which would also drag in stale or user-authored files). A
+    # module that IS installed and will not import is one that raises a
+    # traceback every time Claude Code fires the hook using it.
+    if _smoke_err="$(python3 - "$GLOBAL_HOOKS_DIR" "${INSTALLED_MODULES[@]}" <<'PYEOF' 2>&1
+import importlib
+import sys
+
+hooks_dir, modules = sys.argv[1], sys.argv[2:]
+sys.path.insert(0, hooks_dir)
+
+failed = []
+for name in sorted({m[:-3] if m.endswith(".py") else m for m in modules}):
+    try:
+        importlib.import_module(name)
+    except BaseException as exc:  # noqa: BLE001 - report anything, never crash
+        failed.append("%s: %s: %s" % (name, type(exc).__name__, exc))
+
+if failed:
+    print("\n".join(failed))
+    sys.exit(1)
+PYEOF
+    )"; then
         log_info "Hook modules are working correctly!"
     else
-        log_warn "Hook modules test failed (this may be okay if dependencies are missing)"
+        # Not "probably fine": these hooks are wired into settings.json and will
+        # traceback on every fire until the import is fixed.
+        log_error "Hook modules failed to import — hooks will error at runtime:"
+        printf '%s\n' "$_smoke_err" | sed 's/^/    /'
+        HOOK_IMPORT_FAILED=true
     fi
 fi
 
@@ -4348,5 +4434,11 @@ if [[ ${#FAILED_FEATURES[@]} -gt 0 ]]; then
         local_title="$($local_title_fn 2>/dev/null || echo "$fid")"
         echo "  - $fid: $local_title"
     done
+    exit 1
+fi
+
+# A module that will not import is a hook that tracebacks on every fire, so the
+# install did not succeed even if every feature step reported OK.
+if [[ "$HOOK_IMPORT_FAILED" == true ]]; then
     exit 1
 fi

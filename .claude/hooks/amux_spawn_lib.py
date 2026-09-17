@@ -30,7 +30,12 @@ import re
 import shutil
 import subprocess
 import tempfile
-import tomllib  # Python 3.11+ stdlib
+
+try:
+    import tomllib  # Python 3.11+ stdlib
+except ImportError:  # pragma: no cover - exercised only on Python 3.9/3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path

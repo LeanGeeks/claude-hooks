@@ -11,7 +11,12 @@ Config file: ``~/.config/claude-tg-relay/config.toml``.
 from __future__ import annotations
 
 import time
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+ stdlib
+except ImportError:  # pragma: no cover - exercised only on Python 3.9/3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 import uuid
 from dataclasses import dataclass
 from pathlib import Path

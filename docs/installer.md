@@ -9,14 +9,57 @@ can replay it.
 
 ## Table of contents
 
-1. [Feature inventory](#feature-inventory)
-2. [Sub-toggles](#sub-toggles)
-3. [The tri-state model](#the-tri-state-model)
-4. [The manifest](#the-manifest)
-5. [CLI reference](#cli-reference)
-6. [enable / disable subcommands](#enable--disable-subcommands)
-7. [Uninstall](#uninstall)
-8. [CLAUDE_INSTALL_NO_EXTERNAL seam](#claude_install_no_external-seam)
+1. [Prerequisites](#prerequisites)
+2. [Feature inventory](#feature-inventory)
+3. [Sub-toggles](#sub-toggles)
+4. [The tri-state model](#the-tri-state-model)
+5. [The manifest](#the-manifest)
+6. [CLI reference](#cli-reference)
+7. [enable / disable subcommands](#enable--disable-subcommands)
+8. [Uninstall](#uninstall)
+9. [CLAUDE_INSTALL_NO_EXTERNAL seam](#claude_install_no_external-seam)
+
+---
+
+## Prerequisites
+
+`_check_dependencies` enforces these before any feature runs, and exits 1 with
+an actionable message if one is missing. `--probe` and `--list` run before the
+check, so they still work on an unsupported interpreter.
+
+| Requirement | Why |
+| --- | --- |
+| `jq` | settings.json merging |
+| `python3` >= 3.9 | the floor the hook modules are written to (`MIN_PYTHON_MINOR` in install.sh) |
+| a TOML parser | stdlib `tomllib` on 3.11+, otherwise the `tomli` backport |
+| `uv` (optional) | only the context-usage and permissions MCP servers |
+
+### Which python3?
+
+Hooks are wired into `settings.json` as bare `python3 <path>`, so Claude Code
+resolves the interpreter through `PATH` at hook-fire time. That is the
+interpreter the installer checks — **a pyenv, conda, or venv shim on `PATH` is
+what counts**, not `/usr/bin/python3`. A stock Ubuntu 22.04 `python3` is 3.10
+and needs the backport:
+
+```bash
+sudo apt install python3-tomli      # or: python3 -m pip install --user tomli
+```
+
+`tomllib` only entered the stdlib in 3.11. Every hook that reads a `.toml`
+config (profiles, roles, questions, relay) imports it at module scope, and an
+import-time failure takes down the *entire* hook — including the parts that
+never touch TOML — surfacing as a raw traceback in the user's session. The
+modules fall back to `tomli` on 3.9/3.10, and the gate above makes a missing
+parser an install-time error instead of a runtime one.
+
+After installing, the closing "Testing hook installation..." step imports every
+module *this run* copied into `~/.claude/hooks/` — both the ones a feature
+install shipped and the ones the module closure refreshed — and reports any that
+fail. It deliberately does not glob the directory, which would also pick up
+stale or user-authored files the installer does not own. A failure there is
+fatal and exits 1: those hooks are already wired into `settings.json` and will
+traceback on every fire.
 
 ---
 

@@ -57,7 +57,12 @@ import fcntl
 import os
 import re
 import tempfile
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+ stdlib
+except ImportError:  # pragma: no cover - exercised only on Python 3.9/3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone

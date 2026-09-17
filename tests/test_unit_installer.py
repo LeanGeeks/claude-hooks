@@ -2011,7 +2011,7 @@ class TestRefcountMatrix(InstallerTestBase):
         "permission_state_store.py": ("permission-hooks", "telegram"),  # also amux, test two
         "project_key.py": ("permission-hooks", "telegram"),
         "roles_config.py": ("telegram", "questions"),
-        "amux_spawn_lib.py": ("amux", "profiles"),
+        "amux_spawn_lib.py": ("amux", "profiles"),  # also telegram, test two
         # settings_writer.py is telegram-only, not shared
     }
 
@@ -4836,6 +4836,146 @@ class TestLauncherDirtyTree(unittest.TestCase):
             "Clean tree must not produce a propagation-withheld warning",
         )
         self.assertTrue(called.exists(), "Launcher must call amux-spawn on clean tree")
+
+
+def _parse_features() -> list:
+    """The FEATURES array from install.sh, in registry order."""
+    m = _re.search(r"^FEATURES=\(\n(.*?)^\)$", INSTALL_SH.read_text(),
+                   _re.MULTILINE | _re.DOTALL)
+    assert m, "FEATURES array not found in install.sh"
+    return m.group(1).split()
+
+
+def _parse_feature_module_lists() -> dict:
+    """Parse `feature_<id>_modules() { echo "a.py b.py" }` out of install.sh.
+
+    Keys are real feature ids: the shell function names spell hyphens as
+    underscores (`feature_${id//-/_}_modules`), so they are mapped back through
+    FEATURES.
+    """
+    pattern = _re.compile(
+        r'feature_(\w+)_modules\(\)\s*\{?\s*\n?(?:\s*#[^\n]*\n)*\s*echo "([^"]*)"'
+    )
+    by_shell_name = {fid.replace("-", "_"): fid for fid in _parse_features()}
+    found = {
+        by_shell_name.get(name, name): mods.split()
+        for name, mods in pattern.findall(INSTALL_SH.read_text())
+    }
+    assert found, "no feature_<id>_modules definitions parsed"
+    return found
+
+
+def _parse_module_owners() -> dict:
+    """Parse `declare -A MODULE_OWNERS=( [mod.py]="a b" ... )` out of install.sh."""
+    block = _re.search(r"declare -A MODULE_OWNERS=\((.*?)\n\)",
+                       INSTALL_SH.read_text(), _re.DOTALL)
+    assert block, "MODULE_OWNERS not found in install.sh"
+    owners = dict(
+        (mod, ids.split())
+        for mod, ids in _re.findall(r'\[([^\]]+)\]="([^"]*)"', block.group(1))
+    )
+    assert owners, "MODULE_OWNERS parsed empty"
+    return owners
+
+
+class TestModuleOwnersMatchFeatureLists(unittest.TestCase):
+    """
+    MODULE_OWNERS must agree with the feature_<id>_modules lists.
+
+    Closure install reads feature_<id>_modules; refcounted uninstall reads
+    MODULE_OWNERS. Nothing in install.sh ties the two together, so they can
+    drift silently -- and did: telegram started shipping amux_spawn_lib.py for
+    notification_hook.py while MODULE_OWNERS still listed only "amux profiles".
+    With just permission-hooks+telegram installed, `--uninstall amux` then
+    deleted a module notification_hook.py imports unconditionally, and the
+    Notification hook tracebacked on every fire.
+    """
+
+    def test_owners_are_exactly_the_features_that_ship_the_module(self):
+        declared = _parse_module_owners()
+        derived = {}
+        for feature, modules in _parse_feature_module_lists().items():
+            for mod in modules:
+                derived.setdefault(mod, set()).add(feature)
+
+        problems = []
+        for mod, features in sorted(derived.items()):
+            listed = set(declared.get(mod, []))
+            if listed != features:
+                problems.append(
+                    f"{mod}: ships with {sorted(features)}, "
+                    f"MODULE_OWNERS says {sorted(listed)}"
+                )
+        self.assertEqual(
+            problems, [],
+            "MODULE_OWNERS has drifted from the feature module lists; "
+            "uninstall will delete modules a still-installed feature imports:\n  "
+            + "\n  ".join(problems),
+        )
+
+
+class TestFeatureModuleClosure(unittest.TestCase):
+    """
+    Every feature_<id>_modules list must be import-closed.
+
+    A feature installs a fixed set of .py files into ~/.claude/hooks. If one of
+    them imports a sibling the list does not ship, the hook is wired into
+    settings.json but tracebacks on every fire -- the user sees ModuleNotFound,
+    not a disabled feature. `--only telegram` shipped notification_hook.py
+    without amux_spawn_lib.py (which it needs for lib.read_handle) exactly this
+    way, so the check is a real regression guard, not a formality.
+
+    Each list is staged into a temp dir on its own and every module imported.
+    """
+
+    def setUp(self):
+        self.assertIn(
+            "CLAUDE_INSTALL_NO_EXTERNAL",
+            os.environ,
+            "Tests must run with CLAUDE_INSTALL_NO_EXTERNAL=1",
+        )
+        self.hooks_dir = REPO / ".claude" / "hooks"
+
+    def test_every_feature_module_list_is_import_closed(self):
+        import sys
+
+        failures = []
+        for feature, modules in sorted(_parse_feature_module_lists().items()):
+            if not modules:
+                continue
+            staged = Path(tempfile.mkdtemp(prefix=f"closure-{feature}-"))
+            try:
+                for mod in modules:
+                    source = self.hooks_dir / mod
+                    self.assertTrue(source.is_file(), f"{feature}: missing {mod}")
+                    shutil.copy(str(source), str(staged / mod))
+
+                script = (
+                    "import importlib, pathlib, sys\n"
+                    "d = pathlib.Path(sys.argv[1])\n"
+                    "sys.path.insert(0, str(d))\n"
+                    "bad = []\n"
+                    "for n in sorted(p.stem for p in d.glob('*.py')):\n"
+                    "    try:\n"
+                    "        importlib.import_module(n)\n"
+                    "    except BaseException as exc:\n"
+                    "        bad.append('%s: %s: %s' % (n, type(exc).__name__, exc))\n"
+                    "print('\\n'.join(bad))\n"
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(staged)],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.stdout.strip():
+                    failures.append(f"{feature}:\n    " + result.stdout.strip())
+            finally:
+                shutil.rmtree(str(staged), ignore_errors=True)
+
+        self.assertEqual(
+            failures, [],
+            "feature module lists that cannot import standalone:\n"
+            + "\n".join(failures),
+        )
 
 
 if __name__ == "__main__":

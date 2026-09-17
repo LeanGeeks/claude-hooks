@@ -13,7 +13,12 @@ overkill for half a dozen scalar fields.
 from __future__ import annotations
 
 import os
-import tomllib
+
+try:
+    import tomllib  # Python 3.11+ stdlib
+except ImportError:  # pragma: no cover - exercised only on Python 3.9/3.10
+    import tomli as tomllib  # type: ignore[no-redef]
+
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any

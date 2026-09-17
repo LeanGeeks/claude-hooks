@@ -60,6 +60,8 @@ Registered user-global by ``install.sh`` so it fires in any
 workspace (D-Hooks / spike Q7).
 """
 
+from __future__ import annotations
+
 import json
 import os
 import sys

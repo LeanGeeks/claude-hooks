@@ -38,6 +38,7 @@ os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")
 # Test modules
 TEST_MODULES = {
     "unit_installer": "test_unit_installer",
+    "unit_python_compat": "test_unit_python_compat",
     "installer_migration": "test_installer_migration",
     "unit_decision": "test_unit_decision_mapper",
     "unit_state": "test_unit_state_store",
