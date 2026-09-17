@@ -1267,16 +1267,50 @@ def cache_state(last_activity: Optional[float], ttl: Optional[int],
     return "warm", format_cache_age(remaining), ("33" if remaining < warn_at else "32")
 
 
+_TTL_SECONDS = {"5m": _CACHE_TTL_5M, "1h": _CACHE_TTL_1H}
+
+
+def cache_state_from_payload(prompt_cache, now_epoch: Optional[float] = None) -> Optional[tuple]:
+    """(word, duration, colour) from Claude Code's own prompt-cache block.
+
+    The status line payload carries `prompt_cache` for the main conversation
+    once the first response lands: the harness's own ledger of what the last
+    request wrote, including the TTL it asked for and when the prefix goes
+    cold. That beats reading the transcript back, so it is tried first — and
+    its `warm` knows something the transcript cannot show, that the last
+    response reported no cache tokens at all.
+
+    Returns None when the block is absent or carries no clock, leaving the
+    caller to fall back to the transcript.
+    """
+    if not isinstance(prompt_cache, dict):
+        return None
+    expires_at = prompt_cache.get("expires_at")
+    ttl = _TTL_SECONDS.get(prompt_cache.get("ttl"))
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool) or ttl is None:
+        return None
+    now = time.time() if now_epoch is None else now_epoch
+    last_activity = expires_at - ttl
+    state = cache_state(last_activity, ttl, now)
+    if state and state[0] == "warm" and prompt_cache.get("warm") is False:
+        # The harness says the prefix is gone; its word beats our arithmetic.
+        return "cold", format_cache_age(now - last_activity), "2"
+    return state
+
+
 def format_cache_segment(status_input: dict) -> list:
     """['warm 58m'] / ['cold 2h15m'] / ['idle 12m'] — this session's cache life."""
-    path = status_input.get("transcript_path")
-    if not isinstance(path, str):
-        return []
-    ttl, recorded = read_cache_ttl(path)
-    if ttl is None and not recorded:
-        # A session that has not called the API yet has no cache to report on.
-        return []
-    state = cache_state(last_activity_epoch(path), ttl)
+    state = cache_state_from_payload(status_input.get("prompt_cache"))
+    if state is None:
+        # Older Claude Code, or a provider the ledger records no lifetime for.
+        path = status_input.get("transcript_path")
+        if not isinstance(path, str):
+            return []
+        ttl, recorded = read_cache_ttl(path)
+        if ttl is None and not recorded:
+            # A session that has not called the API yet has no cache to report.
+            return []
+        state = cache_state(last_activity_epoch(path), ttl)
     return [f"{state[0]} {state[1]}"] if state else []
 
 
@@ -1344,6 +1378,10 @@ def _build_diagnostic_record(status_input: dict, env: StatusEnvironment) -> dict
     # current_usage may be null, int, or dict depending on Claude Code version
     current_usage = ctx.get("current_usage")
 
+    prompt_cache = status_input.get("prompt_cache")
+    if not isinstance(prompt_cache, dict):
+        prompt_cache = None
+
     return {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "session_key": session_key,
@@ -1357,6 +1395,13 @@ def _build_diagnostic_record(status_input: dict, env: StatusEnvironment) -> dict
         },
         "cost": {
             "total_cost_usd": cost_usd,
+        },
+        # Which source answered the cache cell: the harness's own ledger, or the
+        # transcript fallback. Counts and token totals are left out; whether the
+        # block arrived is the question a diagnostic run is asking.
+        "prompt_cache": {
+            "present": prompt_cache is not None,
+            "ttl": (prompt_cache or {}).get("ttl"),
         },
     }
 

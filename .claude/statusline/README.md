@@ -195,6 +195,15 @@ echo '{"model":{"display_name":"GLM-4.7"},"context_window":{"used_percentage":58
 CC_STATUS_DEBUG=1 echo '{"context_window":{"used_percentage":42}}' | python3 statusline.py
 ```
 
+`CC_STATUS_DIAGNOSTIC=1` appends a sanitized record per render under
+`~/.cache/claude-statusline/diagnostics/`. Its `prompt_cache` entry answers which source
+fed the cache cell in a real session — `{"present": true, "ttl": "1h"}` means the harness
+published its own ledger and the transcript was never read:
+
+```bash
+jq -c .prompt_cache ~/.cache/claude-statusline/diagnostics/*.jsonl | tail -3
+```
+
 ## Manual testing
 
 ```bash
@@ -447,19 +456,37 @@ The payload has no cost, `agentType` (only the derived `name`), tool-use count, 
 tool name, queued-message count, backgrounded/idle flags, `endTime` or spawn depth. The
 default row's `N queued` counter cannot be reproduced. Claude Code 2.1.274 does send
 `type`, `cwd` and `tokenSamples` (a 16-deep ring buffer of `tokenCount`, one sample per
-tick — about 80 s of history), none of which this script uses.
+tick — about 80 s of history), none of which this script uses. `prompt_cache` is not
+among them either: that block covers the main conversation only, which is why agent rows
+derive cache freshness from transcripts instead.
 
 ## Prompt cache freshness
 
-Neither payload carries a timestamp for the last API call, so both scripts read it off
-the transcripts on disk:
+The main line asks Claude Code, which publishes its own ledger; the subagent rows have
+no such field and read the transcripts on disk.
+
+**Main line — `prompt_cache` in the payload.** Present once the first response lands
+(`pqo()` in the 2.1.274 bundle, documented in the statusLine stdin schema):
+
+| Field | Used for |
+|---|---|
+| `expires_at` | Unix seconds when the prefix goes cold — counted down directly. |
+| `ttl` | `"5m"` / `"1h"`, the TTL the last request wrote. With `expires_at` it also gives the last call's time, which is what a cold cell reports. |
+| `warm` | Whether the prefix is live *now*. It knows one thing the transcript cannot show — that the last response reported no cache tokens — so when it says cold, it wins over the arithmetic. |
+| `caching_observed` | False means caching is off or unreported; `expires_at` is null and the transcript fallback takes over. |
+
+`misses`, `hit_ratio`, `expected_rebuilds` and `last_miss_cause` (`system_prompt_changed`,
+`tools_changed`, `ttl_expired_5m`, …) ride along in the same block, unused so far — the
+obvious next segment if "what broke the cache" is ever worth a cell.
+
+**Subagent rows, and any payload without that block, fall back to the transcripts:**
 
 - Each subagent appends to `<project>/<session>/subagents/agent-<id>.jsonl` as it works
   (`tasks[].id` *is* the agent id), and the main session to `<project>/<session>.jsonl`,
   which arrives in both payloads as `transcript_path`. Claude Code writes both live —
   file mtime tracks the last entry to within ~100 ms — so one `stat()` per row is the
   whole clock.
-- The TTL is read back from the last recorded `usage`, never assumed: a non-zero
+- The TTL is then read back from the last recorded `usage`, never assumed: a non-zero
   `cache_creation.ephemeral_1h_input_tokens` means the 1h window, `ephemeral_5m` the 5m
   one. It is not a constant — 1h applies to allowlisted *query sources* on a
   subscription, drops back to 5m in overage, and an agent can be handed its own
@@ -507,6 +534,6 @@ Later tasks should extend `statusline.py` without replacing it:
 - **Task 06-03e** ✓ — review and hardening pass: dedupe / suppression / unknown-pricing / state-file-safety / no-network / no-git-output verified in `test_hardening.py`; cost display contract documented above
 
 - **Per-subagent status line** ✓ — `subagent.py` decorates agent-panel rows with model, effort, context and elapsed time; `statusline.py` gained `effort` / `agent` segments and publishes the session effort for it to inherit. Tests in `test_subagent.py`.
-- **Prompt cache freshness** ✓ — both lines report how much prompt-cache life is left (`warm 58m` / `cold 2h15m`, or `idle 12m` where the provider reports no TTL), read from transcript mtime plus the TTL recorded in the last `usage`. Shared helpers (`detect_cache_ttl()`, `last_activity_epoch()`, `cache_state()`) live in `statusline.py`; tests in `test_cache_freshness.py`.
+- **Prompt cache freshness** ✓ — both lines report how much prompt-cache life is left (`warm 58m` / `cold 2h15m`, or `idle 12m` where the provider reports no TTL). The main line counts down the harness's own `prompt_cache.expires_at`; agent rows, which get no such field, derive it from transcript mtime plus the TTL recorded in the last `usage`. Shared helpers (`detect_cache_ttl()`, `last_activity_epoch()`, `cache_state()`) live in `statusline.py`; tests in `test_cache_freshness.py`.
 
 The `detect_environment()` / `render_status_line()` split keeps provider detection stable while allowing segment formatters to evolve independently. `subagent.py` reuses `_normalize_model_name()` and `_infer_provider_billing()` rather than duplicating provider logic.

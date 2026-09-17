@@ -13,6 +13,8 @@ pin that down:
   id that is not an id is never turned into a path.
 - An agent with no usage of its own inherits the session's TTL.
 - Nothing known anywhere means no column at all, not an empty one.
+- The main line prefers the harness's own `prompt_cache` block and only reads the
+  transcript when that is absent or carries no clock.
 
 Run: python3 .claude/statusline/test_cache_freshness.py -v
 """
@@ -351,6 +353,78 @@ class RowRenderingTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("warm", result.stdout)
         self.assertNotIn("cold", result.stdout)
+
+
+class PayloadPromptCacheTest(unittest.TestCase):
+    """The harness publishes its own ledger; the main line prefers it."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.project = os.path.join(self.home, ".claude", "projects", "-repo")
+        self.transcript = os.path.join(self.project, f"{SESSION}.jsonl")
+
+    def render(self, status_input: dict) -> str:
+        result = subprocess.run(
+            [sys.executable, STATUSLINE], input=json.dumps(status_input),
+            env={"PATH": "", "HOME": self.home}, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def payload(self, prompt_cache=None, **overrides):
+        base = {"session_id": SESSION, "transcript_path": self.transcript,
+                "model": {"id": "claude-opus-5", "display_name": "Opus"},
+                "context_window": {"used_percentage": 61}}
+        if prompt_cache is not None:
+            base["prompt_cache"] = prompt_cache
+        base.update(overrides)
+        return base
+
+    def block(self, **overrides):
+        base = {"warm": True, "caching_observed": True, "ttl": "1h",
+                "expires_at": int(time.time() + 3510), "requests": 12}
+        base.update(overrides)
+        return base
+
+    def test_expires_at_is_counted_down_directly(self):
+        self.assertEqual(self.render(self.payload(self.block())),
+                         "Opus | ctx 61% | warm 58m")
+
+    def test_a_lapsed_window_reports_how_long_it_has_been_cold(self):
+        # The window opened at expires_at - ttl, which is the last call.
+        self.assertEqual(
+            self.render(self.payload(self.block(warm=False, ttl="5m",
+                                                expires_at=int(time.time() - 7800)))),
+            "Opus | ctx 61% | cold 2h15m")
+
+    def test_the_harness_word_beats_our_arithmetic(self):
+        # A future expires_at with warm=false means the prefix is gone anyway.
+        self.assertIn("cold", self.render(self.payload(self.block(warm=False))))
+
+    def test_the_block_is_preferred_over_the_transcript(self):
+        # The transcript would say the 1h window has 57m left; the ledger says
+        # 4m. Whoever wrote the request is right.
+        write(self.transcript, [usage_line(ephemeral_1h=954)], age_seconds=130)
+        self.assertEqual(
+            self.render(self.payload(self.block(ttl="5m", expires_at=int(time.time() + 280)))),
+            "Opus | ctx 61% | warm 4m")
+
+    def test_a_block_without_a_clock_falls_back_to_the_transcript(self):
+        # caching_observed false leaves expires_at null — nothing to count down.
+        write(self.transcript, [usage_line(ephemeral_1h=954)], age_seconds=130)
+        self.assertEqual(
+            self.render(self.payload(self.block(warm=False, caching_observed=False,
+                                                expires_at=None))),
+            "Opus | ctx 61% | warm 57m")
+
+    def test_a_malformed_block_falls_back_instead_of_failing(self):
+        write(self.transcript, [usage_line(ephemeral_1h=954)], age_seconds=130)
+        for bad in ("nonsense", [], {"ttl": "1h"}, {"expires_at": "soon", "ttl": "1h"},
+                    {"expires_at": True, "ttl": "1h"}, {"expires_at": 1, "ttl": "7d"}):
+            self.assertRegex(self.render(self.payload(bad)),
+                             r"^Opus \| ctx 61% \| warm \d+m$", bad)
+
+    def test_no_block_and_no_transcript_means_no_segment(self):
+        self.assertEqual(self.render(self.payload()), "Opus | ctx 61%")
 
 
 class MainStatusLineTest(unittest.TestCase):
