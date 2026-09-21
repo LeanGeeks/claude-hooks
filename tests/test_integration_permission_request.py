@@ -33,6 +33,7 @@ from permission_state_store import (  # noqa: E402
     PermissionRequest,
     RequestState,
     RESOLUTION_SOURCE_BYPASS,
+    RESOLUTION_SOURCE_TELEGRAM,
     create_request,
     get_request,
 )
@@ -78,6 +79,67 @@ class TestBuildOutputDecision(unittest.TestCase):
             out = build_output_decision({"action": "yolo"}, req)
         self.assertEqual(out["hookSpecificOutput"]["decision"]["behavior"], "allow")
         mock_enable.assert_called_once_with(req.session_id)
+
+    def test_yolo_carries_setmode_bypass_permissions(self):
+        """40-03 (b): the tap promotes the session to the native mode.
+
+        The allow decision must carry exactly the ``setMode`` update the
+        harness documents — a session-scoped move to ``bypassPermissions``.
+        Without it the terminal's indicator keeps saying "manual mode" while
+        the store flag auto-allows.
+        """
+        req = _make_request()
+        with patch("permission_request_hook.session_yolo_store.enable"):
+            out = build_output_decision({"action": "yolo"}, req)
+        self.assertEqual(
+            out["hookSpecificOutput"]["decision"]["updatedPermissions"],
+            [{"type": "setMode",
+              "mode": "bypassPermissions",
+              "destination": "session"}],
+        )
+
+    def test_yolo_payload_survives_json_roundtrip(self):
+        """The exact JSON the hook prints to stdout, round-tripped."""
+        req = _make_request()
+        with patch("permission_request_hook.session_yolo_store.enable"):
+            out = build_output_decision({"action": "yolo"}, req)
+        emitted = json.loads(json.dumps(out))
+        self.assertEqual(emitted, {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "allow",
+                    "updatedPermissions": [
+                        {"type": "setMode",
+                         "mode": "bypassPermissions",
+                         "destination": "session"}
+                    ],
+                },
+            }
+        })
+
+    def test_yolo_without_request_still_emits_the_mode_update(self):
+        """``request is None`` skips the store but must not lose the setMode.
+
+        The AskUserQuestion branch calls ``build_output_decision(.., request=None)``;
+        the store call is guarded on the request, the payload is not.
+        """
+        out = build_output_decision({"action": "yolo"}, None)
+        self.assertEqual(
+            out["hookSpecificOutput"]["decision"]["updatedPermissions"],
+            [{"type": "setMode",
+              "mode": "bypassPermissions",
+              "destination": "session"}],
+        )
+
+    def test_other_actions_carry_no_mode_update(self):
+        """Guard: only ``yolo`` moves the session's mode."""
+        for action in ("allow", "deny", "stop"):
+            out = build_output_decision({"action": action}, _make_request())
+            self.assertNotIn(
+                "updatedPermissions", out["hookSpecificOutput"]["decision"],
+                f"{action} must not carry updatedPermissions",
+            )
 
     def test_reply(self):
         out = build_output_decision(
@@ -5202,6 +5264,104 @@ class TestLocalModeAutoAllow(unittest.TestCase):
             any("relay-client config init" in m for m in logged),
             f"expected relay config advice, got: {logged}",
         )
+
+
+class TestYoloStoreFallbackStillAutoAllows(unittest.TestCase):
+    """40-03 (b): the store branch stays as the fallback for a stripped update.
+
+    The harness strips permission updates for tools that declare
+    ``suppressesAllPermissionUpdates`` / ``suppressesAlwaysAllowRule``, so the
+    ``setMode`` riding on a YOLO tap can silently do nothing. When that
+    happens the store flag is the only thing left: the top of ``main()`` must
+    still auto-allow without sending a Telegram message.
+    """
+
+    def _run_main(self, payload, *, store_enabled):
+        """Drive main() with the store consulted; return (code, printed, mocks)."""
+        request = _make_request(
+            request_id="yolo-req",
+            session_id=payload["session_id"],
+            tool_input=payload["tool_input"],
+        )
+        printed = []
+
+        def _enable():
+            permission_request_hook.telegram_router.TELEGRAM_ENABLED = True
+
+        _prior_enabled = permission_request_hook.telegram_router.TELEGRAM_ENABLED
+        try:
+            with patch("permission_request_hook.cleanup_expired_requests"), \
+                    patch("permission_request_hook.sweep_orphaned_requests", return_value=[]), \
+                    patch("permission_request_hook.session_yolo_store.prune"), \
+                    patch("permission_request_hook.session_yolo_store.is_enabled",
+                          return_value=store_enabled) as mock_is_enabled, \
+                    patch("permission_request_hook.create_request",
+                          return_value=request), \
+                    patch("permission_request_hook.update_request_state") as mock_update, \
+                    patch("permission_request_hook.send_permission_message",
+                          return_value=12345) as mock_send, \
+                    patch("permission_request_hook.wait_for_response",
+                          return_value={"action": "deny"}), \
+                    patch("permission_request_hook.time.sleep"), \
+                    patch("permission_request_hook.load_telegram_config", side_effect=_enable), \
+                    patch("sys.stdin", io.StringIO(json.dumps(payload))), \
+                    patch("builtins.print",
+                          side_effect=lambda *a, **kw: printed.append(a[0] if a else "")):
+                with self.assertRaises(SystemExit) as ctx:
+                    permission_request_hook.main()
+        finally:
+            # ``_enable`` mutates a module global; leave it as it was found.
+            permission_request_hook.telegram_router.TELEGRAM_ENABLED = _prior_enabled
+
+        return ctx.exception.code, printed, {
+            "update": mock_update,
+            "send": mock_send,
+            "is_enabled": mock_is_enabled,
+        }
+
+    @staticmethod
+    def _payload(**overrides):
+        base = {
+            "session_id": "yolo-session",
+            "cwd": "/tmp/workspace",
+            "tool_name": "Bash",
+            "tool_input": {"command": "echo hello"},
+            "permission_suggestions": [],
+            # A YOLO tap did NOT reach the harness' mode — the update was
+            # stripped — so the payload still reports the original mode.
+            "permission_mode": "default",
+        }
+        base.update(overrides)
+        return base
+
+    def test_store_flag_auto_allows_without_prompting(self):
+        code, printed, mocks = self._run_main(self._payload(), store_enabled=True)
+
+        self.assertEqual(code, 0)
+        mocks["is_enabled"].assert_called_once_with("yolo-session")
+        mocks["send"].assert_not_called()
+        output = json.loads(printed[-1])
+        self.assertEqual(
+            output["hookSpecificOutput"]["decision"]["behavior"], "allow",
+        )
+        # The store branch's allow must NOT carry a setMode: it fires on a
+        # later request, by which time the accepted update (if any) has already
+        # been applied, and re-sending it would be redundant.
+        self.assertNotIn(
+            "updatedPermissions", output["hookSpecificOutput"]["decision"],
+        )
+        mocks["update"].assert_called_once()
+        args, kwargs = mocks["update"].call_args
+        self.assertEqual(args[0], "yolo-req")
+        self.assertEqual(args[1], RequestState.ALLOW)
+        self.assertEqual(kwargs["decision"], {"action": "yolo"})
+        self.assertEqual(kwargs["resolution_source"], RESOLUTION_SOURCE_TELEGRAM)
+
+    def test_store_flag_off_still_prompts(self):
+        """Guard: the fallback is the store, not "allow everything"."""
+        _code, _printed, mocks = self._run_main(self._payload(), store_enabled=False)
+
+        mocks["send"].assert_called_once()
 
 
 if __name__ == "__main__":

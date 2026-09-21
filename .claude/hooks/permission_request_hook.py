@@ -21,9 +21,14 @@ Action mappings:
 - allow     -> behavior: "allow"
 - deny      -> behavior: "deny"
 - stop      -> behavior: "deny" + interrupt: true
-- whitelist -> behavior: "allow" + updatedPermissions
+- yolo      -> behavior: "allow" + updatedPermissions (setMode
+               bypassPermissions, session), and flags the session in
+               ``session_yolo_store`` as the fallback
 - reply     -> behavior: "deny" + message (text reply from user)
 - resolved_terminal -> exit without decision (terminal handles it)
+- whitelist -> *not* a decision this hook builds; it has its own writer path
+               (settings files, ``process_whitelist_update``) and falls through
+               to the terminal like any unknown action
 """
 
 import json
@@ -349,10 +354,24 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
         }
 
     elif action == 'yolo':
-        # Allow this request AND flag the session so every subsequent request
-        # auto-allows without prompting (consulted at the top of main()). The
-        # flag is keyed by session_id, which lives on the request — the relay
-        # has no session concept, so this can only happen here in the hook.
+        # Allow this request AND put the session itself into
+        # `bypassPermissions` via `setMode` (epic 40, task 40-03 option (b)).
+        # That is what makes the terminal's mode indicator tell the truth and
+        # stops the auto-mode classifier refusing a call outright — a refusal
+        # raises no prompt, so this hook is never consulted and the store flag
+        # alone could not rescue it.
+        #
+        # The store stays as the *fallback*: the harness strips permission
+        # updates for tools that declare `suppressesAllPermissionUpdates` /
+        # `suppressesAlwaysAllowRule`, so the `setMode` can silently do nothing.
+        # `session_yolo_store.enable` is what still auto-allows in that case
+        # (consulted at the top of main()). It is also the only half that
+        # `/yolo` can apply — a slash command has no permission request in
+        # flight, so only a Telegram tap can carry a `setMode`.
+        #
+        # The flag is keyed by session_id, which lives on the request — the
+        # relay has no session concept, so this can only happen here in the
+        # hook.
         if request is not None:
             session_yolo_store.enable(request.session_id)
             debug_log(f"YOLO enabled for session {request.session_id}")
@@ -360,7 +379,14 @@ def build_output_decision(decision: Optional[Dict[str, Any]], request: Permissio
             'hookSpecificOutput': {
                 'hookEventName': 'PermissionRequest',
                 'decision': {
-                    'behavior': 'allow'
+                    'behavior': 'allow',
+                    'updatedPermissions': [
+                        {
+                            'type': 'setMode',
+                            'mode': 'bypassPermissions',
+                            'destination': 'session',
+                        }
+                    ],
                 }
             }
         }
