@@ -27,8 +27,8 @@ that describe this hook.
 |---|------|--------|------------|-------|
 | 40-01 | [Pretool defers to the mode](./40-01-pretool-defers-to-the-mode_sonnet.md) | done (cf2fe7b) | — | **The fix.** One emission site, one additive field, one log-path correction. Ship this even if nothing else lands. |
 | 40-02 | [The card names the asker](./40-02-the-card-names-the-asker.md) | done (79c4857) | 40-01 | Records `permission_mode` on the row, stops the card claiming the allowlist raised a prompt it did not raise (brd H4), updates the docs. |
-| 40-03 | [YOLO on the native mode](./40-03-yolo-native-mode.md) | in_progress | 40-01 | **Operator answered (b) 2026-09-21** — promote YOLO to the native `setMode: bypassPermissions`. Sonnet implementer, §4(b) scope. `/yolo-off` becomes keyboard-only; `.claude/commands/yolo-off.md` must say so. |
-| 40-04 | [Live verification](./40-04-live-verification_human.md) | todo | 40-01 + 40-02 installed | **human** — six modes, and it answers brd H8. |
+| 40-03 | [YOLO on the native mode](./40-03-yolo-native-mode.md) | done (e3b4c4e) | 40-01 | **Operator answered (b) 2026-09-21** — promote YOLO to the native `setMode: bypassPermissions`. Sonnet implementer, §4(b) scope. `/yolo-off` becomes keyboard-only; `.claude/commands/yolo-off.md` must say so. |
+| 40-04 | [Live verification](./40-04-live-verification_human.md) | **blocked — awaiting human** | 40-01 + 40-02 installed | **human** — six modes, and it answers brd H8. Install ran 2026-09-21 (`--yes`, md5-verified live for pretool/permission_request/router/yolo/yolo-off), so the gate is satisfied. |
 
 ## Dependency graph
 
