@@ -704,6 +704,97 @@ class TestRoleField(unittest.TestCase):
         self.assertFalse(hasattr(loaded, "a_field_from_the_future"))
 
 
+class TestPermissionModeField(unittest.TestCase):
+    """``PermissionRequest.permission_mode`` — the session's mode at request
+    time. Additive (epic 40, task 40-02): the Telegram card and the MCP summary
+    read it to say who raised a prompt, and the daily reviewer uses it to tell
+    an auto-mode prompt from a default-mode one."""
+
+    def test_create_request_defaults_permission_mode_to_none(self):
+        request = create_request(
+            session_id="test-mode-default",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+        )
+        self.assertIsNone(request.permission_mode)
+        self.assertIsNone(get_request(request.request_id).permission_mode)
+
+    def test_permission_mode_round_trips_through_the_jsonl_store(self):
+        request = create_request(
+            session_id="test-mode-roundtrip",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+            permission_mode="auto",
+        )
+        self.assertEqual(request.permission_mode, "auto")
+        self.assertEqual(request.to_dict()["permission_mode"], "auto")
+
+        loaded = get_request(request.request_id)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.permission_mode, "auto")
+
+    def test_row_written_before_this_change_loads_with_permission_mode_none(self):
+        """Rows persisted before ``permission_mode`` existed must deserialize
+        unchanged — 94 of the last 416 requests were ``default`` and their rows
+        carry no such key at all."""
+        legacy = {
+            "request_id": "legacy-row-no-mode",
+            "session_id": "legacy-session",
+            "cwd": "/test",
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "permission_suggestions": [],
+            "state": "pending",
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+            "expires_at": _expires_at(600),
+            "telegram_message_id": None,
+            "decision": None,
+            "reply_text": None,
+            "actor_user_id": None,
+            "resolution_source": None,
+            "resolved_at": None,
+            "expired_notified_at": None,
+            "agent_id": None,
+        }
+        self.assertNotIn("permission_mode", legacy)
+
+        # Straight from_dict, and through the JSONL store.
+        self.assertIsNone(PermissionRequest.from_dict(legacy).permission_mode)
+
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(STATE_FILE, "a") as f:
+            f.write(json.dumps(legacy) + "\n")
+
+        loaded = get_request("legacy-row-no-mode")
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.permission_mode)
+        self.assertEqual(loaded.tool_name, "Bash")
+
+    def test_update_request_state_preserves_the_recorded_mode(self):
+        """The mode is written once at creation and survives a state update —
+        the card is re-rendered from the row after the decision, so dropping it
+        there would lose the annotation mid-flight."""
+        request = create_request(
+            session_id="test-mode-survives-update",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "ls"},
+            permission_suggestions=[],
+            ttl_seconds=60,
+            permission_mode="bypassPermissions",
+        )
+        updated = update_request_state(request.request_id, RequestState.ALLOW)
+        self.assertIsNotNone(updated)
+        self.assertEqual(updated.permission_mode, "bypassPermissions")
+
+
 class TestSweepOrphanedRequests(unittest.TestCase):
     """Epic 26 layer 2: sweep_orphaned_requests and owner-identity stamping.
 

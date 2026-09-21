@@ -29,6 +29,7 @@ import json
 import os
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -374,34 +375,78 @@ def _format_command_summary(tool_name: str, tool_input: Dict[str, Any]) -> str:
     return "\n".join(result_lines)
 
 
-def _unallowlisted_bash_parts(
-    request: PermissionRequest,
-) -> tuple[list[str], list[str], list[str]]:
-    """Return ``(denied, unknown, asked)`` sub-commands for a Bash permission request.
+@dataclass(frozen=True)
+class BashAnnotations:
+    """What the re-derived validator breakdown says about a Bash request.
+
+    ``denied`` / ``unknown`` / ``asked`` are the per-sub-command buckets the
+    terminal prompt names. ``ask_kind`` and ``redirect_targets`` are copied
+    straight off the validator result (epic 40, task 40-01) and describe the
+    request as a whole: the *kind* of ask we derived, and the write-redirect
+    targets the gate refused. ``failed`` records that the derivation itself
+    raised — the card then renders its command summary and nothing more.
+
+    ``frozen=True`` buys *rebinding* protection only: assigning
+    ``ann.unknown = [...]`` raises ``FrozenInstanceError``. It does **not**
+    make the instance hashable (the list fields are unhashable) or stop a
+    caller mutating a list it received. Treat it as "this record is not
+    reassigned after it is built", not as a value object. Follow the
+    ``__post_init__`` pattern below for any new field with a mutable default.
+    """
+
+    denied: list[str]
+    unknown: list[str]
+    asked: list[str]
+    ask_kind: Optional[str] = None
+    redirect_targets: Optional[list[str]] = None
+    failed: bool = False
+
+    def __post_init__(self) -> None:
+        # Frozen dataclass: normalise the mutable default in place. ``setattr``
+        # via ``object.__setattr__`` is the sanctioned way to do that from
+        # inside ``__post_init__``; every reader can then treat the field as a
+        # plain list and never has to check for None.
+        if self.redirect_targets is None:
+            object.__setattr__(self, "redirect_targets", [])
+
+    @property
+    def empty(self) -> bool:
+        """True when the derivation produced nothing to annotate.
+
+        A ``failed`` derivation counts as empty: an annotation we could not
+        compute must never block the card, and must not be invented either.
+        """
+        return self.failed or not (
+            self.denied or self.unknown or self.asked or self.redirect_targets
+        )
+
+
+def _bash_annotations(request: PermissionRequest) -> BashAnnotations:
+    """Re-derive, from the command, everything the card annotates.
 
     PreToolUse names the non-allowlisted sub-commands in its
     ``permissionDecisionReason`` so the terminal prompt can show them, but
     Claude Code does NOT forward that reason to the PermissionRequest hook, so
-    the Telegram message has no access to it. We re-derive the same breakdown
-    here by running the very same validator against the command (workspace dir =
-    ``request.cwd``, exactly as PreToolUse did), guaranteeing the annotation
-    matches what the terminal shows.
+    the Telegram message has no access to it. We re-run the very same validator
+    against the command (workspace dir = ``request.cwd``, exactly as PreToolUse
+    did), guaranteeing the annotation matches what the terminal shows.
 
     After D1, deny-matched sub-commands no longer produce PermissionRequest rows
     (they hard-block in PreToolUse). The ``denied`` bucket goes quiet naturally
     but is kept so the helper stays correct if settings change between request
-    creation and the sweep. The new ``asked`` bucket names sub-commands that
-    matched a ``permissions.ask`` pattern — these are what caused the prompt.
+    creation and the sweep. The ``asked`` bucket names sub-commands that
+    matched a ``permissions.ask`` pattern.
 
-    Best-effort only: returns ``([], [], [])`` for non-Bash tools, an empty
-    command, or any failure — computing this annotation must never block sending
-    the prompt.
+    Best-effort only: a non-Bash tool, an empty command, or **any** failure
+    returns an empty (or ``failed``) annotation set — computing this must never
+    block sending the prompt.
     """
+    empty = BashAnnotations(denied=[], unknown=[], asked=[])
     if request.tool_name != "Bash":
-        return [], [], []
+        return empty
     command = (request.tool_input or {}).get("command", "")
-    if not command.strip():
-        return [], [], []
+    if not isinstance(command, str) or not command.strip():
+        return empty
     try:
         from pretool_hook import BashPermissionValidator
         from settings_loader import SettingsLoader
@@ -413,7 +458,9 @@ def _unallowlisted_bash_parts(
         result = validator.validate_bash_command(command)
     except Exception as e:  # noqa: BLE001
         debug_log(f"Could not compute non-allowlisted parts: {e}")
-        return [], [], []
+        return BashAnnotations(
+            denied=[], unknown=[], asked=[], failed=True
+        )
 
     seen: set[str] = set()
     denied: list[str] = []
@@ -430,7 +477,48 @@ def _unallowlisted_bash_parts(
             asked.append(cmd)
         elif not r.get("allowed"):
             unknown.append(cmd)
-    return denied, unknown, asked
+
+    # Copied defensively: the validator result is a plain dict and this card
+    # must keep rendering if a future shape omits either key.
+    ask_kind = result.get("ask_kind") if isinstance(result, dict) else None
+    raw_targets = result.get("redirect_targets") if isinstance(result, dict) else None
+    redirect_targets = [t for t in (raw_targets or []) if t]
+
+    return BashAnnotations(
+        denied=denied,
+        unknown=unknown,
+        asked=asked,
+        ask_kind=ask_kind if isinstance(ask_kind, str) else None,
+        redirect_targets=redirect_targets,
+    )
+
+
+def _safe_bash_annotations(request: PermissionRequest) -> BashAnnotations:
+    """``_bash_annotations`` with a belt-and-braces guard around the call itself.
+
+    The helper already fails open for a non-Bash tool, an empty command and any
+    exception from the validator. This outer guard covers what is left — a bug
+    in the derivation or an unexpected result shape — so the card is never
+    blocked by the annotation it wanted to add. Never raises.
+    """
+    try:
+        return _bash_annotations(request)
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"Could not compute Bash annotations: {e}")
+        return BashAnnotations(denied=[], unknown=[], asked=[], failed=True)
+
+
+def _unallowlisted_bash_parts(
+    request: PermissionRequest,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return ``(denied, unknown, asked)`` sub-commands for a Bash request.
+
+    Retained as the compatibility shape for callers that only want the three
+    buckets (``permission_request_hook._format_non_whitelisted``). Everything
+    else the card needs comes from :func:`_bash_annotations`.
+    """
+    ann = _safe_bash_annotations(request)
+    return ann.denied, ann.unknown, ann.asked
 
 
 def _send_relay(
@@ -482,11 +570,12 @@ def render_permission_body(
     """Build the HTML body of a permission-request message.
 
     Pure function — no network, no state-store writes (it does re-run the
-    validator via ``_unallowlisted_bash_parts``, which reads settings files).
+    validator via ``_bash_annotations``, which reads settings files).
     ``send_permission_message`` calls it to compose the text it sends, and
     callers that later need to PATCH that message — the agent-decision
     finalization in ``permission_request_hook`` — call it again to reconstruct
-    the exact body that was sent.
+    the exact body that was sent. Every annotation therefore derives from the
+    *stored row* (``request.*``), never from live state (epic 40 brd H5).
     """
     import html as _html
 
@@ -504,31 +593,105 @@ def render_permission_body(
         title,
         "",
         f"<b>Permission Request</b> <code>{request.request_id}</code>",
+    ]
+
+    # Name who raised the prompt, when the row records a mode. Silent for
+    # `default` (and for pre-epic rows, which carry None): the terminal raises
+    # those prompts, and 94 of the last 416 were `default` — their cards must
+    # not move a byte. Everything else means the harness was involved, so
+    # saying so is the point of the annotation.
+    if request.permission_mode and request.permission_mode != "default":
+        lines.append(
+            f"🤖 Mode: <b>{_html.escape(request.permission_mode, quote=False)}</b>"
+        )
+
+    lines += [
         "",
         "<pre>",
         _html.escape(summary, quote=False),
         "</pre>",
     ]
 
-    # Re-derive and surface which sub-commands tripped the prompt (PreToolUse's
-    # reason isn't forwarded here — see _unallowlisted_bash_parts). Escaped
-    # because command fragments routinely contain <, >, & (e.g. `2>&1`).
-    denied, unknown, asked = _unallowlisted_bash_parts(request)
-    if denied:
+    # Re-derive and surface what tripped the prompt (PreToolUse's reason isn't
+    # forwarded here — see _bash_annotations). Escaped because command fragments
+    # routinely contain <, >, & (e.g. `2>&1`). This call goes through
+    # ``_safe_bash_annotations`` directly — not through its callee
+    # ``_unallowlisted_bash_parts``, which is a thin adapter kept only for
+    # ``permission_request_hook._format_non_whitelisted``. The two share the
+    # same fail-open guarantee, so neither may be deleted on the assumption
+    # that the other carries this path's crash-proofing.
+    ann = _safe_bash_annotations(request)
+    if ann.denied:
         lines.append("")
         lines.append("🚫 <b>Matches a denied pattern:</b>")
-        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in denied]
-    if asked:
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in ann.denied]
+    if ann.asked:
         lines.append("")
         lines.append("❓ <b>Matches an ask pattern (human review required):</b>")
-        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in asked]
-    if unknown:
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in ann.asked]
+    if ann.unknown:
         lines.append("")
-        lines.append("⚠️ <b>Not in allowlist:</b>")
-        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in unknown]
+        # The "Not in allowlist" heading has to be honest about what it claims.
+        # In a session whose mode resolves ask-candidates itself (auto /
+        # bypassPermissions / dontAsk) an unknown-only breakdown means the
+        # validator *deferred* — pretool_hook emitted `defer` and the harness
+        # raised this prompt, so the allowlist is context here, not cause
+        # (epic 40 brd H4). Three things keep the old heading: a risk-gate part
+        # (`asked`), a refused write target (our redirect gate asked, not the
+        # harness), and a mode that asks anyway.
+        if (
+            _mode_resolves_ask_candidates(request)
+            and not ann.asked
+            and not ann.denied
+            and not ann.redirect_targets
+        ):
+            # Mode-neutral on purpose: the same branch serves `auto`,
+            # `bypassPermissions` and `dontAsk`, and the `🤖 Mode:` line above
+            # already names which one is active. Hard-coding "auto mode" here
+            # would have the card name a mode it has just contradicted.
+            lines.append(
+                "🤖 <b>The harness flagged this call — the session's mode "
+                "resolved it; not on the allowlist either:</b>"
+            )
+        else:
+            lines.append("⚠️ <b>Not in allowlist:</b>")
+        lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in ann.unknown]
+
+    # A redirect-gate ask is one of the few things we still raise ourselves in
+    # `auto` mode, and the per-sub-command buckets above cannot see it (the
+    # parser strips redirect targets before command matching). Name the refused
+    # write targets explicitly — in every mode, since the gate asks in every
+    # mode (epic 40 state.md invariant 4).
+    if ann.redirect_targets:
+        lines.append("")
+        lines.append("📝 <b>Writes outside the workspace:</b>")
+        lines += [
+            f"<code>{_html.escape(t, quote=False)}</code>" for t in ann.redirect_targets
+        ]
 
     lines += ["", "Approve this command?"]
     return "\n".join(lines)
+
+
+def _mode_resolves_ask_candidates(request: PermissionRequest) -> bool:
+    """True when the session's mode resolves an ask-candidate by itself.
+
+    The set of such modes is ``pretool_hook.DEFERRING_MODES`` — the very set
+    that emits `defer` for an unknown-only breakdown. It is imported rather
+    than restated so the two decisions cannot drift: a mode that pretool
+    defers for must not render as a plain "Not in allowlist" card, which is
+    exactly the brd H4 regression this task exists to remove. If pretool_hook
+    cannot be imported, the empty set keeps today's card (every mode blames
+    the allowlist) rather than inventing the opposite.
+
+    Reads the stored row only (brd H5).
+    """
+    try:
+        from pretool_hook import DEFERRING_MODES
+    except Exception as e:  # noqa: BLE001
+        debug_log(f"Could not import DEFERRING_MODES: {e}")
+        return False
+    return request.permission_mode in DEFERRING_MODES
 
 
 def send_permission_message(

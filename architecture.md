@@ -109,7 +109,7 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 
 | Event | Matcher | Script | Role |
 |-------|---------|--------|------|
-| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. All allowed → allow; otherwise let Claude Code surface a `PermissionRequest`. |
+| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. Four outcomes: `deny` for a deny match (unconditional, in every mode); `allow` when every sub-command is on the allowlist; `ask` for a **risk gate** — a `permissions.ask` match or a write redirect escaping the workspace (`/tmp` and the write-safe `/dev` sinks excepted) — which prompts in every mode; and `defer` for the **unknown** case when the session's mode resolves ask-candidates by itself (`auto` / `bypassPermissions` / `dontAsk`), which hands the call back to the normal pipeline. Any other mode, and an absent or unrecognised one, keeps emitting `ask`, which lets Claude Code surface a `PermissionRequest`. |
 | `PermissionRequest` | `*` | `permission_request_hook.py` | Send the request to Telegram via the relay, long-poll for the answer, map it to an allow/deny/stop/whitelist/reply decision. Also handles `AskUserQuestion`. timeout 43200s. |
 | `PostToolUse` | `*` | `posttool_hook.py` | If the request was resolved in the terminal instead, cancel the relay message (strip buttons) so the Telegram prompt goes dead. |
 | `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification — conditional on the session being operator-started (see below). |
@@ -331,7 +331,14 @@ Two answer paths (`app.py`):
 ```
 Claude wants to run a tool
         │  PreToolUse(Bash): pretool_hook → allow? ──► yes ──► runs, done
-        │                                   └─ no/other tool
+        │                                   ├─ deny ──► blocked, done
+        │                                   ├─ defer ──► pipeline decides
+        │                                   │            (auto classifies,
+        │                                   │             bypass allows,
+        │                                   │             dontAsk denies);
+        │                                   │            only a prompt it
+        │                                   │            raises comes back here
+        │                                   └─ ask / other tool
         ▼
 PermissionRequest: permission_request_hook
    create state-store request ──► telegram_permission_router.send_permission_message
@@ -343,6 +350,13 @@ PermissionRequest: permission_request_hook
         ▼
    map answer → decision (allow / deny / stop / whitelist / reply) ──► hook output
 ```
+
+The stored row carries the session's `permission_mode`, so the Telegram card can
+say who raised the prompt: in `auto` / `bypassPermissions` / `dontAsk` an
+unknown-only breakdown means the harness flagged the call, not our allowlist
+(epic 40). Those three modes are `pretool_hook.DEFERRING_MODES`, which the
+router imports rather than restating, so the `defer` decision and the card's
+heading can never name different sets.
 
 ### AskUserQuestion
 

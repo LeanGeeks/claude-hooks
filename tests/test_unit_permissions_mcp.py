@@ -115,7 +115,8 @@ class PermissionsMCPTestCase(unittest.TestCase):
         }
 
     def pending(self, command="deploy-thing --now", session_id="worker-session-9",
-                agent_id=None, tool_name="Bash", tool_input=None, cwd=None, ttl=300):
+                agent_id=None, tool_name="Bash", tool_input=None, cwd=None, ttl=300,
+                permission_mode=None):
         return create_request(
             session_id=session_id,
             cwd=cwd if cwd is not None else str(self.workspace),
@@ -124,6 +125,7 @@ class PermissionsMCPTestCase(unittest.TestCase):
             permission_suggestions=[],
             ttl_seconds=ttl,
             agent_id=agent_id,
+            permission_mode=permission_mode,
         )
 
     def decide(self, request_id, action="allow", reason="worker is blocked on a build step",
@@ -583,6 +585,35 @@ class TestReadTools(PermissionsMCPTestCase):
             result = lib.list_permission_requests(state="banana", identity=_identity())
         self.assertIn("error", result)
         self.assertIn("banana", result["error"])
+
+    def test_permission_mode_is_surfaced_on_the_summary(self):
+        """Epic 40: the daily reviewer tells an auto-mode prompt from a
+        default-mode one by reading ``permission_mode`` off the summary. The
+        field is additive and explicit — ``summarize_row`` builds its dict by
+        hand, so nothing surfaces without being named there."""
+        auto_row = self.pending(command="auto-thing", permission_mode="auto")
+        legacy_row = self.pending(command="legacy-thing")
+
+        with patch.dict(os.environ, self.env(), clear=False):
+            summary = lib.summarize_row(auto_row, _identity())
+            legacy_summary = lib.summarize_row(legacy_row, _identity())
+
+        self.assertEqual(summary["permission_mode"], "auto")
+        # A row written without a mode carries None, not a missing key.
+        self.assertIn("permission_mode", legacy_summary)
+        self.assertIsNone(legacy_summary["permission_mode"])
+
+    def test_permission_mode_rides_along_on_permission_history(self):
+        """The reviewer's actual feed. ``permission_history`` builds its own
+        projection, so this pins that the mode reaches it too."""
+        row = self.pending(command="history-thing", permission_mode="bypassPermissions")
+        self.decide(row.request_id, "allow", "worker was blocked")
+
+        with patch.dict(os.environ, self.env(), clear=False):
+            history = lib.permission_history(days=1)
+
+        entry = next(r for r in history["requests"] if r["request_id"] == row.request_id)
+        self.assertEqual(entry["permission_mode"], "bypassPermissions")
 
     def test_get_permission_request_spells_out_the_matched_patterns(self):
         self.workspace_settings(allow=[], ask=["Bash(curl:*)"])

@@ -132,6 +132,15 @@ class PermissionRequest:
     expired_notified_at: Optional[str] = None  # ISO timestamp when Telegram was revoked on expiry
     agent_id: Optional[str] = None  # subagent id (None for parent session)
     role: Optional[str] = None  # resolved role id; None = default destination
+    # The session's permission mode at request time, straight from the hook
+    # payload ("auto", "default", "bypassPermissions", "dontAsk", ...). None for
+    # rows written before epic 40, and for a payload that carried no mode.
+    # Additive column: ``from_dict`` defaults it and ``to_dict`` is ``asdict``,
+    # so existing rows load unchanged. The Telegram card names who raised the
+    # prompt from this field (epic 40 brd H5 — the body must stay reconstructable
+    # from the stored row), and the MCP summary surfaces it to the daily
+    # reviewer so an auto-mode prompt reads differently from a default-mode one.
+    permission_mode: Optional[str] = None
     # What the terminal answered, recorded by the PostToolUse hook so the parked
     # PermissionRequest hook can patch it into the chat the question went to.
     # JSON: {"answers": {question: answer}, "notes": {question: notes}} — a
@@ -281,6 +290,7 @@ def create_request(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     agent_id: Optional[str] = None,
     role: Optional[str] = None,
+    permission_mode: Optional[str] = None,
 ) -> PermissionRequest:
     """
     Create a new pending permission request.
@@ -296,6 +306,10 @@ def create_request(
         role: Resolved role id this request was routed to (None = default
             destination). The role's *token* is deliberately not persisted —
             it is re-resolved from this id when needed.
+        permission_mode: The session's permission mode at request time, as the
+            hook payload reported it. None when the payload carried none (a
+            pre-epic-40 payload, or a subagent whose mode is not measured yet) —
+            the card then says nothing about who raised the prompt.
 
     Returns:
         PermissionRequest object with request_id
@@ -337,6 +351,7 @@ def create_request(
         expires_at=_expires_at(ttl_seconds),
         agent_id=agent_id,
         role=role,
+        permission_mode=permission_mode,
         owner_pid=owner_pid,
         owner_start_ticks=owner_start_ticks,
         owner_host=owner_host,

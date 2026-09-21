@@ -1614,6 +1614,7 @@ def main():
             permission_suggestions=permission_suggestions,
             ttl_seconds=REQUEST_TTL,
             agent_id=agent_id,
+            permission_mode=permission_mode or None,
         )
         debug_log(f"Created request: {request.request_id}")
 
@@ -1625,10 +1626,17 @@ def main():
         #    earlier button tap.
         # 2. bypassPermissions: the session was launched with
         #    `--dangerously-skip-permissions` (what `amux-spawn --yolo` expands to
-        #    on the Claude path) or switched to bypass mode interactively. Claude
-        #    asks us anyway whenever a PreToolUse hook returns `ask` — that
-        #    decision outranks the CLI flag — so pretool_hook's write-redirect
-        #    gate would otherwise prompt in a session that asked for no prompts.
+        #    on the Claude path) or switched to bypass mode interactively. Since
+        #    epic 40 (task 40-01) Claude no longer asks us about an *unknown*
+        #    command in a bypass session — pretool_hook emits `defer` for the
+        #    modes that resolve an ask-candidate themselves, so the pipeline
+        #    allows it silently and no request ever reaches this hook. What still
+        #    reaches it is a **risk-gate** ask — a `permissions.ask` match or a
+        #    write redirect escaping the workspace — because those are opinions
+        #    the harness does not hold, and they prompt in the terminal too.
+        #    That ask outranks the CLI flag, so without this branch a session
+        #    that asked for no prompts would sit on a Telegram card. This branch
+        #    is the only thing that records such an ask, so it stays.
         #    Nobody is consulted here, so the source is neither telegram nor
         #    terminal.
         #

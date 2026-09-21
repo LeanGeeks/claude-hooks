@@ -139,8 +139,10 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
     def test_message_includes_denied_and_unknown_parts(self):
         import telegram_permission_router as tpr
         with patch.object(
-            tpr, "_unallowlisted_bash_parts",
-            return_value=(["dd if=/dev/zero"], ["mysteryfoo --bar"], []),
+            tpr, "_safe_bash_annotations",
+            return_value=tpr.BashAnnotations(
+                denied=["dd if=/dev/zero"], unknown=["mysteryfoo --bar"], asked=[],
+            ),
         ):
             text = self._capture_text(tpr)
         self.assertIn("Matches a denied pattern", text)
@@ -151,7 +153,10 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
 
     def test_message_has_no_annotation_when_all_allowed(self):
         import telegram_permission_router as tpr
-        with patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [], [])):
+        with patch.object(
+            tpr, "_safe_bash_annotations",
+            return_value=tpr.BashAnnotations(denied=[], unknown=[], asked=[]),
+        ):
             text = self._capture_text(tpr)
         self.assertNotIn("Not in allowlist", text)
         self.assertNotIn("denied pattern", text)
@@ -161,8 +166,10 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         import telegram_permission_router as tpr
         # A fragment with shell metacharacters must not break Telegram HTML.
         with patch.object(
-            tpr, "_unallowlisted_bash_parts",
-            return_value=([], ['weird <tag> & "q"'], []),
+            tpr, "_safe_bash_annotations",
+            return_value=tpr.BashAnnotations(
+                denied=[], unknown=['weird <tag> & "q"'], asked=[],
+            ),
         ):
             text = self._capture_text(tpr)
         self.assertIn("&lt;tag&gt; &amp;", text)
@@ -198,7 +205,10 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         with patch.object(tpr, "TELEGRAM_ENABLED", True), \
              patch.object(tpr, "_default_token", "__td__"), \
              patch.object(tpr, "_clients", {"__td__": fake_client}), \
-             patch.object(tpr, "_unallowlisted_bash_parts", return_value=([], [], [])), \
+             patch.object(
+                 tpr, "_safe_bash_annotations",
+                 return_value=tpr.BashAnnotations(denied=[], unknown=[], asked=[]),
+             ), \
              patch("telegram_permission_router.set_telegram_message_id"):
             tpr.send_permission_message(req, "ws<&>name", "sess&ion")
         text = fake_client.send_message.call_args.kwargs["text"]
@@ -214,6 +224,392 @@ class TestPermissionMessageAnnotation(unittest.TestCase):
         import telegram_permission_router as tpr
         req = _make_request(tool_name="Read", tool_input={"file_path": "/x"})
         self.assertEqual(tpr._unallowlisted_bash_parts(req), ([], [], []))
+
+
+def _baseline_body() -> str:
+    """Today's card for the canonical Bash request under test (cases 3/4).
+
+    Frozen literal with one unknown sub-command: it exists to prove the
+    default/None-mode card does not move a byte (epic 40, task 40-02), so this
+    must be a hand-written expectation, not a call back into the code under
+    test. Callers that want a different annotation set compose it from this
+    string rather than re-deriving it.
+    """
+    return (
+        "<b>ws</b> <i>sess</i>\n"
+        "\n"
+        "<b>Permission Request</b> <code>test-id</code>\n"
+        "\n"
+        "<pre>\n"
+        "echo hi; mysteryfoo --bar\n"
+        "</pre>\n"
+        "\n"
+        "⚠️ <b>Not in allowlist:</b>\n"
+        "<code>mysteryfoo --bar</code>\n"
+        "\n"
+        "Approve this command?"
+    )
+
+
+def _harness_heading() -> str:
+    """The honest heading for a deferring mode, as a substring of the body.
+
+    Kept in one place so the wording moves with the code: three tests assert
+    its presence and two assert its absence, and they must not disagree about
+    what "the honest heading" is.
+    """
+    return (
+        "🤖 <b>The harness flagged this call — the session's mode "
+        "resolved it; not on the allowlist either:</b>"
+    )
+
+
+class TestPermissionModeAnnotation(unittest.TestCase):
+    """The card names who raised the prompt (epic 40 brd H4/H5).
+
+    A card that arrives in ``auto`` mode was raised by the *harness* — the
+    validator deferred — so "Not in allowlist" must not claim credit it has not
+    earned. Every annotation derives from the stored row, because the
+    agent-decision finalization re-renders the body from that row.
+    """
+
+    COMMAND = "echo hi; mysteryfoo --bar"
+    UNKNOWN_ONLY = None  # filled in setUp: ([], ["mysteryfoo --bar"], [])
+
+    def setUp(self):
+        import telegram_permission_router as tpr
+        self.tpr = tpr
+        self.UNKNOWN_ONLY = ([], ["mysteryfoo --bar"], [])
+
+    def _render(self, mode, annotations=None, **req_overrides):
+        """Render a body with the validator re-derivation stubbed out."""
+        ann = annotations if annotations is not None else self.UNKNOWN_ONLY
+        req_overrides.setdefault("tool_input", {"command": self.COMMAND})
+        with patch.object(
+            self.tpr, "_safe_bash_annotations",
+            return_value=self.tpr.BashAnnotations(
+                denied=ann[0], unknown=ann[1], asked=ann[2]
+            ),
+        ):
+            return self.tpr.render_permission_body(
+                _make_request(permission_mode=mode, **req_overrides), "ws", "sess"
+            )
+
+    def _render_ann(self, mode, ann, **req_overrides):
+        """Render with a fully-specified annotation object (ask_kind, targets)."""
+        req_overrides.setdefault("tool_input", {"command": self.COMMAND})
+        with patch.object(self.tpr, "_safe_bash_annotations", return_value=ann):
+            return self.tpr.render_permission_body(
+                _make_request(permission_mode=mode, **req_overrides), "ws", "sess"
+            )
+
+    # ── case 3 / case 4: the regression guard ───────────────────────────────
+
+    def test_case3_none_mode_card_is_byte_identical_to_today(self):
+        """No stored mode (a pre-epic row) — the card must not move a byte."""
+        self.assertEqual(self._render(None), _baseline_body())
+
+    def test_case4_default_mode_card_is_byte_identical_to_today(self):
+        """94 of the last 416 requests were `default`; their cards are frozen."""
+        self.assertEqual(self._render("default"), _baseline_body())
+
+    def test_case4b_default_mode_names_refused_write_targets(self):
+        """§3c is an improvement in every mode, not an auto-mode special case:
+        `default` + a refused redirect target = today's card PLUS the new
+        write-target block (the unknown list has no refused target to be
+        confused with — the validator's redirect gate reports the *target*, not
+        a sub-command)."""
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=[], ask_kind="risk",
+            redirect_targets=["/etc/passwd"],
+        )
+        body = self._render_ann("default", ann)
+        self.assertEqual(
+            body,
+            _baseline_body().replace(
+                "\n\n⚠️ <b>Not in allowlist:</b>\n<code>mysteryfoo --bar</code>",
+                "",
+            ).replace(
+                "\n\nApprove this command?",
+                "\n\n📝 <b>Writes outside the workspace:</b>\n"
+                "<code>/etc/passwd</code>\n\nApprove this command?",
+            ),
+        )
+
+    def test_case4c_default_mode_with_the_real_validator_is_byte_identical(self):
+        """Cases 3/4 stub the derivation, so they pin the *rendering* contract
+        only. This one runs the real validator (repo as workspace, user-level
+        settings really loaded) for `default` and re-asserts the same frozen
+        literal, so a future change to the bucket logic cannot make the card
+        move a byte in quiet mode without a test going red.
+
+        The repo's own `.claude/settings.json` allowlists `Bash(echo:*)` and
+        asks nothing, so `mysteryfoo --bar` stays unknown-only — the same
+        breakdown the frozen literal describes.
+        """
+        repo_root = str(Path(__file__).parent.parent)
+        req = _make_request(
+            cwd=repo_root,
+            permission_mode="default",
+            tool_input={"command": self.COMMAND},
+        )
+        ann = self.tpr._bash_annotations(req)
+        self.assertFalse(ann.failed)
+        self.assertEqual([], ann.denied)
+        self.assertEqual([], ann.asked)
+        self.assertEqual([], ann.redirect_targets)
+        self.assertEqual(["mysteryfoo --bar"], ann.unknown)
+        self.assertEqual(
+            self.tpr.render_permission_body(req, "ws", "sess"), _baseline_body()
+        )
+
+    # ── case 5: auto mode, unknown parts only ───────────────────────────────
+
+    def test_case5_auto_mode_unknown_only_names_the_harness(self):
+        body = self._render("auto")
+        # The harness is named as the source …
+        self.assertIn(_harness_heading(), body)
+        # … the mode is on the card (brd §3a) …
+        self.assertIn("Mode: <b>auto</b>", body)
+        # … the command is still shown …
+        self.assertIn("mysteryfoo --bar", body)
+        # … and no bare "Not in allowlist" heading survives.
+        self.assertNotIn("⚠️ <b>Not in allowlist:</b>", body)
+
+    def test_case5_bypass_and_dontask_modes_also_name_the_harness(self):
+        """The three modes that resolve an ask-candidate themselves all defer.
+
+        The heading is mode-neutral, so the only thing that changes between
+        them is the `🤖 Mode:` line — asserting the shared heading here proves
+        the branch is not an `auto`-only special case.
+        """
+        for mode in ("bypassPermissions", "dontAsk"):
+            with self.subTest(mode=mode):
+                body = self._render(mode)
+                self.assertIn(_harness_heading(), body)
+                self.assertIn(f"Mode: <b>{mode}</b>", body)
+                # The card must never name a mode it is not in.
+                self.assertNotIn("auto mode", body)
+                self.assertNotIn("⚠️ <b>Not in allowlist:</b>", body)
+
+    def test_case5_unknown_mode_still_blames_the_allowlist(self):
+        """An unrecognised mode asks, so the allowlist is the reason."""
+        body = self._render("nonsense-value")
+        self.assertNotIn(_harness_heading(), body)
+        self.assertIn("⚠️ <b>Not in allowlist:</b>", body)
+
+    # ── case 6: auto mode, an ask pattern we raised ourselves ───────────────
+
+    def test_case6_auto_mode_with_an_ask_pattern_keeps_todays_block(self):
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=["curl http://example.com"],
+            ask_kind="risk",
+        )
+        body = self._render_ann("auto", ann)
+        # We raised this one, so the allowlist heading is not involved at all…
+        self.assertNotIn(_harness_heading(), body)
+        self.assertIn("❓ <b>Matches an ask pattern (human review required):</b>", body)
+        self.assertIn("curl http://example.com", body)
+
+    def test_case6_auto_mode_ask_pattern_plus_unknown_keeps_the_allowlist_heading(self):
+        """A risk-gate part is present: the prompt is ours, so the unknown list
+        keeps today's heading even though the mode is `auto`."""
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=["mysteryfoo --bar"],
+            asked=["curl http://example.com"], ask_kind="risk",
+        )
+        body = self._render_ann("auto", ann)
+        self.assertIn("⚠️ <b>Not in allowlist:</b>", body)
+        self.assertNotIn(_harness_heading(), body)
+
+    # ── case 7: auto mode, a refused write target ───────────────────────────
+
+    def test_case7_auto_mode_names_the_refused_write_target(self):
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=[], ask_kind="risk",
+            redirect_targets=["/etc/passwd", "/var/log/x.log"],
+        )
+        body = self._render_ann("auto", ann)
+        self.assertIn("📝 <b>Writes outside the workspace:</b>", body)
+        self.assertIn("<code>/etc/passwd</code>", body)
+        self.assertIn("<code>/var/log/x.log</code>", body)
+
+    def test_case7b_refused_write_target_plus_unknown_keeps_the_allowlist_heading(self):
+        """Our own redirect gate raised this ask, so the unknown list is not
+        being credited to the harness."""
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=["mysteryfoo --bar"], asked=[], ask_kind="risk",
+            redirect_targets=["/etc/passwd"],
+        )
+        body = self._render_ann("auto", ann)
+        self.assertIn("⚠️ <b>Not in allowlist:</b>", body)
+        self.assertIn("📝 <b>Writes outside the workspace:</b>", body)
+
+    def test_write_targets_are_html_escaped(self):
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=[], ask_kind="risk",
+            redirect_targets=["/tmp/a<b>&amp"],
+        )
+        body = self._render_ann("auto", ann)
+        self.assertIn("&lt;b&gt;&amp;amp", body)
+        self.assertNotIn("<b>&amp</b>", body)
+
+    # ── case 8: reconstructability (brd H5) ─────────────────────────────────
+
+    def test_case8_same_row_renders_identical_strings_twice(self):
+        """The agent-decision finalization re-renders the body from the stored
+        row; a first and second render must agree byte-for-byte."""
+        req = _make_request(
+            permission_mode="auto", tool_input={"command": self.COMMAND}
+        )
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=["mysteryfoo --bar"], asked=[],
+            ask_kind="unknown", redirect_targets=["/etc/passwd"],
+        )
+        with patch.object(self.tpr, "_safe_bash_annotations", return_value=ann):
+            first = self.tpr.render_permission_body(req, "ws", "sess")
+            second = self.tpr.render_permission_body(req, "ws", "sess")
+        self.assertEqual(first, second)
+
+    def test_case8_row_round_tripped_through_the_store_renders_the_same(self):
+        """Stricter H5: the finalization loads the row from the store, so a
+        round-trip must not change a byte of the body."""
+        req = create_request(
+            session_id="render-roundtrip",
+            cwd="/test",
+            tool_name="Bash",
+            tool_input={"command": "echo hi; mysteryfoo --bar"},
+            permission_suggestions=[],
+            ttl_seconds=300,
+            permission_mode="auto",
+        )
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=["mysteryfoo --bar"], asked=[], ask_kind="unknown",
+        )
+        with patch.object(self.tpr, "_safe_bash_annotations", return_value=ann):
+            before = self.tpr.render_permission_body(req, "ws", "sess")
+            reloaded = get_request(req.request_id)
+            after = self.tpr.render_permission_body(reloaded, "ws", "sess")
+        self.assertEqual(before, after)
+
+    # ── case 9: the derivation blowing up never blocks the card ─────────────
+
+    def test_case9_derivation_raising_still_renders_and_sends(self):
+        """_unallowlisted_bash_parts' best-effort contract: any failure returns
+        empty and the card still goes out."""
+        import telegram_permission_router as tpr
+        req = _make_request(
+            permission_mode="auto", tool_input={"command": self.COMMAND}
+        )
+        with patch.object(
+            tpr, "_bash_annotations", side_effect=RuntimeError("boom")
+        ):
+            body = tpr.render_permission_body(req, "ws", "sess")
+        self.assertIn("Approve this command?", body)
+        self.assertIn("echo hi; mysteryfoo --bar", body)
+        self.assertNotIn("Not in allowlist", body)
+        self.assertNotIn("Writes outside the workspace", body)
+
+    def test_case9_inner_derivation_and_unallowlisted_helper_still_return_empty(self):
+        """Both seams' fail-open contract, driven directly."""
+        import telegram_permission_router as tpr
+        req = _make_request(tool_input={"command": self.COMMAND})
+        with patch.object(tpr, "_bash_annotations", side_effect=RuntimeError("boom")):
+            ann = tpr._safe_bash_annotations(req)
+            self.assertTrue(ann.failed)
+            self.assertTrue(ann.empty)
+            self.assertEqual(tpr._unallowlisted_bash_parts(req), ([], [], []))
+
+    def test_case9_raise_inside_the_helper_returns_empty_and_the_card_goes_out(self):
+        """The helper's own fail-open path, driven through the render seam."""
+        import telegram_permission_router as tpr
+        req = _make_request(permission_mode="auto")
+        with patch(
+            "pretool_hook.BashPermissionValidator",
+            side_effect=RuntimeError("validator unavailable"),
+        ):
+            ann = tpr._bash_annotations(req)
+            self.assertTrue(ann.failed)
+            self.assertTrue(ann.empty)
+            body = tpr.render_permission_body(req, "ws", "sess")
+        self.assertIn("Approve this command?", body)
+        self.assertNotIn("Not in allowlist", body)
+
+    def test_annotations_are_empty_for_non_bash_and_empty_commands(self):
+        import telegram_permission_router as tpr
+        for req in (
+            _make_request(tool_name="Read", tool_input={"file_path": "/x"}),
+            _make_request(tool_input={"command": "   "}),
+            _make_request(tool_input={}),
+        ):
+            with self.subTest(req=req.tool_name):
+                ann = tpr._bash_annotations(req)
+                self.assertTrue(ann.empty)
+                self.assertFalse(ann.failed)
+
+    def test_annotations_carry_ask_kind_and_redirect_targets_from_the_validator(self):
+        """End-to-end against the repo's own allowlist: the two new keys 40-01
+        added must survive into the annotation object the card renders from."""
+        import telegram_permission_router as tpr
+        repo_root = str(Path(__file__).parent.parent)
+        ann = tpr._bash_annotations(
+            _make_request(cwd=repo_root, tool_input={"command": "mysteryfoo --bar"})
+        )
+        self.assertEqual(ann.ask_kind, "unknown")
+        self.assertEqual(ann.redirect_targets, [])
+        self.assertIn("mysteryfoo --bar", ann.unknown)
+
+        redirect = tpr._bash_annotations(
+            _make_request(cwd=repo_root, tool_input={"command": "echo hi > /etc/passwd"})
+        )
+        self.assertEqual(redirect.ask_kind, "risk")
+        self.assertIn("/etc/passwd", redirect.redirect_targets)
+
+    def test_honest_heading_set_is_pretool_deferring_modes(self):
+        """The two sides of the defer decision must name the same modes.
+
+        pretool_hook emits `defer` for `DEFERRING_MODES`; the card renders the
+        honest heading for exactly the set `_mode_resolves_ask_candidates`
+        accepts. If a future CLI adds a mode to one and not the other, pretool
+        would defer while the card kept saying "Not in allowlist" — brd H4
+        again, silently.
+
+        The probes are driven off the *set itself*, not off today's three
+        literals, so this test keeps working when the set grows — and fails the
+        moment the card's policy stops following it (e.g. a hard-coded tuple
+        that a fourth mode outruns).
+        """
+        import telegram_permission_router as tpr
+        from pretool_hook import DEFERRING_MODES, build_pretool_output
+
+        unknown_ask = {"decision": "ask", "ask_kind": "unknown", "reason": "r"}
+        other_modes = ["default", "acceptEdits", "plan", "nonsense-value"]
+
+        for mode in sorted(DEFERRING_MODES) + other_modes:
+            with self.subTest(mode=mode):
+                defers = (
+                    build_pretool_output(unknown_ask, mode)["hookSpecificOutput"][
+                        "permissionDecision"
+                    ]
+                    == "defer"
+                )
+                # pretool's own answer for this mode…
+                self.assertEqual(defers, mode in DEFERRING_MODES)
+                # … and the card's, which must agree.
+                self.assertEqual(
+                    tpr._mode_resolves_ask_candidates(
+                        _make_request(permission_mode=mode)
+                    ),
+                    defers,
+                )
+                body = self._render(mode)
+                self.assertEqual(_harness_heading() in body, defers)
+
+        with self.subTest(mode="absent"):
+            self.assertFalse(
+                tpr._mode_resolves_ask_candidates(_make_request(permission_mode=None))
+            )
+            self.assertFalse(_harness_heading() in self._render(None))
 
 
 class TestRouting(unittest.TestCase):
@@ -430,7 +826,8 @@ class TestBypassPermissionsAutoAllow(unittest.TestCase):
                 patch("permission_request_hook.session_yolo_store.prune"), \
                 patch("permission_request_hook.session_yolo_store.is_enabled",
                       return_value=False), \
-                patch("permission_request_hook.create_request", return_value=request), \
+                patch("permission_request_hook.create_request",
+                      return_value=request) as mock_create, \
                 patch("permission_request_hook.update_request_state") as mock_update, \
                 patch("permission_request_hook.send_permission_message",
                       return_value=12345) as mock_send, \
@@ -449,6 +846,7 @@ class TestBypassPermissionsAutoAllow(unittest.TestCase):
             "update": mock_update,
             "send": mock_send,
             "question": mock_question,
+            "create": mock_create,
         }
 
     @staticmethod
@@ -512,6 +910,40 @@ class TestBypassPermissionsAutoAllow(unittest.TestCase):
 
         mocks["question"].assert_called_once()
         mocks["update"].assert_not_called()
+
+    def test_case10_permission_mode_lands_on_the_stored_row(self):
+        """Epic 40 case 10: the hook payload's ``permission_mode`` is passed
+        through to ``create_request``."""
+        _code, _printed, _mocks = self._run_main(self._payload())
+
+        kwargs = _mocks["create"].call_args.kwargs
+        self.assertEqual(kwargs["permission_mode"], "bypassPermissions")
+
+    def test_case10_auto_mode_lands_on_the_stored_row(self):
+        _code, _printed, _mocks = self._run_main(
+            self._payload(permission_mode="auto")
+        )
+
+        kwargs = _mocks["create"].call_args.kwargs
+        self.assertEqual(kwargs["permission_mode"], "auto")
+
+    def test_case10_absent_permission_mode_stores_none(self):
+        """An older payload carries no mode; the row records ``None`` rather
+        than an empty string, so the card's "is a mode recorded?" test is a
+        plain truthiness check."""
+        payload = self._payload()
+        del payload["permission_mode"]
+
+        _code, _printed, _mocks = self._run_main(payload)
+
+        kwargs = _mocks["create"].call_args.kwargs
+        self.assertIsNone(kwargs["permission_mode"])
+
+    def test_case10_empty_permission_mode_stores_none(self):
+        _code, _printed, _mocks = self._run_main(self._payload(permission_mode=""))
+
+        kwargs = _mocks["create"].call_args.kwargs
+        self.assertIsNone(kwargs["permission_mode"])
 
 
 class TestWorkspaceNameExtraction(unittest.TestCase):

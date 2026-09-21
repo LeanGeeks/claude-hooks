@@ -185,7 +185,12 @@ would hide the bug and grant more than the fix would.
 Two feeds, one window (the last day):
 
 - `mcp__permissions__permission_history` with `days=1` — every terminal store
-  row joined with the manual-confirmation log.
+  row joined with the manual-confirmation log. Since epic 40 the store covers
+  only requests that actually reached a human: in `auto` / `bypassPermissions` /
+  `dontAsk` sessions an unrecognised command is deferred to the harness and
+  writes no row, so `~/.claude/bash_manual_confirm.log` — which carries
+  `permission_mode` and `emitted` per line (the decision the hook really
+  printed) — is the complete parser-level record of non-allowlisted commands.
 - `~/.claude/bash_manual_confirm.log` directly, when you want the raw
   per-sub-command validation results behind a decision.
 

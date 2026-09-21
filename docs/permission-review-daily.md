@@ -141,6 +141,19 @@ The same run rotates `~/.claude/bash_manual_confirm.log` aside to
 hook appends with `open(path, 'a')`, so the live log reappears on the next
 command that is not auto-approved — no coordination needed.
 
+## What each feed covers (and what it no longer does)
+
+Since epic 40 the store holds only the requests that **actually reached a
+human**: in `auto` / `bypassPermissions` / `dontAsk` sessions the hook now emits
+`defer` for a command it simply does not recognise, so the harness resolves the
+call itself and no `permission_requests.jsonl` row is written. Those rows are
+therefore not a complete record of non-allowlisted commands any more.
+`~/.claude/bash_manual_confirm.log` is: every non-allowlisted command is still
+appended there with the validator's verdict, and each line now also carries
+`permission_mode` and `emitted` — the decision the hook actually printed
+(`ask` / `defer` / `deny`) — so a `decision: "ask"` line that produced no prompt
+can be told apart from one that did.
+
 ## Adopting the reviewer in another repo
 
 Steps 1–2 of the prompt (drain the queue, review the traffic) are

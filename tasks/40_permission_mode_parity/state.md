@@ -25,8 +25,8 @@ that describe this hook.
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 40-01 | [Pretool defers to the mode](./40-01-pretool-defers-to-the-mode_sonnet.md) | in_progress | — | **The fix.** One emission site, one additive field, one log-path correction. Ship this even if nothing else lands. |
-| 40-02 | [The card names the asker](./40-02-the-card-names-the-asker.md) | todo | 40-01 | Records `permission_mode` on the row, stops the card claiming the allowlist raised a prompt it did not raise (brd H4), updates the docs. |
+| 40-01 | [Pretool defers to the mode](./40-01-pretool-defers-to-the-mode_sonnet.md) | done (cf2fe7b) | — | **The fix.** One emission site, one additive field, one log-path correction. Ship this even if nothing else lands. |
+| 40-02 | [The card names the asker](./40-02-the-card-names-the-asker.md) | in_progress | 40-01 | Records `permission_mode` on the row, stops the card claiming the allowlist raised a prompt it did not raise (brd H4), updates the docs. |
 | 40-03 | [YOLO on the native mode](./40-03-yolo-native-mode.md) | todo | 40-01 | **Operator answered (b) 2026-09-21** — promote YOLO to the native `setMode: bypassPermissions`. Sonnet implementer, §4(b) scope. `/yolo-off` becomes keyboard-only; `.claude/commands/yolo-off.md` must say so. |
 | 40-04 | [Live verification](./40-04-live-verification_human.md) | todo | 40-01 + 40-02 installed | **human** — six modes, and it answers brd H8. |
 
