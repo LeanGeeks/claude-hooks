@@ -24,7 +24,7 @@ import shlex
 import sys
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 # Import our modules
 try:
@@ -43,8 +43,13 @@ except ImportError:
 DEBUG = os.environ.get('CLAUDE_HOOK_DEBUG', '0') == '1'
 DEBUG_LOG = os.path.expanduser('~/.claude/bash_hook_debug.log')
 
-# Manual confirmation log - stores commands that were not auto-approved
-MANUAL_CONFIRM_LOG = os.path.expanduser('~/.claude/bash_manual_confirm.log')
+# Manual confirmation log - stores commands that were not auto-approved.
+# Honours the CLAUDE_MANUAL_CONFIRM_LOG redirect (read at module import), which
+# the test runner sets and which permission_state_store.py and
+# permissions_mcp_lib.py (which imports this constant by name) already honour.
+MANUAL_CONFIRM_LOG = os.environ.get(
+    'CLAUDE_MANUAL_CONFIRM_LOG'
+) or os.path.expanduser('~/.claude/bash_manual_confirm.log')
 TMP_ALLOWED_ROOT = '/tmp'
 
 # Output redirections to these pseudo-devices are always safe: they discard or
@@ -391,7 +396,8 @@ def resolve_workspace_dir(input_data: Dict[str, Any]) -> str:
     return os.path.abspath(os.getcwd())
 
 
-def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir: str, session_id: str = None):
+def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir: str, session_id: str = None,
+                            permission_mode: str = None, output: Dict[str, Any] = None):
     """
     Log a command that required manual confirmation (was not auto-approved)
 
@@ -400,8 +406,17 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
         result: The validation result dictionary
         workspace_dir: The workspace directory where command was run
         session_id: Optional session ID for correlation
+        permission_mode: The session's permission_mode from the hook payload
+            (None when the payload carried none)
+        output: The PreToolUse payload actually emitted for this command (None
+            when nothing was printed) — recorded as 'emitted' so a log line
+            reading decision "ask" that produced a silent defer can be told
+            apart from one that prompted
     """
     try:
+        emitted = None
+        if output is not None:
+            emitted = output.get('hookSpecificOutput', {}).get('permissionDecision')
         log_entry = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'session_id': session_id or os.environ.get('CLAUDE_SESSION_ID', ''),
@@ -410,12 +425,79 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
             'decision': result['decision'],
             'reason': result['reason'],
             'sub_commands': result.get('sub_commands', []),
-            'validation_results': result.get('validation_results', [])
+            'validation_results': result.get('validation_results', []),
+            'permission_mode': permission_mode or None,
+            'emitted': emitted
         }
         with open(MANUAL_CONFIRM_LOG, 'a') as f:
             f.write(json.dumps(log_entry) + '\n')
     except Exception as e:
         debug_log(f"Failed to write manual confirm log: {e}")
+
+
+# Modes that resolve an ask-candidate themselves, so the hook's "I don't
+# recognise this command" ask must not floor them: emit `defer` instead and let
+# the pipeline (rules → mode → auto-mode classifier) decide, exactly as it would
+# if this hook were not installed. Risk-gate asks (permissions.ask matches and
+# write redirects escaping the workspace) still ask in every mode.
+DEFERRING_MODES = frozenset({'auto', 'bypassPermissions', 'dontAsk'})
+
+
+def build_pretool_output(result: Dict[str, Any], permission_mode: str) -> Optional[Dict[str, Any]]:
+    """Map a validator result + the session's mode onto a PreToolUse payload.
+
+    Rules, in order:
+    1. deny → permissionDecision 'deny' + reason. Never mode-aware.
+    2. allow → permissionDecision 'allow'.
+    3. ask with ask_kind 'unknown' in a deferring mode → permissionDecision
+       'defer'. The reason is included too: the harness drops it (defer is
+       recorded as "this hook passed") but it lands in the debug log.
+    4. any other ask → permissionDecision 'ask' + reason, as before.
+    5. anything else → None (print nothing).
+
+    Args:
+        result: A validate_bash_command result dictionary
+        permission_mode: The session's permission_mode from the hook payload;
+            absent, empty or unrecognised values fall through to rule 4
+
+    Returns:
+        The dict to print, or None to print nothing.
+    """
+    decision = result['decision']
+
+    if decision == 'deny':
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'permissionDecision': 'deny',
+                'permissionDecisionReason': result['reason'],
+            }
+        }
+    if decision == 'allow':
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'permissionDecision': 'allow'
+            }
+        }
+    if decision == 'ask':
+        if result.get('ask_kind') == 'unknown' and permission_mode in DEFERRING_MODES:
+            return {
+                'hookSpecificOutput': {
+                    'hookEventName': 'PreToolUse',
+                    'permissionDecision': 'defer',
+                    'permissionDecisionReason': result['reason'],
+                }
+            }
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'PreToolUse',
+                'permissionDecision': 'ask',
+                'permissionDecisionReason': result['reason']
+            }
+        }
+    # Anything else (should not reach here normally) → silent fallback.
+    return None
 
 
 def replay_from_log(stdin_lines=None):
@@ -436,6 +518,11 @@ def replay_from_log(stdin_lines=None):
     parser = argparse.ArgumentParser(description='Replay commands from log for testing')
     parser.add_argument('--dry-run', '-n', action='store_true',
                         help='Show validation results without processing')
+    parser.add_argument('--mode', choices=sorted(DEFERRING_MODES | {'default', 'acceptEdits', 'plan'}),
+                        default=None,
+                        help='Permission mode to replay under. Default: the '
+                             'permission_mode recorded on the log entry being '
+                             'replayed, else "default".')
     args = parser.parse_args()
 
     workspace_dir = os.environ.get('CLAUDE_WORKSPACE_DIR', os.getcwd())
@@ -477,32 +564,12 @@ def replay_from_log(stdin_lines=None):
             if args.dry_run:
                 continue
 
-            # Simulate the hook decision
-            if result['decision'] == 'allow':
-                output = {
-                    'hookSpecificOutput': {
-                        'hookEventName': 'PreToolUse',
-                        'permissionDecision': 'allow'
-                    }
-                }
-                print(json.dumps(output))
-            elif result['decision'] == 'deny':
-                output = {
-                    'hookSpecificOutput': {
-                        'hookEventName': 'PreToolUse',
-                        'permissionDecision': 'deny',
-                        'permissionDecisionReason': result['reason']
-                    }
-                }
-                print(json.dumps(output))
-            elif result['decision'] == 'ask':
-                output = {
-                    'hookSpecificOutput': {
-                        'hookEventName': 'PreToolUse',
-                        'permissionDecision': 'ask',
-                        'permissionDecisionReason': result['reason']
-                    }
-                }
+            # Simulate the hook decision. The mode comes from --mode when
+            # given, else from the entry's own recorded permission_mode
+            # (entries written before that field existed replay as 'default').
+            replay_mode = args.mode if args.mode is not None else entry.get('permission_mode') or 'default'
+            output = build_pretool_output(result, replay_mode)
+            if output is not None:
                 print(json.dumps(output))
 
         except json.JSONDecodeError as e:
@@ -548,10 +615,16 @@ class BashPermissionValidator:
 
         Returns:
             Dictionary with:
-            - decision: 'allow' | 'deny' | 'defer'
+            - decision: 'allow' | 'deny' | 'ask'
             - reason: Explanation string
             - sub_commands: List of parsed sub-commands
             - validation_results: List of validation results for each sub-command
+            - ask_kind: 'risk' | 'unknown' | None — None unless decision == 'ask';
+              'risk' marks the operator's own configured floor (a permissions.ask
+              match) or this repo's write-redirect gate, 'unknown' marks the
+              absence of a risk judgement (nothing matched the allowlist)
+            - redirect_targets: The write-redirect targets the gate refused
+              ([] when none); structured for consumers that need them
         """
         debug_log(f"Validating command: {command!r}")
 
@@ -641,21 +714,29 @@ class BashPermissionValidator:
             denied_cmds = _dedupe([r['command'] for r in results if r['denied']])
             decision = 'deny'
             reason = "Matches a denied pattern: " + _format_command_list(denied_cmds)
+            ask_kind = None
+            redirect_targets = []
         elif any_asked:
             # Ask outranks allow: a fully-allowlisted command with an ask-matched
             # sub-command still prompts (D2: honor permissions.ask).
             asked_cmds = _dedupe([r['command'] for r in results if r.get('asked')])
             decision = 'ask'
             reason = "Matches an ask pattern: " + _format_command_list(asked_cmds)
+            ask_kind = 'risk'
+            redirect_targets = []
         elif disallowed_targets:
             # A redirection writes outside the workspace, /tmp, or /dev/null.
             decision = 'ask'
             reason = ("Redirects output outside the workspace, /tmp, or /dev/null — "
                       "review the write target: " + _format_command_list(disallowed_targets))
+            ask_kind = 'risk'
+            redirect_targets = list(disallowed_targets)
         elif all_allowed and len(sub_commands) > 0:
             # ALL allowed → explicitly allow
             decision = 'allow'
             reason = "All sub-commands are allowed"
+            ask_kind = None
+            redirect_targets = []
         else:
             # Some unknown or empty → ask. Name the exact sub-commands that are
             # not on the allowlist so the user knows what to scrutinize, rather
@@ -669,6 +750,8 @@ class BashPermissionValidator:
                           + _format_command_list(unknown))
             else:
                 reason = "Contains unknown or empty commands"
+            ask_kind = 'unknown'
+            redirect_targets = []
 
         debug_log(f"Decision: {decision} - {reason}")
 
@@ -676,7 +759,9 @@ class BashPermissionValidator:
             'decision': decision,
             'reason': reason,
             'sub_commands': sub_commands,
-            'validation_results': results
+            'validation_results': results,
+            'ask_kind': ask_kind,
+            'redirect_targets': redirect_targets
         }
 
     def _is_workspace_binary(self, cmd: str) -> bool:
@@ -2051,6 +2136,11 @@ def main():
         # Extract session info for correlation
         session_id = input_data.get('session_id', '')
 
+        # The session's permission mode, as the harness reports it in the hook
+        # payload. Absent, empty or unrecognised values behave as 'default'
+        # (fail conservative): every ask still asks.
+        permission_mode = input_data.get('permission_mode', '')
+
         # Process tools that execute a shell command. Bash is the obvious one;
         # Monitor is a built-in that runs an until-loop shell command and is
         # otherwise gated by Claude Code's own coarse heuristic (which, e.g.,
@@ -2081,47 +2171,43 @@ def main():
 
         debug_log(f"Validation result: {json.dumps(result, indent=2)}")
 
+        # Compute the payload first, then log, then print: the confirm-log
+        # entry records what was EMITTED ('emitted'), which is not knowable
+        # before the emission decision is made.
+        output = build_pretool_output(result, permission_mode)
+
         # Log commands that were NOT auto-approved (ask or deny)
         # These require manual confirmation from the user
         if result['decision'] != 'allow':
-            log_manual_confirmation(command, result, workspace_dir, session_id)
+            log_manual_confirmation(command, result, workspace_dir, session_id,
+                                    permission_mode=permission_mode, output=output)
 
-        # Make decision
-        if result['decision'] == 'allow':
+        emitted = None if output is None else output['hookSpecificOutput']['permissionDecision']
+
+        if emitted == 'allow':
             # Explicitly allow - bypass normal permission system
-            output = {
-                'hookSpecificOutput': {
-                    'hookEventName': 'PreToolUse',
-                    'permissionDecision': 'allow'
-                }
-            }
             print(json.dumps(output))
             debug_log(f"ALLOWING command (bypassing normal permissions)")
             sys.exit(0)
-        elif result['decision'] == 'deny':
+        elif emitted == 'deny':
             # Hard deny — matched a deny pattern; reason names the sub-command(s)
             # so the agent can reformulate. Flows back to the model via
-            # permissionDecisionReason (H1 mitigation).
-            output = {
-                'hookSpecificOutput': {
-                    'hookEventName': 'PreToolUse',
-                    'permissionDecision': 'deny',
-                    'permissionDecisionReason': result['reason'],
-                }
-            }
+            # permissionDecisionReason (H1 mitigation). Never mode-aware.
             print(json.dumps(output))
             debug_log(f"DENYING command: {result['reason']}")
             sys.exit(0)
-        elif result['decision'] == 'ask':
+        elif emitted == 'defer':
+            # Unknown command in a mode that resolves ask-candidates itself
+            # (auto / bypassPermissions / dontAsk): pass the decision back to
+            # the normal pipeline instead of flooring it with 'ask'. The
+            # harness records defer as "this hook passed" — the reason is
+            # logged here but not surfaced.
+            print(json.dumps(output))
+            debug_log(f"DEFERRING to the pipeline ({permission_mode}): {result['reason']}")
+            sys.exit(0)
+        elif emitted == 'ask':
             # Ask user via native Claude permission flow
             # This triggers the PermissionRequest hook for additional handling
-            output = {
-                'hookSpecificOutput': {
-                    'hookEventName': 'PreToolUse',
-                    'permissionDecision': 'ask',
-                    'permissionDecisionReason': result['reason']
-                }
-            }
             print(json.dumps(output))
             debug_log(f"ASKING for permission: {result['reason']}")
             sys.exit(0)

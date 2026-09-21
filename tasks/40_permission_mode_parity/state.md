@@ -25,9 +25,9 @@ that describe this hook.
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 40-01 | [Pretool defers to the mode](./40-01-pretool-defers-to-the-mode_sonnet.md) | todo | — | **The fix.** One emission site, one additive field, one log-path correction. Ship this even if nothing else lands. |
+| 40-01 | [Pretool defers to the mode](./40-01-pretool-defers-to-the-mode_sonnet.md) | in_progress | — | **The fix.** One emission site, one additive field, one log-path correction. Ship this even if nothing else lands. |
 | 40-02 | [The card names the asker](./40-02-the-card-names-the-asker.md) | todo | 40-01 | Records `permission_mode` on the row, stops the card claiming the allowlist raised a prompt it did not raise (brd H4), updates the docs. |
-| 40-03 | [YOLO on the native mode](./40-03-yolo-native-mode.md) | **optional** | 40-01 | Decision-gated. **Ask the operator the §3 question before running it** — it is one-way from Telegram. |
+| 40-03 | [YOLO on the native mode](./40-03-yolo-native-mode.md) | todo | 40-01 | **Operator answered (b) 2026-09-21** — promote YOLO to the native `setMode: bypassPermissions`. Sonnet implementer, §4(b) scope. `/yolo-off` becomes keyboard-only; `.claude/commands/yolo-off.md` must say so. |
 | 40-04 | [Live verification](./40-04-live-verification_human.md) | todo | 40-01 + 40-02 installed | **human** — six modes, and it answers brd H8. |
 
 ## Dependency graph
@@ -158,3 +158,10 @@ way to work than a six-minute one.
   note, invariant 8 (mutation proof), and the Testing baseline above — measured
   rather than remembered, which corrected the standing belief that a full run
   carries six failures: it does not, they are pytest-path only.
+- **2026-09-21 — operator answered 40-03 §3: (b).** Promote YOLO to the native
+  mode: the `yolo` action's allow payload carries
+  `setMode: bypassPermissions`; `session_yolo_store` stays as the fallback for
+  stripped updates. `/yolo-off` can no longer undo the mode from Telegram —
+  `.claude/commands/yolo-off.md` must tell the operator the mode change needs
+  the keyboard (Shift+Tab) or a session end. Accepted one-way cost. Runs after
+  40-01, per the dependency graph; no relay change needed for (b).

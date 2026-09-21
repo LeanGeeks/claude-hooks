@@ -1560,6 +1560,367 @@ class TestRedirectTargets(unittest.TestCase):
         self.assertEqual(self._decision('echo hi > /root/owned'), "ask")
 
 
+class TestPermissionModeParity(unittest.TestCase):
+    """Task 40-01: the hook defers to the session's permission mode.
+
+    In a mode that resolves ask-candidates itself (`auto`,
+    `bypassPermissions`, `dontAsk`) an *unknown* command must emit the
+    harness's `defer` instead of the hookAskFloor `ask`, so the pipeline
+    (rules → mode → auto-mode classifier) decides exactly as it would if the
+    hook were not installed. Risk gates (a `permissions.ask` match, a write
+    redirect escaping the workspace) still ask in every mode; `deny` is
+    unconditional; `default` / `plan` / `acceptEdits` and an absent mode
+    behave byte-identically to before.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Seed a minimal workspace for the whole class.
+
+        A nonexistent workspace would make SettingsLoader resolve only the
+        operator's global ~/.claude/settings.json, silently making these
+        tests depend on that machine-specific file (it must contain the
+        echo allow and dd deny patterns the cases below rely on). The
+        seeded workspace pins those patterns; the loader still merges the
+        global file on top, but the tests no longer require anything
+        from it.
+        """
+        cls.WS = tempfile.mkdtemp(prefix="mode-parity-ws-")
+        os.makedirs(os.path.join(cls.WS, ".claude"))
+        with open(os.path.join(cls.WS, ".claude", "settings.json"), "w") as f:
+            json.dump({"permissions": {
+                "allow": ["Bash(echo:*)"],
+                "deny": ["Bash(dd:*)"],
+            }}, f)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.WS, ignore_errors=True)
+
+    def _validator(self, allow=None, ask=None, deny=None):
+        return BashPermissionValidator(
+            _FakeLoader(allow or ["Bash(echo:*)"], ask=ask, deny=deny or ["Bash(dd:*)"]),
+            BashCommandParser(), workspace_dir=self.WS
+        )
+
+    def _payload(self, command, permission_mode=None, tool_name="Bash"):
+        payload = {
+            "tool_name": tool_name,
+            "tool_input": {"command": command},
+            "session_id": "test-session-mode-parity",
+            "cwd": self.WS,
+        }
+        if permission_mode is not None:
+            payload["permission_mode"] = permission_mode
+        return payload
+
+    def _run_payload(self, payload, workspace=None):
+        """Invoke the hook as a subprocess; return (returncode, parsed
+        hookSpecificOutput or None). `workspace` overrides the env-based
+        workspace resolution (which wins over the payload's cwd)."""
+        hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
+        proc = subprocess.run(
+            [sys.executable, hook], input=json.dumps(payload),
+            capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_WORKSPACE_DIR": workspace or self.WS,
+                 "CLAUDE_HOOK_DEBUG": "0"},
+            timeout=10,
+        )
+        out = proc.stdout.strip()
+        parsed = json.loads(out)["hookSpecificOutput"] if out else None
+        return proc.returncode, parsed
+
+    # --- validator-level: the additive return shape (case 15, 15b) ---------
+
+    def test_case15_validator_return_shape_on_all_paths(self):
+        """`ask_kind` and `redirect_targets` are present on every decision
+        path; `decision` stays one of allow|deny|ask."""
+        validator = self._validator(ask=["Bash(git push:*)"])
+        cases = {
+            "echo hi": "allow",
+            "dd if=x of=y": "deny",
+            "git push origin main": "ask",
+            "frobnicate --all": "ask",
+            "echo hi > /etc/passwd": "ask",
+        }
+        for command, expected_decision in cases.items():
+            with self.subTest(command=command):
+                result = validator.validate_bash_command(command)
+                self.assertEqual(result["decision"], expected_decision)
+                self.assertIn("ask_kind", result)
+                self.assertIn("redirect_targets", result)
+                self.assertIn(result["decision"], ("allow", "deny", "ask"))
+                if expected_decision == "ask":
+                    self.assertIn(result["ask_kind"], ("risk", "unknown"))
+                else:
+                    self.assertIsNone(result["ask_kind"])
+
+    def test_case15b_redirect_targets_structured_and_in_reason(self):
+        """Case 12's result carries the refused targets both structured and in
+        the reason string."""
+        result = self._validator().validate_bash_command('echo hi > /etc/passwd')
+        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["ask_kind"], "risk")
+        self.assertEqual(result["redirect_targets"], ["/etc/passwd"])
+        self.assertIn("/etc/passwd", result["reason"])
+
+    def test_ask_kind_risk_on_ask_pattern_match(self):
+        """A `permissions.ask` match is a risk ask (case 11, validator side)."""
+        result = self._validator(ask=["Bash(git push:*)"]).validate_bash_command(
+            "git push origin main")
+        self.assertEqual(result["decision"], "ask")
+        self.assertEqual(result["ask_kind"], "risk")
+
+    def test_ask_kind_unknown_and_empty_targets_otherwise(self):
+        """allow / deny carry `ask_kind=None` and empty targets; the unknown
+        ask carries kind 'unknown' and empty targets."""
+        validator = self._validator()
+        allow = validator.validate_bash_command("echo hi")
+        deny = validator.validate_bash_command("dd if=x of=y")
+        unknown = validator.validate_bash_command("frobnicate --all")
+        self.assertIsNone(allow["ask_kind"])
+        self.assertEqual(allow["redirect_targets"], [])
+        self.assertIsNone(deny["ask_kind"])
+        self.assertEqual(deny["redirect_targets"], [])
+        self.assertEqual(unknown["ask_kind"], "unknown")
+        self.assertEqual(unknown["redirect_targets"], [])
+
+    # --- payload-level: mode → decision mapping (cases 1–14, 17b) ----------
+
+    UNKNOWN = "frobnicate --all"
+
+    def test_case1_no_permission_mode_still_asks(self):
+        """Load-bearing: a payload WITHOUT permission_mode asks exactly as
+        today — the default-mode contract must not move."""
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "ask")
+        self.assertIn("Not in allowlist", parsed["permissionDecisionReason"])
+
+    def test_case2_default_mode_asks(self):
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "default"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "ask")
+
+    def test_case3_auto_mode_defers(self):
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIn("Not in allowlist", parsed["permissionDecisionReason"])
+
+    def test_case4_bypass_mode_defers(self):
+        code, parsed = self._run_payload(
+            self._payload(self.UNKNOWN, "bypassPermissions"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "defer")
+
+    def test_case5_dontask_mode_defers(self):
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "dontAsk"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "defer")
+
+    def test_case6_acceptedits_and_plan_ask(self):
+        for mode in ("acceptEdits", "plan"):
+            with self.subTest(mode=mode):
+                code, parsed = self._run_payload(self._payload(self.UNKNOWN, mode))
+                self.assertEqual(code, 0)
+                self.assertEqual(parsed["permissionDecision"], "ask")
+
+    def test_case7_nonsense_mode_asks_without_error(self):
+        """An unrecognised mode falls through to `ask`, exit 0, no exception."""
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "nonsense-value"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "ask")
+
+    def test_case8_deny_in_auto_mode_ignores_mode(self):
+        code, parsed = self._run_payload(self._payload("dd if=/dev/zero of=/dev/sda", "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "deny")
+        self.assertIn("denied", parsed["permissionDecisionReason"].lower())
+
+    def test_case9_deny_in_bypass_mode_ignores_mode(self):
+        code, parsed = self._run_payload(
+            self._payload("dd if=/dev/zero of=/dev/sda", "bypassPermissions"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "deny")
+
+    def test_case10_allowlisted_command_in_auto_allows(self):
+        code, parsed = self._run_payload(self._payload("echo hi", "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "allow")
+
+    def test_case11_ask_pattern_in_auto_still_asks(self):
+        """A risk ask (permissions.ask match) asks even in auto mode."""
+        import tempfile
+        settings_dir = tempfile.mkdtemp(prefix="mode-parity-ask-")
+        os.makedirs(os.path.join(settings_dir, ".claude"))
+        try:
+            with open(os.path.join(settings_dir, ".claude", "settings.json"), "w") as f:
+                json.dump({"permissions": {
+                    "allow": ["Bash(echo:*)"],
+                    "ask": ["Bash(git push:*)"],
+                }}, f)
+            payload = self._payload("git push origin main", "auto")
+            payload["cwd"] = settings_dir
+            code, parsed = self._run_payload(payload, workspace=settings_dir)
+            self.assertEqual(code, 0)
+            self.assertEqual(parsed["permissionDecision"], "ask")
+            self.assertIn("ask pattern", parsed["permissionDecisionReason"])
+        finally:
+            shutil.rmtree(settings_dir, ignore_errors=True)
+
+    def test_case12_escaping_redirect_in_auto_still_asks(self):
+        """A risk ask (write redirect outside the workspace) asks even in auto
+        mode — never deferred."""
+        code, parsed = self._run_payload(self._payload('echo hi > /etc/passwd', "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "ask")
+        self.assertIn("Redirects output outside", parsed["permissionDecisionReason"])
+
+    def test_case13_mixed_allow_unknown_in_auto_defers(self):
+        code, parsed = self._run_payload(self._payload("echo hi && frobnicate", "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "defer")
+
+    def test_case14_mixed_deny_unknown_in_auto_denies(self):
+        """Deny outranks everything, including a deferring mode."""
+        code, parsed = self._run_payload(
+            self._payload("dd if=/dev/zero of=/dev/sda && frobnicate", "auto"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "deny")
+
+    def test_case17b_monitor_unknown_in_auto_defers(self):
+        """The PreToolUse matcher is Bash|Monitor; Monitor carries
+        tool_input['command'] and defers like Bash."""
+        code, parsed = self._run_payload(
+            self._payload(self.UNKNOWN, "auto", tool_name="Monitor"))
+        self.assertEqual(code, 0)
+        self.assertEqual(parsed["permissionDecision"], "defer")
+
+    # --- confirm-log integration (cases 16, 17) ----------------------------
+
+    def test_case16_confirm_log_records_mode_and_emitted(self):
+        """The entry for the auto/defer run reads decision:"ask",
+        emitted:"defer", permission_mode:"auto"."""
+        confirm_log = Path(os.environ["CLAUDE_MANUAL_CONFIRM_LOG"])
+        confirm_log.parent.mkdir(parents=True, exist_ok=True)
+        size_before = confirm_log.stat().st_size
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "auto"))
+        self.assertEqual(parsed["permissionDecision"], "defer")
+        entries = [
+            json.loads(line) for line in
+            confirm_log.read_text()[size_before:].splitlines() if line.strip()
+        ]
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["decision"], "ask")
+        self.assertEqual(entry["emitted"], "defer")
+        self.assertEqual(entry["permission_mode"], "auto")
+        self.assertEqual(entry["command"], self.UNKNOWN)
+
+    def test_case16b_confirm_log_emitted_ask_when_prompting(self):
+        """The default-mode run records emitted:"ask" — a prompt really fired."""
+        confirm_log = Path(os.environ["CLAUDE_MANUAL_CONFIRM_LOG"])
+        confirm_log.parent.mkdir(parents=True, exist_ok=True)
+        size_before = confirm_log.stat().st_size
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "default"))
+        self.assertEqual(parsed["permissionDecision"], "ask")
+        entries = [
+            json.loads(line) for line in
+            confirm_log.read_text()[size_before:].splitlines() if line.strip()
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["decision"], "ask")
+        self.assertEqual(entries[0]["emitted"], "ask")
+        self.assertEqual(entries[0]["permission_mode"], "default")
+
+    def test_case17_confirm_log_respects_env_redirect(self):
+        """brd H7: the hook writes to CLAUDE_MANUAL_CONFIRM_LOG, never to the
+        operator's real ~/.claude/bash_manual_confirm.log. Asserted against
+        the REAL path: size and mtime unchanged across a run that logs."""
+        real_log = Path.home() / ".claude" / "bash_manual_confirm.log"
+        stat_before = real_log.stat() if real_log.exists() else None
+        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "default"))
+        self.assertEqual(parsed["permissionDecision"], "ask")
+        if stat_before is None:
+            # The real log did not exist before the run; H7 also forbids the
+            # hook from creating it when the env redirect is honoured.
+            self.assertFalse(
+                real_log.exists(),
+                "the run created the real ~/.claude/bash_manual_confirm.log — "
+                "CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
+            return
+        stat_after = real_log.stat()
+        self.assertEqual(stat_before.st_size, stat_after.st_size,
+                         "the real ~/.claude/bash_manual_confirm.log grew — "
+                         "CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
+        self.assertEqual(stat_before.st_mtime_ns, stat_after.st_mtime_ns,
+                         "the real ~/.claude/bash_manual_confirm.log was "
+                         "touched — CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
+
+    # --- replay mode (case 18) ---------------------------------------------
+
+    def test_case18_replay_with_mode_flag_defers(self):
+        """`--mode auto` on an unknown command prints the defer payload."""
+        hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
+        log_line = json.dumps({
+            "command": self.UNKNOWN,
+            "decision": "ask",
+            "reason": "Not in allowlist — review before approving",
+            "sub_commands": [self.UNKNOWN],
+            "validation_results": [],
+        })
+        proc = subprocess.run(
+            [sys.executable, hook, "--mode", "auto"],
+            input=log_line, capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_WORKSPACE_DIR": self.WS,
+                 "CLAUDE_HOOK_DEBUG": "0", "CLAUDE_HOOK_REPLAY": "1"},
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = proc.stdout.strip()
+        self.assertTrue(out, "replay printed nothing")
+        self.assertEqual(
+            json.loads(out)["hookSpecificOutput"]["permissionDecision"], "defer")
+
+    def test_case18b_replay_default_asks_entry_without_mode(self):
+        """Without --mode, an entry with no recorded permission_mode replays as
+        'default' and asks — history is not retroactively softened."""
+        hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
+        log_line = json.dumps({"command": self.UNKNOWN, "decision": "ask"})
+        proc = subprocess.run(
+            [sys.executable, hook], input=log_line, capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_WORKSPACE_DIR": self.WS,
+                 "CLAUDE_HOOK_DEBUG": "0"},
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = proc.stdout.strip()
+        self.assertTrue(out, "replay printed nothing")
+        self.assertEqual(
+            json.loads(out)["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_case18c_replay_honours_recorded_mode(self):
+        """Without --mode, an entry that recorded permission_mode "auto"
+        replays as auto and defers."""
+        hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
+        log_line = json.dumps({
+            "command": self.UNKNOWN, "decision": "ask",
+            "permission_mode": "auto",
+        })
+        proc = subprocess.run(
+            [sys.executable, hook], input=log_line, capture_output=True, text=True,
+            env={**os.environ, "CLAUDE_WORKSPACE_DIR": self.WS,
+                 "CLAUDE_HOOK_DEBUG": "0"},
+            timeout=10,
+        )
+        self.assertEqual(proc.returncode, 0)
+        out = proc.stdout.strip()
+        self.assertTrue(out, "replay printed nothing")
+        self.assertEqual(
+            json.loads(out)["hookSpecificOutput"]["permissionDecision"], "defer")
+
+
 class TestMonitorToolHandled(unittest.TestCase):
     """The pretool hook validates the Monitor tool's command the same way it
     validates Bash, so a clean Monitor command auto-approves (bypassing Claude
