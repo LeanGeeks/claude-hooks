@@ -131,7 +131,29 @@ way to work than a six-minute one.
 
 ## Log
 
-- **2026-09-21 — epic created.** From the operator's report that permission
+- **2026-09-21 — 40-04 will be closed from normal use, not a scripted matrix.
+  What stays owed.** The operator opted to verify by using the hooks normally
+  (auto/default/bypass sessions accumulate evidence in the logs for free) plus
+  one deliberate experiment. Owed at closure:
+  1. **H8 (subagent mode) — the one experiment normal use won't run.** In an
+     `auto`-mode session, spawn a subagent (Task/Agent) that runs Bash, then
+     `grep -B 4 "Agent ID: " ~/.claude/permission_request_debug.log | grep -A 4 "Agent ID: [^N]"`.
+     Record the answer in this file. Until then the absent-mode ⇒ `ask`
+     fallback (invariant 3) stands.
+  2. **dontAsk and plan cells of the matrix.** Normal sessions are never in
+     these modes; each needs one deliberate session. `plan` additionally owes
+     the ExitPlanMode-still-reaches-Telegram check.
+  3. **§4b — acceptEdits.** Only if the operator happens to work in
+     acceptEdits sessions; otherwise record "not exercised, question open".
+  4. **The post-change `Permission mode:` tally** (successor to the
+     236/94/86 baseline) — grepped and recorded after a few days of use.
+  5. **A yolo tap observation.** Next real /yolo tap: confirm the terminal
+     indicator flips to bypass mode (40-03's payload is only proven live
+     once). Also note the session cannot be un-bypassed from Telegram — the
+     one-way cost, seen once.
+  Normal use is expected to cover the auto-mode acceptance criterion
+  (defer + no card, brd §4.1), the default byte-parity claim (§4.3), the
+  bypass silence (§4.5 row), and card wording in the wild (§4.5).
   forwarding predates Auto mode and defeats it. Diagnosis in brd §1: the
   `hookAskFloor` mechanism, measured at 69 of 86 auto-mode requests on this
   machine between 2026-09-14 and 2026-09-21. Two proposals were **rejected**
