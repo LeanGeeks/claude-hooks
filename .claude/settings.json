@@ -55,6 +55,7 @@
       "mcp__chrome-devtools__take_snapshot",
       "mcp__chrome-devtools__upload_file",
       "mcp__chrome-devtools__wait_for",
+      "mcp__claude-in-chrome__*",
       "mcp__plugin_figma_figma__add_code_connect_map",
       "mcp__plugin_figma_figma__create_design_system_rules",
       "mcp__plugin_figma_figma__generate_diagram",
