@@ -532,12 +532,19 @@ def _bash_launch_ack(tool_use_id, task_id):
 
 
 def _monitor_launch_ack(tool_use_id, task_id, persistent=False):
-    text = (f"Monitor started (task {task_id}, persistent — runs until TaskStop)"
-            if persistent else f"Monitor started (task {task_id})")
+    if persistent:
+        text = f"Monitor started (task {task_id}, persistent — runs until TaskStop)"
+        timeout_ms = 0
+    else:
+        text = (f"Monitor started (task {task_id}, expires in 30m unless the "
+                "source ends first; you get one notice at expiry — re-arm if "
+                "you still need the watch).")
+        timeout_ms = 1800000
     return _tool_result(
         tool_use_id,
         text=text,
-        tool_use_result={"taskId": task_id, "timeoutMs": 0, "persistent": persistent},
+        tool_use_result={"taskId": task_id, "timeoutMs": timeout_ms,
+                         "persistent": persistent},
     )
 
 
@@ -796,15 +803,87 @@ class TestHasActiveBackgroundWork(unittest.TestCase):
         t = _write_transcript([_monitor_tool_use()])
         self.assertTrue(nh.has_active_background_agents(t))
 
-    def test_monitor_event_completes_nonpersistent(self):
-        # One-shot monitor: event notification carries no tool-use-id and no
-        # status; matched via the task id recorded from the launch ack.
+    def test_timed_monitor_event_keeps_running(self):
+        # A timed (non-persistent) monitor fires one event per output line
+        # until its source ends or it expires; an event carries no status and
+        # does not mean the monitor stopped.
         t = _write_transcript([
             _monitor_tool_use("toolu_m1"),
             _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification("boil111", status=None, event="armed"),
             _task_notification("boil111", status=None, event="condition met"),
         ])
-        self.assertFalse(nh.has_active_background_agents(t))
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_timed_monitor_terminal_notice_clears(self):
+        # Stream end / expiry / kill / failure all arrive with a <status>.
+        for status in ("completed", "killed", "failed"):
+            with self.subTest(status=status):
+                t = _write_transcript([
+                    _monitor_tool_use("toolu_m1"),
+                    _monitor_launch_ack("toolu_m1", "boil111"),
+                    _task_notification("boil111", status=None, event="tick"),
+                    _task_notification("boil111", "toolu_m1", status=status),
+                ])
+                self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_timed_monitor_expiry_event_clears(self):
+        # Expiry arrives as a status-less <event> with no tool-use-id, and no
+        # status notice follows it (observed in real transcripts). Missing it
+        # would suppress idle pings for the rest of the session.
+        for delivered in ("no events delivered. Re-arm it if you still need "
+                          "the watch — and widen the filter if silence is "
+                          "unexpected.",
+                          "7 events delivered. Re-arm it if you still need "
+                          "the watch."):
+            with self.subTest(delivered=delivered):
+                t = _write_transcript([
+                    _monitor_tool_use("toolu_m1"),
+                    _monitor_launch_ack("toolu_m1", "boil111"),
+                    _task_notification("boil111", status=None, event="tick"),
+                    _task_notification(
+                        "boil111", status=None,
+                        event=f"[Monitor expired after 30m with {delivered}]"),
+                ])
+                self.assertFalse(nh.has_active_background_agents(t))
+
+    def test_monitor_event_quoting_expiry_text_mid_line_keeps_running(self):
+        # Only an event that *is* the expiry notice ends the watch.
+        t = _write_transcript([
+            _monitor_tool_use("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification(
+                "boil111", status=None,
+                event="log: saw [Monitor expired after 30m] upstream"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_timed_monitor_outlives_finished_background_bash(self):
+        # Regression (night-wave controller): a background Bash finishing
+        # after the watcher's first event left no tracked work, so the idle
+        # ping fired while the monitor was still watching child sessions.
+        t = _write_transcript([
+            _monitor_tool_use("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification("boil111", status=None, event="armed"),
+            _bash_bg_tool_use("toolu_b1"),
+            _bash_launch_ack("toolu_b1", "bqq111"),
+            _task_notification("bqq111", "toolu_b1"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
+
+    def test_timed_monitor_rearm_tracks_new_task(self):
+        # The old watch ends and a new one is armed; the new one's events must
+        # not clear it either.
+        t = _write_transcript([
+            _monitor_tool_use("toolu_m1"),
+            _monitor_launch_ack("toolu_m1", "boil111"),
+            _task_notification("boil111", "toolu_m1", status="completed"),
+            _monitor_tool_use("toolu_m2"),
+            _monitor_launch_ack("toolu_m2", "boil222"),
+            _task_notification("boil222", status=None, event="armed"),
+        ])
+        self.assertTrue(nh.has_active_background_agents(t))
 
     def test_persistent_monitor_event_keeps_running(self):
         t = _write_transcript([

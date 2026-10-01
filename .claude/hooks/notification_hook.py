@@ -172,6 +172,9 @@ def _is_background_tool_use(block: dict) -> bool:
 #   <status>completed</status>...</task-notification>
 _NOTIF_TASK_ID_RE = re.compile(r"<task-id>\s*([^<\s]+)\s*</task-id>")
 _NOTIF_TOOL_USE_ID_RE = re.compile(r"<tool-use-id>\s*([^<\s]+)\s*</tool-use-id>")
+# A timed monitor's expiry is delivered as a plain <event> (no <status>, no
+# <tool-use-id>) and nothing follows it, so it has to be recognised by text.
+_MONITOR_EXPIRED_RE = re.compile(r"<event>\s*\[Monitor expired after ")
 
 # Fallbacks for pulling the task id out of a launch ack's *text* when the
 # entry-level toolUseResult metadata is missing.
@@ -220,9 +223,12 @@ def has_active_background_agents(transcript_path: str) -> bool:
                                        no async marker means the tool actually
                                        ran synchronously → not running
     - <task-notification>            → task stopped → not running; except a
-                                       persistent Monitor's <event> (no
-                                       <status>), which fires per event while
-                                       the monitor keeps watching
+                                       Monitor's <event> (no <status>), which
+                                       fires per event while the monitor keeps
+                                       watching — timed monitors included; the
+                                       terminal notice carries <status>, except
+                                       expiry, an <event> "[Monitor expired
+                                       after …]"
     - TaskStop tool_use              → task killed → not running
     - SendMessage ack "resumed it in the background" → agent running again
     """
@@ -341,7 +347,10 @@ def has_active_background_agents(transcript_path: str) -> bool:
                     content_str = msg["content"]
                 if isinstance(content_str, str) and "<task-notification>" in content_str:
                     has_status = "<status>" in content_str
-                    is_event = "<event>" in content_str
+                    is_event = (
+                        "<event>" in content_str
+                        and not _MONITOR_EXPIRED_RE.search(content_str)
+                    )
                     keys = set()
                     for task_id in _NOTIF_TASK_ID_RE.findall(content_str):
                         key = task_to_key.get(task_id)
@@ -352,11 +361,11 @@ def has_active_background_agents(transcript_path: str) -> bool:
                             keys.add(tool_use_id)
                     for key in keys:
                         if (
-                            running.get(key) == "monitor-persistent"
+                            running.get(key, "").startswith("monitor")
                             and is_event
                             and not has_status
                         ):
-                            continue  # persistent monitor: fired, still watching
+                            continue  # monitor fired an event, still watching
                         running.pop(key, None)
                     continue
 
