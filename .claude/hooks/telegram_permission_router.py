@@ -453,12 +453,14 @@ def _bash_annotations(request: PermissionRequest) -> BashAnnotations:
         from settings_loader import SettingsLoader
         from bash_command_parser import BashCommandParser
 
-        # Settings come from the row's stored root (epic 41 D8): this runs in
-        # another process, without the session's CLAUDE_PROJECT_DIR.
+        # Settings and write roots come from the row (epic 41 D8): this runs
+        # in another process, without the session's environment or payload.
+        # A row without write_roots gets none (cwd and /tmp only).
         validator = BashPermissionValidator(
             SettingsLoader(settings_root_for_row(request.settings_root, request.cwd)),
             BashCommandParser(),
             workspace_dir=request.cwd,
+            extra_roots=request.write_roots,
         )
         result = validator.validate_bash_command(command)
     except Exception as e:  # noqa: BLE001

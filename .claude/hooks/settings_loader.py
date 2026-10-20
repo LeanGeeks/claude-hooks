@@ -94,7 +94,7 @@ class SettingsLoader:
 
             with open(path, 'r') as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
+        except (json.JSONDecodeError, IOError, RecursionError) as e:
             # Log error to stderr but continue
             print(f"Warning: Failed to load {path}: {e}", file=__import__('sys').stderr)
             return {}

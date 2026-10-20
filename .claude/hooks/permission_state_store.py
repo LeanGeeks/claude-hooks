@@ -160,6 +160,13 @@ class PermissionRequest:
     # Additive: older rows load with None and fall back to
     # ``resolve_workspace_root(cwd)``.
     settings_root: Optional[str] = None
+    # Epic 41 (41-02, brd D8): the extra write roots the PreToolUse hook used
+    # for this request's redirect gate and `rm` check (``pretool_hook.
+    # compute_write_roots``: project root, user-level additionalDirectories,
+    # own memory dir in a deferring mode), as realpaths. The router card and
+    # the permissions MCP pass them to the validator. Additive: older rows
+    # load with None and get no extra roots (cwd and /tmp only).
+    write_roots: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -299,6 +306,7 @@ def create_request(
     role: Optional[str] = None,
     permission_mode: Optional[str] = None,
     settings_root: Optional[str] = None,
+    write_roots: Optional[List[str]] = None,
 ) -> PermissionRequest:
     """
     Create a new pending permission request.
@@ -320,6 +328,8 @@ def create_request(
             the card then says nothing about who raised the prompt.
         settings_root: Resolved settings root (epic 41); None for callers that
             never reach a settings read or write.
+        write_roots: Extra write roots (epic 41, 41-02); None for callers
+            that never re-run the validator.
 
     Returns:
         PermissionRequest object with request_id
@@ -363,6 +373,7 @@ def create_request(
         role=role,
         permission_mode=permission_mode,
         settings_root=settings_root,
+        write_roots=list(write_roots) if write_roots is not None else None,
         owner_pid=owner_pid,
         owner_start_ticks=owner_start_ticks,
         owner_host=owner_host,

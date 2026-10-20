@@ -45,6 +45,7 @@ TEST_MODULES = {
     "unit_whitelist": "test_unit_whitelist",
     "unit_permissions_mcp": "test_unit_permissions_mcp",
     "unit_settings_root": "test_unit_settings_root",
+    "unit_write_roots": "test_unit_write_roots",
     "unit_allowlist_queue": "test_unit_allowlist_queue",
     "unit_session_yolo": "test_unit_session_yolo",
     "unit_notification": "test_unit_notification_hook",

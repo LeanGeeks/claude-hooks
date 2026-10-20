@@ -66,6 +66,7 @@ except ImportError:
 
 # Import the new modules
 from project_key import resolve_settings_root
+from pretool_hook import compute_write_roots
 from permission_state_store import (
     PermissionRequest,
     RequestState,
@@ -1607,6 +1608,13 @@ def main():
         debug_log(f"CLAUDE_PROJECT_DIR: {os.environ.get('CLAUDE_PROJECT_DIR')!r}")
         settings_root = resolve_settings_root(cwd)
         debug_log(f"Settings root: {settings_root}")
+        # Epic 41-02 (brd D8): the same write roots PreToolUse computed from
+        # this payload (transcript_path / cwd / env / mode), stored on the row
+        # so the router card and the permissions MCP re-run the validator
+        # with them instead of their own environment.
+        write_roots = compute_write_roots(input_data, mode=permission_mode,
+                                          settings_root=settings_root)
+        debug_log(f"Write roots: {write_roots}")
         debug_log(f"Tool input: {json.dumps(tool_input)[:200]}")
         debug_log(f"Permission suggestions: {permission_suggestions}")
 
@@ -1647,6 +1655,7 @@ def main():
             agent_id=agent_id,
             permission_mode=permission_mode or None,
             settings_root=settings_root,
+            write_roots=write_roots,
         )
         debug_log(f"Created request: {request.request_id}")
 
@@ -1664,7 +1673,7 @@ def main():
         #    modes that resolve an ask-candidate themselves, so the pipeline
         #    allows it silently and no request ever reaches this hook. What still
         #    reaches it is a **risk-gate** ask — a `permissions.ask` match or a
-        #    write redirect escaping the workspace — because those are opinions
+        #    write redirect escaping the allowed roots — because those are opinions
         #    the harness does not hold, and they prompt in the terminal too.
         #    That ask outranks the CLI flag, so without this branch a session
         #    that asked for no prompts would sit on a Telegram card. This branch

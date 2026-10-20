@@ -2492,27 +2492,38 @@ class TestPermissionModeParity(unittest.TestCase):
 
     def test_case17_confirm_log_respects_env_redirect(self):
         """brd H7: the hook writes to CLAUDE_MANUAL_CONFIRM_LOG, never to the
-        operator's real ~/.claude/bash_manual_confirm.log. Asserted against
-        the REAL path: size and mtime unchanged across a run that logs."""
+        operator's real ~/.claude/bash_manual_confirm.log. Live sessions on a
+        shared machine append to the real log concurrently, so its size and
+        mtime say nothing. Instead the run's command carries a unique marker:
+        the marker must land in the isolated log and in no line the real log
+        gains meanwhile. The real log is only read, never written."""
+        import uuid
+        marker = "frobnicate-" + uuid.uuid4().hex
+        command = f"{marker} --all"
+        confirm_log = Path(os.environ["CLAUDE_MANUAL_CONFIRM_LOG"])
+        confirm_log.parent.mkdir(parents=True, exist_ok=True)
         real_log = Path.home() / ".claude" / "bash_manual_confirm.log"
-        stat_before = real_log.stat() if real_log.exists() else None
-        code, parsed = self._run_payload(self._payload(self.UNKNOWN, "default"))
+        self.assertNotEqual(confirm_log.resolve(), real_log.resolve(),
+                            "the test env must redirect the confirm log")
+        real_size = real_log.stat().st_size if real_log.exists() else 0
+        isolated_size = confirm_log.stat().st_size if confirm_log.exists() else 0
+
+        code, parsed = self._run_payload(self._payload(command, "default"))
         self.assertEqual(parsed["permissionDecision"], "ask")
-        if stat_before is None:
-            # The real log did not exist before the run; H7 also forbids the
-            # hook from creating it when the env redirect is honoured.
-            self.assertFalse(
-                real_log.exists(),
-                "the run created the real ~/.claude/bash_manual_confirm.log — "
-                "CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
-            return
-        stat_after = real_log.stat()
-        self.assertEqual(stat_before.st_size, stat_after.st_size,
-                         "the real ~/.claude/bash_manual_confirm.log grew — "
-                         "CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
-        self.assertEqual(stat_before.st_mtime_ns, stat_after.st_mtime_ns,
-                         "the real ~/.claude/bash_manual_confirm.log was "
-                         "touched — CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
+
+        isolated_tail = confirm_log.read_bytes()[isolated_size:].decode("utf-8", "replace")
+        self.assertIn(marker, isolated_tail,
+                      "the entry did not land in CLAUDE_MANUAL_CONFIRM_LOG")
+        if real_log.exists():
+            with open(real_log, "rb") as handle:
+                handle.seek(real_size)
+                real_tail = handle.read().decode("utf-8", "replace")
+            self.assertNotIn(marker, real_tail,
+                             "the run wrote to the real ~/.claude/bash_manual_confirm.log "
+                             "— CLAUDE_MANUAL_CONFIRM_LOG is not honoured")
+        else:
+            self.assertFalse(real_log.exists(),
+                             "the run created the real ~/.claude/bash_manual_confirm.log")
 
     # --- replay mode (case 18) ---------------------------------------------
 

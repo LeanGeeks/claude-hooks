@@ -110,7 +110,7 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 
 | Event | Matcher | Script | Role |
 |-------|---------|--------|------|
-| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. Four outcomes: `deny` for a deny match (unconditional, in every mode); `allow` when every sub-command is on the allowlist; `ask` for a **risk gate** — a `permissions.ask` match or a write redirect escaping the workspace (`/tmp` and the write-safe `/dev` sinks excepted) — which prompts in every mode; and **no output** for the **unknown** case when the session's mode resolves ask-candidates by itself (`auto` / `bypassPermissions` / `dontAsk`), which hands the call back to the normal pipeline. (Silence, not the harness's `defer` decision: `defer` is print-mode only — an interactive session ignores it, a non-interactive one, `claude -p` or a subagent, parks the call and ends its run.) Any other mode, and an absent or unrecognised one, keeps emitting `ask`, which lets Claude Code surface a `PermissionRequest`. |
+| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. Four outcomes: `deny` for a deny match (unconditional, in every mode); `allow` when every sub-command is on the allowlist; `ask` for a **risk gate** — a `permissions.ask` match or a write redirect escaping the allowed write roots (payload `cwd`, `/tmp`, the project root, user-level `additionalDirectories`, and in `auto` / `bypassPermissions` / `dontAsk` the session's own auto-memory directory — see *Write roots* below; the write-safe `/dev` sinks excepted) or hitting a protected path (`<root>/.claude/settings*.json`, `<root>/.claude/hooks/`, `~/.claude/` outside the own memory dir) — which prompts in every mode; and **no output** for the **unknown** case when the session's mode resolves ask-candidates by itself (`auto` / `bypassPermissions` / `dontAsk`), which hands the call back to the normal pipeline. (Silence, not the harness's `defer` decision: `defer` is print-mode only — an interactive session ignores it, a non-interactive one, `claude -p` or a subagent, parks the call and ends its run.) Any other mode, and an absent or unrecognised one, keeps emitting `ask`, which lets Claude Code surface a `PermissionRequest`. |
 | `PermissionRequest` | `*` | `permission_request_hook.py` | Send the request to Telegram via the relay, long-poll for the answer, map it to an allow/deny/stop/whitelist/reply decision. Also handles `AskUserQuestion`. timeout 43200s. |
 | `PostToolUse` | `*` | `posttool_hook.py` | If the request was resolved in the terminal instead, cancel the relay message (strip buttons) so the Telegram prompt goes dead. |
 | `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification — conditional on the session being operator-started (see below). |
@@ -132,8 +132,47 @@ at one directory: `project_key.resolve_settings_root(cwd)` =
 (card annotations, Whitelist write) and the permissions MCP classifier use the
 row's value, because they run later in other processes without the session's
 environment. Rows without it (written before epic 41) fall back to the git top
-level of `row.cwd`. The validator's `workspace_dir` (redirect / `rm` roots) is
-still the payload `cwd`.
+level of `row.cwd`. The validator's `workspace_dir` is still the payload `cwd`;
+the settings root joins the redirect / `rm` roots as one of the write roots below.
+
+### Write roots (epic 41, task 41-02)
+
+The redirect gate and the `rm` shortcut accept a target inside the payload
+`cwd`, `/tmp`, or one of the extra roots `pretool_hook.compute_write_roots`
+computes from the payload, the environment and the mode — what Claude Code
+itself treats as in-bounds, read only from sources the agent and the repo cannot
+write:
+
+- the project root (the settings root above);
+- `permissions.additionalDirectories` from `~/.claude/settings.json` only
+  (absolute and `~/` entries; none inside `~/.claude`; `--add-dir` is not
+  visible to hooks);
+- in `DEFERRING_MODES` only, until 41-04 verifies that Claude Code writes memory
+  without a prompt in `default` (brd H5): the session's own auto-memory
+  directory, `dirname(transcript_path)/memory` for a
+  `~/.claude/projects/<key>/<id>.jsonl` transcript, plus the main checkout's
+  `<key>/memory` for a linked worktree that the main checkout's
+  `git worktree list` registers and whose key passes an encoding self-check
+  (`project_key.encode_cli_project_key`, every non-alphanumeric → `-`, must
+  reproduce the transcript's key). A user-level `autoMemoryDirectory` replaces
+  it; `autoMemoryEnabled: false` removes it. Project and local settings are
+  never read for any of these.
+
+Protected paths stay refused inside every root, the new ones included:
+`<root>/.claude/settings.json`, `settings.local.json` and `hooks/` (for an
+unresolvable target the whole `<root>/.claude/`), and all of `~/.claude/` except
+the own memory dir (`~/.claude/projects/<key>/memory`; a sibling key, the own
+key outside `memory/` and `~/.claude/settings.json` stay protected). `rm` also
+refuses a protected path or a directory holding one. Workspace-binary execution
+keeps `cwd` + `/tmp` only.
+
+`permission_request_hook.py` calls the same helper on its own payload and stores
+the result on the row as `write_roots`; the router card and the permissions MCP
+classifier pass the row's `write_roots` to the validator (rows without it get
+none), and `find_deny_collision`, which has no row, passes none. Replay
+(`pretool_hook.py` with log lines on stdin) gets the project root and
+`additionalDirectories` but no memory root: log entries carry no
+`transcript_path`.
 
 ### permission_state_store.py — cross-hook coordination
 

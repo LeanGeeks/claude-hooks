@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 _log = logging.getLogger(__name__)
 
@@ -108,6 +109,34 @@ def encode_project_key(path: str) -> str:
     """
     encoded = str(path).replace("/", "-")
     return encoded or "-"
+
+
+def encode_cli_project_key(path: str) -> str:
+    """Claude Code's own ``~/.claude/projects/<key>`` encoding (epic 41, 41-02).
+
+    Every character other than ``[A-Za-z0-9]`` becomes ``-``. Observed on this
+    machine for 322 of 322 transcript directories (``/``, ``.``, ``_`` and
+    ``-`` all map to ``-``: ``dr_remi`` -> ``dr-remi``, ``/.worktrees/`` ->
+    ``--worktrees-``). Not the queue key: ``encode_project_key`` maps ``/``
+    only and must stay that way. Callers self-check the result against a key
+    the CLI actually wrote (``transcript_path``) before trusting it, because
+    the CLI shortens very long keys in a way this does not reproduce.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def list_worktrees(main: str) -> Optional[List[str]]:
+    """The worktree paths ``git -C <main> worktree list --porcelain`` registers.
+
+    Read from the main checkout's own ``.git`` (its ``worktrees/`` registry),
+    which an agent working inside a linked worktree cannot rewrite the way it
+    can rewrite the worktree's ``.git`` file. ``None`` when git gives no answer.
+    """
+    out = _run_git(main, "worktree", "list", "--porcelain")
+    if out is None:
+        return None
+    prefix = "worktree "
+    return [line[len(prefix):] for line in out.splitlines() if line.startswith(prefix)]
 
 
 def resolve_project_key(cwd: str) -> str:

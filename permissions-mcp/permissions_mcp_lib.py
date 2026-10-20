@@ -192,7 +192,9 @@ class Classification:
 
 
 def _build_validator(
-    cwd: str, settings_root: Optional[str] = None
+    cwd: str,
+    settings_root: Optional[str] = None,
+    write_roots: Optional[List[str]] = None,
 ) -> BashPermissionValidator:
     """The one classifier, bound to the **row's** workspace settings.
 
@@ -200,6 +202,11 @@ def _build_validator(
     directory the PreToolUse hook read rules from. ``None`` keeps the
     historical behaviour — settings read from ``cwd`` — which is what
     ``find_deny_collision`` (no row) relies on.
+
+    ``write_roots`` (epic 41, 41-02) is the row's stored extra write roots,
+    so a redirect the hook let through is not refused here. ``None``: no
+    extra roots (cwd and /tmp), for rows without the field and for
+    ``find_deny_collision``.
 
     H4: ``SettingsLoader`` caches merged settings for 60 s at class level. In a
     per-invocation hook that is invisible; in this long-lived server a
@@ -210,6 +217,7 @@ def _build_validator(
         SettingsLoader(settings_root or workspace_dir),
         BashCommandParser(),
         workspace_dir,
+        extra_roots=write_roots,
     )
 
 
@@ -276,7 +284,8 @@ def classify(row: PermissionRequest) -> Classification:
 
     try:
         validator = _build_validator(
-            row.cwd, settings_root_for_row(row.settings_root, row.cwd)
+            row.cwd, settings_root_for_row(row.settings_root, row.cwd),
+            row.write_roots,
         )
     except Exception as exc:  # noqa: BLE001 — a classifier that cannot run is human-only.
         return Classification(

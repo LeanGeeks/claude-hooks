@@ -24,13 +24,14 @@ import shlex
 import sys
 import os
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Mapping, Optional, Sequence
 
 # Import our modules
 try:
     from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
-    from project_key import resolve_settings_root
+    from project_key import (encode_cli_project_key, list_worktrees,
+                             resolve_project_root, resolve_settings_root)
 except ImportError:
     # If running from different directory, try adding hooks dir to path
     import pathlib
@@ -38,7 +39,8 @@ except ImportError:
     sys.path.insert(0, str(hooks_dir))
     from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
-    from project_key import resolve_settings_root
+    from project_key import (encode_cli_project_key, list_worktrees,
+                             resolve_project_root, resolve_settings_root)
 
 
 # Debug logging
@@ -467,7 +469,7 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
 # recognise this command" ask must not floor them: print nothing instead and let
 # the pipeline (rules → mode → auto-mode classifier) decide, exactly as it would
 # if this hook were not installed. Risk-gate asks (permissions.ask matches and
-# write redirects escaping the workspace) still ask in every mode.
+# write redirects escaping the allowed roots) still ask in every mode.
 #
 # Not the harness's `defer` decision, despite the name: `defer` is print-mode
 # only. An interactive session ignores it (logs a warning, same as silence); a
@@ -528,6 +530,235 @@ def build_pretool_output(result: Dict[str, Any], permission_mode: str) -> Option
     return None
 
 
+# ---------------------------------------------------------------------------
+# Write roots (epic 41, task 41-02): where a write redirect or `rm` may land
+# without a prompt, beyond the payload cwd and /tmp. Mirrors what Claude Code
+# itself treats as in-bounds, read only from sources the agent and the repo
+# cannot write (brd D5, state.md invariant 4).
+# ---------------------------------------------------------------------------
+
+def _path_within(path: str, root: str) -> bool:
+    """True if realpath `path` is realpath `root` or lies under it."""
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _claude_home() -> str:
+    """realpath of the user's Claude Code directory, `~/.claude`."""
+    return os.path.realpath(os.path.expanduser('~/.claude'))
+
+
+def _claude_projects() -> str:
+    """realpath of `~/.claude/projects`, where the CLI keeps per-project state."""
+    return os.path.realpath(os.path.join(os.path.expanduser('~/.claude'), 'projects'))
+
+
+def is_memory_shaped(path: str) -> bool:
+    """True if realpath `path` is `~/.claude/projects/<key>/memory`: the one
+    shape under `~/.claude/` the gate may treat as a write root (brd D4)."""
+    key_dir = os.path.dirname(path)
+    return (os.path.basename(path) == 'memory'
+            and os.path.dirname(key_dir) == _claude_projects()
+            and os.path.basename(key_dir) not in ('', '.', '..'))
+
+
+def _user_settings() -> Dict[str, Any]:
+    """`~/.claude/settings.json` only. Project and local settings files are
+    repo- or agent-writable, so no root is ever read from them (brd D5)."""
+    try:
+        with open(os.path.expanduser('~/.claude/settings.json')) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _user_dir(entry: Any) -> Optional[str]:
+    """realpath of an absolute or `~/` directory from user settings; None for
+    anything else (relative entries are ignored, as is a `~user` form)."""
+    if not isinstance(entry, str):
+        return None
+    entry = entry.strip()
+    if entry.startswith('~/'):
+        entry = os.path.expanduser(entry)
+    if not entry.startswith('/'):
+        return None
+    return os.path.realpath(entry)
+
+
+def _transcript_key(transcript_path: Any) -> Optional[str]:
+    """`<key>` of a `~/.claude/projects/<key>/<id>.jsonl` transcript path, or
+    None for anything else: missing, relative, not normalised, a deeper
+    (subagent) transcript, or one outside `~/.claude/projects`."""
+    if not isinstance(transcript_path, str) or not transcript_path.endswith('.jsonl'):
+        return None
+    if (not os.path.isabs(transcript_path)
+            or os.path.normpath(transcript_path) != transcript_path):
+        return None
+    key_dir = os.path.dirname(transcript_path)
+    key = os.path.basename(key_dir)
+    if key in ('', '.', '..'):
+        return None
+    if os.path.realpath(os.path.dirname(key_dir)) != _claude_projects():
+        return None
+    return key
+
+
+def _memory_root_for_key(key: str) -> Optional[str]:
+    """realpath of `~/.claude/projects/<key>/memory`, if it still has that
+    shape after symlinks are resolved."""
+    root = os.path.realpath(os.path.join(_claude_projects(), key, 'memory'))
+    return root if is_memory_shaped(root) else None
+
+
+def _worktree_memory_root(project_root: str, transcript_key: str) -> Optional[str]:
+    """The main checkout's memory dir for a linked-worktree session (brd H2),
+    or None unless all hold:
+
+    1. the encoding self-check: the project root, encoded the way the CLI
+       encodes it, equals the key the CLI wrote the transcript under;
+    2. the main checkout (`resolve_project_root`) differs from the project
+       root;
+    3. the main checkout's own `git worktree list` registers the project
+       root. The worktree's `.git` file is agent-writable and could name any
+       repo; the main checkout's registry is not.
+    """
+    root = os.path.realpath(project_root)
+    if encode_cli_project_key(root) != transcript_key:
+        debug_log(f"Write roots: key self-check failed for {root!r} "
+                  f"(transcript key {transcript_key!r}); no worktree memory root")
+        return None
+    main = resolve_project_root(root)
+    if main == root:
+        return None
+    registered = list_worktrees(main)
+    if not registered or root not in {os.path.realpath(p) for p in registered}:
+        debug_log(f"Write roots: {root!r} is not a worktree registered in {main!r}")
+        return None
+    return _memory_root_for_key(encode_cli_project_key(main))
+
+
+def _memory_roots(payload: Mapping[str, Any], user: Dict[str, Any],
+                  project_root: str) -> List[str]:
+    """The session's own auto-memory directory (brd D5, H2).
+
+    `autoMemoryEnabled: false` -> none. A user-level `autoMemoryDirectory`
+    (absolute or `~/`) replaces the default; one that is invalid, contains
+    `~/.claude`, or sits inside `~/.claude` without the
+    `projects/<key>/memory` shape gives none. Otherwise the default:
+    `dirname(transcript_path)/memory`, plus the main checkout's memory dir
+    for a registered linked worktree.
+    """
+    if user.get('autoMemoryEnabled') is False:
+        return []
+    override = user.get('autoMemoryDirectory')
+    if override not in (None, ''):
+        path = _user_dir(override)
+        if path is None:
+            return []
+        claude = _claude_home()
+        if _path_within(claude, path):
+            return []
+        if _path_within(path, claude) and not is_memory_shaped(path):
+            return []
+        # A directory under any other `.claude/` (another project's settings
+        # and hooks live there) is never a memory root.
+        if '.claude' in path.split(os.sep) and not is_memory_shaped(path):
+            return []
+        return [path]
+    key = _transcript_key(payload.get('transcript_path'))
+    if key is None:
+        return []
+    roots = []
+    own = _memory_root_for_key(key)
+    if own:
+        roots.append(own)
+    worktree = _worktree_memory_root(project_root, key)
+    if worktree:
+        roots.append(worktree)
+    return roots
+
+
+def compute_write_roots(payload: Mapping[str, Any],
+                        env: Optional[Mapping[str, str]] = None,
+                        mode: Optional[str] = None,
+                        settings_root: Optional[str] = None) -> List[str]:
+    """The write roots beyond the payload cwd and /tmp, as realpaths (41-02).
+
+    The one computation for every process (brd D8): `main()` passes the result
+    to the validator, and the PermissionRequest hook stores it on the row as
+    `write_roots` for the router and the permissions MCP, which re-run the
+    validator later without the payload.
+
+    1. The project root: 41-05's settings root (`settings_root` when the
+       caller already resolved it, else `resolve_settings_root(cwd, env)`).
+    2. `permissions.additionalDirectories` from `~/.claude/settings.json`
+       only; absolute and `~/` entries; none inside `~/.claude`.
+    3. In DEFERRING_MODES only (brd H5, until 41-04 verifies that Claude Code
+       writes memory without a prompt in `default`): the session's own
+       auto-memory directory (`_memory_roots`).
+
+    `mode` defaults to the payload's `permission_mode`. Each part fails
+    closed on its own: an error drops that part's roots, never adds one.
+    """
+    if mode is None:
+        mode = payload.get('permission_mode') or ''
+    roots: List[str] = []
+    try:
+        if settings_root is None:
+            settings_root = resolve_settings_root(payload.get('cwd') or os.getcwd(), env)
+        project_root = os.path.realpath(settings_root)
+        # A project root of `/` is never a root of its own: the `/`-aware
+        # containment is for additionalDirectories only; the cwd covers it as
+        # before.
+        if project_root != os.sep:
+            roots.append(project_root)
+    except Exception as e:
+        debug_log(f"Write roots: no project root: {e}")
+        settings_root = None
+    try:
+        user = _user_settings()
+    except Exception as e:
+        # RecursionError (deeply nested JSON), MemoryError...: fail safe. No
+        # user-level or memory roots (today's behaviour); the gate still runs.
+        debug_log(f"Write roots: user settings unreadable, no extra roots: {e}")
+        return _dedupe(roots)
+    try:
+        perms = user.get('permissions')
+        entries = perms.get('additionalDirectories') if isinstance(perms, dict) else None
+        claude = _claude_home()
+        for entry in entries if isinstance(entries, list) else []:
+            try:
+                path = _user_dir(entry)
+            except ValueError:
+                continue
+            if path is not None and not _path_within(path, claude):
+                roots.append(path)
+    except Exception as e:
+        debug_log(f"Write roots: additionalDirectories skipped: {e}")
+    if mode in DEFERRING_MODES and settings_root:
+        try:
+            roots.extend(_memory_roots(payload, user, settings_root))
+        except Exception as e:
+            debug_log(f"Write roots: no memory root: {e}")
+    return _dedupe(roots)
+
+
+def _sanitize_extra_roots(roots: Optional[Sequence[str]]) -> List[str]:
+    """Extra roots as the validator accepts them: absolute paths, realpathed
+    (the router and the MCP take them from a stored row). A root never lifts
+    a protected path: inside `~/.claude` only a memory-shaped root is carved
+    out (_is_protected_write_path), so no filter is needed here for that."""
+    clean: List[str] = []
+    for root in roots or []:
+        if not isinstance(root, str) or not os.path.isabs(root):
+            continue
+        try:
+            clean.append(os.path.realpath(root))
+        except ValueError:
+            continue
+    return _dedupe(clean)
+
+
 def replay_from_log(stdin_lines=None):
     """
     Debug mode: Read and replay commands from stdin (one JSON entry per line)
@@ -543,7 +774,13 @@ def replay_from_log(stdin_lines=None):
     """
     import argparse
 
-    parser = argparse.ArgumentParser(description='Replay commands from log for testing')
+    parser = argparse.ArgumentParser(
+        description='Replay commands from log for testing. Write roots: each '
+                    "entry's project root (the settings root) and the "
+                    'user-level additionalDirectories. Log entries carry no '
+                    'transcript_path, so no auto-memory root is applied: a '
+                    'memory-dir write that the live hook let through in a '
+                    'deferring mode replays as a redirect ask.')
     parser.add_argument('--dry-run', '-n', action='store_true',
                         help='Show validation results without processing')
     parser.add_argument('--mode', choices=sorted(DEFERRING_MODES | {'default', 'acceptEdits', 'plan'}),
@@ -562,7 +799,9 @@ def replay_from_log(stdin_lines=None):
 
         CLAUDE_WORKSPACE_DIR wins (epic 41 D7 step 1). Otherwise the root is
         resolved from the entry's logged workspace with NO env: replay has no
-        session environment, so CLAUDE_PROJECT_DIR must not leak in.
+        session environment, so CLAUDE_PROJECT_DIR must not leak in. The write
+        roots come from the same helper as the live hook (41-02) with no mode
+        and no transcript_path: project root and additionalDirectories only.
         """
         if override:
             workspace = settings_root = override
@@ -572,7 +811,9 @@ def replay_from_log(stdin_lines=None):
         key = (workspace, settings_root)
         if key not in validators:
             validators[key] = BashPermissionValidator(
-                SettingsLoader(settings_root), cmd_parser, workspace)
+                SettingsLoader(settings_root), cmd_parser, workspace,
+                extra_roots=compute_write_roots({'cwd': workspace}, env={}, mode='',
+                                                settings_root=settings_root))
         return validators[key]
 
     default_validator = validator_for({})
@@ -637,7 +878,8 @@ def replay_from_log(stdin_lines=None):
 class BashPermissionValidator:
     """Validate bash commands against Claude settings"""
 
-    def __init__(self, settings_loader: SettingsLoader, command_parser: BashCommandParser, workspace_dir: str = None):
+    def __init__(self, settings_loader: SettingsLoader, command_parser: BashCommandParser,
+                 workspace_dir: str = None, extra_roots: Optional[Sequence[str]] = None):
         """
         Initialize validator
 
@@ -645,6 +887,11 @@ class BashPermissionValidator:
             settings_loader: Settings loader instance
             command_parser: Command parser instance
             workspace_dir: The workspace directory for checking local binaries
+            extra_roots: Write roots beyond workspace_dir and /tmp for the
+                redirect gate and `rm` (epic 41, 41-02): the output of
+                compute_write_roots, or a row's stored `write_roots`. None:
+                no extra roots (the pre-41-02 behaviour). Mode-unaware: the
+                caller decided which roots apply in its mode.
         """
         self.parser = command_parser
         self.settings = settings_loader.load_all_settings()
@@ -652,9 +899,13 @@ class BashPermissionValidator:
         self.denied_patterns = self.settings.get('permissions', {}).get('deny', [])
         self.ask_patterns = self.settings.get('permissions', {}).get('ask', [])
         self.workspace_dir = os.path.abspath(workspace_dir or os.getcwd())
+        self.extra_roots = _sanitize_extra_roots(extra_roots)
+        # The only roots exempt from the `~/.claude` protection (brd D4).
+        self.memory_roots = [root for root in self.extra_roots if is_memory_shaped(root)]
 
         debug_log(f"Loaded {len(self.allowed_patterns)} allow patterns, {len(self.denied_patterns)} deny patterns, {len(self.ask_patterns)} ask patterns")
         debug_log(f"Workspace dir: {self.workspace_dir}")
+        debug_log(f"Extra write roots: {self.extra_roots}")
 
     def validate_bash_command(self, command: str) -> Dict[str, Any]:
         """
@@ -736,8 +987,10 @@ class BashPermissionValidator:
         # Independently of the per-command allow/deny check, gate where output
         # redirections WRITE. The parser strips redirect targets before command
         # matching, so an allowed command can still carry `> /etc/passwd`; this
-        # surfaces every write target and flags any that escapes the workspace,
-        # /tmp, or the write-safe /dev sinks. Recurses into command
+        # surfaces every write target and flags any that escapes the allowed
+        # roots (_allowed_roots: workspace, /tmp, and 41-02's project root,
+        # additionalDirectories and own memory dir) or the write-safe /dev
+        # sinks, or hits a protected path. Recurses into command
         # substitutions, so a redirect hidden in `$(... > /etc/x)` is caught too.
         #
         # First resolve constant-like `$VAR` references the same way command
@@ -775,7 +1028,9 @@ class BashPermissionValidator:
             ask_kind = 'risk'
             redirect_targets = []
         elif disallowed_targets:
-            # A redirection writes outside the workspace, /tmp, or /dev/null.
+            # A redirection writes outside the allowed roots and /dev sinks,
+            # or into a protected path. (Reason text unchanged: the permissions
+            # MCP matches its prefix, REDIRECT_REASON_PREFIX.)
             decision = 'ask'
             reason = ("Redirects output outside the workspace, /tmp, or /dev/null — "
                       "review the write target: " + _format_command_list(disallowed_targets))
@@ -930,28 +1185,46 @@ class BashPermissionValidator:
             return False
 
     def _allowed_roots(self) -> List[str]:
-        """Realpaths of the roots writes/deletes may touch: workspace and /tmp."""
+        """Realpaths of the roots writes/deletes may touch: the workspace
+        (payload cwd), /tmp, and the extra roots (41-02: project root,
+        additionalDirectories, own memory dir). Not workspace-binary
+        execution, which keeps its own narrow list."""
+        return _dedupe(self._base_roots() + self.extra_roots)
+
+    def _base_roots(self) -> List[str]:
+        """Realpaths of the payload cwd and /tmp: the roots that are not
+        user-configured."""
         return [
             os.path.realpath(self.workspace_dir),
             os.path.realpath(TMP_ALLOWED_ROOT),
         ]
 
     def _realpath_inside_allowed_roots(self, resolved: str) -> bool:
-        """True if an already-resolved realpath sits in the workspace or /tmp."""
-        for root in self._allowed_roots():
+        """True if an already-resolved realpath sits in an allowed root."""
+        # The cwd and /tmp compare exactly as before 41-02 (a cwd of `/` is
+        # not a `/` root). Only the user-configured extra roots get the
+        # `/`-aware containment, so an additionalDirectories `/` works.
+        for root in self._base_roots():
             if resolved == root or resolved.startswith(root + os.sep):
                 return True
-        return False
+        return any(_path_within(resolved, root) for root in self.extra_roots)
 
     def _is_path_inside_allowed_rm_roots(self, path: str) -> bool:
         """
         Check if a path is allowed for rm operations.
 
-        We allow deletions inside the active workspace and inside /tmp.
+        We allow deletions inside the allowed roots (_allowed_roots), except
+        a protected path (brd D4) or a directory that holds one: a root must
+        not become a way to delete the hook's own configuration.
         """
         try:
             resolved = self._resolve_target_path(path)
             if resolved is None:
+                return False
+            if self._is_protected_write_path(resolved):
+                return False
+            files, dirs = self._protected_write_paths()
+            if any(p != resolved and _path_within(p, resolved) for p in files + dirs):
                 return False
             return self._realpath_inside_allowed_roots(resolved)
         except Exception:
@@ -1016,9 +1289,11 @@ class BashPermissionValidator:
 
         For a resolved target: `.claude/settings.json`,
         `.claude/settings.local.json` and `.claude/hooks/` under every allowed
-        root. For an unresolvable one (`unresolved=True`) the whole
-        `<root>/.claude/`: a name the gate cannot read must not land anywhere
-        near the hook's configuration. Both: all of `~/.claude/`.
+        root (the extra roots of 41-02 included, memory dir too). For an
+        unresolvable one (`unresolved=True`) the whole `<root>/.claude/`: a
+        name the gate cannot read must not land anywhere near the hook's
+        configuration. Both: all of `~/.claude/`, except the session's own
+        memory dir (_is_protected_write_path).
         """
         files, dirs = [], []
         for root in self._allowed_roots():
@@ -1029,18 +1304,37 @@ class BashPermissionValidator:
                 files.append(os.path.realpath(os.path.join(claude, 'settings.json')))
                 files.append(os.path.realpath(os.path.join(claude, 'settings.local.json')))
                 dirs.append(os.path.realpath(os.path.join(claude, 'hooks')))
-        # The user's Claude Code directory. This entry is the one place 41-02
-        # carves the session's own auto-memory directory out of.
-        dirs.append(os.path.realpath(os.path.expanduser('~/.claude')))
+        # The user's Claude Code directory; the own memory dir is carved out
+        # of it in _is_protected_write_path.
+        dirs.append(_claude_home())
         return files, dirs
+
+    def _inside_memory_root(self, resolved: str) -> bool:
+        """True if a realpath is, or lies under, the session's own memory dir."""
+        return any(_path_within(resolved, root) for root in self.memory_roots)
 
     def _is_protected_write_path(self, resolved: str,
                                  unresolved: bool = False) -> bool:
-        """True if a realpath is, or lies under, a protected path (brd D4)."""
+        """True if a realpath is, or lies under, a protected path (brd D4).
+
+        The carve-out (41-02): `~/.claude/` does not protect a path inside the
+        own memory dir (`self.memory_roots`, `~/.claude/projects/<key>/memory`
+        only). Every other entry still does, the memory dir's own
+        `.claude/settings*.json` and `.claude/hooks/` (and, unresolved, its
+        whole `.claude/`) included. Sibling keys, `<own key>/` outside
+        `memory/` and `~/.claude/settings.json` stay protected.
+        """
         files, dirs = self._protected_write_paths(unresolved)
         if resolved in files:
             return True
-        return any(resolved == d or resolved.startswith(d + os.sep) for d in dirs)
+        claude_home = _claude_home()
+        for d in dirs:
+            if not _path_within(resolved, d):
+                continue
+            if d == claude_home and self._inside_memory_root(resolved):
+                continue
+            return True
+        return False
 
     def _is_redirect_target_allowed(self, target: str, literal: bool = False) -> bool:
         """
@@ -1048,8 +1342,9 @@ class BashPermissionValidator:
         prompt. Allowed: the write-safe /dev sinks (and an exact `/dev/fd/<digits>`), the
         bash network pseudo-paths (`/dev/tcp/...`, `/dev/udp/...`; see
         NET_REDIRECT_PREFIXES for the security trade-off), and anything
-        resolving inside the workspace or /tmp — the same roots that gate `rm`
-        and workspace-binary execution — except the hook's own configuration
+        resolving inside an allowed root (_allowed_roots, the same roots that
+        gate `rm`; workspace-binary execution keeps workspace and /tmp only) —
+        except the hook's own configuration
         (`_is_protected_write_path`, brd D4), which is refused before any root
         check.
 
@@ -1126,7 +1421,10 @@ class BashPermissionValidator:
               symlink leading out of the roots or into `.claude`. A
               filesystem error refuses.
           R6  Defence in depth: `.claude` anywhere in the text, or `claude`
-              inside a construct's source, refuses.
+              inside a construct's source, refuses. When realpath(D) lies in
+              the session's own memory dir (41-02), D's literal text is
+              exempt (it spells `~/.claude/projects/<key>/memory/` by
+              necessity; R2/R3 judged it on its realpath); F is not.
 
         Accepted residual (brd D3; 41-03 reclassifies): a final-segment
         construct whose runtime VALUE contains `/`. `./$V` with
@@ -1137,10 +1435,6 @@ class BashPermissionValidator:
         """
         R = RedirectTarget
         text = ''.join(source for _kind, source in parts)
-        # R6
-        if '.claude' in text or any(
-                kind != R.LITERAL and 'claude' in source for kind, source in parts):
-            return False
         # R0
         if not parts or parts[0][0] not in (R.LITERAL, R.TILDE):
             return False
@@ -1190,6 +1484,13 @@ class BashPermissionValidator:
             # R3
             if self._is_protected_write_path(base, unresolved=True):
                 return False
+            # R6 (after R3: whether D is exempt depends on its realpath)
+            checked = text
+            if self._inside_memory_root(base):
+                checked = ''.join(source for _kind, source in leaf_parts)
+            if '.claude' in checked or any(
+                    kind != R.LITERAL and 'claude' in source for kind, source in parts):
+                return False
             # R5
             has_glob = any(kind == R.GLOB for kind, _source in leaf_parts)
             has_construct = any(kind != R.LITERAL for kind, _source in leaf_parts)
@@ -1233,7 +1534,8 @@ class BashPermissionValidator:
 
     def _is_workspace_rm(self, cmd: str) -> bool:
         """
-        Check if command is 'rm' targeting files inside the workspace.
+        Check if command is 'rm' targeting files inside the allowed roots
+        (_is_path_inside_allowed_rm_roots).
 
         Supports:
         - rm file.txt
@@ -1245,7 +1547,7 @@ class BashPermissionValidator:
             cmd: Normalized command string
 
         Returns:
-            True if all rm targets are inside workspace
+            True if all rm targets are inside the allowed roots
         """
         parts = cmd.split()
         if not parts or parts[0] != 'rm':
@@ -1261,13 +1563,13 @@ class BashPermissionValidator:
         if not targets:
             return False  # No targets specified
 
-        # Check ALL targets are inside workspace
+        # Check ALL targets are inside the allowed roots
         for target in targets:
             if not self._is_path_inside_allowed_rm_roots(target):
-                debug_log(f"rm target {target!r} is outside workspace and /tmp")
+                debug_log(f"rm target {target!r} is outside the allowed roots or protected")
                 return False
 
-        debug_log(f"rm command {cmd!r} - all targets inside workspace or /tmp")
+        debug_log(f"rm command {cmd!r} - all targets inside the allowed roots")
         return True
 
     def _basename_variant(self, cmd: str) -> str:
@@ -1732,6 +2034,13 @@ class BashPermissionValidator:
                     'matched_deny_patterns': [],
                     'matched_ask_patterns': []
                 }
+
+        # The workspace-binary and workspace-rm shortcuts are ALLOW-TIER ONLY
+        # (41-02 fix, state.md invariant 1): an operator deny/ask matches first
+        # and wins for every root (cwd, project root, memory dir, extra roots, /tmp).
+        override = self._tier_override_result(cmd)
+        if override is not None:
+            return override
 
         # First check: workspace binaries are always allowed
         if self._is_workspace_binary(cmd):
@@ -2427,13 +2736,22 @@ def main():
 
         # Initialize components
         # Settings follow the project root, not the agent's cd (epic 41 D7);
-        # the validator's workspace_dir stays the payload cwd (41-02 widens it).
+        # the validator's workspace_dir stays the payload cwd.
         debug_log(f"CLAUDE_PROJECT_DIR: {os.environ.get('CLAUDE_PROJECT_DIR')!r}")
         settings_root = resolve_settings_root(workspace_dir)
         debug_log(f"Settings root: {settings_root}")
+        # Extra write roots (41-02): computed here, from the payload's mode,
+        # so the validator stays mode-unaware (epic 40 invariant 2).
+        # transcript_path is logged because no Bash PreToolUse payload of the
+        # current CLI has been observed carrying it yet (41-04 checks).
+        debug_log(f"transcript_path: {input_data.get('transcript_path')!r}")
+        write_roots = compute_write_roots(input_data, mode=permission_mode,
+                                          settings_root=settings_root)
+        debug_log(f"Write roots: {write_roots}")
         settings_loader = SettingsLoader(settings_root)
         parser = BashCommandParser()
-        validator = BashPermissionValidator(settings_loader, parser, workspace_dir)
+        validator = BashPermissionValidator(settings_loader, parser, workspace_dir,
+                                            extra_roots=write_roots)
 
         # Validate command
         result = validator.validate_bash_command(command)

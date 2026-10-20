@@ -137,7 +137,7 @@ def decide_permission_request(request_id: str, action: str, reason: str) -> str:
       decide a subagent's request (a row that carries an agent_id), and any row
       from another session.
     * Human-only requests are refused: anything matching an `ask` pattern,
-      anything whose redirects write outside the workspace/tmp, anything that
+      anything whose redirects write outside the allowed roots, anything that
       now matches a deny pattern, and every AskUserQuestion row.
 
     The tier is re-computed at call time against the ROW's workspace settings,

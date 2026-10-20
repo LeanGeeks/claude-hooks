@@ -143,10 +143,10 @@ class TestHookReadsProjectRoot(_Base):
             self.run_hook(wsub, env_extra={"CLAUDE_PROJECT_DIR": wt}), "deny")
         self.assertEqual(self.run_hook(wsub), "deny")  # git top level of a worktree
 
-    def test_redirect_gate_still_uses_cwd_as_its_root(self):
-        """41-02 widens the redirect roots, not this task: `> ../x` from
-        proj/sub is still refused though the settings root is proj. Needs a tree
-        outside /tmp (itself an allowed root)."""
+    def test_redirect_gate_accepts_the_settings_root(self):
+        """41-02: the settings root is a write root, so `> ../x` from proj/sub
+        lands inside it and is allowed; `> ../../x` (outside proj) still asks.
+        Needs a tree outside /tmp (itself an allowed root)."""
         if not os.path.isdir("/var/tmp"):
             self.skipTest("no /var/tmp")
         outside = os.path.realpath(tempfile.mkdtemp(prefix="settings-root-", dir="/var/tmp"))
@@ -157,6 +157,10 @@ class TestHookReadsProjectRoot(_Base):
         _write_settings(proj, "settings.json", allow=["Bash(echo:*)"])
         self.assertEqual(
             self.run_hook(sub, command="echo hi > ../x",
+                          env_extra={"CLAUDE_PROJECT_DIR": proj}),
+            "allow")
+        self.assertEqual(
+            self.run_hook(sub, command="echo hi > ../../x",
                           env_extra={"CLAUDE_PROJECT_DIR": proj}),
             "ask")
         # control: the same command inside the cwd is fine
