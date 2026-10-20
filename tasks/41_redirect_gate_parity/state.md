@@ -27,8 +27,8 @@ suffix.
 | 41-05 | [Settings follow the project root](./41-05-settings-follow-the-project-root_sonnet.md) | done | — | One settings-root resolver (`CLAUDE_PROJECT_DIR` → git top level) for the hook's reads and the Whitelist button's writes; `settings_root` stored on the request row. Added after filing, hence the number. |
 | 41-02 | [Allowed write roots mirror Claude Code](./41-02-allowed-roots-mirror-claude-code_opus.md) | done | 41-01, 41-05 | Project root, own memory dir (registered-worktree key with an encoding self-check, user-level `autoMemoryDirectory`; deferring modes only until H5 is verified), user-level `additionalDirectories`; `write_roots` stored on the row for the router and MCP. Redirect gate + `rm` only. |
 | 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | done | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
-| — | `./install.sh --yes` | todo | 41-03 committed | The orchestrator runs it once all four are committed (never `--all`). Not an agent task. |
-| 41-04 | [Re-measure and live checks](./41-04-remeasure-and-live-checks_human.md) | todo | install | **human** — live checks H1/H2/H5 and the Whitelist-from-subdir check right after install; the tally after a week. Leave `blocked — awaiting human` once install has run. |
+| — | `./install.sh --yes` | done | 41-03 committed | The orchestrator runs it once all four are committed (never `--all`). Not an agent task. |
+| 41-04 | [Re-measure and live checks](./41-04-remeasure-and-live-checks_human.md) | blocked — awaiting human | install | **human** — live checks H1/H2/H5 and the Whitelist-from-subdir check right after install; the tally after a week. Leave `blocked — awaiting human` once install has run. |
 
 ## Dependency graph
 
@@ -234,6 +234,26 @@ Skipped: `test_unit_python_compat.TestImportUnderOldInterpreter.test_all_hook_mo
   checks that unresolved targets are silent (`emitted: null`, new reason) and
   `~/.bashrc$V` still prompts; the harness-raised card's 🤖 line and 📝
   section.
+- **2026-10-21 00:53 — final install; 41-04 blocked — awaiting human.**
+  41-03 committed (9acd7bd); clean tree; `./install.sh --yes` exit 0; all 20
+  installed `~/.claude/hooks/*.py` byte-identical to the repo at 9acd7bd.
+  Settings backup `~/.claude/backups/settings.json.20261021_005351.bak`.
+  Smoke test of the installed `pretool_hook.py` (stdin payloads, confirm log
+  redirected to a temp file, nothing executed), cwd = this repo: auto —
+  `for f …; > "$f.out"` silent, `>> ~/.bashrc$V` ask, own-memory `MEMORY.md`
+  allow, `>> ~/.claude/settings.json` ask, `(ls 2>/dev/null) | grep a` allow;
+  default — the first four ask, the paren row allows. **41-04 owes:** H1
+  (`CLAUDE_PROJECT_DIR` in PreToolUse + PermissionRequest, main + worktree);
+  `transcript_path` in a Bash PreToolUse payload (main + worktree); H5
+  (memory writes in `default`; lifting the gate is one line in
+  `compute_write_roots`); Whitelist tap from a subdirectory lands in the
+  project root; acceptance 3 and 6 live (auto session, Telegram card wording);
+  the week's tally — exclude the 84 test entries of 2026-10-20T15:3x (empty
+  `session_id`, `/tmp/tmp…` workspace). **Follow-up epic needed** (pre-existing
+  command-matching fail-opens, all `allow` in every mode): `$'\''` tokenizer
+  desync; commands inside a `case` body in `$(…)`; command substitutions in
+  unquoted heredoc bodies; `$((cmd) | (cmd))` read as arithmetic; plus the
+  in-command `cd` that moves a relative write unseen (`cd /etc && echo k > x`).
 - **2026-10-20 — fresh-context review; rev 3.** An independent reviewer
   reproduced brd §1.3 and the §1.2 tally, and found more fail-opens, all
   confirmed: quoting only stripped once (`> "/etc"/x`, `> "$HOME"/.bashrc`,
