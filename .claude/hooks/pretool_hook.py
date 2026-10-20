@@ -30,6 +30,7 @@ from typing import Dict, List, Any, Optional
 try:
     from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
+    from project_key import resolve_settings_root
 except ImportError:
     # If running from different directory, try adding hooks dir to path
     import pathlib
@@ -37,6 +38,7 @@ except ImportError:
     sys.path.insert(0, str(hooks_dir))
     from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
+    from project_key import resolve_settings_root
 
 
 # Debug logging
@@ -551,13 +553,33 @@ def replay_from_log(stdin_lines=None):
                              'replayed, else "default".')
     args = parser.parse_args()
 
-    workspace_dir = os.environ.get('CLAUDE_WORKSPACE_DIR', os.getcwd())
-    settings_loader = SettingsLoader(workspace_dir)
     cmd_parser = BashCommandParser()
-    validator = BashPermissionValidator(settings_loader, cmd_parser, workspace_dir)
+    override = os.environ.get('CLAUDE_WORKSPACE_DIR', '')
+    validators: Dict[Any, 'BashPermissionValidator'] = {}
+
+    def validator_for(entry: Dict[str, Any]) -> 'BashPermissionValidator':
+        """One validator per distinct (workspace, settings root).
+
+        CLAUDE_WORKSPACE_DIR wins (epic 41 D7 step 1). Otherwise the root is
+        resolved from the entry's logged workspace with NO env: replay has no
+        session environment, so CLAUDE_PROJECT_DIR must not leak in.
+        """
+        if override:
+            workspace = settings_root = override
+        else:
+            workspace = entry.get('workspace') or os.getcwd()
+            settings_root = resolve_settings_root(workspace, env={})
+        key = (workspace, settings_root)
+        if key not in validators:
+            validators[key] = BashPermissionValidator(
+                SettingsLoader(settings_root), cmd_parser, workspace)
+        return validators[key]
+
+    default_validator = validator_for({})
 
     print(f"=== Replay Mode ===", file=sys.stderr)
-    print(f"Workspace: {workspace_dir}", file=sys.stderr)
+    print(f"Workspace: {override or '(per entry)'}", file=sys.stderr)
+    validator = default_validator
     print(f"Allowed patterns: {len(validator.allowed_patterns)}", file=sys.stderr)
     print(f"Denied patterns: {len(validator.denied_patterns)}", file=sys.stderr)
     print(f"==================\n", file=sys.stderr)
@@ -581,7 +603,7 @@ def replay_from_log(stdin_lines=None):
                 continue
 
             print(f"\n--- Command: {command!r} ---", file=sys.stderr)
-            result = validator.validate_bash_command(command)
+            result = validator_for(entry).validate_bash_command(command)
 
             print(f"Decision: {result['decision']}", file=sys.stderr)
             print(f"Reason: {result['reason']}", file=sys.stderr)
@@ -2404,7 +2426,12 @@ def main():
         debug_log(f"Workspace: {workspace_dir}")
 
         # Initialize components
-        settings_loader = SettingsLoader(workspace_dir)
+        # Settings follow the project root, not the agent's cd (epic 41 D7);
+        # the validator's workspace_dir stays the payload cwd (41-02 widens it).
+        debug_log(f"CLAUDE_PROJECT_DIR: {os.environ.get('CLAUDE_PROJECT_DIR')!r}")
+        settings_root = resolve_settings_root(workspace_dir)
+        debug_log(f"Settings root: {settings_root}")
+        settings_loader = SettingsLoader(settings_root)
         parser = BashCommandParser()
         validator = BashPermissionValidator(settings_loader, parser, workspace_dir)
 

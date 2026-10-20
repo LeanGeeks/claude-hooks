@@ -153,6 +153,13 @@ class PermissionRequest:
     owner_pid: Optional[int] = None
     owner_start_ticks: Optional[int] = None   # /proc/<pid>/stat field 22
     owner_host: Optional[str] = None
+    # Epic 41 (brd D7/D8): the directory whose ``.claude/settings*.json`` the
+    # PreToolUse hook read for this request (``project_key.resolve_settings_root``).
+    # The router and the permissions MCP re-run the validator in other processes
+    # without the session's CLAUDE_PROJECT_DIR; the Whitelist button writes here.
+    # Additive: older rows load with None and fall back to
+    # ``resolve_workspace_root(cwd)``.
+    settings_root: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization"""
@@ -291,6 +298,7 @@ def create_request(
     agent_id: Optional[str] = None,
     role: Optional[str] = None,
     permission_mode: Optional[str] = None,
+    settings_root: Optional[str] = None,
 ) -> PermissionRequest:
     """
     Create a new pending permission request.
@@ -310,6 +318,8 @@ def create_request(
             hook payload reported it. None when the payload carried none (a
             pre-epic-40 payload, or a subagent whose mode is not measured yet) —
             the card then says nothing about who raised the prompt.
+        settings_root: Resolved settings root (epic 41); None for callers that
+            never reach a settings read or write.
 
     Returns:
         PermissionRequest object with request_id
@@ -352,6 +362,7 @@ def create_request(
         agent_id=agent_id,
         role=role,
         permission_mode=permission_mode,
+        settings_root=settings_root,
         owner_pid=owner_pid,
         owner_start_ticks=owner_start_ticks,
         owner_host=owner_host,

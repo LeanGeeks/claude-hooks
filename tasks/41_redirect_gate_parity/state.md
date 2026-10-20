@@ -24,7 +24,7 @@ suffix.
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
 | 41-01 | [The gate reads the real target](./41-01-the-gate-reads-the-real-target_opus.md) | done | — | **Security fix first.** Five fail-open groups in every mode (brd §1.3): substitution and glued targets, unscanned inner redirects, quoting, the lenient fallback's `~` / `..`, and redirects into the hook's own settings. Also the `/dev/null)` paren bug. Its report carries the testing baseline. |
-| 41-05 | [Settings follow the project root](./41-05-settings-follow-the-project-root_sonnet.md) | todo | — | One settings-root resolver (`CLAUDE_PROJECT_DIR` → git top level) for the hook's reads and the Whitelist button's writes; `settings_root` stored on the request row. Added after filing, hence the number. |
+| 41-05 | [Settings follow the project root](./41-05-settings-follow-the-project-root_sonnet.md) | done | — | One settings-root resolver (`CLAUDE_PROJECT_DIR` → git top level) for the hook's reads and the Whitelist button's writes; `settings_root` stored on the request row. Added after filing, hence the number. |
 | 41-02 | [Allowed write roots mirror Claude Code](./41-02-allowed-roots-mirror-claude-code_opus.md) | todo | 41-01, 41-05 | Project root, own memory dir (registered-worktree key with an encoding self-check, user-level `autoMemoryDirectory`; deferring modes only until H5 is verified), user-level `additionalDirectories`; `write_roots` stored on the row for the router and MCP. Redirect gate + `rm` only. |
 | 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | todo | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
 | — | `./install.sh --yes` | todo | 41-03 committed | The orchestrator runs it once all four are committed (never `--all`). Not an agent task. |
@@ -186,6 +186,16 @@ Skipped: `test_unit_python_compat.TestImportUnderOldInterpreter.test_all_hook_mo
   refusal, which its helper documents). Final suite 2052 tests, `OK
   (skipped=2)`. Reports: `agents_output/41-01_*` (implementation, review 1–9,
   fix 1–8). Repo copy only; not installed.
+- **2026-10-20 — 41-01 committed (10e2a0b). 41-05 done.** Review 2 PASS
+  (pass-1 LOW, cosmetic naming in `replay_from_log`, accepted). Suite 2073,
+  `OK (skipped=2)`. For 41-02: resolver `project_key.resolve_settings_root`,
+  row field `settings_root`, shared fallback `settings_root_for_row`. Old rows
+  fall back to `resolve_workspace_root(row.cwd)` in both the router and the
+  MCP. **Owed to 41-04:** H1 (`CLAUDE_PROJECT_DIR` in the installed PreToolUse
+  and PermissionRequest env, main + worktree session; debug lines added) and
+  the Whitelist-from-subdir check. Stray `settings.local.json` below a git top
+  level, left for the operator: `dr_remi/hipaa_form/frontend-react/.claude/`
+  and `asafechoice/formdr_replacement.bak-oct-14-2025/frontend-react/.claude/`.
 - **2026-10-20 — fresh-context review; rev 3.** An independent reviewer
   reproduced brd §1.3 and the §1.2 tally, and found more fail-opens, all
   confirmed: quoting only stripped once (`> "/etc"/x`, `> "$HOME"/.bashrc`,

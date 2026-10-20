@@ -44,6 +44,7 @@ from permission_state_store import (
 # like ``permission_state_store`` above: both the repo checkout and the
 # installed ``~/.claude/hooks/`` copy put these modules in the same directory.
 import settings_writer
+from project_key import settings_root_for_row
 
 # ``roles_config`` (epic 15) supplies the machine's relay credentials *and* its
 # per-role bindings. The import is guarded because the installer only learned
@@ -452,8 +453,12 @@ def _bash_annotations(request: PermissionRequest) -> BashAnnotations:
         from settings_loader import SettingsLoader
         from bash_command_parser import BashCommandParser
 
+        # Settings come from the row's stored root (epic 41 D8): this runs in
+        # another process, without the session's CLAUDE_PROJECT_DIR.
         validator = BashPermissionValidator(
-            SettingsLoader(request.cwd), BashCommandParser(), workspace_dir=request.cwd
+            SettingsLoader(settings_root_for_row(request.settings_root, request.cwd)),
+            BashCommandParser(),
+            workspace_dir=request.cwd,
         )
         result = validator.validate_bash_command(command)
     except Exception as e:  # noqa: BLE001
@@ -1169,7 +1174,9 @@ def process_whitelist_update(
     success = True
     for pattern in updated_perms:
         if isinstance(pattern, str):
-            if not update_settings_local_json(request.cwd, pattern):
+            if not update_settings_local_json(
+                settings_root_for_row(request.settings_root, request.cwd), pattern
+            ):
                 success = False
         else:
             debug_log(f"Skipping rule object (handled by Claude Code): {pattern}")

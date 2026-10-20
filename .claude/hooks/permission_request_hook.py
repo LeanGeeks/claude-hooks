@@ -65,6 +65,7 @@ except ImportError:
     telegram_router = None  # type: ignore[assignment]
 
 # Import the new modules
+from project_key import resolve_settings_root
 from permission_state_store import (
     PermissionRequest,
     RequestState,
@@ -1602,6 +1603,10 @@ def main():
         debug_log(f"Tool: {tool_name}")
         debug_log(f"Agent ID: {agent_id}")
         debug_log(f"Permission mode: {permission_mode}")
+        # Epic 41 brd H1: record what the CLI put in the hook environment.
+        debug_log(f"CLAUDE_PROJECT_DIR: {os.environ.get('CLAUDE_PROJECT_DIR')!r}")
+        settings_root = resolve_settings_root(cwd)
+        debug_log(f"Settings root: {settings_root}")
         debug_log(f"Tool input: {json.dumps(tool_input)[:200]}")
         debug_log(f"Permission suggestions: {permission_suggestions}")
 
@@ -1641,6 +1646,7 @@ def main():
             ttl_seconds=REQUEST_TTL,
             agent_id=agent_id,
             permission_mode=permission_mode or None,
+            settings_root=settings_root,
         )
         debug_log(f"Created request: {request.request_id}")
 

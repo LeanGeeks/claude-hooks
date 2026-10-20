@@ -36,6 +36,7 @@ relay HTTP API itself.
     pretool_hook.py              PreToolUse(Bash): allow/ask/deny against allowlist
     bash_command_parser.py       compound-command splitter (|, &&, ||, ;, …)
     settings_loader.py           reads permissions.allow/deny from settings.json
+                                 (at the settings root: project_key.resolve_settings_root)
     permission_request_hook.py   PermissionRequest: send to relay, long-poll, decide
     telegram_permission_router.py relay transport + message formatting + answer→decision
     permission_state_store.py    local JSON state store; cross-hook race coordination
@@ -118,6 +119,21 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 | `Stop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: authoritative turn-end. Update handle state to `idle` (clean stop) or `running` (background work outstanding), write `stopped_at`, append `stop` lifecycle event. Handle-gated. |
 | `SubagentStop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: freshness update when a background subagent completes; append `subagent_stop` lifecycle event. Handle-gated. |
 | `SessionEnd` | `*` | `spawn_producer_hook.py` | Epic-10 producer: mark handle `terminated`, append `session_end` lifecycle event. Handle-gated. |
+
+### Settings root (epic 41)
+
+The payload `cwd` follows the agent's `cd`; Claude Code keeps applying the
+launch directory's project settings after one. So the hook reads, and the
+Telegram Whitelist button writes, `.claude/settings.json` / `settings.local.json`
+at one directory: `project_key.resolve_settings_root(cwd)` =
+`CLAUDE_WORKSPACE_DIR` → `CLAUDE_PROJECT_DIR` → git top level of `cwd` (else
+`realpath(cwd)`; never the main checkout, a worktree's settings are its own).
+`permission_request_hook.py` stores it on the row as `settings_root`; the router
+(card annotations, Whitelist write) and the permissions MCP classifier use the
+row's value, because they run later in other processes without the session's
+environment. Rows without it (written before epic 41) fall back to the git top
+level of `row.cwd`. The validator's `workspace_dir` (redirect / `rm` roots) is
+still the payload `cwd`.
 
 ### permission_state_store.py — cross-hook coordination
 

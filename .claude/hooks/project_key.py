@@ -25,10 +25,13 @@ tool call).
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Dict, Optional
+
+_log = logging.getLogger(__name__)
 
 # ``git rev-parse`` on a healthy repo answers in milliseconds; the timeout only
 # exists so a wedged filesystem cannot hang the MCP server forever.
@@ -137,3 +140,41 @@ def resolve_workspace_root(cwd: str) -> str:
     root = _realpath(top_level) if top_level else _realpath(key)
     _WORKSPACE_ROOT_CACHE[key] = root
     return root
+
+
+def resolve_settings_root(cwd: str, env: Optional[Dict[str, str]] = None) -> str:
+    """The directory whose ``.claude/settings*.json`` the hooks read AND write.
+
+    Epic 41 (brd D7). The payload ``cwd`` follows the agent's ``cd``, but Claude
+    Code keeps applying the *launch* directory's project settings after one, so
+    building ``SettingsLoader`` from ``cwd`` loses the project's rules in a
+    subdirectory and sends Whitelist writes into ``<subdir>/.claude/``. One
+    order, for reads and writes alike:
+
+    1. ``CLAUDE_WORKSPACE_DIR`` — the existing override (tests, replay).
+    2. ``CLAUDE_PROJECT_DIR`` — Claude Code's project root for hooks.
+    3. ``resolve_workspace_root(cwd)`` — the git top level, else ``realpath(cwd)``;
+       the same fallback the permissions MCP write path uses. Logged at debug
+       level, since it means the CLI did not tell us the project root.
+
+    Deliberately **not** ``resolve_project_root`` (the main checkout): a
+    worktree's settings are its own (epic 22 invariant 4).
+
+    ``env`` defaults to ``os.environ``; pass ``{}`` to ignore the process
+    environment (replay has no session environment).
+    """
+    environ = os.environ if env is None else env
+    for name in ("CLAUDE_WORKSPACE_DIR", "CLAUDE_PROJECT_DIR"):
+        value = (environ.get(name) or "").strip()
+        if value:
+            return os.path.abspath(value)
+    root = resolve_workspace_root(cwd)
+    _log.debug("settings root: no CLAUDE_WORKSPACE_DIR/CLAUDE_PROJECT_DIR; "
+               "using %s (from cwd %r)", root, cwd)
+    return root
+
+
+def settings_root_for_row(stored: Optional[str], cwd: str) -> str:
+    """A permission row's settings root: the stored one, else the git-top-level
+    fallback for rows written before epic 41 (no ``settings_root`` field)."""
+    return stored or resolve_workspace_root(cwd)

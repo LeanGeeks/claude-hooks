@@ -79,6 +79,7 @@ from project_key import (  # noqa: E402
     resolve_project_key,
     resolve_project_root,
     resolve_workspace_root,
+    settings_root_for_row,
 )
 from pretool_hook import MANUAL_CONFIRM_LOG, BashPermissionValidator  # noqa: E402
 from settings_loader import SettingsLoader  # noqa: E402
@@ -190,8 +191,15 @@ class Classification:
         }
 
 
-def _build_validator(cwd: str) -> BashPermissionValidator:
+def _build_validator(
+    cwd: str, settings_root: Optional[str] = None
+) -> BashPermissionValidator:
     """The one classifier, bound to the **row's** workspace settings.
+
+    ``settings_root`` (epic 41 D8) is the row's stored settings root: the
+    directory the PreToolUse hook read rules from. ``None`` keeps the
+    historical behaviour — settings read from ``cwd`` — which is what
+    ``find_deny_collision`` (no row) relies on.
 
     H4: ``SettingsLoader`` caches merged settings for 60 s at class level. In a
     per-invocation hook that is invisible; in this long-lived server a
@@ -199,7 +207,9 @@ def _build_validator(cwd: str) -> BashPermissionValidator:
     """
     workspace_dir = cwd or os.getcwd()
     return BashPermissionValidator(
-        SettingsLoader(workspace_dir), BashCommandParser(), workspace_dir
+        SettingsLoader(settings_root or workspace_dir),
+        BashCommandParser(),
+        workspace_dir,
     )
 
 
@@ -265,7 +275,9 @@ def classify(row: PermissionRequest) -> Classification:
     command = tool_input.get("command") if tool_name in COMMAND_BEARING_TOOLS else None
 
     try:
-        validator = _build_validator(row.cwd)
+        validator = _build_validator(
+            row.cwd, settings_root_for_row(row.settings_root, row.cwd)
+        )
     except Exception as exc:  # noqa: BLE001 — a classifier that cannot run is human-only.
         return Classification(
             False,
