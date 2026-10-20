@@ -131,6 +131,17 @@ way to work than a six-minute one.
 
 ## Log
 
+- **2026-10-20 — the hook stays silent instead of emitting `defer`.** A
+  subagent in an auto-mode session ended on its first unknown Bash command. In
+  CLI 2.1.304 `defer` is print-mode only: interactive sessions ignore it, and
+  non-interactive ones (`claude -p`, subagents) park the tool call and end the
+  run. `build_pretool_output` now returns `None` for the unknown case in
+  `DEFERRING_MODES` (the name is kept: the router and tests import it). Fallout:
+  confirm-log entries read `emitted: null` instead of `"defer"`; the
+  `DEFERRING to the pipeline` debug line is unchanged; replay prints
+  `No output: left to the pipeline (<mode>)` on stderr. brd §1.5 carries the
+  correction; 40-04 §3 and brd §4.1 now look for the debug line.
+
 - **2026-09-21 — 40-04 will be closed from normal use, not a scripted matrix.
   What stays owed.** The operator opted to verify by using the hooks normally
   (auto/default/bypass sessions accumulate evidence in the logs for free) plus

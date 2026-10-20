@@ -159,6 +159,13 @@ By explicitly returning `ask`, we ensure:
 2. **Better logging**: Session ID and command metadata are preserved
 3. **Flexible routing**: Future handlers can make routing decisions based on command type
 
+The one exception (epic 40): in a session whose mode resolves ask-candidates by
+itself — `auto`, `bypassPermissions`, `dontAsk` — an unknown command gets no
+output again, so that mode decides instead of being floored by our `ask`. Risk
+gates still `ask` there. The harness's `defer` value is never used: it is
+print-mode only, and a non-interactive session (`claude -p`, a subagent) parks
+the tool call on it and ends its run.
+
 ### Debugging
 
 Enable debug logging:

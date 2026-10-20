@@ -63,7 +63,8 @@ grep -n "Decision: \|permissionDecision" ~/.claude/bash_hook_debug.log | tail -2
 grep -n "Permission mode: \|Created request" ~/.claude/permission_request_debug.log | tail -20
 ```
 
-A P2 in auto mode must show the hook emitting **`defer`** and **no** matching
+A P2 in auto mode must show the hook's **`DEFERRING to the pipeline`** debug
+line (it prints no payload; brd §1.5 correction) and **no** matching
 `Created request` line. That single pair is the epic's acceptance criterion 1.
 
 ## 4. The open question this task answers (brd H8)

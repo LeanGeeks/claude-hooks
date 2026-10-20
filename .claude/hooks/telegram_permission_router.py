@@ -634,7 +634,7 @@ def render_permission_body(
         # The "Not in allowlist" heading has to be honest about what it claims.
         # In a session whose mode resolves ask-candidates itself (auto /
         # bypassPermissions / dontAsk) an unknown-only breakdown means the
-        # validator *deferred* — pretool_hook emitted `defer` and the harness
+        # validator *deferred* — pretool_hook printed nothing and the harness
         # raised this prompt, so the allowlist is context here, not cause
         # (epic 40 brd H4). Three things keep the old heading: a risk-gate part
         # (`asked`), a refused write target (our redirect gate asked, not the
@@ -677,12 +677,12 @@ def _mode_resolves_ask_candidates(request: PermissionRequest) -> bool:
     """True when the session's mode resolves an ask-candidate by itself.
 
     The set of such modes is ``pretool_hook.DEFERRING_MODES`` — the very set
-    that emits `defer` for an unknown-only breakdown. It is imported rather
-    than restated so the two decisions cannot drift: a mode that pretool
-    defers for must not render as a plain "Not in allowlist" card, which is
-    exactly the brd H4 regression this task exists to remove. If pretool_hook
-    cannot be imported, the empty set keeps today's card (every mode blames
-    the allowlist) rather than inventing the opposite.
+    for which pretool stays silent on an unknown-only breakdown. It is
+    imported rather than restated so the two decisions cannot drift: a mode
+    that pretool defers for must not render as a plain "Not in allowlist"
+    card, which is exactly the brd H4 regression this task exists to remove.
+    If pretool_hook cannot be imported, the empty set keeps today's card
+    (every mode blames the allowlist) rather than inventing the opposite.
 
     Reads the stored row only (brd H5).
     """

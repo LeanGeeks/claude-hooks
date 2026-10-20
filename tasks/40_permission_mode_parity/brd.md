@@ -86,6 +86,17 @@ That rule decides every open question in this epic, including the ones it
 
 ### 1.5 The harness already has the vocabulary for "I don't recognise this"
 
+> **Corrected 2026-10-20 — this section's premise is wrong; the hook no longer
+> emits `defer`.** Re-read in CLI 2.1.304, `defer` is *print-mode only*. An
+> interactive session ignores it (`"returned permissionDecision=defer in
+> interactive mode; ignoring (defer is print-mode only)"`), so it behaves like no
+> output at all. A non-interactive session (`claude -p`, and subagents) parks
+> the tool call as a `hook_deferred_tool` for an external resume and ends the
+> run, so a subagent died on its first unknown command. Since then the hook
+> prints **nothing** for the unknown case in the deferring modes, which is the
+> "run the normal pipeline" this section wanted. Do not reintroduce `defer`.
+> The text below is kept as written.
+
 `defer` is a fourth PreToolUse decision value, schema-validated for command
 hooks alongside `allow` / `deny` / `ask`, and documented in the CLI's own hook
 help text. It means *I looked, I have no opinion, run the normal pipeline* —
@@ -230,7 +241,8 @@ The epic is done when, on this machine, with the hooks installed:
 
 1. In an **auto**-mode session, a non-allowlisted command the classifier is
    happy with runs **with no Telegram card and no terminal prompt**, and
-   `~/.claude/bash_hook_debug.log` shows the hook emitted `defer`.
+   `~/.claude/bash_hook_debug.log` shows the hook's `DEFERRING to the pipeline`
+   line (it prints nothing; see the §1.5 correction).
 2. In the same session, a command that trips a **deny pattern** is still blocked
    by the hook, and one that trips a **risk gate** (ask pattern or a write
    redirect escaping the workspace) still prompts — on both surfaces.

@@ -630,7 +630,7 @@ class TestPermissionModeAnnotation(unittest.TestCase):
     def test_honest_heading_set_is_pretool_deferring_modes(self):
         """The two sides of the defer decision must name the same modes.
 
-        pretool_hook emits `defer` for `DEFERRING_MODES`; the card renders the
+        pretool_hook stays silent for `DEFERRING_MODES`; the card renders the
         honest heading for exactly the set `_mode_resolves_ask_candidates`
         accepts. If a future CLI adds a mode to one and not the other, pretool
         would defer while the card kept saying "Not in allowlist" — brd H4
@@ -649,12 +649,7 @@ class TestPermissionModeAnnotation(unittest.TestCase):
 
         for mode in sorted(DEFERRING_MODES) + other_modes:
             with self.subTest(mode=mode):
-                defers = (
-                    build_pretool_output(unknown_ask, mode)["hookSpecificOutput"][
-                        "permissionDecision"
-                    ]
-                    == "defer"
-                )
+                defers = build_pretool_output(unknown_ask, mode) is None
                 # pretool's own answer for this mode…
                 self.assertEqual(defers, mode in DEFERRING_MODES)
                 # … and the card's, which must agree.

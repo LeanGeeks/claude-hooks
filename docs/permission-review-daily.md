@@ -144,15 +144,17 @@ command that is not auto-approved — no coordination needed.
 ## What each feed covers (and what it no longer does)
 
 Since epic 40 the store holds only the requests that **actually reached a
-human**: in `auto` / `bypassPermissions` / `dontAsk` sessions the hook now emits
-`defer` for a command it simply does not recognise, so the harness resolves the
+human**: in `auto` / `bypassPermissions` / `dontAsk` sessions the hook now prints
+nothing for a command it simply does not recognise, so the harness resolves the
 call itself and no `permission_requests.jsonl` row is written. Those rows are
 therefore not a complete record of non-allowlisted commands any more.
 `~/.claude/bash_manual_confirm.log` is: every non-allowlisted command is still
 appended there with the validator's verdict, and each line now also carries
 `permission_mode` and `emitted` — the decision the hook actually printed
-(`ask` / `defer` / `deny`) — so a `decision: "ask"` line that produced no prompt
-can be told apart from one that did.
+(`ask` / `deny`, or `null` when it printed nothing) — so a `decision: "ask"` line
+that produced no prompt can be told apart from one that did. Entries written
+between epic 40 and the fix that dropped `defer` read `emitted: "defer"`; treat
+them as `null`.
 
 ## Adopting the reviewer in another repo
 

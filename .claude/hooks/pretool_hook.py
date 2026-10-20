@@ -410,8 +410,8 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
             (None when the payload carried none)
         output: The PreToolUse payload actually emitted for this command (None
             when nothing was printed) — recorded as 'emitted' so a log line
-            reading decision "ask" that produced a silent defer can be told
-            apart from one that prompted
+            reading decision "ask" that was left silently to the pipeline
+            (emitted null) can be told apart from one that prompted
     """
     try:
         emitted = None
@@ -436,10 +436,16 @@ def log_manual_confirmation(command: str, result: Dict[str, Any], workspace_dir:
 
 
 # Modes that resolve an ask-candidate themselves, so the hook's "I don't
-# recognise this command" ask must not floor them: emit `defer` instead and let
+# recognise this command" ask must not floor them: print nothing instead and let
 # the pipeline (rules → mode → auto-mode classifier) decide, exactly as it would
 # if this hook were not installed. Risk-gate asks (permissions.ask matches and
 # write redirects escaping the workspace) still ask in every mode.
+#
+# Not the harness's `defer` decision, despite the name: `defer` is print-mode
+# only. An interactive session ignores it (logs a warning, same as silence); a
+# non-interactive one — `claude -p`, and subagents — parks the tool call for an
+# external resume and ends the run. Silence is the only "no opinion" that works
+# everywhere.
 DEFERRING_MODES = frozenset({'auto', 'bypassPermissions', 'dontAsk'})
 
 
@@ -449,9 +455,9 @@ def build_pretool_output(result: Dict[str, Any], permission_mode: str) -> Option
     Rules, in order:
     1. deny → permissionDecision 'deny' + reason. Never mode-aware.
     2. allow → permissionDecision 'allow'.
-    3. ask with ask_kind 'unknown' in a deferring mode → permissionDecision
-       'defer'. The reason is included too: the harness drops it (defer is
-       recorded as "this hook passed") but it lands in the debug log.
+    3. ask with ask_kind 'unknown' in a deferring mode → None (print
+       nothing), leaving the call to the pipeline. Never the harness's
+       'defer': see DEFERRING_MODES.
     4. any other ask → permissionDecision 'ask' + reason, as before.
     5. anything else → None (print nothing).
 
@@ -482,13 +488,7 @@ def build_pretool_output(result: Dict[str, Any], permission_mode: str) -> Option
         }
     if decision == 'ask':
         if result.get('ask_kind') == 'unknown' and permission_mode in DEFERRING_MODES:
-            return {
-                'hookSpecificOutput': {
-                    'hookEventName': 'PreToolUse',
-                    'permissionDecision': 'defer',
-                    'permissionDecisionReason': result['reason'],
-                }
-            }
+            return None
         return {
             'hookSpecificOutput': {
                 'hookEventName': 'PreToolUse',
@@ -571,6 +571,8 @@ def replay_from_log(stdin_lines=None):
             output = build_pretool_output(result, replay_mode)
             if output is not None:
                 print(json.dumps(output))
+            else:
+                print(f"No output: left to the pipeline ({replay_mode})", file=sys.stderr)
 
         except json.JSONDecodeError as e:
             print(f"Invalid JSON line: {line[:100]}... Error: {e}", file=sys.stderr)
@@ -2196,20 +2198,17 @@ def main():
             print(json.dumps(output))
             debug_log(f"DENYING command: {result['reason']}")
             sys.exit(0)
-        elif emitted == 'defer':
-            # Unknown command in a mode that resolves ask-candidates itself
-            # (auto / bypassPermissions / dontAsk): pass the decision back to
-            # the normal pipeline instead of flooring it with 'ask'. The
-            # harness records defer as "this hook passed" — the reason is
-            # logged here but not surfaced.
-            print(json.dumps(output))
-            debug_log(f"DEFERRING to the pipeline ({permission_mode}): {result['reason']}")
-            sys.exit(0)
         elif emitted == 'ask':
             # Ask user via native Claude permission flow
             # This triggers the PermissionRequest hook for additional handling
             print(json.dumps(output))
             debug_log(f"ASKING for permission: {result['reason']}")
+            sys.exit(0)
+        elif result['decision'] == 'ask':
+            # Unknown command in a mode that resolves ask-candidates itself
+            # (auto / bypassPermissions / dontAsk): print nothing, so the
+            # normal pipeline decides instead of being floored by 'ask'.
+            debug_log(f"DEFERRING to the pipeline ({permission_mode}): {result['reason']}")
             sys.exit(0)
         else:
             # Fallback (should not reach here normally)

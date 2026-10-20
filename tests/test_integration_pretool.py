@@ -33,6 +33,7 @@ from pretool_hook import (
     BashPermissionValidator,
     BashCommandParser,
     _strip_function_def_header,
+    build_pretool_output,
 )
 from settings_loader import SettingsLoader
 
@@ -1564,10 +1565,11 @@ class TestPermissionModeParity(unittest.TestCase):
     """Task 40-01: the hook defers to the session's permission mode.
 
     In a mode that resolves ask-candidates itself (`auto`,
-    `bypassPermissions`, `dontAsk`) an *unknown* command must emit the
-    harness's `defer` instead of the hookAskFloor `ask`, so the pipeline
-    (rules → mode → auto-mode classifier) decides exactly as it would if the
-    hook were not installed. Risk gates (a `permissions.ask` match, a write
+    `bypassPermissions`, `dontAsk`) an *unknown* command must print nothing
+    instead of the hookAskFloor `ask`, so the pipeline (rules → mode →
+    auto-mode classifier) decides exactly as it would if the hook were not
+    installed. Never the harness's `defer` decision: a non-interactive
+    session (`claude -p`, a subagent) parks the call on it and ends its run. Risk gates (a `permissions.ask` match, a write
     redirect escaping the workspace) still ask in every mode; `deny` is
     unconditional; `default` / `plan` / `acceptEdits` and an absent mode
     behave byte-identically to before.
@@ -1603,7 +1605,7 @@ class TestPermissionModeParity(unittest.TestCase):
             BashCommandParser(), workspace_dir=self.WS
         )
 
-    def _payload(self, command, permission_mode=None, tool_name="Bash"):
+    def _payload(self, command, permission_mode=None, tool_name="Bash", agent_id=None):
         payload = {
             "tool_name": tool_name,
             "tool_input": {"command": command},
@@ -1612,6 +1614,8 @@ class TestPermissionModeParity(unittest.TestCase):
         }
         if permission_mode is not None:
             payload["permission_mode"] = permission_mode
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
         return payload
 
     def _run_payload(self, payload, workspace=None):
@@ -1705,19 +1709,59 @@ class TestPermissionModeParity(unittest.TestCase):
     def test_case3_auto_mode_defers(self):
         code, parsed = self._run_payload(self._payload(self.UNKNOWN, "auto"))
         self.assertEqual(code, 0)
-        self.assertEqual(parsed["permissionDecision"], "defer")
-        self.assertIn("Not in allowlist", parsed["permissionDecisionReason"])
+        self.assertIsNone(parsed)
 
     def test_case4_bypass_mode_defers(self):
         code, parsed = self._run_payload(
             self._payload(self.UNKNOWN, "bypassPermissions"))
         self.assertEqual(code, 0)
-        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIsNone(parsed)
 
     def test_case5_dontask_mode_defers(self):
         code, parsed = self._run_payload(self._payload(self.UNKNOWN, "dontAsk"))
         self.assertEqual(code, 0)
-        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIsNone(parsed)
+
+    def test_case5a_deferring_never_emits_the_harness_defer(self):
+        """No payload this hook can print carries `defer` — the harness parks
+        a non-interactive session's tool call on it and ends the run."""
+        for mode in ("auto", "bypassPermissions", "dontAsk"):
+            for result in (
+                {"decision": "ask", "ask_kind": "unknown", "reason": "r"},
+                {"decision": "ask", "ask_kind": "risk", "reason": "r"},
+                {"decision": "allow", "reason": "r"},
+                {"decision": "deny", "reason": "r"},
+            ):
+                with self.subTest(mode=mode, result=result):
+                    out = build_pretool_output(result, mode)
+                    if out is not None:
+                        self.assertNotEqual(
+                            out["hookSpecificOutput"]["permissionDecision"], "defer")
+
+    # --- subagents: the payload's agent_id changes nothing -----------------
+
+    def test_case5b_subagent_in_deferring_mode_prints_nothing(self):
+        """A subagent (payload carries agent_id) gets the same silence as the
+        main session, so the pipeline decides and the subagent keeps running."""
+        for mode in ("auto", "bypassPermissions", "dontAsk"):
+            with self.subTest(mode=mode):
+                code, parsed = self._run_payload(
+                    self._payload(self.UNKNOWN, mode, agent_id="a123"))
+                self.assertEqual(code, 0)
+                self.assertIsNone(parsed)
+
+    def test_case5c_subagent_other_decisions_unchanged(self):
+        """A subagent's other decisions match the main session's: default
+        mode still asks, deny still denies, a risk ask still asks."""
+        code, parsed = self._run_payload(
+            self._payload(self.UNKNOWN, "default", agent_id="a123"))
+        self.assertEqual(parsed["permissionDecision"], "ask")
+        code, parsed = self._run_payload(
+            self._payload("dd if=/dev/zero of=/dev/sda", "bypassPermissions", agent_id="a123"))
+        self.assertEqual(parsed["permissionDecision"], "deny")
+        code, parsed = self._run_payload(
+            self._payload("echo hi > /etc/passwd", "auto", agent_id="a123"))
+        self.assertEqual(parsed["permissionDecision"], "ask")
 
     def test_case6_acceptedits_and_plan_ask(self):
         for mode in ("acceptEdits", "plan"):
@@ -1780,7 +1824,7 @@ class TestPermissionModeParity(unittest.TestCase):
     def test_case13_mixed_allow_unknown_in_auto_defers(self):
         code, parsed = self._run_payload(self._payload("echo hi && frobnicate", "auto"))
         self.assertEqual(code, 0)
-        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIsNone(parsed)
 
     def test_case14_mixed_deny_unknown_in_auto_denies(self):
         """Deny outranks everything, including a deferring mode."""
@@ -1795,18 +1839,18 @@ class TestPermissionModeParity(unittest.TestCase):
         code, parsed = self._run_payload(
             self._payload(self.UNKNOWN, "auto", tool_name="Monitor"))
         self.assertEqual(code, 0)
-        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIsNone(parsed)
 
     # --- confirm-log integration (cases 16, 17) ----------------------------
 
     def test_case16_confirm_log_records_mode_and_emitted(self):
         """The entry for the auto/defer run reads decision:"ask",
-        emitted:"defer", permission_mode:"auto"."""
+        emitted:null (nothing printed), permission_mode:"auto"."""
         confirm_log = Path(os.environ["CLAUDE_MANUAL_CONFIRM_LOG"])
         confirm_log.parent.mkdir(parents=True, exist_ok=True)
         size_before = confirm_log.stat().st_size
         code, parsed = self._run_payload(self._payload(self.UNKNOWN, "auto"))
-        self.assertEqual(parsed["permissionDecision"], "defer")
+        self.assertIsNone(parsed)
         entries = [
             json.loads(line) for line in
             confirm_log.read_text()[size_before:].splitlines() if line.strip()
@@ -1814,7 +1858,8 @@ class TestPermissionModeParity(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         entry = entries[0]
         self.assertEqual(entry["decision"], "ask")
-        self.assertEqual(entry["emitted"], "defer")
+        self.assertIn("emitted", entry)
+        self.assertIsNone(entry["emitted"])
         self.assertEqual(entry["permission_mode"], "auto")
         self.assertEqual(entry["command"], self.UNKNOWN)
 
@@ -1861,7 +1906,8 @@ class TestPermissionModeParity(unittest.TestCase):
     # --- replay mode (case 18) ---------------------------------------------
 
     def test_case18_replay_with_mode_flag_defers(self):
-        """`--mode auto` on an unknown command prints the defer payload."""
+        """`--mode auto` on an unknown command prints no payload and says so
+        on stderr."""
         hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
         log_line = json.dumps({
             "command": self.UNKNOWN,
@@ -1878,10 +1924,8 @@ class TestPermissionModeParity(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(proc.returncode, 0)
-        out = proc.stdout.strip()
-        self.assertTrue(out, "replay printed nothing")
-        self.assertEqual(
-            json.loads(out)["hookSpecificOutput"]["permissionDecision"], "defer")
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn("No output: left to the pipeline (auto)", proc.stderr)
 
     def test_case18b_replay_default_asks_entry_without_mode(self):
         """Without --mode, an entry with no recorded permission_mode replays as
@@ -1902,7 +1946,7 @@ class TestPermissionModeParity(unittest.TestCase):
 
     def test_case18c_replay_honours_recorded_mode(self):
         """Without --mode, an entry that recorded permission_mode "auto"
-        replays as auto and defers."""
+        replays as auto and prints no payload."""
         hook = str(Path(__file__).parent.parent / ".claude" / "hooks" / "pretool_hook.py")
         log_line = json.dumps({
             "command": self.UNKNOWN, "decision": "ask",
@@ -1915,10 +1959,8 @@ class TestPermissionModeParity(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(proc.returncode, 0)
-        out = proc.stdout.strip()
-        self.assertTrue(out, "replay printed nothing")
-        self.assertEqual(
-            json.loads(out)["hookSpecificOutput"]["permissionDecision"], "defer")
+        self.assertEqual(proc.stdout.strip(), "")
+        self.assertIn("No output: left to the pipeline (auto)", proc.stderr)
 
 
 class TestMonitorToolHandled(unittest.TestCase):

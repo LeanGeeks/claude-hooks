@@ -1654,7 +1654,7 @@ def main():
         #    `--dangerously-skip-permissions` (what `amux-spawn --yolo` expands to
         #    on the Claude path) or switched to bypass mode interactively. Since
         #    epic 40 (task 40-01) Claude no longer asks us about an *unknown*
-        #    command in a bypass session — pretool_hook emits `defer` for the
+        #    command in a bypass session — pretool_hook prints nothing for the
         #    modes that resolve an ask-candidate themselves, so the pipeline
         #    allows it silently and no request ever reaches this hook. What still
         #    reaches it is a **risk-gate** ask — a `permissions.ask` match or a
