@@ -28,14 +28,14 @@ from typing import Dict, List, Any, Optional
 
 # Import our modules
 try:
-    from bash_command_parser import BashCommandParser
+    from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
 except ImportError:
     # If running from different directory, try adding hooks dir to path
     import pathlib
     hooks_dir = pathlib.Path(__file__).parent.absolute()
     sys.path.insert(0, str(hooks_dir))
-    from bash_command_parser import BashCommandParser
+    from bash_command_parser import BashCommandParser, RedirectTarget
     from settings_loader import SettingsLoader
 
 
@@ -51,6 +51,32 @@ MANUAL_CONFIRM_LOG = os.environ.get(
     'CLAUDE_MANUAL_CONFIRM_LOG'
 ) or os.path.expanduser('~/.claude/bash_manual_confirm.log')
 TMP_ALLOWED_ROOT = '/tmp'
+
+# A path that continues THROUGH a per-process descriptor/cwd/root link: what the
+# link points to is a fact about the command's process, not the hook's.
+_PROCESS_LINK = re.compile(
+    r'/(?:dev/(?:fd/[^/]+|stdin|stdout|stderr)|proc/(?:self|thread-self|[0-9]+))')
+
+
+def _passes_through_process_link(path: str) -> bool:
+    """True if `path`, walked lexically segment by segment before any realpath
+    (`.` and empty segments dropped, `..` popping the segment before it),
+    has a further segment (`..` included) after a per-process fd/cwd/root link.
+    A trailing `/` counts as a further segment."""
+    segments = [seg for seg in path.split('/')[1:] if seg not in ('', '.')]
+    if path.endswith('/') and segments:
+        segments.append('')
+    stack: List[str] = []
+    for seg in segments:
+        if stack and _PROCESS_LINK.fullmatch('/' + '/'.join(stack)):
+            return True
+        if seg == '..':
+            if stack:
+                stack.pop()
+        else:
+            stack.append(seg)
+    return False
+
 
 # Output redirections to these pseudo-devices are always safe: they discard or
 # echo output and create no file on disk, so they need no root containment
@@ -700,10 +726,10 @@ class BashPermissionValidator:
         # so a constant pointing outside the allowed roots (`OUT=/etc`) stays
         # refused — and is now shown resolved in the prompt.
         disallowed_targets = []
-        for target, off in self.parser.extract_write_redirect_targets(command):
-            expanded = self._expand_constants(target, const_assignments, off)
-            if not self._is_redirect_target_allowed(expanded):
-                disallowed_targets.append(expanded)
+        for word in self.parser.extract_write_redirect_words(command):
+            shown, allowed = self._judge_redirect_word(word, const_assignments)
+            if not allowed:
+                disallowed_targets.append(shown)
         disallowed_targets = _dedupe(disallowed_targets)
 
         # Make decision
@@ -909,67 +935,278 @@ class BashPermissionValidator:
         except Exception:
             return False
 
-    def _is_redirect_target_allowed(self, target: str) -> bool:
+    def _judge_redirect_word(self, word: RedirectTarget,
+                             const_assignments: dict = None):
+        """
+        (shown_target, allowed) for one RedirectTarget from
+        `BashCommandParser.extract_write_redirect_words`.
+
+        `const_assignments` resolves `$VAR` references to constants assigned
+        earlier in the same compound command (see _expand_constants); a
+        literal word has no expansion to resolve. A word that resolves is
+        judged on its realpath (_is_redirect_target_allowed). One that does
+        not — an unresolvable construct, or a variable with no value here — is
+        judged by _unresolved_target_allowed on its parts, never by resolving
+        its text: `{/etc/x,}` or `/etc/x*` read as a relative or literal path
+        would vouch for a write bash makes elsewhere.
+
+        An error while judging refuses the target: this gate only ever turns a
+        decision into a prompt, so refusing is the conservative failure.
+        """
+        if word.fd_pipe:
+            # `> >(cmd)` writes to the /dev/fd/N pipe bash substitutes; cmd's
+            # own redirects are separate targets.
+            return word.text, True
+        try:
+            if word.literal:
+                return word.text, self._is_redirect_target_allowed(
+                    word.text, literal=True)
+
+            def expand(text):
+                if not const_assignments:
+                    return text
+                return self._expand_constants(text, const_assignments, word.offset)
+
+            shown = expand(word.text)
+            if not word.unresolvable:
+                if self._is_redirect_target_allowed(shown):
+                    return shown, True
+                if self._resolve_target_path(shown) is not None:
+                    return shown, False  # resolved: outside, or protected
+            parts = []
+            for kind, source in word.parts:
+                if kind == RedirectTarget.EXPANSION:
+                    value = expand(source)
+                    if '$' not in value and '`' not in value:
+                        kind, source = RedirectTarget.LITERAL, value
+                parts.append((kind, source))
+            return shown, self._unresolved_target_allowed(parts)
+        except Exception as e:
+            debug_log(f"redirect target {word.text!r} could not be judged: {e}")
+            return word.text, False
+
+    def _protected_write_paths(self, unresolved: bool = False):
+        """
+        (files, dirs) a write redirect may never touch, as realpaths (brd D4).
+        These configure the hook itself; a redirect into them would let an
+        agent widen its own allowlist or roots without a prompt, even though
+        they sit inside a root.
+
+        For a resolved target: `.claude/settings.json`,
+        `.claude/settings.local.json` and `.claude/hooks/` under every allowed
+        root. For an unresolvable one (`unresolved=True`) the whole
+        `<root>/.claude/`: a name the gate cannot read must not land anywhere
+        near the hook's configuration. Both: all of `~/.claude/`.
+        """
+        files, dirs = [], []
+        for root in self._allowed_roots():
+            claude = os.path.join(root, '.claude')
+            if unresolved:
+                dirs.append(os.path.realpath(claude))
+            else:
+                files.append(os.path.realpath(os.path.join(claude, 'settings.json')))
+                files.append(os.path.realpath(os.path.join(claude, 'settings.local.json')))
+                dirs.append(os.path.realpath(os.path.join(claude, 'hooks')))
+        # The user's Claude Code directory. This entry is the one place 41-02
+        # carves the session's own auto-memory directory out of.
+        dirs.append(os.path.realpath(os.path.expanduser('~/.claude')))
+        return files, dirs
+
+    def _is_protected_write_path(self, resolved: str,
+                                 unresolved: bool = False) -> bool:
+        """True if a realpath is, or lies under, a protected path (brd D4)."""
+        files, dirs = self._protected_write_paths(unresolved)
+        if resolved in files:
+            return True
+        return any(resolved == d or resolved.startswith(d + os.sep) for d in dirs)
+
+    def _is_redirect_target_allowed(self, target: str, literal: bool = False) -> bool:
         """
         Decide whether an output redirection may write to `target` without a
-        prompt. Allowed: the write-safe /dev sinks (and any `/dev/fd/N`), the
+        prompt. Allowed: the write-safe /dev sinks (and an exact `/dev/fd/<digits>`), the
         bash network pseudo-paths (`/dev/tcp/...`, `/dev/udp/...`; see
         NET_REDIRECT_PREFIXES for the security trade-off), and anything
         resolving inside the workspace or /tmp — the same roots that gate `rm`
-        and workspace-binary execution.
+        and workspace-binary execution — except the hook's own configuration
+        (`_is_protected_write_path`, brd D4), which is refused before any root
+        check.
 
-        When the target fully resolves (no unexpanded construct), we realpath it
-        and require containment, exactly like `rm`. When it does NOT resolve
-        because of an undefined `$VAR`, a `$(...)`, or a `~user` we cannot expand,
-        we fall back to a lenient literal-prefix check (see _literal_prefix...):
-        the target is still allowed if its literal leading directory roots inside
-        an allowed root and it contains no literal `..`. This keeps frictionless
-        the common diagnostic pattern `> /tmp/jit_$i.txt` (literal `/tmp/` root)
-        while still prompting on a target with no literal anchor (`> "$LOG"`) or
-        one rooted outside (`> /etc/$x`). The residual risk — a variable that
-        itself expands to `../` and escapes — is accepted by design.
+        `literal=True` says the target performs no expansion (the parser's
+        RedirectTarget.literal): it is resolved as written, with no tilde or `$`
+        expansion, so `'$HOME'/x` is a directory named `$HOME`.
+
+        The target must fully resolve (no unexpanded construct); it is then
+        realpathed and must be contained, exactly like `rm`. A `..` in a
+        resolved target is fine — it is judged on where it lands. A target that
+        does NOT resolve is refused here: only the whole word says which of its
+        characters were quoted, so the lenient check for unresolvable targets
+        (_unresolved_target_allowed) is reached through _judge_redirect_word.
         """
-        if target in SAFE_REDIRECT_DEVICES or target.startswith('/dev/fd/'):
+        # Exact names only: `/dev/fd/../../etc/x` or `/dev/fd/$V` is a path
+        # bash resolves, not a descriptor, so it falls through to resolution.
+        if target in SAFE_REDIRECT_DEVICES or re.fullmatch(r'/dev/fd/[0-9]+', target):
             return True
         if target.startswith(NET_REDIRECT_PREFIXES):
             return True
-        resolved = self._resolve_target_path(target)
-        if resolved is not None:
-            return self._realpath_inside_allowed_roots(resolved)
-        return self._literal_prefix_inside_allowed_roots(target)
-
-    def _literal_prefix_inside_allowed_roots(self, target: str) -> bool:
-        """
-        Lenient fallback for a redirect target carrying an unexpandable construct
-        (`$VAR`/`$(...)`/backtick/`~user`): allow it only if the LITERAL leading
-        portion — everything before the first such construct — anchors it inside
-        an allowed root.
-
-        Rules, all required:
-          - The literal prefix must be non-empty: a target that begins with the
-            construct (`$LOG`, `$SP/out`) has no anchor and is refused.
-          - No literal `..` path segment anywhere in the target (a literal
-            traversal could climb out of the anchored root).
-          - The literal directory (the prefix's containing dir, or the prefix
-            itself when it ends in `/`) must realpath inside the workspace or
-            /tmp. A relative literal dir is joined onto the workspace first.
-        """
-        # Cut at the first shell construct we could not expand.
-        prefix = re.split(r'[$`]', target, maxsplit=1)[0]
-        if not prefix:
+        # The gate cannot know what a per-process link points to in the
+        # command's process (`2<.. > /dev/stderr/../x`): refuse any path
+        # that continues through one.
+        if _passes_through_process_link(target):
             return False
-        # A literal parent-dir segment could traverse out of the anchored root.
-        if '..' in prefix.split('/'):
+        if literal:
+            resolved = os.path.realpath(
+                target if target.startswith('/')
+                else os.path.join(self.workspace_dir, target))
+        else:
+            resolved = self._resolve_target_path(target)
+        if resolved is None:
             return False
-        # The literal directory the write is anchored under.
-        literal_dir = prefix if prefix.endswith('/') else os.path.dirname(prefix)
+        if self._is_protected_write_path(resolved):
+            return False
+        return self._realpath_inside_allowed_roots(resolved)
+
+    def _unresolved_target_allowed(self, parts) -> bool:
+        """
+        The lenient check for a write target the gate cannot resolve (brd D3):
+        vouch only for what it can read. `parts` are RedirectTarget.parts with
+        constants already substituted. Constructs are EXPANSION, SUBST and GLOB
+        parts (and a TILDE anywhere but the start).
+
+        The word is split at its last `/` in LITERAL text: D is the directory
+        part up to and including it (empty: the cwd), F the final segment.
+        Allowed only when all hold:
+
+          R0  The word begins with literal text or a tilde: a target whose
+              anchor is empty (`$LOG`, `"$f.out"`, `$(…)`) is refused.
+          R1  D holds no construct and no unquoted glob character; those may
+              appear in F only. A `/` inside a construct is not a split point,
+              so `$(echo a/b)` or `${V:-/}` before the last literal `/` puts a
+              construct in D.
+          R2  D, with an unquoted leading `~`/`~user` expanded (one that does
+              not expand is refused), has no literal `..` segment, and its
+              realpath (joined onto the cwd) lies inside an allowed root.
+          R3  realpath(D) is not protected — for an unresolvable target the
+              whole `<root>/.claude/` and all of `~/.claude/`
+              (`_protected_write_paths(unresolved=True)`).
+          R4  No construct in F has `/`, `..` or a backslash in its source
+              (`${V:-a/b}`, `$(echo ../x)`, `${V/x/\\/}`, `$'\\x2f'`), no
+              literal piece of F holds `..`, and F with its constructs taken
+              as empty is not `..` (`.$V.`).
+          R5  The disk agrees, since a symlink is visible there. F of literal
+              text only, if it exists under realpath(D), must realpath inside
+              a root and not be protected (as R3). If F holds a construct or
+              glob, a construct is a wildcard (`*`, never matching `/`), a
+              glob keeps its own meaning (`[`, `{` and an extglob group match
+              anything from there on), and every entry of realpath(D) the
+              pattern can match, dotfiles included, is checked the same way
+              (for a construct without a glob, only symlink entries matter).
+              So `ln${V:-k}s` and `./$V` ask when the directory holds a
+              symlink leading out of the roots or into `.claude`. A
+              filesystem error refuses.
+          R6  Defence in depth: `.claude` anywhere in the text, or `claude`
+              inside a construct's source, refuses.
+
+        Accepted residual (brd D3; 41-03 reclassifies): a final-segment
+        construct whose runtime VALUE contains `/`. `./$V` with
+        V=../../x or V=.claude/settings.json, `x$(cmd)` whose output holds `/`
+        or `..`, are allowed. Nothing in the source or on disk says what such
+        a value is. A value without `/` is covered by R5, which treats the
+        construct as a wildcard.
+        """
+        R = RedirectTarget
+        text = ''.join(source for _kind, source in parts)
+        # R6
+        if '.claude' in text or any(
+                kind != R.LITERAL and 'claude' in source for kind, source in parts):
+            return False
+        # R0
+        if not parts or parts[0][0] not in (R.LITERAL, R.TILDE):
+            return False
+        # Split at the last `/` in literal text.
+        cut = None
+        for index, (kind, source) in enumerate(parts):
+            if kind == R.LITERAL and '/' in source:
+                cut = index
+        if cut is None:
+            dir_parts, leaf_parts = [], list(parts)
+        else:
+            source = parts[cut][1]
+            split_at = source.rindex('/') + 1
+            dir_parts = list(parts[:cut]) + [(R.LITERAL, source[:split_at])]
+            leaf_parts = ([(R.LITERAL, source[split_at:])] if source[split_at:]
+                          else []) + list(parts[cut + 1:])
+        # R1 (a tilde-prefix is the word's first part or a construct)
+        if any(kind not in (R.LITERAL, R.TILDE) or (kind == R.TILDE and index)
+               for index, (kind, _source) in enumerate(dir_parts)):
+            return False
+        if any(kind == R.TILDE for kind, _source in leaf_parts):
+            return False  # `~`/`~user` with no `/` after it
+        directory = ''.join(source for _kind, source in dir_parts)
+        # R2
+        if directory.startswith('~'):
+            directory = os.path.expanduser(directory)
+            if directory.startswith('~'):
+                return False
+        if '..' in directory.split('/'):
+            return False
+        if _passes_through_process_link(directory):
+            return False
+        # R4
+        for kind, source in leaf_parts:
+            if kind == R.LITERAL:
+                if '..' in source:
+                    return False
+            elif '/' in source or '..' in source or '\\' in source:
+                return False
+        leaf = ''.join(source for kind, source in leaf_parts if kind == R.LITERAL)
+        if leaf == '..':
+            return False
         try:
-            if literal_dir.startswith('/'):
-                base = os.path.realpath(literal_dir)
+            base = os.path.realpath(os.path.join(self.workspace_dir, directory))
+            if not self._realpath_inside_allowed_roots(base):
+                return False
+            # R3
+            if self._is_protected_write_path(base, unresolved=True):
+                return False
+            # R5
+            has_glob = any(kind == R.GLOB for kind, _source in leaf_parts)
+            has_construct = any(kind != R.LITERAL for kind, _source in leaf_parts)
+            if has_glob or has_construct:
+                pattern = []
+                for kind, source in leaf_parts:
+                    if kind == R.LITERAL:
+                        pattern.append(re.escape(source))
+                    elif kind != R.GLOB:
+                        pattern.append('.*')  # a construct: any value without `/`
+                    elif source in ('*', '?'):
+                        pattern.append('.*' if source == '*' else '.')
+                    else:
+                        pattern.append('.*')  # `[`, `{`, extglob: anything on
+                        break
+                regex = re.compile(''.join(pattern), re.DOTALL)
+                if has_glob:
+                    names = [name for name in os.listdir(base)
+                             if regex.fullmatch(name)]
+                elif os.path.isdir(base):
+                    # A construct can only complete the name of an entry that
+                    # is a symlink; any other entry is inside realpath(D),
+                    # which R2/R3 passed (and `.claude` itself is R6's).
+                    names = [name for name in os.listdir(base)
+                             if regex.fullmatch(name)
+                             and os.path.islink(os.path.join(base, name))]
+                else:
+                    names = []  # no such directory, so no symlink in it
             else:
-                base = os.path.realpath(os.path.join(self.workspace_dir, literal_dir))
-            return self._realpath_inside_allowed_roots(base)
-        except Exception:
+                names = [leaf] if leaf and os.path.lexists(
+                    os.path.join(base, leaf)) else []
+            for name in names:
+                real = os.path.realpath(os.path.join(base, name))
+                if (not self._realpath_inside_allowed_roots(real)
+                        or self._is_protected_write_path(real, unresolved=True)):
+                    return False
+            return True
+        except Exception as e:
+            debug_log(f"unresolvable target {text!r}: filesystem check failed: {e}")
             return False
 
     def _is_workspace_rm(self, cmd: str) -> bool:
@@ -1948,11 +2185,14 @@ class BashPermissionValidator:
         # /etc/cron.d/pwn' EXIT` allowed while both `echo ok > /etc/cron.d/pwn`
         # and `$(echo ok > /etc/cron.d/pwn)` asked (review finding HIGH 1).
         # A `$VAR` target is not resolved here and never will be — it falls to
-        # the same literal-prefix rule and asks when it has no allowed anchor.
+        # the same unresolvable-target rule (_unresolved_target_allowed) and
+        # asks when it has no allowed anchor.
         disallowed_targets = _dedupe([
-            target
-            for target, _off in self.parser.extract_write_redirect_targets(handler)
-            if not self._is_redirect_target_allowed(target)
+            shown
+            for shown, allowed in (
+                self._judge_redirect_word(word)
+                for word in self.parser.extract_write_redirect_words(handler))
+            if not allowed
         ])
         if disallowed_targets:
             debug_log(f"trap handler {handler!r} writes outside the allowed roots: "

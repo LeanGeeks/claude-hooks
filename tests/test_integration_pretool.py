@@ -9,6 +9,7 @@ Tests the PreToolUse hook with simulated stdin payloads:
 - Compound commands are validated correctly
 """
 
+import atexit
 import collections
 import itertools
 import json
@@ -22,6 +23,22 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+# Isolate the permission store and the manual-confirm log BEFORE the hook
+# modules are imported (they read these paths once, at import), so running this
+# module directly (`python3 -m unittest tests.test_integration_pretool`) cannot
+# write to the developer's real ~/.claude files. Mirrors tests/run_all_tests.py
+# and tests/conftest.py; `setdefault` lets an explicit outer override win.
+_tmp_store = Path(tempfile.mkdtemp(prefix="claude-hooks-tests-"))
+atexit.register(shutil.rmtree, str(_tmp_store), ignore_errors=True)
+for _var, _name in (
+        ("CLAUDE_PERMISSION_STATE_FILE", "permission_requests.jsonl"),
+        ("CLAUDE_PERMISSION_AUDIT_FILE", "permission_actions.jsonl"),
+        ("CLAUDE_PERMISSION_DEBUG_LOG", "permission_state_debug.log"),
+        ("CLAUDE_PERMISSION_ARCHIVE_FILE", "permission_requests.archive.jsonl"),
+        ("CLAUDE_MANUAL_CONFIRM_LOG", "bash_manual_confirm.log")):
+    os.environ.setdefault(_var, str(_tmp_store / _name))
+os.environ.setdefault("CLAUDE_INSTALL_NO_EXTERNAL", "1")
 
 # Add paths for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / ".claude" / "hooks"))
@@ -1452,8 +1469,8 @@ class TestRedirectTargets(unittest.TestCase):
     redirect targets before command matching, so an otherwise-allowed command
     can still carry `> /etc/passwd`; the validator surfaces every write target
     and forces a prompt on any that escapes the workspace, /tmp, or the
-    write-safe /dev sinks. Unresolvable targets fall back to a lenient
-    literal-prefix anchor (see _literal_prefix_inside_allowed_roots)."""
+    write-safe /dev sinks. Unresolvable targets are judged by a structural
+    rule (see _unresolved_target_allowed)."""
 
     WS = "/ws/project"
 
@@ -1474,6 +1491,60 @@ class TestRedirectTargets(unittest.TestCase):
     def test_dev_sinks_and_fd_allowed(self):
         for tgt in ('/dev/stdout', '/dev/stderr', '/dev/tty', '/dev/fd/3'):
             self.assertEqual(self._decision(f'echo hi > {tgt}'), "allow", tgt)
+
+    def test_41_dev_fd_is_exact_digits_only(self):
+        # A /dev/fd/ prefix is not a descriptor: bash resolves `..` and `$V`.
+        for tgt in ('/dev/fd/../../../etc/x', '/dev/fd/../../etc/x',
+                    '/dev/fd/3/../../../../etc/x', '/dev/fd/$V',
+                    '/dev/fd/', '/dev/fd/3x', '/dev/fd/-1'):
+            self.assertNotEqual(self._decision(f'echo k > {tgt}'), "allow", tgt)
+        for tgt in ('/dev/fd/2', '/dev/fd/10'):
+            self.assertEqual(self._decision(f'echo k > {tgt}'), "allow", tgt)
+        self.assertEqual(self._decision('echo k 2>/dev/stderr'), "allow")
+        self.assertEqual(self._decision('echo k >&2'), "allow")
+
+    def test_41_process_link_paths_are_refused(self):
+        # `2<.. > /dev/stderr/../zz` writes outside the roots: the link points
+        # elsewhere in the command's process than in the hook's. The hook's own
+        # fds 0-2 are pointed at a file under /tmp so that realpath-ing through
+        # them would land INSIDE an allowed root (the unsafe verdict).
+        import tempfile
+        tmpdir = tempfile.mkdtemp(prefix='t41fix8-')
+        fdfile = os.path.join(tmpdir, 'f')
+        saved = [os.dup(n) for n in (0, 1, 2)]
+        fd = os.open(fdfile, os.O_RDWR | os.O_CREAT)
+        try:
+            for n in (0, 1, 2):
+                os.dup2(fd, n)
+            self._41_process_link_refusals()
+        finally:
+            for n, keep in zip((0, 1, 2), saved):
+                os.dup2(keep, n)
+                os.close(keep)
+            os.close(fd)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _41_process_link_refusals(self):
+        for tgt in ('/dev/stderr/../zz', '/dev/stdout/../zz', '/dev/stdin/../zz',
+                    '/dev/stderr/zz', '/dev/fd/2/../zz', '/dev/fd/3/zz',
+                    '/dev//fd/2/../zz', '/dev/./stderr/../zz',
+                    '/dev/../dev/stderr/../zz', '/proc/self/fd/2/../zz',
+                    '/proc/self/cwd/../zz', '/proc/self/root/zz',
+                    '/proc/thread-self/fd/1/../zz', '/proc/1234/fd/2/../zz',
+                    '/proc/1234/cwd/../zz', '/proc/1234/root/zz',
+                    '/proc//self/fd/2/../zz', f'/proc/{os.getpid()}/fd/2/../zz',
+                    f'/proc/{os.getpid()}/cwd/../zz'):
+            self.assertNotEqual(self._decision(f'echo k 2<.. > {tgt}'), "allow", tgt)
+            self.assertNotEqual(self._decision(f'echo k > {tgt}'), "allow", tgt)
+        # the unresolvable path: a literal directory part through the link
+        for tgt in ('/dev/stderr/$V', '/dev/stderr/../$V', '/dev/fd/2/$V',
+                    '/proc/self/cwd/$V', '/proc/1234/fd/2/$V'):
+            self.assertNotEqual(self._decision(f'echo k > {tgt}'), "allow", tgt)
+
+    def test_41_process_link_sinks_still_allowed(self):
+        for cmd in ('echo k 2>/dev/null', 'echo k &>/dev/null', 'echo k >&2',
+                    'echo k > /dev/fd/2', 'echo k 2>/dev/stderr', 'echo k >/dev/tty'):
+            self.assertEqual(self._decision(cmd), "allow", cmd)
 
     def test_tmp_redirect_allowed(self):
         self.assertEqual(self._decision('echo hi > /tmp/out.log'), "allow")
@@ -1559,6 +1630,546 @@ class TestRedirectTargets(unittest.TestCase):
     def test_allowed_command_does_not_excuse_bad_target(self):
         # `echo` is allowlisted, but the escaping write still forces a prompt.
         self.assertEqual(self._decision('echo hi > /root/owned'), "ask")
+
+    # --- task 41-01: the gate reads the target bash writes to -------------
+    #
+    # Every row below returned `allow` before 41-01 (brd §1.3). `/tmp` is an
+    # allowed root, so every "should refuse" target sits outside it: /etc, or
+    # a home directory set through a patched HOME. `$V` is kept out of the
+    # environment so `expandvars` cannot resolve it.
+    HOME = "/home/fakeuser41"
+    ALLOW_41 = ["Bash(echo:*)", "Bash(ls:*)", "Bash(cat:*)", "Bash(grep:*)",
+                "Bash(date:*)"]
+
+    def _result_41(self, command, workspace=None):
+        env = {k: v for k, v in os.environ.items() if k != "V"}
+        env["HOME"] = self.HOME
+        with patch.dict(os.environ, env, clear=True):
+            return BashPermissionValidator(
+                _FakeLoader(self.ALLOW_41), BashCommandParser(),
+                workspace_dir=workspace or self.WS,
+            ).validate_bash_command(command)
+
+    def _assert_refused(self, command, target, workspace=None):
+        r = self._result_41(command, workspace)
+        self.assertEqual(r["decision"], "ask", command)
+        self.assertEqual(r["ask_kind"], "risk", command)
+        self.assertIn(target, r["redirect_targets"], command)
+
+    def _assert_no_refusal(self, command, workspace=None):
+        r = self._result_41(command, workspace)
+        self.assertEqual(r["redirect_targets"], [], command)
+        self.assertEqual(r["decision"], "allow", command)
+
+    def _targets(self, command):
+        return [t for t, _off in BashCommandParser().extract_write_redirect_targets(command)]
+
+    # (i) the whole word, not its first token
+    def test_41_substitution_target_is_kept_in_source_form(self):
+        cmd = "echo hi > $(echo ~/.bashrc)"
+        self.assertEqual(self._targets(cmd), ["$(echo ~/.bashrc)"])
+        self._assert_refused(cmd, "$(echo ~/.bashrc)")
+
+    def test_41_quoted_substitution_target(self):
+        cmd = 'ls >"$(echo /etc/x)"'
+        self.assertEqual(self._targets(cmd), ["$(echo /etc/x)"])
+        self._assert_refused(cmd, "$(echo /etc/x)")
+
+    def test_41_glued_substitution_with_traversal(self):
+        cmd = "echo hi > x$(echo y)/../../../etc/x"
+        self.assertEqual(self._targets(cmd), ["x$(echo y)/../../../etc/x"])
+        self._assert_refused(cmd, "x$(echo y)/../../../etc/x")
+
+    def test_41_anchored_substitution_stays_allowed(self):
+        # Anchored inside — the accepted residual risk, as for `x$V`.
+        self._assert_no_refusal("echo hi > x$(echo y)")
+        self._assert_no_refusal("echo hi > /tmp/out_$(date +%s).txt")
+
+    # (ii) redirects inside a substitution that IS the target
+    def test_41_inner_redirect_of_a_target_substitution_is_scanned(self):
+        for cmd in ("echo hi > $(echo x > /etc/passwd)",
+                    "echo hi > `echo x > /etc/passwd`",
+                    'echo hi > "$(echo x > /etc/passwd)"'):
+            with self.subTest(cmd=cmd):
+                self.assertIn("/etc/passwd", self._targets(cmd))
+                self._assert_refused(cmd, "/etc/passwd")
+
+    def test_41_inner_redirect_of_a_process_substitution_target(self):
+        cmd = "echo hi > >(cat > /etc/x)"
+        self.assertIn("/etc/x", self._targets(cmd))
+        self._assert_refused(cmd, "/etc/x")
+        # The pipe itself is a /dev/fd sink, as before.
+        self._assert_no_refusal("echo hi > >(cat)")
+
+    # (iii) quote removal, not quote stripping
+    def test_41_quote_removal_finds_the_real_path(self):
+        for cmd, target in (('echo x > "/etc"/x', "/etc/x"),
+                            ('echo x > ""/etc/x', "/etc/x"),
+                            ("echo x > '/etc/x'y", "/etc/xy"),
+                            ("echo x > \\/etc/x", "/etc/x")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._targets(cmd), [target])
+                self._assert_refused(cmd, target)
+
+    def test_41_double_quoted_parameter_is_still_expanded(self):
+        cmd = 'echo x > "$HOME"/.bashrc'
+        self.assertEqual(self._targets(cmd), ["$HOME/.bashrc"])
+        self._assert_refused(cmd, "$HOME/.bashrc")
+
+    def test_41_quoted_variable_glued_to_home_path(self):
+        self._assert_refused('echo x > ~/.bashrc"$V"', "~/.bashrc$V")
+
+    def test_41_quoted_tilde_is_literal(self):
+        # bash writes `<ws>/~/x` — inside the workspace.
+        cmd = "echo x > '~'/x"
+        self.assertEqual(self._targets(cmd), ["./~/x"])
+        self._assert_no_refusal(cmd)
+        # ...and its containment is judged, not assumed: `<ws>/~/../../../etc/x`.
+        self._assert_refused("echo x > '~'/../../../etc/x", "./~/../../../etc/x")
+
+    def test_41_unmodelled_expansions_are_unresolvable(self):
+        for cmd, target in (("echo x > {/etc/x,}", "{/etc/x,}"),
+                            ("echo x > ~-/x", "~-/x"),
+                            ("echo x > ~+/x", "~+/x"),
+                            ("echo x > /etc/x*", "/etc/x*")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._targets(cmd), [target])
+                self._assert_refused(cmd, target)
+
+    # (iv) the lenient fallback keeps its docstring's promise
+    def test_41_lenient_fallback_reports_the_real_target(self):
+        # What these rows are refused FOR lives in `_REFUSED_BY_RULE_41`
+        # (R1/R2) and `_MUST_ALLOW_41` (`./$V`); here the refusal must also
+        # name the word bash writes to.
+        for word in ("~/.bashrc$V", "~/.ssh/authorized_keys$V",
+                     ".$V/../../etc/x", "~nosuchuser41/$V"):
+            with self.subTest(word=word):
+                self._assert_refused("echo k >> " + word, word)
+
+    def test_41_directory_stack_tilde_is_unresolvable_in_the_parser(self):
+        # `~+`, `~-`, `~N` name a directory the gate cannot know. The parser
+        # says so itself, in source form; R2 would refuse the unexpanded text
+        # anyway, so the parser rule is pinned here, not through the gate.
+        for word in ("~+/x", "~-/x", "~1/x", "~+", "~-"):
+            with self.subTest(word=word):
+                (target,) = BashCommandParser().extract_write_redirect_words(
+                    "echo x > " + word)
+                self.assertTrue(target.unresolvable, word)
+                self.assertEqual(target.text, word)
+        (target,) = BashCommandParser().extract_write_redirect_words(
+            "echo x > ~/x")
+        self.assertFalse(target.unresolvable)
+
+    # (v) the hook's own settings
+    def test_41_protected_settings_inside_the_workspace(self):
+        for cmd, target in (("echo x > .claude/settings.local.json",
+                             ".claude/settings.local.json"),
+                            ("echo x >> .claude/settings.json",
+                             ".claude/settings.json"),
+                            ("echo x > .claude/hooks/y", ".claude/hooks/y")):
+            with self.subTest(cmd=cmd):
+                self._assert_refused(cmd, target)
+
+    def test_41_protected_settings_through_an_unresolvable_target(self):
+        self._assert_refused("echo x > .claude/hooks/$V", ".claude/hooks/$V")
+        self._assert_refused("echo x > .claude/settings.local.json$V",
+                             ".claude/settings.local.json$V")
+
+    def test_41_protected_settings_from_a_subdirectory(self):
+        self._assert_refused("echo x > ../.claude/settings.local.json",
+                             "../.claude/settings.local.json",
+                             workspace=self.WS + "/sub")
+
+    def test_41_user_claude_dir_protected_when_home_is_the_workspace(self):
+        self._assert_refused("echo x > ~/.claude/settings.json",
+                             "~/.claude/settings.json", workspace=self.HOME)
+        # The rest of the home workspace is still writable.
+        self._assert_no_refusal("echo x > ~/notes.txt", workspace=self.HOME)
+
+    # --- fix 4: one structural rule for unresolvable targets ---------------
+    #
+    # _unresolved_target_allowed splits the word at its last literal `/` into
+    # D (directory) and F (final segment) and vouches only when R0-R6 hold.
+    # These rows run in a REAL workspace (symlinks into `.claude` are on disk)
+    # created outside /tmp, since /tmp is an allowed root and would mask a
+    # refusal; each row is judged from the workspace root and from `sub/`.
+    # Fixtures, in the workspace and again in `sub/` (pointing one level up):
+    #   lnk -> .claude, lnk2 -> .claude/hooks, lnks -> .claude/settings.json,
+    #   esc -> /etc/hostname, out_1.txt (a plain file).
+    @classmethod
+    def setUpClass(cls):
+        base = "/var/tmp"
+        if not os.path.isdir(base) or os.path.realpath(base).startswith(
+                os.path.realpath(tempfile.gettempdir()) + os.sep):
+            cls._real_base = None
+            return
+        cls._real_base = tempfile.mkdtemp(prefix="claude-hooks-41-", dir=base)
+        ws = os.path.join(cls._real_base, "ws")
+        os.makedirs(os.path.join(ws, ".claude", "hooks"))
+        os.makedirs(os.path.join(ws, "sub"))
+        Path(ws, ".claude", "settings.json").write_text("{}")
+        for d, up in ((ws, ""), (os.path.join(ws, "sub"), "../")):
+            os.symlink(up + ".claude", os.path.join(d, "lnk"))
+            os.symlink(up + ".claude/hooks", os.path.join(d, "lnk2"))
+            os.symlink(up + ".claude/settings.json", os.path.join(d, "lnks"))
+            os.symlink(up + ".claude", os.path.join(d, "hc"))
+            os.symlink("/etc/hostname", os.path.join(d, "esc"))
+            Path(d, "out_1.txt").write_text("")
+        cls.REAL_WS = ws
+        # A workspace with a `.claude` and plain files only: no symlink for a
+        # construct to complete.
+        clean = os.path.join(cls._real_base, "clean")
+        os.makedirs(os.path.join(clean, ".claude"))
+        os.makedirs(os.path.join(clean, "sub"))
+        for d in (clean, os.path.join(clean, "sub")):
+            Path(d, "out_1.txt").write_text("")
+        cls.CLEAN_WS = clean
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._real_base:
+            shutil.rmtree(cls._real_base, ignore_errors=True)
+
+    def _real_cwds(self):
+        if not self._real_base:
+            self.skipTest("needs /var/tmp outside the temp dir for a real workspace")
+        return (self.REAL_WS, self.REAL_WS + "/sub")
+
+    def _clean_cwds(self):
+        self._real_cwds()
+        return (self.CLEAN_WS, self.CLEAN_WS + "/sub")
+
+    # Every spelling here asks. Each is filed under the rule written for it;
+    # many are refused by more than one rule (defence in depth), and every
+    # rule has rows only it refuses (mutation-proofed per rule).
+    _REFUSED_BY_RULE_41 = {
+        # R0: no literal anchor at all (41-03 makes these `unknown`)
+        "R0": ('"$LOG"', '$V.log', '$(mktemp)', '$V.claude/settings.json'),
+        # R1: a construct or glob before the last literal `/`
+        "R1": ('..${V:-/}etc/x', '..`echo /et`c/x', '..${V:=/}etc/x',
+               '..${U:-/et}${V:-}c/x', '.${V:-claude}/settings.json',
+               '.cl${V:-aude}/settings.json', '.$(echo claude)/settings.json',
+               '.`echo claude`/settings.json', '.c${V-la}ude/hooks/x.py',
+               '.claud${V-e/setting}s.json', '.${V:-claude/hooks}/x.py',
+               '/tmp/${V:-..}/x', '/tmp/${V:=../etc}/x', '.${V:-./e}tc/x',
+               '/tmp/$(echo ..)/x', 'ln*/settings.json', 'l${V}nk2/x.py',
+               'ln$(true)k2/x.py', 'ln"$V"k2/x.py', 'l"$V"nk/settings.json',
+               './$V/settings.json', '.cl$V/settings.json',
+               '.$V.claude/settings.json', '.cl$V"aude"/settings.json',
+               './$(echo a/b).claude/settings.json', '.c*/settings.json',
+               '.[c]laude/settings.json', '+(/)etc/x', '!(a)/etc/x',
+               'x$(echo y)/../../../etc/x', '.$V/../../etc/x', '{/etc/x,}',
+               '~-/x', '~+/x', '~$V/x',
+               'r$[ 0 + 0 ]/../.claude/settings.json', 'r$[1|0]/x'),
+        # R2: D outside the roots, a literal `..` in D, an unexpandable `~user`
+        "R2": ('~/.bashrc$V', '~/.ssh/authorized_keys$V', '~nosuchuser41/$V',
+               '/etc/x*', '/etc/$x', '/tmp/../etc/$x', '../x$V',
+               'sub/../../x$V', 'sub/../x$V'),
+        # R3: D inside `<root>/.claude/` (whole dir for unresolvable targets)
+        "R3": ('lnk/setti$(true)ngs.json', 'lnk/sett${V:-}ings.json',
+               'lnk/${V:-}settings.json', 'lnk/settings.jso${V}n',
+               'lnk/x$V', 'lnk2/$V', '.claude/hooks/$V',
+               '.claude/settings.local.json$V'),
+        # R4: a construct in F whose source holds `/`, `..` or a backslash;
+        # `..` in F's literal text
+        "R4": ('./${V:-../../etc/x}', './$(echo ../../etc/x)', './x${V/x/\\/}',
+               "./$'\\x2e\\x2e\\x2fetc\\x2fx'", '/tmp/x${V:-/../../etc/x}',
+               '.c"$(echo laude/settings.js)"on', '..$V', './..$V', '.$V.',
+               'sub/.$V.', 'x..$(date)'),
+        # R5: the leaf, constructs as empty or glob-matched, is on disk and
+        # resolves into `.claude` or out of the roots
+        "R5": ('./lnk${V}s', './ln*s', 'ln?s', '{lnks,}', './[l]nks',
+               './@(lnks)', './+(l)nks', './l$(true)nks', './es${V}c',
+               './e*c', 'lnk$V',
+               # a construct completes the name of an existing symlink
+               'ln${V:-k}s', './ln$(echo k)s', 'l"$(echo nks)"', 'es$(echo c)',
+               './h${V:-c}', './$V', './l$V', './e$V',
+               # a legacy arithmetic with blanks completes the name
+               'es$[ 2 + 3 ]c', 'es$[ 0 ]c', './h$[ 1 + 1 ]'),
+        # R6: defence in depth, `.claude` in the text / `claude` in a construct
+        "R6": ('./$V.claude.bak', './x${V:-claude}', './.$(echo claude)'),
+    }
+
+    def test_41_unresolvable_targets_refused_by_rule(self):
+        for workspace in self._real_cwds():
+            for rule, spellings in self._REFUSED_BY_RULE_41.items():
+                for spelling in spellings:
+                    cmd = "echo x > " + spelling
+                    with self.subTest(rule=rule, cmd=cmd, cwd=workspace):
+                        r = self._result_41(cmd, workspace)
+                        self.assertEqual(r["decision"], "ask", cmd)
+                        self.assertEqual(r["ask_kind"], "risk", cmd)
+                        self.assertNotEqual(r["redirect_targets"], [], cmd)
+
+    # The documented allow rows: a literal anchor inside a root, constructs
+    # and globs in the final segment only, nothing on disk to say otherwise.
+    _MUST_ALLOW_41 = (
+        "echo x > ./$V", "echo x > .$V", "echo x > x$V",
+        "echo x > x$(echo y)", "echo x > /tmp/out_$(date +%s).txt",
+        "echo x > out_$(date).txt", "echo x > /tmp/.$i.log",
+        "echo x > ./out_*.txt", "echo $(ls 2>/dev/null)",
+        "(ls 2>/dev/null) | grep a", "( (ls 2>/dev/null) )",
+        "echo x > ./my$V_notes", "echo x > ./out.$V.log",
+        "echo x > ./cache/$V.json", "echo x > /tmp/jit_$i.txt",
+        "echo x > run_$i.log", "echo x > ./.$V.log",
+        # `claude` in literal text next to a construct is not refused
+        "echo x > ./claude_$(date).log",
+        # legacy arithmetic in the final segment only
+        "echo x > out_$[ 1 + 1 ].txt", "echo x > ./out_$[ 2 * 3 ].txt")
+
+    def test_41_unresolvable_targets_that_stay_allowed(self):
+        for workspace in self._clean_cwds():
+            for cmd in self._MUST_ALLOW_41:
+                with self.subTest(cmd=cmd, cwd=workspace):
+                    self._assert_no_refusal(cmd, workspace)
+
+    # Behaviour change (fix 4): a construct in a directory position now asks,
+    # even under a literal anchor inside the workspace (41-03 reclassifies).
+    def test_41_construct_in_a_directory_position_asks(self):
+        for cmd in ("echo x > out/$name/x.log", 'echo x > ./"$dir"/x',
+                    "echo x > logs/$(date +%F)/run.log", "echo x > /tmp/$V/x",
+                    "echo x > ./*/x"):
+            with self.subTest(cmd=cmd):
+                r = self._result_41(cmd, self._real_cwds()[0])
+                self.assertEqual(r["decision"], "ask", cmd)
+
+    # Accepted residual (brd D3): a construct confined to the final segment is
+    # judged by its spelling, not its runtime value. `./$V` with
+    # V=../../x or V=.claude/settings.json is allowed; nothing in the source
+    # or on disk says where the value points.
+    def test_41_construct_value_in_the_final_segment_is_the_documented_residual(self):
+        for cmd in ("V=$(cat f); echo x > ./$V", "echo x > ./$(cat f)"):
+            with self.subTest(cmd=cmd):
+                self._assert_no_refusal(cmd, self._clean_cwds()[0])
+
+    # Behaviour change (fix 5): a final-segment construct is a wildcard against
+    # the directory, so the same rows ask where a symlink leading out of the
+    # roots or into `.claude` is on disk (the fixture workspace has several).
+    def test_41_construct_in_the_final_segment_asks_beside_an_escaping_symlink(self):
+        for cmd in ("echo x > ./$V", "echo x > l$V", "echo x > ./e$V"):
+            for workspace in self._real_cwds():
+                with self.subTest(cmd=cmd, cwd=workspace):
+                    self.assertEqual(self._result_41(cmd, workspace)["decision"], "ask")
+
+    # A `case` inside a target substitution ends at its first `)` for the paren
+    # scanner, which would drop the rest of the word (`/../.claude/settings.json`).
+    # The reader refuses such a word instead of guessing where it ends.
+    def test_41_case_inside_a_target_substitution_is_refused(self):
+        sentinel = BashCommandParser.UNPROVEN_SUBSTITUTION_TARGET
+        for cmd in ("echo k > rd$(case x in x) echo ;; esac)/../.claude/settings.json",
+                    "echo k > $(case x in x) echo ;; esac)",
+                    'echo k > "$(case x in x) echo ;; esac)"',
+                    "echo k > ./a$(echo $(case x in x) echo ;; esac))b",
+                    "echo k > >(case x in x) cat ;; esac)",
+                    "echo k > ./$(true;case x in x) :;; esac)"):
+            with self.subTest(cmd=cmd):
+                self.assertIn(sentinel, self._targets(cmd))
+                for workspace in self._clean_cwds():
+                    r = self._result_41(cmd, workspace)
+                    self.assertEqual(r["decision"], "ask", cmd)
+                    self.assertEqual(r["ask_kind"], "risk", cmd)
+
+    # Other spellings that end the paren scanner's substitution early or late:
+    # a `)` in a `${…}` or a comment, a here-doc body, a substitution inside
+    # double quotes that holds its own quotes, `$( (subshell) …)`. Each is
+    # refused (sentinel), never read as a shorter target.
+    _EARLY_END_41 = (
+        "rd$(echo ${V:-)})/../.claude/settings.json",
+        "rd$(echo ${V//)/x})/../.claude/settings.json",
+        "rd$(echo x # )\n)/../.claude/settings.json",
+        "rd$( # )\n)/../.claude/settings.json",
+        "rd$(true;(echo a)# )\n)/../.claude/settings.json",
+        "rd$(cat <<EOF\n)\nEOF\n)/../.claude/settings.json",
+        'rd$(echo "$(echo ")")")/../.claude/settings.json',
+        "rd$((echo a)\"$(echo \")\")\")/../.claude/settings.json",
+        "rd>(echo ${V:-)})/../.claude/settings.json",
+    )
+
+    def test_41_other_early_ends_of_a_target_substitution_are_refused(self):
+        sentinel = BashCommandParser.UNPROVEN_SUBSTITUTION_TARGET
+        for word in self._EARLY_END_41:
+            cmd = "echo k > " + word
+            with self.subTest(cmd=cmd):
+                self.assertIn(sentinel, self._targets(cmd))
+                for workspace in self._clean_cwds():
+                    r = self._result_41(cmd, workspace)
+                    self.assertEqual(r["decision"], "ask", cmd)
+                    self.assertEqual(r["ask_kind"], "risk", cmd)
+
+    # Forms the scanner reads to the right end stay readable.
+    def test_41_substitutions_the_scanner_ends_correctly_are_read_whole(self):
+        for word in ('rd$(echo ")")', "rd$(echo ')')", "rd$(echo \\))",
+                     "rd$(echo $((1+(2))))", "rd$(echo $(echo $(echo y)))",
+                     "rd$(echo ${#V})", "rd$(echo $#)", "rd$((1+2))",
+                     "rd$(echo `echo )`)", 'rd"$(echo `echo )`)"',
+                     'rd"$(echo ")")"'):
+            cmd = "echo k > " + word + "/../x.txt"
+            with self.subTest(cmd=cmd):
+                (target,) = self._targets(cmd)
+                self.assertTrue(target.endswith("/../x.txt"), target)
+
+    # The reader must END a word where bash does. Every word below is one word
+    # in bash that evaluates to `r0` (a real directory in the oracle's
+    # workspace), and it holds a blank or an operator character that would end
+    # an ordinary word. Bash wrote `<ws>/.claude/settings.json` through each
+    # of them (oracle under /dev/shm); the reader must keep the whole word, so
+    # the target ends in `_TAIL_41`, and a cut word, which is a bare final
+    # segment, is the allow that was the defect.
+    _TAIL_41 = "/../.claude/settings.json"
+    _WHOLE_WORD_41 = (
+        # legacy arithmetic `$[ … ]`
+        "r$[0 + 0]", "r$[ 0 ]", "r$[0|0]", "r$[ (0) ]", "r$[ $[ 0 ] ]",
+        "r$[ $(echo 0) ]", "r$[ a[0] ]", 'r"$[ 0 + 0 ]"',
+        # `$((…))`, `$(…)`, backticks, `${…}`
+        "r$((0 + 0))", "r$(( 0 | 0 ))",
+        "r$(echo 0 | cat)", "r`echo 0 | cat`", "r${V:-0 }", "r${V:-a b}",
+        'r${V:-"0 "}', "r$(echo ${V:-0 })",
+        # `$'…'`, `$"…"`
+        "r$'0 '", "r$' '0", 'r$"0 "', 'r"$V 0"',
+        # extglob `@(…)`, `?(…)`, `*(…)`, `+(…)`, `!(…)`
+        "r@(0 | 1)", "r?( 0 )", "r*( 0 )", "r+(0 | 1)", "r!(a b)",
+        "r@(0|$(echo ')'))", "r@(0|\\))",
+    )
+
+    def test_41_blank_bearing_constructs_are_read_to_their_end(self):
+        for word in self._WHOLE_WORD_41:
+            cmd = "shopt -s extglob\necho k > " + word + self._TAIL_41
+            with self.subTest(word=word):
+                (target,) = self._targets(cmd)
+                self.assertTrue(target.endswith(self._TAIL_41), target)
+
+    def test_41_blank_bearing_constructs_in_a_directory_position_ask(self):
+        for word in self._WHOLE_WORD_41:
+            if word.startswith(("r@(", "r?(", "r*(", "r+(", "r!(")):
+                continue  # extglob needs `shopt`, which is not allowed here
+            for workspace in self._real_cwds():
+                for tail in (self._TAIL_41, "/../.." + self._TAIL_41[3:]):
+                    cmd = "echo k > " + word + tail
+                    with self.subTest(cmd=cmd, cwd=workspace):
+                        r = self._result_41(cmd, workspace)
+                        self.assertEqual(r["decision"], "ask", cmd)
+                        self.assertEqual(r["ask_kind"], "risk", cmd)
+
+    # A `$[ … ]` whose end the reader cannot prove is refused with the
+    # sentinel, never read as a shorter word. Each row is refused by ONE of the
+    # four conditions: closed on a `]`, brackets balanced, parens balanced,
+    # plain arithmetic characters only.
+    _UNPROVEN_LEGACY_41 = (
+        "r$[ 0",                  # not closed
+        "r$[ $(echo ]) ]",        # a `]` inside a command substitution
+        'r$[ "]" ]',              # a quoted `]`
+        "r$[ ${V:-]} ]",          # a `]` inside a parameter expansion
+        "r$[ ${V:-0} ]",          # a `{` is not plain arithmetic
+        "r$[ 1; 0 ]",             # a command separator
+        "r$[ \\] ]",              # an escaped `]`
+    )
+
+    def test_41_legacy_arithmetic_with_an_unproven_end_is_refused(self):
+        sentinel = BashCommandParser.UNPROVEN_SUBSTITUTION_TARGET
+        # `r$[ [ ]` at the very end: the scan runs off the input and the last
+        # character happens to be a `]`, so only the bracket balance refuses it.
+        for cmd in ["echo k > " + w + self._TAIL_41
+                    for w in self._UNPROVEN_LEGACY_41] + ["echo k > r$[ [ ]"]:
+            with self.subTest(cmd=cmd):
+                self.assertIn(sentinel, self._targets(cmd))
+                for workspace in self._clean_cwds():
+                    r = self._result_41(cmd, workspace)
+                    self.assertEqual(r["decision"], "ask", cmd)
+                    self.assertEqual(r["ask_kind"], "risk", cmd)
+
+    # `$((echo a > lnks) | (cat))` is a command substitution (bash falls back
+    # to it), but the tokenizer reads it as arithmetic and does not surface the
+    # redirect inside. The reader therefore refuses a `$((` body that dips
+    # below balance (a subshell pair), whatever follows: with `lnks` a symlink
+    # into `.claude`, a word with no other refusal (final segment, no `/`, no
+    # leaf that `x.*` matches) would otherwise be allowed.
+    def test_41_arithmetic_shaped_subshell_pair_is_refused(self):
+        sentinel = BashCommandParser.UNPROVEN_SUBSTITUTION_TARGET
+        cmd = "echo k > x$((echo a > lnks) | (cat))"
+        self.assertEqual(self._targets(cmd), [sentinel])
+        for workspace in self._real_cwds():
+            r = self._result_41(cmd, workspace)
+            self.assertEqual(r["decision"], "ask", cmd)
+            self.assertEqual(r["ask_kind"], "risk", cmd)
+        # real arithmetic with balanced parens is still read whole
+        self.assertEqual(self._targets("echo k > x$(((1+2)*3))"),
+                         ["x$(((1+2)*3))"])
+
+    def test_41_an_unreadable_operand_is_refused_not_dropped(self):
+        with patch.object(BashCommandParser, "_redirect_operand_start",
+                          return_value=None):
+            self.assertEqual(self._targets("echo k > /etc/x"),
+                             [BashCommandParser.UNREAD_REDIRECT_TARGET])
+            self.assertEqual(self._result_41("echo k > /etc/x")["decision"], "ask")
+
+    def test_41_the_word_case_without_a_case_statement_is_not_refused(self):
+        for cmd in ("echo k > ./$(echo showcase).txt", "echo k > ./case_$(date)",
+                    "echo k > ./$(echo uppercase)"):
+            with self.subTest(cmd=cmd):
+                self._assert_no_refusal(cmd, self._clean_cwds()[0])
+
+    def test_41_filesystem_error_in_the_leaf_check_refuses(self):
+        # A glob under a directory that cannot be listed (here: missing).
+        self._assert_refused("echo x > ./nosuchdir41/out_*.txt",
+                             "./nosuchdir41/out_*.txt", self._real_cwds()[0])
+
+    # Quote removal must not glue word characters onto a variable name.
+    def test_41_quote_removal_keeps_the_variable_name_apart(self):
+        for cmd, target in (('echo x > .cl$V"aude"/s', ".cl${V}aude/s"),
+                            ('echo x > "$V"aude', "${V}aude"),
+                            ("echo x > $V''aude", "${V}aude"),
+                            ("echo x > $V$'aude'", "${V}aude"),
+                            ("echo x > $V\\aude", "${V}aude"),
+                            ('echo x > $1"0"', "${1}0"),
+                            ('echo x > ./"$V".claude/s', "./$V.claude/s")):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(self._targets(cmd), [target])
+        # The boundary is what keeps a constant from being misread:
+        # bash writes /etc/xaude, not /tmp/y.
+        self._assert_refused('V=/etc/x; Vaude=/tmp/y; echo hi > $V"aude"',
+                             "/etc/xaude")
+
+    def test_41_word_parts_record_what_was_quoted(self):
+        from bash_command_parser import RedirectTarget as RT
+        (word,) = BashCommandParser().extract_write_redirect_words(
+            "echo x > ~/a'*'\"$V\"*$(d)b@(c)")
+        self.assertEqual(word.parts, (
+            (RT.TILDE, "~"), (RT.LITERAL, "/a*"), (RT.EXPANSION, "$V"),
+            (RT.GLOB, "*"), (RT.SUBST, "$(d)"), (RT.LITERAL, "b"),
+            (RT.GLOB, "@(c)")))
+        self.assertEqual(word.text, "~/a*$V*$(d)b@(c)")
+        self.assertTrue(word.unresolvable)
+
+    # D2: a subshell's closing paren is not part of the target
+    def test_41_subshell_paren_is_not_glued_to_the_target(self):
+        self.assertEqual(self._targets("(ls 2>/dev/null) | grep a"), ["/dev/null"])
+        self._assert_no_refusal("(ls 2>/dev/null) | grep a")
+        self._assert_no_refusal("( (ls 2>/dev/null) )")
+        self.assertEqual(self._targets("(ls > /etc/x)"), ["/etc/x"])
+        self._assert_refused("(ls > /etc/x)", "/etc/x")
+
+    def test_41_parens_that_belong_to_the_word_stay(self):
+        self.assertEqual(self._targets("echo x > $(echo a)"), ["$(echo a)"])
+        self.assertEqual(self._targets('ls > "a)"'), ["a)"])
+
+    def test_41_redirect_inside_a_plain_substitution_unchanged(self):
+        self.assertEqual(self._targets("echo $(ls 2>/dev/null)"), ["/dev/null"])
+        self._assert_no_refusal("echo $(ls 2>/dev/null)")
+
+    def test_41_target_substitution_past_the_depth_cap_is_refused(self):
+        depth = BashCommandParser.MAX_SUBSTITUTION_DEPTH + 1
+        cmd = "echo hi > " + "$(" * depth + "echo x" + ")" * depth
+        self.assertIn(BashCommandParser.TRUNCATED_SUBSTITUTION_TARGET,
+                      self._targets(cmd))
+        self.assertEqual(self._result_41(cmd)["decision"], "ask")
+
+    def test_41_pathological_target_words_do_not_raise(self):
+        # main() turns a raise into no decision; the target scanner must not
+        # be the place one comes from.
+        for body in ("$((" * 3000, "$(" * 3000, "<(" * 3000, "`" * 3000,
+                     "${" * 3000, "${$((" * 1500, '"$(' * 3000, "$'\\" * 3000):
+            with self.subTest(body=body[:6]):
+                self._targets("echo > " + body + "\nshred -u /etc/passwd")
 
 
 class TestPermissionModeParity(unittest.TestCase):

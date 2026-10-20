@@ -10,7 +10,62 @@ Parses compound bash commands, splitting on operators while respecting:
 """
 
 import re
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
+
+
+class RedirectTarget(NamedTuple):
+    """
+    One write-redirect operand: the target bash will write to, or a word the
+    gate must not vouch for (task 41-01, brd D1). Built by
+    `BashCommandParser._read_redirect_word`.
+
+    text          The word after shell quote removal. A `$`-expansion that is
+                  unquoted or double-quoted (`$HOME`, `${X}`, `"$(…)"`) stays
+                  in its source spelling for the gate to resolve; so does every
+                  unresolvable construct. A bare `$NAME` that quote removal
+                  would glue onto following word characters is braced
+                  (`$V"aude"` -> `${V}aude`), so the text names the variable
+                  bash expands.
+    offset        Source offset of the word's first character.
+    unresolvable  The word holds a construct whose value the gate cannot know:
+                  an unquoted command or process substitution, brace expansion,
+                  a glob or extglob, `~+`/`~-`/`~N`, a tilde-prefix carrying a
+                  quote or an expansion, an ANSI-C escape, or a quoted `$` or
+                  backtick beside a real expansion (the text can then no longer
+                  say which `$` expands).
+    literal       No expansion of any kind: `text` is the exact path, to be
+                  resolved with no tilde or `$` expansion.
+    fd_pipe       The whole word is one process substitution (`>(…)`), which
+                  bash replaces with the `/dev/fd/N` pipe it writes to. Its
+                  inner command is scanned for redirects separately.
+    parts         `text` cut into (kind, source) pieces, in order; the sources
+                  concatenate to `text`. Kinds:
+                    LITERAL    characters bash uses as written (quoted ones
+                               included: a quoted `*`, `$` or `/` is literal)
+                    TILDE      the unquoted leading `~` / `~user` tilde-prefix
+                    EXPANSION  a parameter or arithmetic expansion, or a
+                               double-quoted command substitution
+                    SUBST      any other construct the gate cannot read: an
+                               unquoted `$(…)` / backtick, a process
+                               substitution, an ANSI-C string with escapes, a
+                               `~+`/`~-`/`~N` or quoted/expanded tilde-prefix
+                    GLOB       an unquoted `*`, `?`, `[`, `{`, or an extglob
+                               group with its `@`/`+`/`!` prefix
+                  The redirect gate reads an unresolvable word through these,
+                  since `text` alone cannot say which characters were quoted.
+    """
+    LITERAL = 'literal'
+    TILDE = 'tilde'
+    EXPANSION = 'expansion'
+    SUBST = 'subst'
+    GLOB = 'glob'
+
+    text: str
+    offset: int
+    unresolvable: bool = False
+    literal: bool = False
+    fd_pipe: bool = False
+    parts: Tuple[Tuple[str, str], ...] = ()
 
 
 class BashCommandParser:
@@ -2012,14 +2067,6 @@ class BashCommandParser:
                     assignments.append((name, value, t_off))
         return assignments
 
-    @staticmethod
-    def _strip_quotes(value: str) -> str:
-        """Strip one layer of matching surrounding single/double quotes."""
-        v = value
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
-            v = v[1:-1]
-        return v
-
     def extract_write_redirect_targets(self, command: str) -> List[Tuple[str, int]]:
         """
         Return (target, offset) for every output redirection that WRITES to a
@@ -2031,41 +2078,62 @@ class BashCommandParser:
         is written. This surfaces those write targets so a caller can gate them
         by destination.
 
-        One layer of surrounding quotes is stripped from the target; the text is
-        otherwise returned verbatim, so an unexpanded `$VAR`/`$(...)` stays
-        visible and the caller can refuse to vouch for an unresolvable location.
-        Only path-operand writes are returned; fd-dup forms (`2>&1`, `>&`) carry
-        no target and are skipped.
+        The target is the `text` of `extract_write_redirect_words`: the whole
+        shell word after quote removal, with every expansion left in its source
+        spelling so the caller can refuse to vouch for an unresolvable location.
+        Callers that need to know WHICH constructs were quoted (the redirect
+        gate) use `extract_write_redirect_words` instead. Only path-operand
+        writes are returned; fd-dup forms (`2>&1`, `>&`) carry no target and
+        are skipped.
 
         Examples:
             'echo x > /etc/passwd'      -> [('/etc/passwd', 7)]
             'grep x 2>/dev/null'        -> [('/dev/null', 9)]
             'cmd >> "$LOG"'             -> [('$LOG', 7)]
+            'echo x > "/etc"/x'         -> [('/etc/x', 9)]
+            '(ls 2>/dev/null)'          -> [('/dev/null', 6)]
             'a 2>&1 | b'                -> []   (fd-dup, no path)
             'cat < in.txt'             -> []   (read, not a write)
+        """
+        return [(word.text, word.offset)
+                for word in self.extract_write_redirect_words(command)]
+
+    def extract_write_redirect_words(self, command: str) -> List['RedirectTarget']:
+        """
+        Every write-redirect target in the compound command as a
+        `RedirectTarget`: the target bash will write to, or a word flagged
+        unresolvable — never a shorter or different string (task 41-01, brd
+        D1). Recurses into every command and process substitution, including
+        one that IS a target (`> $(echo x > /etc/passwd)`), because its own
+        redirects execute too.
         """
         if not command or not command.strip():
             return []
         return self._scan_write_targets(command)
 
     def _scan_write_targets(self, command: str,
-                            _depth: int = 0) -> List[Tuple[str, int]]:
+                            _depth: int = 0) -> List['RedirectTarget']:
+        """
+        The target word is read from the SOURCE, not reassembled from tokens.
+        Tokens carry only a start offset, a CMD_SUBST's value is the
+        substitution's inner text, and a quoted `"$(…)"` emits its CMD_SUBST
+        before the quoted WORD — so "the next token" was a fragment: the inner
+        text of `> $(echo ~/.bashrc)`, the `x` of `> x$(echo y)/../..`, or the
+        `/dev/null)` of `(ls 2>/dev/null)` (brd §1.3 (i), §1.2).
+
+        Only REDIRECT and CMD_SUBST tokens are acted on, so the tokens that
+        make up a target word need no skipping. A CMD_SUBST inside the target
+        word runs, and its redirects are scanned like any other's (brd §1.3
+        (ii) — the old target branch `continue`d past them). A REDIRECT the
+        tokenizer reports inside a word this scanner read as one (`${x:-a > b}`)
+        is still scanned: a spare target can only add a prompt.
+        """
         tokens = self._tokenize_with_quotes(command, _depth=_depth)
         targets = []
-        pending = False  # previous token was a write redirect awaiting its path
         for t_type, t_val, t_off in tokens:
-            if pending:
-                pending = False
-                # The path is the immediately following token. An operator (or a
-                # case pattern) here means the redirect had no path operand
-                # (malformed `> ;`) — neither names a file, so record nothing and
-                # let this token be re-examined as a possible new redirect below.
-                if t_type not in ('OP', 'CASE_PATTERN'):
-                    targets.append((self._strip_quotes(t_val), t_off))
+            if t_type == 'CMD_SUBST':
+                if not t_val.strip():
                     continue
-            if t_type == 'REDIRECT' and t_val in self.WRITE_REDIRECTIONS_WITH_ARG:
-                pending = True
-            elif t_type == 'CMD_SUBST' and t_val.strip():
                 if _depth < self.MAX_SUBSTITUTION_DEPTH:
                     targets.extend(self._scan_write_targets(t_val, _depth + 1))
                 else:
@@ -2075,8 +2143,454 @@ class BashCommandParser:
                     # reporting NO write target for
                     # `echo A $(… 65 deep … echo x > /etc/passwd …)` — which is
                     # what turned HEAD's `ask` into an `allow`.
-                    targets.append((self.TRUNCATED_SUBSTITUTION_TARGET, t_off))
+                    targets.append(self._unread_target(
+                        self.TRUNCATED_SUBSTITUTION_TARGET, t_off))
+                continue
+            if t_type == 'REDIRECT' and t_val in self.WRITE_REDIRECTIONS_WITH_ARG:
+                operand = self._redirect_operand_start(command, t_off, t_val)
+                if operand is None:
+                    # Not reachable with this tokenizer; if it ever is, refuse
+                    # to vouch rather than report no write at all — main()'s
+                    # blanket handler would turn a raise into an allow.
+                    targets.append(self._unread_target(
+                        self.UNREAD_REDIRECT_TARGET, t_off))
+                    continue
+                word = self._read_redirect_word(command, operand, _depth)
+                # An empty word (malformed `> ;`, `>` at end of input) names no
+                # file, so nothing is recorded.
+                if word is not None:
+                    targets.append(word)
         return targets
+
+    # What the gate reports for a write redirect whose operand could not be
+    # located in the source. Begins with `$`, so it is unresolvable by the
+    # gate's own rule and has no literal anchor — see TRUNCATED_SUBSTITUTION_TARGET.
+    UNREAD_REDIRECT_TARGET = '$__unread_redirect_operand__'
+
+    # What the gate reports for a target word holding a `$(…)` / `<(…)` / `>(…)`
+    # whose `case` keyword the paren scanner cannot follow (`$(case x in x) …
+    # esac)` ends at the first `)`, so the rest of the word would be dropped).
+    UNPROVEN_SUBSTITUTION_TARGET = '$__unproven_substitution_end__'
+
+    # Spellings after which the paren scanner may end a substitution early (or
+    # late): a `case` keyword, a comment (`#` at word start), a `${…}` whose body
+    # holds a `)` or is cut off, a substitution inside double quotes (its own
+    # quotes), a here-doc operator.
+    _UNPROVEN_PAREN_RE = re.compile(
+        r'(?<![^\s;&|(){}`])case(?![^\s;&|(){}`])'
+        r'|(?<![^\s;&|()`])#'
+        r'|\$\{[^}]*(?:\)|$)'
+        r'|"[^"]*\$\('
+        r'|<<')
+
+    _ARITHMETIC_BODY_RE = re.compile(r'[\w\s+\-*/%()<>=!&|^~?:,.$\[\]#]*')
+
+    @staticmethod
+    def _balanced(text: str, pair: str) -> bool:
+        """True when `text` closes every `pair[0]` and never closes an unopened one."""
+        depth = 0
+        for ch in text:
+            depth += (ch == pair[0]) - (ch == pair[1])
+            if depth < 0:
+                return False
+        return depth == 0
+
+    def _unproven_paren_end(self, command: str, i: int, end: int) -> bool:
+        """
+        True when the `$(…)` / `<(…)` / `>(…)` / `$((…))` / `$[…]` text at
+        command[i:end] holds a spelling whose `)` (or `]`) the scanner mistakes
+        for the construct's close (`case x in x)`, a `)` inside a comment or a
+        `${…}`) or whose body it skips (a here-doc). Read as a redirect word the
+        target would then stop early, so the reader refuses it instead (fail
+        closed). Only the redirect-word reader asks; command matching is
+        unchanged.
+        """
+        if command.startswith('$[', i):
+            # Legacy arithmetic: proven only when the scan closed on a `]`
+            # and the body is plain arithmetic characters with balanced
+            # brackets and parens (a `$(echo ])` or a quoted `]` is not).
+            body = command[i + 2:end - 1]
+            return not (command[end - 1:end] == ']'
+                        and self._balanced(body, '[]')
+                        and self._balanced(body, '()')
+                        and self._ARITHMETIC_BODY_RE.fullmatch(body))
+        if command.startswith('$((', i):
+            # Arithmetic, unless it is `$( (subshell) …)`: accept only a body
+            # of plain arithmetic characters with balanced parens that the
+            # scan closed on `))`; anything else may be a command.
+            body = command[i + 3:end - 2]
+            return not (command[end - 2:end] == '))'
+                        and self._balanced(body, '()')
+                        and self._ARITHMETIC_BODY_RE.fullmatch(body))
+        if not (command.startswith('$(', i) or command[i] in '<>'):
+            return False
+        return bool(self._UNPROVEN_PAREN_RE.search(command[i + 2:end]))
+
+    @staticmethod
+    def _unread_target(sentinel: str, offset: int) -> 'RedirectTarget':
+        """A sentinel target: one construct the gate cannot read, no anchor."""
+        return RedirectTarget(sentinel, offset, unresolvable=True,
+                              parts=((RedirectTarget.SUBST, sentinel),))
+
+    def _redirect_operand_start(self, command: str, offset: int,
+                                op: str) -> Optional[int]:
+        """
+        Source index just past the write-redirect operator whose REDIRECT token
+        sits at `offset`, or None if the operator is not found there.
+
+        The token offset is the operator's own for a bare operator, and the fd
+        word's for an fd-prefixed one (`2>`, `10>>`, `{v}>|`), whose fd word
+        the tokenizer drops. `>&` with a path operand is reported as its
+        same-length synonym `&>` (see _check_operator).
+        """
+        spellings = (op, '>&') if op == '&>' else (op,)
+        j = offset
+        if not command.startswith(spellings, j):
+            if command[j:j + 1].isdigit():
+                while j < len(command) and command[j].isdigit():
+                    j += 1
+            else:
+                match = self._FD_VARNAME_RE.match(command, j)
+                if match:
+                    j = match.end()
+        if command.startswith(spellings, j):
+            return j + len(op)
+        return None
+
+    def _read_redirect_word(self, command: str, pos: int, _depth: int = 0
+                            ) -> Optional['RedirectTarget']:
+        """
+        Read the shell word that is a redirect's operand, starting at `pos`
+        (just past the operator), and apply quote removal to it. Returns the
+        RedirectTarget, or None when the operand is empty.
+
+        The word ends at an unquoted blank or bash metacharacter. `'…'`,
+        `"…"`, `$'…'`, `$(…)`, `` `…` ``, `${…}`, `$((…))`, `$[…]` and
+        `<(…)`/`>(…)` are kept balanced, so a `)` they contain stays in the
+        word, while an unquoted `)` that is unbalanced within the word closes
+        an enclosing subshell and is not part of it (brd D2: `(ls 2>/dev/null)` writes
+        `/dev/null`, `> $(echo x)` keeps its paren, `> "a)"` writes `a)`).
+
+        Quote removal (brd §1.3 (iii)): quoted and backslash-escaped characters
+        are literal; a `$`-expansion unquoted or inside double quotes is kept
+        in its source spelling for the gate's constant/`expandvars`
+        resolution; an unquoted leading `~`/`~user` is a tilde expansion,
+        while a quoted one is literal (the text is then prefixed `./` so the
+        gate cannot expand it). See RedirectTarget for what makes a word
+        unresolvable.
+        """
+        n = len(command)
+        i = pos
+        # bash skips blanks, and a line continuation, before the operand.
+        while i < n:
+            if command[i] in ' \t':
+                i += 1
+            elif command.startswith('\\\n', i):
+                i += 2
+            else:
+                break
+        start = i
+
+        R = RedirectTarget
+        parts = []                # [kind, source] pieces of the word, in order
+        has_expansion = False     # a `$`-expansion or an expanding tilde
+        has_unresolvable = False  # a construct the gate cannot resolve
+        has_literal_meta = False  # a quoted `$` or backtick
+        proc_subst_end = None     # end of a process substitution opening the word
+
+        def add_literal(s):
+            nonlocal has_literal_meta
+            if not s:
+                return
+            if '$' in s or '`' in s:
+                has_literal_meta = True
+            if parts and parts[-1][0] == R.EXPANSION and (
+                    s[0].isalnum() or s[0] == '_'):
+                self._brace_before_glued_name(parts[-1])
+            if parts and parts[-1][0] == R.LITERAL:
+                parts[-1][1] += s
+            else:
+                parts.append([R.LITERAL, s])
+
+        def add_expansion(s, kind=R.EXPANSION):
+            nonlocal has_expansion
+            has_expansion = True
+            parts.append([kind, s])
+
+        def add_unresolvable(s, kind=R.SUBST):
+            nonlocal has_unresolvable
+            has_unresolvable = True
+            parts.append([kind, s])
+
+        # Tilde expansion applies only to an unquoted `~` that begins the word.
+        # Its tilde-prefix runs to the first unquoted `/`; the gate expands a
+        # plain `~`/`~user` itself (and refuses one that does not expand). The
+        # directory-stack forms `~+`, `~-`, `~N` name a directory the gate
+        # cannot know, and a prefix carrying a quote or an expansion is too
+        # intricate to model (bash then does not tilde-expand it at all), so
+        # both are unresolvable.
+        if command.startswith('~', start):
+            k = start + 1
+            while k < n and command[k] != '/' and command[k] not in self._METACHARS:
+                k += 1
+            login = command[start + 1:k]
+            if (login[:1] in ('+', '-') or login[:1].isdigit()
+                    or any(ch in login for ch in '\'"\\$`{}*?[')):
+                add_unresolvable(command[start:k])
+            else:
+                add_expansion(command[start:k], R.TILDE)
+            i = k
+
+        in_dquote = False
+        while i < n:
+            c = command[i]
+            if in_dquote:
+                if c == '"':
+                    in_dquote = False
+                    i += 1
+                    continue
+                if c == '\\' and i + 1 < n:
+                    nxt = command[i + 1]
+                    if nxt == '\n':
+                        i += 2
+                        continue
+                    if nxt in '$`"\\':
+                        add_literal(nxt)
+                        i += 2
+                        continue
+                    add_literal(c)
+                    i += 1
+                    continue
+                end = self._dollar_expansion_end(command, i, _depth)
+                if end is not None:
+                    if self._unproven_paren_end(command, i, end):
+                        return self._unread_target(
+                            self.UNPROVEN_SUBSTITUTION_TARGET, start)
+                    # Inside double quotes even a command substitution is one
+                    # field, so it is resolved (or refused) like a variable.
+                    add_expansion(command[i:end])
+                    i = end
+                    continue
+                add_literal(c)
+                i += 1
+                continue
+
+            # Unquoted.
+            if c == '\\':
+                if i + 1 < n:
+                    if command[i + 1] != '\n':
+                        add_literal(command[i + 1])
+                    i += 2
+                    continue
+                add_literal(c)
+                i += 1
+                continue
+            if c == "'":
+                close = command.find("'", i + 1)
+                if close < 0:
+                    close = n  # unterminated: bash rejects the whole command
+                add_literal(command[i + 1:close])
+                i = close + 1
+                continue
+            if command.startswith("$'", i):
+                k = i + 2
+                while k < n and command[k] != "'":
+                    k += 2 if command[k] == '\\' else 1
+                body = command[i + 2:k]
+                if '\\' in body:
+                    # ANSI-C escapes (`\x2f`, `\057`) spell characters the gate
+                    # does not decode.
+                    add_unresolvable(command[i:k + 1])
+                else:
+                    add_literal(body)
+                i = k + 1
+                continue
+            if c == '"':
+                in_dquote = True
+                i += 1
+                continue
+            if command.startswith('$"', i):
+                in_dquote = True  # locale translation: a double-quoted string
+                i += 2
+                continue
+            if c in '<>' and command.startswith('(', i + 1):
+                # Process substitution. `_scan_paren_subst` skips two
+                # characters and scans to the balancing `)`, exactly as for
+                # `$(`.
+                end = self._scan_paren_subst(command, i)[1]
+                if self._unproven_paren_end(command, i, end):
+                    return self._unread_target(
+                        self.UNPROVEN_SUBSTITUTION_TARGET, start)
+                if i == start:
+                    proc_subst_end = end
+                add_unresolvable(command[i:end])
+                i = end
+                continue
+            if c == '(':
+                # Only an extglob group (`@(a|b)`) puts `(` inside a word;
+                # read it balanced. Treated as a glob, together with its
+                # `@`/`+`/`!` prefix, which is part of the pattern.
+                end = self._scan_paren_subst(command, i - 1)[1]
+                group = command[i:end]
+                if (parts and parts[-1][0] == R.LITERAL
+                        and parts[-1][1][-1] in '@+!'):
+                    group = parts[-1][1][-1] + group
+                    parts[-1][1] = parts[-1][1][:-1]
+                    if not parts[-1][1]:
+                        parts.pop()
+                add_unresolvable(group, R.GLOB)
+                i = end
+                continue
+            if c in self._METACHARS:
+                break  # includes an unbalanced `)` — brd D2
+            end = self._dollar_expansion_end(command, i, _depth)
+            if end is not None:
+                if self._unproven_paren_end(command, i, end):
+                    return self._unread_target(
+                        self.UNPROVEN_SUBSTITUTION_TARGET, start)
+                if command.startswith('$((', i) or not (
+                        command.startswith('$(', i) or c == '`'):
+                    add_expansion(command[i:end])
+                else:
+                    # An unquoted command substitution: its output is word-
+                    # split and globbed, and the gate cannot know it.
+                    add_unresolvable(command[i:end])
+                i = end
+                continue
+            if c in '*?[{':
+                # Glob or brace expansion — the written path is not this text.
+                add_unresolvable(c, R.GLOB)
+                i += 1
+                continue
+            add_literal(c)
+            i += 1
+
+        if i == start:
+            return None
+        if (parts and parts[0][0] == R.LITERAL and parts[0][1].startswith('~')):
+            # A quoted leading tilde is literal; `./` keeps the gate from
+            # expanding it while naming the same path.
+            parts[0][1] = './' + parts[0][1]
+        literal = not has_unresolvable and not has_expansion
+        return RedirectTarget(
+            ''.join(source for _kind, source in parts), start,
+            # A quoted `$` or backtick beside a real expansion: the text can
+            # no longer say which `$` the gate may expand.
+            unresolvable=has_unresolvable or (not literal and has_literal_meta),
+            literal=literal,
+            fd_pipe=proc_subst_end is not None and proc_subst_end == i,
+            parts=tuple((kind, source) for kind, source in parts),
+        )
+
+    _BARE_PARAMETER_RE = re.compile(r'\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9])')
+
+    @classmethod
+    def _brace_before_glued_name(cls, part: list) -> None:
+        """
+        Brace a bare `$NAME` (or `$N`) expansion part in place, `${NAME}`,
+        because quote removal is about to glue word characters onto it:
+        `$V"aude"`, `$V''aude`, `$V\\aude`, `$V$'aude'` are `$V` then `aude`,
+        but the text `$Vaude` names another variable, and `$1"0"` is `$1` then
+        `0`, not `$10`. The gate resolves the text (constants, `expandvars`),
+        so the boundary must survive in it.
+        """
+        if cls._BARE_PARAMETER_RE.fullmatch(part[1]):
+            part[1] = '${' + part[1][1:] + '}'
+
+    def _dollar_expansion_end(self, command: str, i: int,
+                              _depth: int = 0) -> Optional[int]:
+        """
+        If an expansion begins at `i` — `$((…))`, `$[…]`, `$(…)`, `` `…` ``,
+        `${…}`, `$NAME`, or a special parameter (`$1`, `$@`, `$$`, ...) — return the
+        index just past it; otherwise None (a `$` before any other character
+        is literal to bash).
+        """
+        n = len(command)
+        if command.startswith('$((', i):
+            return self._scan_arith(command, i, _depth)[0]
+        if command.startswith('$[', i):
+            return self._scan_legacy_arith(command, i)
+        if command.startswith('$(', i):
+            return self._scan_paren_subst(command, i)[1]
+        if command.startswith('`', i):
+            return self._scan_backtick(command, i)[1]
+        if command.startswith('${', i):
+            return self._scan_param_brace(command, i, _depth)
+        if command.startswith('$', i) and i + 1 < n:
+            nxt = command[i + 1]
+            if nxt.isalpha() or nxt == '_':
+                k = i + 2
+                while k < n and (command[k].isalnum() or command[k] == '_'):
+                    k += 1
+                return k
+            if nxt.isdigit() or nxt in '@*#?$!-':
+                return i + 2
+        return None
+
+    @staticmethod
+    def _scan_legacy_arith(command: str, start: int) -> int:
+        """
+        Index just past the `]` closing the legacy arithmetic `$[…]` that begins
+        at `start`, or end-of-input if unterminated. Only `[`/`]` nesting is
+        followed (a quote or backslash that would move the end is left for
+        `_unproven_paren_end`, whose body check refuses it).
+        """
+        depth = 0
+        k = start + 1
+        n = len(command)
+        while k < n:
+            ch = command[k]
+            if ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+            k += 1
+        return n
+
+    def _scan_param_brace(self, command: str, start: int,
+                          _depth: int = 0) -> int:
+        """
+        Index just past the `}` closing the `${…}` that begins at `start`, or
+        end-of-input if unterminated. Quotes, nested `${…}` and command
+        substitutions inside (`${x:-$(cmd)}`) are kept balanced.
+        """
+        n = len(command)
+        depth = 1
+        quote = None
+        k = start + 2
+        while k < n:
+            ch = command[k]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
+                k += 1
+                continue
+            if ch == '\\':
+                k += 2
+                continue
+            if ch == '"':
+                quote = None if quote == '"' else '"'
+                k += 1
+                continue
+            if quote is None and ch == "'":
+                quote = ch
+                k += 1
+                continue
+            if command.startswith('${', k):
+                depth += 1
+                k += 2
+                continue
+            if command.startswith('$(', k) or ch == '`':
+                k = self._dollar_expansion_end(command, k, _depth)
+                continue
+            if ch == '}' and quote is None:
+                depth -= 1
+                if depth == 0:
+                    return k + 1
+            k += 1
+        return n
 
     @staticmethod
     def _is_env_prefix(token: str) -> bool:

