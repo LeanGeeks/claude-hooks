@@ -228,6 +228,57 @@ class TestDecideTier(PermissionsMCPTestCase):
         self.assertIn("Redirects output outside the workspace", result["reason"])
         self.assertEqual(get_request(row.request_id).state, RequestState.PENDING.value)
 
+    # -- 41-03: an unresolvable write target is human-only too ----------------
+    def test_unresolved_target_refuses_as_human_only(self):
+        """An agent must not approve a write whose destination nobody can
+        read: the validator calls it an unknown (silent in auto mode), but the
+        MCP tiers it with the redirect asks, off `unresolved_redirect_targets`."""
+        self.workspace_settings(allow=["Bash(echo:*)"])
+        row = self.pending(command='echo hi > "$UNSET_VAR_41_03.out"')
+
+        result = self.decide(row.request_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tier"], "human-only")
+        self.assertIn("Write target cannot be resolved", result["reason"])
+        self.assertEqual(get_request(row.request_id).state, RequestState.PENDING.value)
+        # The same row through the listing classifier.
+        self.assertFalse(self.classify(row).decidable)
+
+    def test_unknown_command_with_unresolved_target_is_human_only(self):
+        self.workspace_settings(allow=["Bash(echo:*)"])
+        row = self.pending(command='deploy-thing --now > "$UNSET_VAR_41_03"')
+        tier = self.classify(row)
+        self.assertFalse(tier.decidable)
+        self.assertIn("Not in allowlist", tier.tier_reason)
+
+    def test_unknown_command_without_targets_stays_agent_decidable(self):
+        self.workspace_settings(allow=["Bash(echo:*)"])
+        self.assertTrue(self.classify(self.pending(command="deploy-thing --now")).decidable)
+
+    def test_redirect_tier_reads_the_structured_keys(self):
+        """Either key alone makes the row human-only, whatever the reason says;
+        a result without them falls back to the reason prefix (older shape)."""
+
+        class _Fixed:
+            def __init__(self, result):
+                self.result = result
+
+            def validate_bash_command(self, _command):
+                return dict(self.result)
+
+        base = {"decision": "ask", "reason": "neutral wording", "validation_results": []}
+        for extra in ({"redirect_targets": ["/etc/x"], "unresolved_redirect_targets": []},
+                      {"redirect_targets": [], "unresolved_redirect_targets": ["$f"]}):
+            with self.subTest(extra=extra):
+                tier = lib._classify_command(_Fixed({**base, **extra}), "echo x")
+                self.assertFalse(tier.decidable)
+                self.assertTrue(tier.tier_reason.startswith("human-only"))
+        prefixed = {**base, "reason": lib.REDIRECT_REASON_PREFIX + ", /tmp: `/etc/x`"}
+        self.assertFalse(lib._classify_command(_Fixed(prefixed), "echo x").decidable)
+        neither = {**base, "redirect_targets": [], "unresolved_redirect_targets": []}
+        self.assertTrue(lib._classify_command(_Fixed(neither), "echo x").decidable)
+
     # -- case 6 --------------------------------------------------------------
     def test_now_deny_matched_row_refuses_with_predates_wording(self):
         self.workspace_settings(deny=["Bash(curl:*)"])

@@ -26,7 +26,7 @@ suffix.
 | 41-01 | [The gate reads the real target](./41-01-the-gate-reads-the-real-target_opus.md) | done | — | **Security fix first.** Five fail-open groups in every mode (brd §1.3): substitution and glued targets, unscanned inner redirects, quoting, the lenient fallback's `~` / `..`, and redirects into the hook's own settings. Also the `/dev/null)` paren bug. Its report carries the testing baseline. |
 | 41-05 | [Settings follow the project root](./41-05-settings-follow-the-project-root_sonnet.md) | done | — | One settings-root resolver (`CLAUDE_PROJECT_DIR` → git top level) for the hook's reads and the Whitelist button's writes; `settings_root` stored on the request row. Added after filing, hence the number. |
 | 41-02 | [Allowed write roots mirror Claude Code](./41-02-allowed-roots-mirror-claude-code_opus.md) | done | 41-01, 41-05 | Project root, own memory dir (registered-worktree key with an encoding self-check, user-level `autoMemoryDirectory`; deferring modes only until H5 is verified), user-level `additionalDirectories`; `write_roots` stored on the row for the router and MCP. Redirect gate + `rm` only. |
-| 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | todo | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
+| 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | done | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
 | — | `./install.sh --yes` | todo | 41-03 committed | The orchestrator runs it once all four are committed (never `--all`). Not an agent task. |
 | 41-04 | [Re-measure and live checks](./41-04-remeasure-and-live-checks_human.md) | todo | install | **human** — live checks H1/H2/H5 and the Whitelist-from-subdir check right after install; the tally after a week. Leave `blocked — awaiting human` once install has run. |
 
@@ -212,6 +212,28 @@ Skipped: `test_unit_python_compat.TestImportUnderOldInterpreter.test_all_hook_mo
   acceptance 3 in a live auto session. The operator asked (2026-10-20) for an
   install as soon as safe and again at the end of the epic: the first install
   runs after this commit, before 41-03 starts.
+- **2026-10-20 23:41 — interim install (operator's request).** 41-02
+  committed (2df3c12); clean tree; `./install.sh --yes` exit 0, all 20
+  installed `~/.claude/hooks/*.py` byte-identical to the repo at 2df3c12
+  (`test_task03.py` is not an installed file). Settings backup
+  `~/.claude/backups/settings.json.20261020_234111.bak`. Live now: 41-01, 41-05,
+  41-02. Until 41-03 lands, 41-01's stricter unresolvable-target refusals
+  (e.g. a construct in a directory position) are `risk` asks in auto mode too.
+  The final install after 41-03 is still owed.
+- **2026-10-21 — 41-03 done.** Review 2 PASS (0 issues). Suite 2151,
+  `OK (skipped=2)`. Unresolvable targets are classified in one place from the
+  rule that refused them: **risk** when the gate can name a concrete escape
+  (R2 outside, R3 protected incl. fd links, a literal `..`, visible `.claude`,
+  unexpandable `~user`, an R5 match outside/protected — directory segments
+  only when they hold a literal character or a glob — and the UNREAD/UNPROVEN
+  sentinels); **unknown** for an empty anchor, the truncation marker, and
+  R1/R4 refusals inside the roots (incl. an all-construct directory segment:
+  `./"$dir"/x`, `out/$name/x.log`). HEAD-vs-change fuzz: 109,532 comparisons,
+  0 flips to allow, every change risk → unknown. MCP keeps unresolved rows
+  human-only. Epic 40 invariant 4 amended. **Owed to 41-04:** auto-session
+  checks that unresolved targets are silent (`emitted: null`, new reason) and
+  `~/.bashrc$V` still prompts; the harness-raised card's 🤖 line and 📝
+  section.
 - **2026-10-20 — fresh-context review; rev 3.** An independent reviewer
   reproduced brd §1.3 and the §1.2 tally, and found more fail-opens, all
   confirmed: quoting only stripped once (`> "/etc"/x`, `> "$HOME"/.bashrc`,

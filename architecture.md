@@ -110,7 +110,7 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 
 | Event | Matcher | Script | Role |
 |-------|---------|--------|------|
-| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. Four outcomes: `deny` for a deny match (unconditional, in every mode); `allow` when every sub-command is on the allowlist; `ask` for a **risk gate** — a `permissions.ask` match or a write redirect escaping the allowed write roots (payload `cwd`, `/tmp`, the project root, user-level `additionalDirectories`, and in `auto` / `bypassPermissions` / `dontAsk` the session's own auto-memory directory — see *Write roots* below; the write-safe `/dev` sinks excepted) or hitting a protected path (`<root>/.claude/settings*.json`, `<root>/.claude/hooks/`, `~/.claude/` outside the own memory dir) — which prompts in every mode; and **no output** for the **unknown** case when the session's mode resolves ask-candidates by itself (`auto` / `bypassPermissions` / `dontAsk`), which hands the call back to the normal pipeline. (Silence, not the harness's `defer` decision: `defer` is print-mode only — an interactive session ignores it, a non-interactive one, `claude -p` or a subagent, parks the call and ends its run.) Any other mode, and an absent or unrecognised one, keeps emitting `ask`, which lets Claude Code surface a `PermissionRequest`. |
+| `PreToolUse` | `Bash` | `pretool_hook.py` | Split compound command, check each sub-command against `permissions.allow/deny`. Four outcomes: `deny` for a deny match (unconditional, in every mode); `allow` when every sub-command is on the allowlist; `ask` for a **risk gate** — a `permissions.ask` match or a write redirect escaping the allowed write roots (payload `cwd`, `/tmp`, the project root, user-level `additionalDirectories`, and in `auto` / `bypassPermissions` / `dontAsk` the session's own auto-memory directory — see *Write roots* below; the write-safe `/dev` sinks excepted) or hitting a protected path (`<root>/.claude/settings*.json`, `<root>/.claude/hooks/`, `~/.claude/` outside the own memory dir), including an unresolvable target whose literal anchor lies outside or is protected, or that carries a literal `..` — which prompts in every mode; and **no output** for the **unknown** case — a command not on the allowlist, or a write target the gate cannot resolve and that names no escape (`> "$f.out"`, `> $(…)`; see *Write-target outcomes* below) — when the session's mode resolves ask-candidates by itself (`auto` / `bypassPermissions` / `dontAsk`), which hands the call back to the normal pipeline. (Silence, not the harness's `defer` decision: `defer` is print-mode only — an interactive session ignores it, a non-interactive one, `claude -p` or a subagent, parks the call and ends its run.) Any other mode, and an absent or unrecognised one, keeps emitting `ask`, which lets Claude Code surface a `PermissionRequest`. |
 | `PermissionRequest` | `*` | `permission_request_hook.py` | Send the request to Telegram via the relay, long-poll for the answer, map it to an allow/deny/stop/whitelist/reply decision. Also handles `AskUserQuestion`. timeout 43200s. |
 | `PostToolUse` | `*` | `posttool_hook.py` | If the request was resolved in the terminal instead, cancel the relay message (strip buttons) so the Telegram prompt goes dead. |
 | `Notification` | `idle_prompt` | `notification_hook.py` | When the session goes idle, forward the agent's **last message** to Telegram as a notification — conditional on the session being operator-started (see below). |
@@ -173,6 +173,26 @@ none), and `find_deny_collision`, which has no row, passes none. Replay
 (`pretool_hook.py` with log lines on stdin) gets the project root and
 `additionalDirectories` but no memory root: log entries carry no
 `transcript_path`.
+
+### Write-target outcomes (epic 41, task 41-03)
+
+`BashPermissionValidator._redirect_target_outcome` gives every write target one
+of three outcomes. **Allowed**: it resolves inside the roots and is not
+protected, or it is unresolvable and passes every rule R0–R6 of
+`_unresolved_target_refusal`. **Outside** (`ask_kind: 'risk'`, asks in every
+mode): it resolves outside the roots or into a protected path, or an R-rule
+refuses it for an escape the gate can name — a literal anchor outside or
+protected, a literal `..`, `.claude` in the text, an unexpandable `~user`, an
+escaping or protected entry on disk, an unreadable word. **Unresolved**
+(`ask_kind: 'unknown'`, silent in `DEFERRING_MODES`): refused only because the
+gate cannot read it — no literal anchor (`$f.out`, `"$S/.env"`, `$(…)`,
+`{a,b}`, the depth-cap marker), a construct in a directory position, or a
+final-segment construct holding `/`, under a literal directory inside the roots
+(`pretool_hook.UNRESOLVED_REFUSALS`; any other refusal is outside). An outside
+target wins over unresolved ones. The result carries `redirect_targets`
+(outside) and `unresolved_redirect_targets`; the card lists the latter under
+"Write targets the hook could not resolve", and the permissions MCP tiers a row
+with either list non-empty human-only.
 
 ### permission_state_store.py — cross-hook coordination
 

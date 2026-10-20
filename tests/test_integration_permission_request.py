@@ -668,6 +668,134 @@ class TestPermissionModeAnnotation(unittest.TestCase):
             )
             self.assertFalse(_harness_heading() in self._render(None))
 
+    # ── epic 41, task 41-03: write targets the hook could not resolve ───────
+
+    UNRESOLVED_HEADING = "📝 <b>Write targets the hook could not resolve:</b>"
+    RESOLVED_BY_MODE = (
+        "🤖 <b>The harness flagged this call — the session's mode resolved it</b>"
+    )
+
+    def _unresolved_only(self):
+        return self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=[], ask_kind="unknown",
+            unresolved_redirect_targets=["$f.out"],
+        )
+
+    def test_41_03_deferring_mode_allowlisted_command_with_unresolved_target(self):
+        """pretool printed nothing (an unknown), so the harness raised this
+        card: it must not say the hook asked, nor that the command is off the
+        allowlist, nor that the write escapes."""
+        from pretool_hook import DEFERRING_MODES
+        ann = self._unresolved_only()
+        self.assertFalse(ann.empty)
+        for mode in sorted(DEFERRING_MODES):
+            with self.subTest(mode=mode):
+                body = self._render_ann(
+                    mode, ann, tool_input={"command": 'echo x > "$f.out"'})
+                self.assertEqual(
+                    body,
+                    "<b>ws</b> <i>sess</i>\n"
+                    "\n"
+                    "<b>Permission Request</b> <code>test-id</code>\n"
+                    f"🤖 Mode: <b>{mode}</b>\n"
+                    "\n"
+                    "<pre>\n"
+                    "echo x &gt; \"$f.out\"\n"
+                    "</pre>\n"
+                    "\n"
+                    f"{self.RESOLVED_BY_MODE}\n"
+                    "\n"
+                    f"{self.UNRESOLVED_HEADING}\n"
+                    "<code>$f.out</code>\n"
+                    "\n"
+                    "Approve this command?",
+                )
+                self.assertNotIn(_harness_heading(), body)
+                self.assertNotIn("Not in allowlist", body)
+                self.assertNotIn("Writes outside the workspace", body)
+
+    def test_41_03_deferring_mode_unknown_command_keeps_its_heading(self):
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=["mysteryfoo --bar"], asked=[], ask_kind="unknown",
+            unresolved_redirect_targets=["$x"],
+        )
+        body = self._render_ann("auto", ann)
+        self.assertIn(_harness_heading(), body)
+        self.assertNotIn(self.RESOLVED_BY_MODE, body)
+        self.assertIn(self.UNRESOLVED_HEADING + "\n<code>$x</code>", body)
+        self.assertNotIn("Writes outside the workspace", body)
+
+    def test_41_03_outside_and_unresolved_targets_both_listed_hook_asked(self):
+        """An outside target is a risk ask the hook raised itself, in every
+        mode: no harness line; each target under its own heading."""
+        ann = self.tpr.BashAnnotations(
+            denied=[], unknown=[], asked=[], ask_kind="risk",
+            redirect_targets=["/etc/x"], unresolved_redirect_targets=["$f"],
+        )
+        for mode in ("auto", "default"):
+            with self.subTest(mode=mode):
+                body = self._render_ann(mode, ann)
+                self.assertNotIn(self.RESOLVED_BY_MODE, body)
+                self.assertNotIn(_harness_heading(), body)
+                self.assertIn("📝 <b>Writes outside the workspace:</b>\n"
+                              "<code>/etc/x</code>\n\n"
+                              + self.UNRESOLVED_HEADING + "\n<code>$f</code>", body)
+
+    def test_41_03_default_mode_lists_unresolved_under_the_neutral_heading(self):
+        body = self._render_ann("default", self._unresolved_only())
+        self.assertEqual(
+            body,
+            _baseline_body().replace(
+                "⚠️ <b>Not in allowlist:</b>\n<code>mysteryfoo --bar</code>",
+                self.UNRESOLVED_HEADING + "\n<code>$f.out</code>",
+            ),
+        )
+
+    def test_41_03_default_mode_outside_only_card_is_byte_identical(self):
+        """Frozen literal of the card HEAD (2df3c12) renders for an outside-only
+        command, through the real validator (epic 40 brd §4.3)."""
+        repo_root = str(Path(__file__).parent.parent)
+        req = _make_request(
+            cwd=repo_root, permission_mode="default",
+            tool_input={"command": "echo hi > /etc/passwd"},
+        )
+        self.assertEqual(
+            self.tpr.render_permission_body(req, "ws", "sess"),
+            "<b>ws</b> <i>sess</i>\n"
+            "\n"
+            "<b>Permission Request</b> <code>test-id</code>\n"
+            "\n"
+            "<pre>\n"
+            "echo hi &gt; /etc/passwd\n"
+            "</pre>\n"
+            "\n"
+            "📝 <b>Writes outside the workspace:</b>\n"
+            "<code>/etc/passwd</code>\n"
+            "\n"
+            "Approve this command?",
+        )
+
+    def test_41_03_annotations_carry_unresolved_targets_from_the_validator(self):
+        """The real validator against the repo's allowlist (`echo` allowed):
+        an anchorless target lands in the new key, not in redirect_targets."""
+        repo_root = str(Path(__file__).parent.parent)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNSET_VAR_41_03", None)
+            ann = self.tpr._bash_annotations(_make_request(
+                cwd=repo_root, permission_mode="auto",
+                tool_input={"command": 'echo hi > "$UNSET_VAR_41_03.out"'}))
+        self.assertFalse(ann.failed)
+        self.assertEqual(ann.ask_kind, "unknown")
+        self.assertEqual(ann.unknown, [])
+        self.assertEqual(ann.redirect_targets, [])
+        self.assertEqual(ann.unresolved_redirect_targets, ["$UNSET_VAR_41_03.out"])
+        self.assertFalse(ann.empty)
+
+    def test_41_03_annotations_default_the_new_key_to_a_list(self):
+        ann = self.tpr.BashAnnotations(denied=[], unknown=[], asked=[])
+        self.assertEqual(ann.unresolved_redirect_targets, [])
+        self.assertTrue(ann.empty)
+
 
 class TestRouting(unittest.TestCase):
     """Smoke tests confirming hook helpers route through RelayClient.

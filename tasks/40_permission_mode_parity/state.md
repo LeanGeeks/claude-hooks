@@ -108,8 +108,10 @@ way to work than a six-minute one.
 3. **Absent or unrecognised `permission_mode` means `default`, means `ask`.**
    Fail conservative, fail open (brd H1, H8).
 4. **Risk gates keep asking in every mode.** A `permissions.ask` match and a
-   write redirect escaping the workspace/`/tmp`/`/dev/null` still emit `ask`.
-   Only the *unknown* case is deferred.
+   write redirect that resolves — or whose literal anchor lies — outside the
+   allowed roots, or hits a protected path, still emit `ask` in every mode. A
+   write target the gate cannot resolve and that has no literal anchor is an
+   unknown (epic 41, 41-03). Only the *unknown* case is deferred.
 5. **Telegram mirrors the terminal.** Never forward what the terminal would not
    have prompted for; never suppress what it would. This is the tie-breaker for
    any question these files do not answer (brd §1.4).
@@ -130,6 +132,16 @@ way to work than a six-minute one.
    into something testable.
 
 ## Log
+
+- **2026-10-20 — invariant 4 amended by epic 41 (task 41-03).** Operator chose
+  option (a) (epic 41 brd D6): a write target the redirect gate cannot resolve
+  and that names no escape (no literal anchor: `> "$f.out"`, `x=$(mktemp); > $x`,
+  `> "$S/.env"`, `> $(…)`, `> {a,b}`) is now `ask_kind: 'unknown'` — silent in
+  `DEFERRING_MODES`, `ask` elsewhere — instead of a risk ask. Resolved-outside,
+  anchored-outside, literal-`..` and protected-path targets stay risk asks in
+  every mode. Validator results gain `unresolved_redirect_targets`; the card
+  lists those under a neutral heading, and the permissions MCP keeps them
+  human-only. Report: `agents_output/41-03_implementation_report.md`.
 
 - **2026-10-20 — the hook stays silent instead of emitting `defer`.** A
   subagent in an auto-mode session ended on its first unknown Bash command. In

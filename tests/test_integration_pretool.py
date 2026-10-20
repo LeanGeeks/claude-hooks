@@ -1469,8 +1469,10 @@ class TestRedirectTargets(unittest.TestCase):
     redirect targets before command matching, so an otherwise-allowed command
     can still carry `> /etc/passwd`; the validator surfaces every write target
     and forces a prompt on any that escapes the workspace, /tmp, or the
-    write-safe /dev sinks. Unresolvable targets are judged by a structural
-    rule (see _unresolved_target_allowed)."""
+    write-safe /dev sinks. Unresolvable targets are judged by structural
+    rules (see _unresolved_target_refusal), and since 41-03 each target has
+    one of three outcomes (_redirect_target_outcome): allowed, outside
+    (ask/risk) or unresolved (ask/unknown)."""
 
     WS = "/ws/project"
 
@@ -1659,21 +1661,32 @@ class TestRedirectTargets(unittest.TestCase):
     def _assert_no_refusal(self, command, workspace=None):
         r = self._result_41(command, workspace)
         self.assertEqual(r["redirect_targets"], [], command)
+        self.assertEqual(r["unresolved_redirect_targets"], [], command)
         self.assertEqual(r["decision"], "allow", command)
+
+    def _assert_unresolved(self, command, target, workspace=None):
+        """41-03: a target the gate cannot resolve and that names no escape
+        is an unknown, never an allow and never a risk."""
+        r = self._result_41(command, workspace)
+        self.assertEqual(r["decision"], "ask", command)
+        self.assertEqual(r["ask_kind"], "unknown", command)
+        self.assertEqual(r["redirect_targets"], [], command)
+        self.assertIn(target, r["unresolved_redirect_targets"], command)
 
     def _targets(self, command):
         return [t for t, _off in BashCommandParser().extract_write_redirect_targets(command)]
 
     # (i) the whole word, not its first token
+    # An anchorless substitution is an unknown since 41-03 (brd D6).
     def test_41_substitution_target_is_kept_in_source_form(self):
         cmd = "echo hi > $(echo ~/.bashrc)"
         self.assertEqual(self._targets(cmd), ["$(echo ~/.bashrc)"])
-        self._assert_refused(cmd, "$(echo ~/.bashrc)")
+        self._assert_unresolved(cmd, "$(echo ~/.bashrc)")
 
     def test_41_quoted_substitution_target(self):
         cmd = 'ls >"$(echo /etc/x)"'
         self.assertEqual(self._targets(cmd), ["$(echo /etc/x)"])
-        self._assert_refused(cmd, "$(echo /etc/x)")
+        self._assert_unresolved(cmd, "$(echo /etc/x)")
 
     def test_41_glued_substitution_with_traversal(self):
         cmd = "echo hi > x$(echo y)/../../../etc/x"
@@ -1728,13 +1741,16 @@ class TestRedirectTargets(unittest.TestCase):
         self._assert_refused("echo x > '~'/../../../etc/x", "./~/../../../etc/x")
 
     def test_41_unmodelled_expansions_are_unresolvable(self):
+        # Anchorless (41-03: unknown) ...
         for cmd, target in (("echo x > {/etc/x,}", "{/etc/x,}"),
                             ("echo x > ~-/x", "~-/x"),
-                            ("echo x > ~+/x", "~+/x"),
-                            ("echo x > /etc/x*", "/etc/x*")):
+                            ("echo x > ~+/x", "~+/x")):
             with self.subTest(cmd=cmd):
                 self.assertEqual(self._targets(cmd), [target])
-                self._assert_refused(cmd, target)
+                self._assert_unresolved(cmd, target)
+        # ... or anchored outside the roots (risk).
+        self.assertEqual(self._targets("echo x > /etc/x*"), ["/etc/x*"])
+        self._assert_refused("echo x > /etc/x*", "/etc/x*")
 
     # (iv) the lenient fallback keeps its docstring's promise
     def test_41_lenient_fallback_reports_the_real_target(self):
@@ -1788,7 +1804,7 @@ class TestRedirectTargets(unittest.TestCase):
 
     # --- fix 4: one structural rule for unresolvable targets ---------------
     #
-    # _unresolved_target_allowed splits the word at its last literal `/` into
+    # _unresolved_target_refusal splits the word at its last literal `/` into
     # D (directory) and F (final segment) and vouches only when R0-R6 hold.
     # These rows run in a REAL workspace (symlinks into `.claude` are on disk)
     # created outside /tmp, since /tmp is an allowed root and would mask a
@@ -1841,9 +1857,11 @@ class TestRedirectTargets(unittest.TestCase):
 
     # Every spelling here asks. Each is filed under the rule written for it;
     # many are refused by more than one rule (defence in depth), and every
-    # rule has rows only it refuses (mutation-proofed per rule).
+    # rule has rows only it refuses (mutation-proofed per rule). Since 41-03
+    # a row is a risk ask unless _UNKNOWN_SINCE_41_03 lists it: refused only
+    # for what the gate cannot read, it is an unknown ask.
     _REFUSED_BY_RULE_41 = {
-        # R0: no literal anchor at all (41-03 makes these `unknown`)
+        # R0: no literal anchor at all (unknown, but for `.claude` in the text)
         "R0": ('"$LOG"', '$V.log', '$(mktemp)', '$V.claude/settings.json'),
         # R1: a construct or glob before the last literal `/`
         "R1": ('..${V:-/}etc/x', '..`echo /et`c/x', '..${V:=/}etc/x',
@@ -1890,16 +1908,49 @@ class TestRedirectTargets(unittest.TestCase):
         "R6": ('./$V.claude.bak', './x${V:-claude}', './.$(echo claude)'),
     }
 
+    # The rows of _REFUSED_BY_RULE_41 that are unknowns since 41-03, and from
+    # which cwd ("root": the fixture workspace, "sub": its `sub/`). Anchorless
+    # (R0), or refused for a construct in a directory position (R1) or a
+    # construct holding `/` (R4) under a literal directory inside the roots,
+    # with nothing on disk naming an escape. From the root the R1 rows that
+    # spell `.cl…`/`.c…` match the real `.claude` directory (R5 in a directory
+    # position) and stay risk; `sub/` has no entry they can match.
+    _UNKNOWN_SINCE_41_03 = {
+        '"$LOG"': ("root", "sub"), '$V.log': ("root", "sub"),
+        '$(mktemp)': ("root", "sub"),
+        '.cl${V:-aude}/settings.json': ("sub",),
+        '.c${V-la}ude/hooks/x.py': ("sub",),
+        '.cl$V/settings.json': ("sub",),
+        '.cl$V"aude"/settings.json': ("sub",),
+        '.c*/settings.json': ("sub",), '.[c]laude/settings.json': ("sub",),
+        '.claud${V-e/setting}s.json': ("root", "sub"),
+        '.${V:-./e}tc/x': ("root", "sub"),
+        '+(/)etc/x': ("root", "sub"), '!(a)/etc/x': ("root", "sub"),
+        '{/etc/x,}': ("root", "sub"), '~-/x': ("root", "sub"),
+        '~+/x': ("root", "sub"), '~$V/x': ("root", "sub"),
+        'r$[1|0]/x': ("root", "sub"),
+        '.c"$(echo laude/settings.js)"on': ("root", "sub"),
+        '{lnks,}': ("root", "sub"),
+        './$V/settings.json': ("root", "sub"),
+    }
+
     def test_41_unresolvable_targets_refused_by_rule(self):
-        for workspace in self._real_cwds():
+        for workspace, where in zip(self._real_cwds(), ("root", "sub")):
             for rule, spellings in self._REFUSED_BY_RULE_41.items():
                 for spelling in spellings:
                     cmd = "echo x > " + spelling
+                    unknown = where in self._UNKNOWN_SINCE_41_03.get(spelling, ())
                     with self.subTest(rule=rule, cmd=cmd, cwd=workspace):
                         r = self._result_41(cmd, workspace)
                         self.assertEqual(r["decision"], "ask", cmd)
-                        self.assertEqual(r["ask_kind"], "risk", cmd)
-                        self.assertNotEqual(r["redirect_targets"], [], cmd)
+                        if unknown:
+                            self.assertEqual(r["ask_kind"], "unknown", cmd)
+                            self.assertEqual(r["redirect_targets"], [], cmd)
+                            self.assertNotEqual(r["unresolved_redirect_targets"], [], cmd)
+                        else:
+                            self.assertEqual(r["ask_kind"], "risk", cmd)
+                            self.assertNotEqual(r["redirect_targets"], [], cmd)
+                            self.assertEqual(r["unresolved_redirect_targets"], [], cmd)
 
     # The documented allow rows: a literal anchor inside a root, constructs
     # and globs in the final segment only, nothing on disk to say otherwise.
@@ -1925,6 +1976,9 @@ class TestRedirectTargets(unittest.TestCase):
 
     # Behaviour change (fix 4): a construct in a directory position now asks,
     # even under a literal anchor inside the workspace (41-03 reclassifies).
+    # 41-03: such a target is an unknown unless the disk names an escape: the
+    # fixture root holds `.claude` and symlinks into it, which `./"$dir"` and
+    # `./*` can match; `out/` and `logs/` do not exist, so nothing matches.
     def test_41_construct_in_a_directory_position_asks(self):
         for cmd in ("echo x > out/$name/x.log", 'echo x > ./"$dir"/x',
                     "echo x > logs/$(date +%F)/run.log", "echo x > /tmp/$V/x",
@@ -1932,6 +1986,40 @@ class TestRedirectTargets(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 r = self._result_41(cmd, self._real_cwds()[0])
                 self.assertEqual(r["decision"], "ask", cmd)
+        for cmd, target in (("echo x > out/$name/x.log", "out/$name/x.log"),
+                            ("echo x > logs/$(date +%F)/run.log",
+                             "logs/$(date +%F)/run.log")):
+            with self.subTest(cmd=cmd):
+                self._assert_unresolved(cmd, target, self._real_cwds()[0])
+        self._assert_unresolved('echo x > ./"$dir"/x', "./$dir/x",
+                                self._real_cwds()[0])
+        self._assert_refused("echo x > ./*/x", "./*/x", self._real_cwds()[0])
+
+    # A directory-position segment of constructs only names nothing, so it is
+    # an unknown from the root (which holds `.claude/`) as from `sub/`, as
+    # `"$dir"/x` is. A segment with a literal character or a glob keeps the
+    # match against the directory's entries and stays risk from the root.
+    def test_41_construct_only_directory_segment_is_unknown(self):
+        for cmd, target in (('echo x > ./"$dir"/x', "./$dir/x"),
+                            ("echo x > ./$V/x", "./$V/x"),
+                            ("echo x > ./$V/settings.json", "./$V/settings.json"),
+                            ("echo x > ./${a}${b}/x", "./${a}${b}/x"),
+                            ("echo x > out/$name/x.log", "out/$name/x.log"),
+                            ('echo x > "$dir"/x', "$dir/x")):
+            for workspace in self._real_cwds():
+                with self.subTest(cmd=cmd, cwd=workspace):
+                    self._assert_unresolved(cmd, target, workspace)
+
+    def test_41_directory_segment_with_literal_or_glob_stays_risk_from_the_root(self):
+        root, sub = self._real_cwds()
+        for cmd, target in (("echo x > .$V/x", ".$V/x"),
+                            ("echo x > .cl${V:-aude}/settings.json",
+                             ".cl${V:-aude}/settings.json"),
+                            ("echo x > ./.*/settings.json", "./.*/settings.json")):
+            with self.subTest(cmd=cmd, cwd=root):
+                self._assert_refused(cmd, target, root)
+            with self.subTest(cmd=cmd, cwd=sub):
+                self.assertEqual(self._result_41(cmd, sub)["decision"], "ask")
 
     # Accepted residual (brd D3): a construct confined to the final segment is
     # judged by its spelling, not its runtime value. `./$V` with
@@ -2170,6 +2258,229 @@ class TestRedirectTargets(unittest.TestCase):
                      "${" * 3000, "${$((" * 1500, '"$(' * 3000, "$'\\" * 3000):
             with self.subTest(body=body[:6]):
                 self._targets("echo > " + body + "\nshred -u /etc/passwd")
+
+
+class TestUnresolvedTargetsAreUnknowns(unittest.TestCase):
+    """Task 41-03 (brd D6, operator option (a)): every write target has one of
+    three outcomes. Allowed; outside (a known escape: ask/risk, which asks in
+    every mode); unresolved (the gate cannot read where it writes: ask/unknown,
+    which prints nothing in a deferring mode and asks everywhere else).
+
+    Each row is checked at the validator (decision, ask_kind, both target
+    keys) and through build_pretool_output in auto, bypassPermissions and
+    default. The workspace is real and outside /tmp (an allowed root), HOME
+    is a fake path outside it, and no `$f`/`$x`/`$S`/`$V` is in the
+    environment, so expandvars cannot resolve them.
+    """
+
+    HOME = "/home/fakeuser4103"
+    ALLOW = ["Bash(echo:*)", "Bash(mktemp:*)", "Bash(git:*)", "Bash(rm:*)"]
+    ASK = ["Bash(git push:*)"]
+    DENY = ["Bash(rm:*)"]
+    MODES = ("auto", "bypassPermissions", "default")
+
+    @classmethod
+    def setUpClass(cls):
+        base = "/var/tmp"
+        if not os.path.isdir(base) or os.path.realpath(base).startswith(
+                os.path.realpath(tempfile.gettempdir()) + os.sep):
+            cls._base = None
+            return
+        cls._base = tempfile.mkdtemp(prefix="claude-hooks-4103-", dir=base)
+        cls.ROOT = os.path.join(cls._base, "root")
+        os.makedirs(os.path.join(cls.ROOT, ".claude"))
+        os.makedirs(os.path.join(cls.ROOT, "sub"))
+        os.makedirs(os.path.join(cls.ROOT, "links"))
+        # An outward symlink a final-segment construct can complete (R5).
+        os.symlink("/etc/hostname", os.path.join(cls.ROOT, "links", "lns"))
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._base:
+            shutil.rmtree(cls._base, ignore_errors=True)
+
+    def setUp(self):
+        if not self._base:
+            self.skipTest("needs /var/tmp outside the temp dir for a real workspace")
+
+    def _result(self, command, cwd=None, extra_roots=None):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("V", "f", "x", "S", "name", "dir")}
+        env["HOME"] = self.HOME
+        with patch.dict(os.environ, env, clear=True):
+            return BashPermissionValidator(
+                _FakeLoader(self.ALLOW, deny=self.DENY, ask=self.ASK),
+                BashCommandParser(), workspace_dir=cwd or self.ROOT,
+                extra_roots=extra_roots,
+            ).validate_bash_command(command)
+
+    @staticmethod
+    def _printed(result, mode):
+        out = build_pretool_output(result, mode)
+        if out is None:
+            return "silent"
+        return out["hookSpecificOutput"]["permissionDecision"]
+
+    def _check(self, command, outcome, auto_bypass, default, cwd=None,
+               extra_roots=None, target=None):
+        r = self._result(command, cwd, extra_roots)
+        self.assertIn("redirect_targets", r)
+        self.assertIn("unresolved_redirect_targets", r)
+        if outcome == "unresolved":
+            self.assertEqual((r["decision"], r["ask_kind"]), ("ask", "unknown"))
+            self.assertEqual(r["redirect_targets"], [])
+            self.assertNotEqual(r["unresolved_redirect_targets"], [])
+            if target:
+                self.assertIn(target, r["unresolved_redirect_targets"])
+            self.assertNotIn("Redirects output outside", r["reason"])
+        elif outcome == "outside":
+            self.assertEqual((r["decision"], r["ask_kind"]), ("ask", "risk"))
+            self.assertNotEqual(r["redirect_targets"], [])
+            if target:
+                self.assertIn(target, r["redirect_targets"])
+            self.assertTrue(r["reason"].startswith(
+                "Redirects output outside the workspace, /tmp, or /dev/null — "
+                "review the write target: "), r["reason"])
+        elif outcome == "allowed":
+            self.assertEqual(r["decision"], "allow")
+            self.assertEqual(r["redirect_targets"], [])
+            self.assertEqual(r["unresolved_redirect_targets"], [])
+        elif outcome == "risk":  # a permissions.ask match
+            self.assertEqual((r["decision"], r["ask_kind"]), ("ask", "risk"))
+        elif outcome == "deny":
+            self.assertEqual(r["decision"], "deny")
+        else:
+            self.fail(outcome)
+        for mode in self.MODES:
+            want = default if mode == "default" else auto_bypass
+            self.assertEqual(self._printed(r, mode), want, (command, mode))
+        return r
+
+    # The task's table, row by row.
+    _TABLE = (
+        ('for f in a b; do echo x > "$f.out"; done', "unresolved", "silent", "ask", "$f.out"),
+        ("x=$(mktemp); echo y > $x", "unresolved", "silent", "ask", "$x"),
+        ("echo hi > $(echo ~/.bashrc)", "unresolved", "silent", "ask", "$(echo ~/.bashrc)"),
+        ('echo y > "$S/.env"', "unresolved", "silent", "ask", "$S/.env"),
+        ("echo y > {/etc/x,}", "unresolved", "silent", "ask", "{/etc/x,}"),
+        ("echo k >> $HOME/.bashrc", "outside", "ask", "ask", "$HOME/.bashrc"),
+        ('echo k >> "${HOME}"/.claude/settings.json', "outside", "ask", "ask",
+         "${HOME}/.claude/settings.json"),
+        ("echo k >> ~/.bashrc$V", "outside", "ask", "ask", "~/.bashrc$V"),
+        ("echo k >> /etc/$V", "outside", "ask", "ask", "/etc/$V"),
+        ("echo k >> .$V/../../etc/x", "outside", "ask", "ask", ".$V/../../etc/x"),
+        ("echo k >> ~/.bashrc", "outside", "ask", "ask", "~/.bashrc"),
+        ("echo x > .claude/settings.local.json", "outside", "ask", "ask",
+         ".claude/settings.local.json"),
+        ('echo a > "$f" ; echo b > /etc/x', "outside", "ask", "ask", "/etc/x"),
+        ("echo a > ./$V", "allowed", "allow", "allow", None),
+        ('echo a > "$f"; git push origin main', "risk", "ask", "ask", None),
+        ('echo a > "$f"; rm -rf build', "deny", "deny", "deny", None),
+    )
+
+    def test_41_03_task_table(self):
+        for command, outcome, auto_bypass, default, target in self._TABLE:
+            with self.subTest(command=command):
+                self._check(command, outcome, auto_bypass, default, target=target)
+
+    def test_41_03_resolved_dotdot_from_a_subdirectory_is_allowed(self):
+        # cwd = <root>/sub; 41-02's project root is an extra root. A resolved
+        # `..` is judged on its realpath, which lands in the root.
+        self._check("echo a > ../x", "allowed", "allow", "allow",
+                    cwd=os.path.join(self.ROOT, "sub"), extra_roots=[self.ROOT])
+
+    def test_41_03_outside_wins_over_unresolved(self):
+        r = self._check('echo a > "$f" ; echo b > /etc/x', "outside", "ask", "ask")
+        self.assertEqual(r["redirect_targets"], ["/etc/x"])
+        self.assertEqual(r["unresolved_redirect_targets"], ["$f"])
+        self.assertEqual(
+            r["reason"],
+            "Redirects output outside the workspace, /tmp, or /dev/null — "
+            "review the write target: `/etc/x`; write target cannot be "
+            "resolved: `$f`")
+
+    def test_41_03_reasons(self):
+        # Old outcomes only: today's wording, byte for byte.
+        self.assertEqual(
+            self._result("echo b > /etc/x")["reason"],
+            "Redirects output outside the workspace, /tmp, or /dev/null — "
+            "review the write target: `/etc/x`")
+        # Unresolved only: no claim that the write escapes.
+        self.assertEqual(self._result('echo y > "$S/.env"')["reason"],
+                         "Write target cannot be resolved — review: `$S/.env`")
+        # An unknown sub-command keeps its reason; the target rides along.
+        r = self._result('mysteryfoo > "$S/.env"')
+        self.assertEqual((r["decision"], r["ask_kind"]), ("ask", "unknown"))
+        self.assertEqual(r["reason"],
+                         "Not in allowlist — review before approving: `mysteryfoo`")
+        self.assertEqual(r["unresolved_redirect_targets"], ["$S/.env"])
+        # Deny and permissions.ask carry neither list.
+        for command in ('echo a > "$f"; rm -rf build', 'echo a > "$f"; git push'):
+            r = self._result(command)
+            self.assertEqual(r["redirect_targets"], [], command)
+            self.assertEqual(r["unresolved_redirect_targets"], [], command)
+
+    # The orchestrator's rule → outcome rows (state.md 41-03 decision):
+    # risk whenever the gate can name an escape or a protected hit, unknown
+    # when it only cannot read the target.
+    _RISK = (
+        ("echo k > /etc/$V", "/etc/$V"),                    # R2: anchor outside
+        ("echo k > ~/.bashrc$V", "~/.bashrc$V"),            # R2: `~` anchor outside
+        ("echo k > .$V/../../etc/x", ".$V/../../etc/x"),    # literal `..`
+        ("echo k > $V/../x", "$V/../x"),                    # literal `..`, no anchor
+        ("echo k > $(cd ..; pwd)/x", "$(cd ..; pwd)/x"),    # `..` in construct text
+        ("echo k > .claude/$V", ".claude/$V"),              # R3: protected anchor
+        ("echo k > $V.claude/x", "$V.claude/x"),            # R6: `.claude` visible
+        ("echo k > ~nosuchuser4103/$V", "~nosuchuser4103/$V"),  # unexpandable ~user
+        ("echo k > links/ln${V}s", "links/ln${V}s"),        # R5: outward symlink
+        ("echo k > .$V/x", ".$V/x"),                        # R5: `.claude` dir entry
+        ("echo k > ./x${V/a/\\/}", "./x${V/a/\\/}"),        # R4: backslash in construct
+        ("echo k > $(case x in x) echo ;; esac)",
+         BashCommandParser.UNPROVEN_SUBSTITUTION_TARGET),   # sentinel
+    )
+    _UNKNOWN = (
+        ("echo k > out/$name/x.log", "out/$name/x.log"),    # R1, anchor inside
+        ('echo k > "$dir"/x', "$dir/x"),                    # R0
+        ("echo k > ./$V/x", "./$V/x"),                      # R1: constructs-only segment
+        ("echo k > $(mktemp)", "$(mktemp)"),                # R0
+        ("echo k > {/etc/x,}", "{/etc/x,}"),                # R0
+        ("echo k > ./out_${V:-a/b}", "./out_${V:-a/b}"),    # R4: `/` in leaf construct
+    )
+
+    def test_41_03_rule_to_outcome_risk_rows(self):
+        for command, target in self._RISK:
+            with self.subTest(command=command):
+                self._check(command, "outside", "ask", "ask", target=target)
+
+    def test_41_03_rule_to_outcome_unknown_rows(self):
+        for command, target in self._UNKNOWN:
+            with self.subTest(command=command):
+                self._check(command, "unresolved", "silent", "ask", target=target)
+
+    def test_41_03_unread_operand_sentinel_is_risk(self):
+        with patch.object(BashCommandParser, "_redirect_operand_start",
+                          return_value=None):
+            self._check("echo k > out.txt", "outside", "ask", "ask",
+                        target=BashCommandParser.UNREAD_REDIRECT_TARGET)
+
+    def test_41_03_truncation_marker_is_unknown(self):
+        depth = BashCommandParser.MAX_SUBSTITUTION_DEPTH + 1
+        cmd = "echo hi > " + "$(" * depth + "echo x" + ")" * depth
+        r = self._result(cmd)
+        self.assertEqual((r["decision"], r["ask_kind"]), ("ask", "unknown"))
+        self.assertEqual(r["redirect_targets"], [])
+        self.assertTrue(any(
+            BashCommandParser.TRUNCATED_SUBSTITUTION_TARGET in t
+            for t in r["unresolved_redirect_targets"]), r)
+        for mode in self.MODES:
+            self.assertEqual(self._printed(r, mode),
+                             "ask" if mode == "default" else "silent", mode)
+
+    def test_41_03_never_allow_what_the_gate_cannot_read(self):
+        # Invariant 2: no unresolved or outside row is ever an allow.
+        for command, *_ in self._RISK + self._UNKNOWN:
+            with self.subTest(command=command):
+                self.assertNotEqual(self._result(command)["decision"], "allow")
 
 
 class TestPermissionModeParity(unittest.TestCase):

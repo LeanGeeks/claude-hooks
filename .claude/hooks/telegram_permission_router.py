@@ -381,11 +381,13 @@ class BashAnnotations:
     """What the re-derived validator breakdown says about a Bash request.
 
     ``denied`` / ``unknown`` / ``asked`` are the per-sub-command buckets the
-    terminal prompt names. ``ask_kind`` and ``redirect_targets`` are copied
-    straight off the validator result (epic 40, task 40-01) and describe the
-    request as a whole: the *kind* of ask we derived, and the write-redirect
-    targets the gate refused. ``failed`` records that the derivation itself
-    raised — the card then renders its command summary and nothing more.
+    terminal prompt names. ``ask_kind``, ``redirect_targets`` and
+    ``unresolved_redirect_targets`` are copied straight off the validator
+    result (epic 40, task 40-01; epic 41, task 41-03) and describe the request
+    as a whole: the *kind* of ask we derived, the write-redirect targets the
+    gate refused as escaping, and the ones it could not resolve. ``failed``
+    records that the derivation itself raised — the card then renders its
+    command summary and nothing more.
 
     ``frozen=True`` buys *rebinding* protection only: assigning
     ``ann.unknown = [...]`` raises ``FrozenInstanceError``. It does **not**
@@ -400,6 +402,7 @@ class BashAnnotations:
     asked: list[str]
     ask_kind: Optional[str] = None
     redirect_targets: Optional[list[str]] = None
+    unresolved_redirect_targets: Optional[list[str]] = None
     failed: bool = False
 
     def __post_init__(self) -> None:
@@ -409,6 +412,8 @@ class BashAnnotations:
         # plain list and never has to check for None.
         if self.redirect_targets is None:
             object.__setattr__(self, "redirect_targets", [])
+        if self.unresolved_redirect_targets is None:
+            object.__setattr__(self, "unresolved_redirect_targets", [])
 
     @property
     def empty(self) -> bool:
@@ -418,7 +423,11 @@ class BashAnnotations:
         compute must never block the card, and must not be invented either.
         """
         return self.failed or not (
-            self.denied or self.unknown or self.asked or self.redirect_targets
+            self.denied
+            or self.unknown
+            or self.asked
+            or self.redirect_targets
+            or self.unresolved_redirect_targets
         )
 
 
@@ -486,10 +495,14 @@ def _bash_annotations(request: PermissionRequest) -> BashAnnotations:
             unknown.append(cmd)
 
     # Copied defensively: the validator result is a plain dict and this card
-    # must keep rendering if a future shape omits either key.
+    # must keep rendering if a future shape omits any of these keys.
     ask_kind = result.get("ask_kind") if isinstance(result, dict) else None
     raw_targets = result.get("redirect_targets") if isinstance(result, dict) else None
     redirect_targets = [t for t in (raw_targets or []) if t]
+    raw_unresolved = (
+        result.get("unresolved_redirect_targets") if isinstance(result, dict) else None
+    )
+    unresolved_redirect_targets = [t for t in (raw_unresolved or []) if t]
 
     return BashAnnotations(
         denied=denied,
@@ -497,6 +510,7 @@ def _bash_annotations(request: PermissionRequest) -> BashAnnotations:
         asked=asked,
         ask_kind=ask_kind if isinstance(ask_kind, str) else None,
         redirect_targets=redirect_targets,
+        unresolved_redirect_targets=unresolved_redirect_targets,
     )
 
 
@@ -663,6 +677,22 @@ def render_permission_body(
         else:
             lines.append("⚠️ <b>Not in allowlist:</b>")
         lines += [f"<code>{_html.escape(c, quote=False)}</code>" for c in ann.unknown]
+    elif (
+        ann.unresolved_redirect_targets
+        and _mode_resolves_ask_candidates(request)
+        and not ann.asked
+        and not ann.denied
+        and not ann.redirect_targets
+    ):
+        # Every sub-command is allowlisted, but a write target could not be
+        # resolved: an unknown (epic 41, task 41-03), so pretool printed
+        # nothing in this mode and the harness raised this prompt. The heading
+        # above would say "not on the allowlist either", which is false here.
+        lines.append("")
+        lines.append(
+            "🤖 <b>The harness flagged this call — the session's mode "
+            "resolved it</b>"
+        )
 
     # A redirect-gate ask is one of the few things we still raise ourselves in
     # `auto` mode, and the per-sub-command buckets above cannot see it (the
@@ -674,6 +704,16 @@ def render_permission_body(
         lines.append("📝 <b>Writes outside the workspace:</b>")
         lines += [
             f"<code>{_html.escape(t, quote=False)}</code>" for t in ann.redirect_targets
+        ]
+    # A write target the gate could not resolve claims no escape (41-03): a
+    # neutral heading, in every mode. In a deferring mode it did not make the
+    # hook ask; in any other mode the hook asked about it as an unknown.
+    if ann.unresolved_redirect_targets:
+        lines.append("")
+        lines.append("📝 <b>Write targets the hook could not resolve:</b>")
+        lines += [
+            f"<code>{_html.escape(t, quote=False)}</code>"
+            for t in ann.unresolved_redirect_targets
         ]
 
     lines += ["", "Approve this command?"]

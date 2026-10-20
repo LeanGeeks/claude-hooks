@@ -101,10 +101,12 @@ QUESTION_TOOL = "AskUserQuestion"
 # 22-01's tier vocabulary is read off a **fresh** validator run, never off the
 # row's stored reason, and structurally wherever possible: the deny and ask tiers
 # come from that run's ``decision`` plus its per-sub-command
-# ``matched_deny_patterns`` / ``matched_ask_patterns``, not from prose. The one
-# branch with no structured marker is the redirect escape (the validator reports
-# it as an ``ask`` with no matched patterns), so that single branch is told apart
-# by its reason prefix — still off the fresh run, still the one classifier.
+# ``matched_deny_patterns`` / ``matched_ask_patterns``, not from prose. A
+# write-redirect ask is told apart by the run's ``redirect_targets`` (escaping)
+# and ``unresolved_redirect_targets`` (unreadable, epic 41 task 41-03): either
+# non-empty is human-only. The reason prefix below is the fallback for a
+# validator whose result predates those keys — still off the fresh run, still
+# the one classifier.
 REDIRECT_REASON_PREFIX = "Redirects output outside the workspace"
 
 # The action vocabulary ``decide`` accepts, and the terminal state each writes.
@@ -356,7 +358,13 @@ def _classify_command(
                 "human-only: " + reason + f" (ask patterns: {', '.join(asked)})",
                 asked,
             )
-        if reason.startswith(REDIRECT_REASON_PREFIX):
+        # A write redirect is human-only, escaping or unresolvable: an agent
+        # must not approve a write whose destination nobody can read (41-03).
+        if (
+            fresh.get("redirect_targets")
+            or fresh.get("unresolved_redirect_targets")
+            or reason.startswith(REDIRECT_REASON_PREFIX)
+        ):
             return Classification(False, "human-only: " + reason, [])
         return Classification(True, "agent-decidable: " + reason, [])
 
