@@ -122,6 +122,11 @@ Deliverables, in this order:
   Its operator table, token-stream derivation, declined-delimiter marker and
   real-bash sweeps are the foundation this builds on, and its recorded gaps are
   the beginning of §3 item 1's list.
+- **[42](./42_command_matching_fail_opens/brd.md)** (draft, 2026-10-21) records
+  four more lexing fail-opens found by epic 41 (`$'\''`, `case` inside `$(…)`,
+  `$((cmd) | (cmd))`, and handed-over item 1 below, re-measured) plus an
+  in-command `cd` the write gate does not follow. Decide them together with
+  this task.
 - **[36](./36_parser_cleanups_from_task_32.md)** carries two narrow `ask`-direction
   cleanups out of 32; independent of this task.
 
