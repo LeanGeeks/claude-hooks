@@ -28,7 +28,7 @@ suffix.
 | 41-02 | [Allowed write roots mirror Claude Code](./41-02-allowed-roots-mirror-claude-code_opus.md) | done | 41-01, 41-05 | Project root, own memory dir (registered-worktree key with an encoding self-check, user-level `autoMemoryDirectory`; deferring modes only until H5 is verified), user-level `additionalDirectories`; `write_roots` stored on the row for the router and MCP. Redirect gate + `rm` only. |
 | 41-03 | [Unresolvable targets are unknowns](./41-03-unresolvable-targets-are-unknowns_opus.md) | done | 41-01, 41-02 | Operator answered (a). 181 of 365 refused targets. Card wording, MCP human-only tier. Amends epic 40 invariant 4. |
 | — | `./install.sh --yes` | done | 41-03 committed | The orchestrator runs it once all four are committed (never `--all`). Not an agent task. |
-| 41-04 | [Re-measure and live checks](./41-04-remeasure-and-live-checks_human.md) | blocked — awaiting human | install | **human** — live checks H1/H2/H5 and the Whitelist-from-subdir check right after install; the tally after a week. Leave `blocked — awaiting human` once install has run. |
+| 41-04 | [Re-measure and live checks](./41-04-remeasure-and-live-checks_human.md) | blocked — awaiting human | install | **human** — live checks done by the orchestrator 2026-10-21 (see Log). Still open: the tally after a week (~2026-10-28), and an operator glance at a real harness-raised card. |
 
 ## Dependency graph
 
@@ -254,6 +254,61 @@ Skipped: `test_unit_python_compat.TestImportUnderOldInterpreter.test_all_hook_mo
   desync; commands inside a `case` body in `$(…)`; command substitutions in
   unquoted heredoc bodies; `$((cmd) | (cmd))` read as arithmetic; plus the
   in-command `cd` that moves a relative write unseen (`cd /etc && echo k > x`).
+- **2026-10-21 — 41-04 live checks run by the orchestrator (operator's
+  request).** Spawned Claude Code 2.1.306 sessions with `amux-spawn` in
+  `/data/sync/work/leangeeks-ai/ai-playground-2`, which is now a git repo with
+  `sub/`, a project `.claude/settings.json` allowing only `Bash(factor:*)`, and
+  a registered worktree at `.claude/worktrees/wt41`. Installed hooks at
+  `8539904`, `CLAUDE_HOOK_DEBUG=1`. Results:
+  - **H1 — pass.** `CLAUDE_PROJECT_DIR` is set in PreToolUse and in
+    PermissionRequest, in the main checkout and in the worktree. In each case it
+    equals the session's root, and the settings root follows it. No fallback
+    line appeared.
+  - **`transcript_path` — pass.** Present in every Bash PreToolUse payload,
+    main and worktree. The worktree's transcript sits under the worktree's own
+    key (`…-ai-playground-2--claude-worktrees-wt41`).
+  - **H2 — pass.** The worktree session names the **main checkout's** memory
+    dir (`-data-sync-work-leangeeks-ai-ai-playground-2/memory/`). Write roots
+    hold the worktree-key and the main-key memory dirs. In auto mode,
+    `echo … >> <main-key memory>/MEMORY.md` was `allow` with no row.
+  - **H5 — Claude Code does not prompt.** In `default` mode the Write tool
+    saved a memory file with no prompt and no row. Follow-up filed as
+    [task 43](../43_memory_root_in_every_mode.md), which drops the
+    `DEFERRING_MODES` condition in `compute_write_roots`.
+  - **Acceptance 3 — pass (auto).** Own-memory `echo >> MEMORY.md` → `allow`.
+    `: >> ~/.claude/settings.json` and `: >> <sibling project memory>/MEMORY.md`
+    → hook `ask`, terminal prompt, Telegram cards 7796/7797, both declined in
+    the terminal (`resolved_terminal`).
+  - **41-03 — pass (auto).** `for f in a b; do echo x > "$f.out"; done`,
+    `: >> $(echo ~/.bashrc)` and `: >> "$(echo .git)"/config` were logged with
+    `emitted: null` and reason "Write target cannot be resolved — review: …".
+    Claude Code's auto classifier then let the loop run and denied the other
+    two itself, with no PermissionRequest and no card. `: >> ~/.bashrc$V` still
+    asks: terminal prompt plus card 7798 (main) and card 7800 (worktree).
+  - **Acceptance 4 and 5a — pass (default).** After `cd sub`, the payload cwd is
+    `…/sub` and the settings root is the project root. `echo x > ../file41.out`
+    and `factor 12` (allowed only by the project's settings.json) were both
+    `allow`.
+  - **Acceptance 6 — wording verified, live card not raised.** No harness-raised
+    card could be triggered: the auto classifier denies outright rather than
+    asking. The installed `render_permission_body`, run on the live rows plus
+    auto/default variants of the unresolved-target commands, gives "🤖 The
+    harness flagged this call — the session's mode resolved it" and "📝 Write
+    targets the hook could not resolve:". It never says "Writes outside the
+    workspace" for an unresolved target, and the gate-asked rows render "📝
+    Writes outside the workspace". An operator glance at a real card is still
+    welcome.
+  - **Whitelist from a subdirectory — moot.** The card has no Whitelist button
+    since `056c882` ("replace dead Whitelist button with per-session YOLO"), and
+    `telegram_permission_router.process_whitelist_update` has no caller. 41-05's
+    `settings_root` on the row is still used by the reads (5a above) and by the
+    MCP.
+  - **Still owed:** the tally after a week of use (from 2026-10-21T00:53Z;
+    exclude the 84 test entries of 2026-10-20T15:3x).
+  - **Epic 42 filed as a draft** (`tasks/42_command_matching_fail_opens/brd.md`)
+    for the five pre-existing command-matching fail-opens, re-measured on
+    `8539904`. The first four also get past a deny rule, and
+    `cd ~/.claude && echo '{}' > settings.json` is `allow`.
 - **2026-10-20 — fresh-context review; rev 3.** An independent reviewer
   reproduced brd §1.3 and the §1.2 tally, and found more fail-opens, all
   confirmed: quoting only stripped once (`> "/etc"/x`, `> "$HOME"/.bashrc`,
