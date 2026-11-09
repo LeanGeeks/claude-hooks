@@ -119,6 +119,9 @@ Hooks are wired into the **global** `~/.claude/settings.json` by
 | `Stop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: authoritative turn-end. Update handle state to `idle` (clean stop) or `running` (background work outstanding), write `stopped_at`, append `stop` lifecycle event. Handle-gated. |
 | `SubagentStop` | `*` | `spawn_producer_hook.py` | Epic-10 producer: freshness update when a background subagent completes; append `subagent_stop` lifecycle event. Handle-gated. |
 | `SessionEnd` | `*` | `spawn_producer_hook.py` | Epic-10 producer: mark handle `terminated`, append `session_end` lifecycle event. Handle-gated. |
+| `UserPromptSubmit` · `Notification[permission_prompt]` · `Stop` · `SessionEnd` | `*` / `permission_prompt` | `keep_awake_hook.py` | Task 44: hold one logind `sleep:idle` inhibitor per working session, via a detached `systemd-inhibit … --watch` process that exits when the owning `claude` process exits (pidfd) or the session goes idle. Not handle-gated: every session. See [docs/keep-awake.md](docs/keep-awake.md). |
+
+Several features register on the same event (`Stop` has both `spawn_producer_hook.py` and `keep_awake_hook.py`). The installer owns hook entries per **(event, script)**: installing or uninstalling one feature never touches another feature's entries on a shared event.
 
 ### Settings root (epic 41)
 

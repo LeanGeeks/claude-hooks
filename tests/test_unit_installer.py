@@ -1509,6 +1509,141 @@ class TestHooksMerge(InstallerTestBase):
         self.assertIn("permission_prompt", matchers)
 
 
+class TestSharedEventOwnership(InstallerTestBase):
+    """
+    Task 44: amux and keep-awake both own UserPromptSubmit / Stop / SessionEnd /
+    Notification[permission_prompt]. Ownership is per (event, script), so
+    installing, re-installing or uninstalling one leaves the other wired.
+    """
+
+    _AMUX = ["--only", "amux,profiles"]
+
+    def _entries(self, event: str) -> list:
+        """(matcher, script) for each of our hook commands on this event."""
+        hooks_dir = str(self.tmp_home / ".claude" / "hooks") + "/"
+        out = []
+        for entry in read_settings(self.tmp_home).get("hooks", {}).get(event, []):
+            for h in entry.get("hooks", []):
+                cmd = h.get("command", "")
+                if hooks_dir in cmd:
+                    out.append((entry.get("matcher"), cmd.split(hooks_dir)[-1].split(" ")[0]))
+        return out
+
+    def _scripts(self, event: str) -> list:
+        return [script for _, script in self._entries(event)]
+
+    def _run(self, *args):
+        result = run_installer(self.tmp_home, extra_args=list(args))
+        self.assertEqual(result.returncode, 0, result.stderr[-600:])
+        return result
+
+    def test_both_features_wired_on_shared_events(self):
+        self._run("--only", "amux,profiles,keep-awake")
+        for event in ("UserPromptSubmit", "Stop", "SessionEnd", "Notification"):
+            scripts = self._scripts(event)
+            self.assertEqual(sorted(scripts), ["keep_awake_hook.py", "spawn_producer_hook.py"],
+                             f"{event}: {scripts}")
+        self.assertEqual(self._scripts("SubagentStop"), ["spawn_producer_hook.py"])
+
+    def test_notification_matchers_with_telegram(self):
+        self._run("--only", "permission-hooks,telegram,amux,profiles,keep-awake")
+        self.assertEqual(sorted(self._entries("Notification")), [
+            ("idle_prompt", "notification_hook.py"),
+            ("permission_prompt", "keep_awake_hook.py"),
+            ("permission_prompt", "spawn_producer_hook.py"),
+        ])
+        self._run("--uninstall", "telegram")
+        self.assertEqual(sorted(self._entries("Notification")), [
+            ("permission_prompt", "keep_awake_hook.py"),
+            ("permission_prompt", "spawn_producer_hook.py"),
+        ])
+
+    def test_keep_awake_command_tolerates_a_removed_script(self):
+        """A session still holding the old hook config must not fail its prompt."""
+        self._run("--only", "keep-awake")
+        cmd = [h["command"] for e in read_settings(self.tmp_home)["hooks"]["UserPromptSubmit"]
+               for h in e["hooks"]][0]
+        (self.tmp_home / ".claude" / "hooks" / "keep_awake_hook.py").unlink()
+        r = subprocess.run(["sh", "-c", cmd], input="{}", capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), r.stderr)
+
+    def test_uninstall_tolerates_malformed_and_foreign_empty_events(self):
+        self._run("--only", "keep-awake")
+        settings = read_settings(self.tmp_home)
+        settings["hooks"]["Weird"] = "not-an-array"
+        settings["hooks"]["ForeignEmpty"] = []
+        _write_settings(self.tmp_home, settings)
+        self._run("--uninstall", "keep-awake")
+        hooks = read_settings(self.tmp_home).get("hooks", {})
+        self.assertEqual(hooks.get("Weird"), "not-an-array")
+        self.assertEqual(hooks.get("ForeignEmpty"), [])
+        self.assertNotIn("UserPromptSubmit", hooks, "array emptied by the uninstall is dropped")
+
+    def test_quoted_script_path_is_owned(self):
+        hooks_dir = self.tmp_home / ".claude" / "hooks"
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "Stop", f'python3 "{hooks_dir}/keep_awake_hook.py" --event Stop'))
+        self._run("--only", "keep-awake")
+        self.assertEqual(self._scripts("Stop"), ["keep_awake_hook.py"], "no duplicate")
+        self._run("--uninstall", "keep-awake")
+        self.assertEqual(self._scripts("Stop"), [])
+
+    def test_installing_keep_awake_alone_keeps_amux_entries(self):
+        self._run(*self._AMUX)
+        self._run("--only", "keep-awake")
+        self.assertEqual(sorted(self._scripts("Stop")),
+                         ["keep_awake_hook.py", "spawn_producer_hook.py"])
+        self.assertEqual(self._scripts("SubagentStop"), ["spawn_producer_hook.py"])
+
+    def test_installing_amux_alone_keeps_keep_awake_entries(self):
+        self._run("--only", "keep-awake")
+        self._run(*self._AMUX)
+        self.assertEqual(sorted(self._scripts("UserPromptSubmit")),
+                         ["keep_awake_hook.py", "spawn_producer_hook.py"])
+
+    def test_reinstall_does_not_duplicate(self):
+        for _ in range(2):
+            self._run("--only", "amux,profiles,keep-awake")
+        for event in ("UserPromptSubmit", "Stop", "SessionEnd", "Notification"):
+            self.assertEqual(len(self._scripts(event)), 2, event)
+
+    def test_uninstall_keep_awake_leaves_amux(self):
+        self._run("--only", "amux,profiles,keep-awake")
+        self._run("--uninstall", "keep-awake")
+        for event in ("UserPromptSubmit", "Stop", "SessionEnd", "Notification"):
+            self.assertEqual(self._scripts(event), ["spawn_producer_hook.py"], event)
+
+    def test_uninstall_amux_leaves_keep_awake(self):
+        self._run("--only", "amux,profiles,keep-awake")
+        self._run("--uninstall", "amux")
+        for event in ("UserPromptSubmit", "Stop", "SessionEnd", "Notification"):
+            self.assertEqual(self._scripts(event), ["keep_awake_hook.py"], event)
+        self.assertEqual(self._scripts("SubagentStop"), [])
+
+    def test_amux_probe_not_fooled_by_keep_awake(self):
+        self._run("--only", "keep-awake")
+        probe = run_installer(self.tmp_home, extra_args=["--probe", "amux"])
+        self.assertNotEqual(probe.returncode, 0,
+                            "keep-awake's Stop entry must not make amux look installed")
+        probe = run_installer(self.tmp_home, extra_args=["--probe", "keep-awake"])
+        self.assertEqual(probe.returncode, 0, probe.stdout + probe.stderr)
+
+    def test_retired_script_entry_is_dropped_on_rewire(self):
+        hooks_dir = self.tmp_home / ".claude" / "hooks"
+        _write_settings(self.tmp_home, _settings_with_foreign_hook(
+            "Stop", f"python3 {hooks_dir}/retired_hook.py"))
+        self._run("--only", "keep-awake")
+        self.assertEqual(self._scripts("Stop"), ["keep_awake_hook.py"])
+
+    def test_foreign_entry_survives_keep_awake_uninstall(self):
+        foreign = "python3 /usr/local/my-hooks/custom_hook.py"
+        _write_settings(self.tmp_home, _settings_with_foreign_hook("Stop", foreign))
+        self._run("--only", "keep-awake")
+        self._run("--uninstall", "keep-awake")
+        stop = read_settings(self.tmp_home).get("hooks", {}).get("Stop", [])
+        self.assertEqual([h["command"] for e in stop for h in e["hooks"]], [foreign])
+
+
 # =============================================================================
 # §7.2 Permissions merge — union and overwrite (task 29-04)
 # =============================================================================
@@ -1541,6 +1676,22 @@ class TestPermissionsMerge(InstallerTestBase):
                       "Foreign allow entry must survive union install")
         self.assertIn("AnotherTool", allow,
                       "Foreign allow entry must survive union install")
+
+    def test_other_permissions_keys_survive_both_modes(self):
+        """defaultMode / additionalDirectories are not the allowlist's to drop."""
+        for mode in ("union", "overwrite"):
+            with self.subTest(mode=mode):
+                settings = self._settings_with_allow(["MyCustomTool"])
+                settings["permissions"]["defaultMode"] = "acceptEdits"
+                settings["permissions"]["additionalDirectories"] = ["/srv/shared"]
+                _write_settings(self.tmp_home, settings)
+                result = run_installer(
+                    self.tmp_home, extra_args=["--only", "permissions-allowlist"],
+                    extra_env={"CLAUDE_INSTALL_PERMISSIONS_MODE": mode})
+                self.assertEqual(result.returncode, 0, result.stderr[:300])
+                perms = read_settings(self.tmp_home).get("permissions", {})
+                self.assertEqual(perms.get("defaultMode"), "acceptEdits")
+                self.assertEqual(perms.get("additionalDirectories"), ["/srv/shared"])
 
     def test_union_adds_project_entries(self):
         """Union install: project config entries are added."""
@@ -3002,10 +3153,9 @@ class TestSelectorDependencies(InstallerTestBase):
         """
         Cannot toggle a sub-option when its parent feature is Skip.
         """
-        # Cycle questions (9) to Skip, then try to toggle 9a
-        # Feature 9 = questions, default = Skip (D14), so it starts Skip.
-        # Try to toggle 9a directly.
-        result = run_selector(self.tmp_home, keystrokes="9a\nq\n")
+        # Feature 10 = questions (after keep-awake was added at 6), default =
+        # Skip (D14), so it starts Skip. Try to toggle 10a directly.
+        result = run_selector(self.tmp_home, keystrokes="10a\nq\n")
         output = result.stdout + result.stderr
         self.assertIn(
             "Enable", output,

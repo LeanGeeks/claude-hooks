@@ -86,7 +86,7 @@ from the repo, so the user's hooks really are broken on disk.
 
 ## Feature inventory
 
-Ten features, in registry (execution) order. The registry order matters:
+Eleven features, in registry (execution) order. The registry order matters:
 `profiles` precedes `amux` because `amux-spawn.bash` sources
 `claude-profiles.bash`.
 
@@ -97,6 +97,7 @@ Ten features, in registry (execution) order. The registry order matters:
 | `telegram` | Telegram integration (approvals, notifications, reply-injection) | install | user-site `.pth`, `~/.local/bin/claude-roles` | `permission-hooks` |
 | `profiles` | Model profiles (`~/.claude/profiles.toml`) | install | — | — |
 | `amux` | amux integration (launcher, tmux options, bash completion) | install | `/usr/local/bin/amux`, `~/.tmux.conf` + live tmux server, `~/.local/bin/amux-spawn`, bash-completion dir | `profiles` |
+| `keep-awake` | Keep the machine awake while agents work (logind inhibitor per working session) | install | — (takes a logind lock at runtime) | `systemd-inhibit` on PATH (else a no-op) |
 | `permissions-allowlist` | Global permissions allowlist (union or overwrite mode) | install | — | — |
 | `context-mcp` | MCP: context-usage (registers `uv --script` MCP server) | install | `~/.claude.json` | `uv` on PATH |
 | `claude-history` | `claude-history` diagnostic tool | install | `~/.local/bin/claude-history` | — |
@@ -139,6 +140,14 @@ to install.
 - `~/.tmux.conf` — marked tmux options block (focus-events, set-titles)
 - Live `tmux set -g` commands applied to any running tmux server
 - Sub-toggle `amux-autowrap`: writes one sourcing line to `~/.bashrc`
+
+**`keep-awake`**
+- `~/.claude/hooks/keep_awake_hook.py`
+- `~/.claude/settings.json` — `UserPromptSubmit(*)`, `Stop(*)`, `SessionEnd(*)`,
+  `Notification(permission_prompt)` hook entries
+- At runtime: `~/.claude/keep-awake/<session>.json` state and
+  `~/.claude/keep_awake.log`; see [keep-awake.md](./keep-awake.md)
+- Uninstall drops every live lock (`keep_awake_hook.py --release-all`)
 
 **`permissions-allowlist`**
 - `~/.claude/settings.json` — `permissions.allow` and `permissions.deny` keys

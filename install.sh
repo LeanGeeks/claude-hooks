@@ -113,6 +113,7 @@ FEATURES=(
     telegram
     profiles
     amux
+    keep-awake
     permissions-allowlist
     context-mcp
     claude-history
@@ -137,6 +138,7 @@ REQUIRED_HOOKS=(
     "reply_injector.py"
     "amux_spawn_lib.py"
     "spawn_producer_hook.py"
+    "keep_awake_hook.py"
     "codex_event_reducer.py"
     "claude_event_reducer.py"
     "lifecycle_events.py"
@@ -307,8 +309,8 @@ feature_permission_hooks_install() {
 feature_permission_hooks_uninstall() {
     log_step "Uninstalling: $(feature_permission_hooks_title)"
 
-    # Hooks entries (PreToolUse, PermissionRequest) removed by _remove_hooks_for_feature
-    UNINSTALL_HOOK_EVENTS+=" PreToolUse PermissionRequest"
+    # Hook entries running these scripts are removed by _apply_uninstall_to_settings
+    UNINSTALL_HOOK_SCRIPTS+=" pretool_hook.py permission_request_hook.py"
 
     # Modules removed by refcounted removal in the executor
     log_info "Permission hooks uninstalled"
@@ -443,9 +445,8 @@ feature_telegram_uninstall() {
     # De-register permissions MCP server
     _deregister_mcp_server "permissions"
 
-    # Hooks entries (PostToolUse, Notification[idle_prompt]) removed by _remove_hooks_for_feature
-    UNINSTALL_HOOK_EVENTS+=" PostToolUse"
-    UNINSTALL_NOTIFICATION_MATCHERS+=" idle_prompt"
+    # Hook entries (PostToolUse, Notification[idle_prompt]) removed by script
+    UNINSTALL_HOOK_SCRIPTS+=" posttool_hook.py notification_hook.py"
 
     # Modules removed by refcounted removal in the executor
     log_info "Telegram uninstalled"
@@ -547,11 +548,12 @@ feature_amux_modules()    {
 feature_amux_suboptions() { echo "amux-autowrap"; }
 
 feature_amux_probe() {
-    # Artifact AND wiring: amux-spawn on PATH AND hooks.Stop references GLOBAL_HOOKS_DIR
+    # Artifact AND wiring: amux-spawn on PATH AND hooks.Stop runs our producer
+    # (script-specific: keep-awake also owns a Stop entry in GLOBAL_HOOKS_DIR)
     [[ -f "$HOME/.local/bin/amux-spawn" ]] || return 1
     [[ -f "$GLOBAL_CONFIG" ]] || return 1
-    jq -e --arg dir "$GLOBAL_HOOKS_DIR" \
-        '.hooks.Stop // [] | any(.[]; .hooks // [] | any(.[]; .command // "" | contains($dir)))' \
+    jq -e --arg script "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
+        '.hooks.Stop // [] | any(.[]; .hooks // [] | any(.[]; .command // "" | contains($script)))' \
         "$GLOBAL_CONFIG" >/dev/null 2>&1
 }
 
@@ -671,9 +673,9 @@ feature_amux_install() {
     AMUX_CODEX_STATUS="${AMUX_CODEX_STATUS:-not probed}"
 
     # Build amux hooks: Notification[permission_prompt], UserPromptSubmit, Stop,
-    # SubagentStop, SessionEnd (architecture §7.1 — amux owns all of these).
-    # Notification[permission_prompt] is amux's share of the shared Notification array;
-    # telegram owns Notification[idle_prompt].
+    # SubagentStop, SessionEnd (architecture §7.1). Every array is appended to,
+    # never replaced: keep-awake shares UserPromptSubmit/Stop/SessionEnd/
+    # Notification, and telegram shares Notification. Ownership is per script.
     if [[ "$AMUX_SPAWN_INSTALLED" == true ]]; then
         HOOKS_JSON=$(echo "$HOOKS_JSON" | jq \
             --arg producer_path "$GLOBAL_HOOKS_DIR/spawn_producer_hook.py" \
@@ -687,34 +689,34 @@ feature_amux_install() {
                         command: ("python3 " + $producer_path + " --event Notification")
                     }]
                 }]),
-                UserPromptSubmit: [{
+                UserPromptSubmit: ((.UserPromptSubmit // []) + [{
                     matcher: "*",
                     hooks: [{
                         type: "command",
                         command: ("python3 " + $producer_path + " --event UserPromptSubmit")
                     }]
-                }],
-                Stop: [{
+                }]),
+                Stop: ((.Stop // []) + [{
                     matcher: "*",
                     hooks: [{
                         type: "command",
                         command: ("python3 " + $producer_path + " --event Stop")
                     }]
-                }],
-                SubagentStop: [{
+                }]),
+                SubagentStop: ((.SubagentStop // []) + [{
                     matcher: "*",
                     hooks: [{
                         type: "command",
                         command: ("python3 " + $producer_path + " --event SubagentStop")
                     }]
-                }],
-                SessionEnd: [{
+                }]),
+                SessionEnd: ((.SessionEnd // []) + [{
                     matcher: "*",
                     hooks: [{
                         type: "command",
                         command: ("python3 " + $producer_path + " --event SessionEnd")
                     }]
-                }]
+                }])
             }')
         log_info "amux hooks wired (Notification[permission_prompt], UserPromptSubmit, Stop, SubagentStop, SessionEnd)"
     fi
@@ -743,9 +745,10 @@ feature_amux_uninstall() {
     # Remove tmux options
     ext_tmux_remove
 
-    # Hooks entries (Notification[permission_prompt], UserPromptSubmit, Stop, SubagentStop, SessionEnd)
-    UNINSTALL_HOOK_EVENTS+=" UserPromptSubmit Stop SubagentStop SessionEnd"
-    UNINSTALL_NOTIFICATION_MATCHERS+=" permission_prompt"
+    # Hook entries (Notification[permission_prompt], UserPromptSubmit, Stop,
+    # SubagentStop, SessionEnd) removed by script — keep-awake's entries on the
+    # same events survive.
+    UNINSTALL_HOOK_SCRIPTS+=" spawn_producer_hook.py"
 
     # Modules removed by refcounted removal in the executor
     log_info "amux uninstalled"
@@ -755,6 +758,59 @@ feature_amux_uninstall() {
 feature_amux_autowrap_probe() {
     local marker="# claude-hooks:amux-autowrap"
     [[ -f "$HOME/.bashrc" ]] && grep -Fxq "$marker" "$HOME/.bashrc" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Feature: keep-awake (task 44)
+# ---------------------------------------------------------------------------
+# One logind inhibitor lock per working Claude session, held by a watcher
+# process that exits when the session exits or goes idle (keep_awake_hook.py).
+feature_keep_awake_title()      { echo "Keep the machine awake while agents work"; }
+feature_keep_awake_writes()     { echo ""; }
+feature_keep_awake_default()    { echo "install"; }
+feature_keep_awake_requires()   { echo ""; }
+feature_keep_awake_modules()    { echo "keep_awake_hook.py"; }
+feature_keep_awake_suboptions() { echo ""; }
+
+feature_keep_awake_probe() {
+    [[ -f "$GLOBAL_HOOKS_DIR/keep_awake_hook.py" ]] || return 1
+    [[ -f "$GLOBAL_CONFIG" ]] || return 1
+    jq -e --arg script "$GLOBAL_HOOKS_DIR/keep_awake_hook.py" \
+        '.hooks.UserPromptSubmit // [] | any(.[]; .hooks // [] | any(.[]; .command // "" | contains($script)))' \
+        "$GLOBAL_CONFIG" >/dev/null 2>&1
+}
+
+feature_keep_awake_install() {
+    log_step "Installing: $(feature_keep_awake_title)"
+    if ! command -v systemd-inhibit >/dev/null 2>&1; then
+        log_warn "systemd-inhibit not found — the keep-awake hook will be a no-op on this machine"
+    fi
+    _install_modules "$(feature_keep_awake_modules)" || return 0
+
+    HOOKS_JSON=$(echo "$HOOKS_JSON" | jq \
+        --arg ka "$GLOBAL_HOOKS_DIR/keep_awake_hook.py" \
+        'def entry(m; ev): {matcher: m, hooks: [{type: "command",
+                            # Guarded: a session still running the hooks it
+                            # started with must not fail its prompt after an
+                            # uninstall removed the script (python3 exits 2).
+                            command: ("[ -f " + $ka + " ] || exit 0; python3 " + $ka + " --event " + ev)}]};
+         . + {
+            UserPromptSubmit: ((.UserPromptSubmit // []) + [entry("*"; "UserPromptSubmit")]),
+            Stop:             ((.Stop // [])             + [entry("*"; "Stop")]),
+            SessionEnd:       ((.SessionEnd // [])       + [entry("*"; "SessionEnd")]),
+            Notification:     ((.Notification // [])     + [entry("permission_prompt"; "Notification")])
+         }')
+    log_info "keep-awake hooks wired (UserPromptSubmit, Stop, SessionEnd, Notification[permission_prompt])"
+}
+
+feature_keep_awake_uninstall() {
+    log_step "Uninstalling: $(feature_keep_awake_title)"
+    # Drop every live lock while the module is still on disk.
+    if [[ -f "$GLOBAL_HOOKS_DIR/keep_awake_hook.py" ]]; then
+        python3 "$GLOBAL_HOOKS_DIR/keep_awake_hook.py" --release-all >/dev/null 2>&1 || true
+    fi
+    UNINSTALL_HOOK_SCRIPTS+=" keep_awake_hook.py"
+    log_info "keep-awake uninstalled"
 }
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1230,7 @@ declare -A MODULE_OWNERS=(
     [claude_event_reducer.py]="amux"
     [codex_event_reducer.py]="amux"
     [spawn_producer_hook.py]="amux"
+    [keep_awake_hook.py]="keep-awake"
     [questions_store.py]="questions"
     [questions_listen_lib.py]="questions"
 )
@@ -2208,64 +2265,48 @@ _deregister_mcp_server() {
 
 # _merge_hooks_owned <current_settings_json> <hooks_json> <hooks_dir>
 # Merges the per-feature HOOKS_JSON into the existing settings.json hooks,
-# ownership-scoped: an entry is ours if any of its hooks[].command references
-# $hooks_dir.
+# ownership-scoped. An entry is ours if a hooks[].command runs a script in
+# $hooks_dir; ownership is keyed by (event, script), not by event: several
+# features share UserPromptSubmit / Stop / SessionEnd / Notification
+# (amux, telegram, keep-awake), and a feature may be installed alone.
 #
 # Rules (architecture §7.1):
-# - Install/update: remove ours for the events being installed, append new ones.
-#   Foreign entries in the same array survive in order.
-# - Notification is shared between telegram (idle_prompt) and amux (permission_prompt).
-#   Merge keys on .matcher — never replaces the whole array.
+# - For every event in HOOKS_JSON: drop our entries that run a script this
+#   run re-wires on that event, and our entries whose script is no longer one
+#   of REQUIRED_HOOKS (renamed/retired); append the new entries.
+# - Our entries for scripts not being re-wired (a kept feature) survive in place.
+# - Foreign entries always survive, in order.
 # - Returns the full settings JSON with merged hooks on stdout.
 _merge_hooks_owned() {
     local current="$1"   # full settings.json string
     local new_hooks="$2" # HOOKS_JSON built by feature installs
     local hooks_dir="$3" # GLOBAL_HOOKS_DIR
+    local known
+    known=$(printf '%s\n' "${REQUIRED_HOOKS[@]}" | jq -R . | jq -s .)
 
     echo "$current" | jq \
         --argjson nh "$new_hooks" \
+        --argjson known "$known" \
         --arg hdir "$hooks_dir" \
         '
-        # True if any hooks[].command in this entry references $hdir (= owned by us).
-        def is_ours:
-          [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
+        # Script basenames in $hdir that this entry runs ([] = foreign entry).
+        def our_scripts: [.hooks // [] | .[] | .command // ""
+                          | select(contains($hdir + "/"))
+                          | split($hdir + "/")[1:][] | split(" ")[0]
+                          | rtrimstr("\"") | rtrimstr("\u0027") | rtrimstr(";")] | unique;
 
-        # Merge a simple (non-Notification) event array:
-        # remove our old entries, append the new ones.
-        def merge_event(event_key):
-          if ($nh[event_key] // [] | length) == 0 then .
-          else
-            .hooks[event_key] = (
-              (.hooks[event_key] // [] | map(select(is_ours | not))) +
-              $nh[event_key]
-            )
-          end;
-
-        # Merge Notification, keyed by .matcher.
-        # Keeps: foreign entries (not ours) and our entries for matchers NOT being replaced.
-        # Replaces: our entries for matchers present in $nh.Notification.
-        def merge_notification:
-          if ($nh.Notification // [] | length) == 0 then .
-          else
-            ($nh.Notification | [.[].matcher]) as $our_matchers |
-            .hooks.Notification = (
-              (.hooks.Notification // [] | map(select(
-                (is_ours | not)
-                or
-                ((.matcher // "") as $m | ($our_matchers | any(.[]; . == $m)) | not)
-              ))) +
-              $nh.Notification
-            )
-          end;
-
-        merge_event("PreToolUse") |
-        merge_event("PermissionRequest") |
-        merge_event("PostToolUse") |
-        merge_notification |
-        merge_event("UserPromptSubmit") |
-        merge_event("Stop") |
-        merge_event("SubagentStop") |
-        merge_event("SessionEnd")
+        reduce ($nh | keys[]) as $ev (.;
+            ([$nh[$ev][] | our_scripts[]] | unique) as $rewired |
+            if ($nh[$ev] | length) == 0 then .
+            else
+                .hooks[$ev] = (
+                    (.hooks[$ev] // [] | map(select(
+                        our_scripts as $s |
+                        ($s | length) == 0 or
+                        ((($s - $rewired) == $s) and (($s - $known) | length) == 0)
+                    ))) + $nh[$ev]
+                )
+            end)
         '
 }
 
@@ -2306,11 +2347,13 @@ _merge_permissions_union() {
          (.permissions.ask // []) as $ex_ask |
          ($new_ask | map(select(. as $x | $ex_ask | any(.[]; . == $x) | not))) as $added_ask |
          del(.allowedTools, .disallowedTools) |
-         . + {permissions: {
+         # Only allow/deny/ask are ours: defaultMode, additionalDirectories
+         # and any other permissions key survive the merge.
+         .permissions = ((.permissions // {}) + {
              allow: ($ex_allow + $added_allow),
              deny:  ($ex_deny  + $added_deny),
              ask:   ($ex_ask   + $added_ask)
-         }}'
+         })'
 }
 
 # _merge_permissions_overwrite <current_settings_json> <new_allow_json> <new_deny_json> <new_ask_json>
@@ -2345,7 +2388,7 @@ _merge_permissions_overwrite() {
         --argjson disallowed "$new_deny" \
         --argjson ask        "$new_ask" \
         'del(.allowedTools, .disallowedTools) |
-         . + {permissions: {allow: $allowed, deny: $disallowed, ask: $ask}}'
+         .permissions = ((.permissions // {}) + {allow: $allowed, deny: $disallowed, ask: $ask})'
 }
 
 # =============================================================================
@@ -2426,7 +2469,7 @@ build_and_write_settings() {
             log_info "  - Notification (matchers: $(echo "$HOOKS_JSON" | jq -r '[.Notification // [] | .[].matcher] | join(", ")'))"
         fi
         if echo "$HOOKS_JSON" | jq -e '.Stop' >/dev/null 2>&1; then
-            log_info "  - UserPromptSubmit/Stop/SubagentStop/SessionEnd → spawn_producer_hook.py"
+            log_info "  - Stop: $(echo "$HOOKS_JSON" | jq -r --arg d "$GLOBAL_HOOKS_DIR/" '[.Stop[].hooks[].command | split($d)[1] | split(" ")[0]] | join(", ")')"
         fi
     fi
 
@@ -2450,7 +2493,7 @@ build_and_write_settings() {
     fi
 
     # Uninstall settings mutations (§4, 29-05)
-    if [[ -n "$UNINSTALL_SETTINGS_KEYS" || -n "$UNINSTALL_HOOK_EVENTS" || -n "$UNINSTALL_NOTIFICATION_MATCHERS" || "$UNINSTALL_PERMISSIONS_REMOVE" == true ]]; then
+    if [[ -n "$UNINSTALL_SETTINGS_KEYS" || -n "$UNINSTALL_HOOK_SCRIPTS" || "$UNINSTALL_PERMISSIONS_REMOVE" == true ]]; then
         log_info "Applying uninstall settings changes..."
         merged=$(_apply_uninstall_to_settings "$merged")
     fi
@@ -2689,43 +2732,37 @@ _apply_uninstall_to_settings() {
         fi
     done
 
-    # Remove our hook entries for uninstalled events
-    for event in $UNINSTALL_HOOK_EVENTS; do
+    # Remove our hook entries that run an uninstalled feature's scripts, on any
+    # event. Ownership is per script, not per event: amux and keep-awake both
+    # own Stop entries, and uninstalling one must leave the other's in place.
+    if [[ -n "$UNINSTALL_HOOK_SCRIPTS" ]]; then
+        local rm_scripts
+        rm_scripts=$(printf '%s\n' $UNINSTALL_HOOK_SCRIPTS | jq -R . | jq -s .)
         tmp_merged=$(echo "$merged" | jq \
-            --arg event "$event" \
+            --argjson rm "$rm_scripts" \
             --arg hdir "$GLOBAL_HOOKS_DIR" \
             '
-            def is_ours: [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
-            if (.hooks // {})[($event)] then
-                .hooks[$event] = [.hooks[$event][] | select(is_ours | not)]
-                | if (.hooks[$event] | length) == 0 then del(.hooks[$event]) else . end
+            def our_scripts: [.hooks // [] | .[] | .command // ""
+                              | select(contains($hdir + "/"))
+                              | split($hdir + "/")[1:][] | split(" ")[0]
+                              | rtrimstr("\"") | rtrimstr("\u0027") | rtrimstr(";")] | unique;
+            # Only arrays: a malformed event value is left alone, not fatal.
+            # Only an array this removal emptied is deleted.
+            if (.hooks | type) == "object" then
+                .hooks |= with_entries(
+                    if (.value | type) == "array" then
+                        (.value | map(select(our_scripts as $s | ($s - $rm) == $s))) as $kept |
+                        if ($kept | length) == 0 and (.value | length) > 0
+                        then .value = null else .value = $kept end
+                    else . end
+                ) | .hooks |= with_entries(select(.value != null))
             else . end
             ') || true
         if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
             merged="$tmp_merged"
-            log_info "  Removed hook entries for event: $event" >&2
+            log_info "  Removed hook entries for: $UNINSTALL_HOOK_SCRIPTS" >&2
         fi
-    done
-
-    # Remove Notification entries by matcher
-    for matcher in $UNINSTALL_NOTIFICATION_MATCHERS; do
-        tmp_merged=$(echo "$merged" | jq \
-            --arg matcher "$matcher" \
-            --arg hdir "$GLOBAL_HOOKS_DIR" \
-            '
-            def is_ours: [.hooks // [] | .[] | .command // ""] | any(.[]; contains($hdir));
-            if (.hooks // {}).Notification then
-                .hooks.Notification = [.hooks.Notification[] | select(
-                    (.matcher // "") != $matcher or (is_ours | not)
-                )]
-                | if (.hooks.Notification | length) == 0 then del(.hooks.Notification) else . end
-            else . end
-            ') || true
-        if [[ -n "$tmp_merged" ]] && echo "$tmp_merged" | jq empty 2>/dev/null; then
-            merged="$tmp_merged"
-            log_info "  Removed Notification matcher: $matcher" >&2
-        fi
-    done
+    fi
 
     # Remove permissions entries we added
     if [[ "$UNINSTALL_PERMISSIONS_REMOVE" == true ]]; then
@@ -2855,8 +2892,7 @@ TMUX_LIVE_STATUS="no running server"
 HOOKS_JSON='{}'
 # Uninstall tracking — populated by feature_<id>_uninstall, consumed by executor
 UNINSTALL_SETTINGS_KEYS=""         # space-separated settings keys to delete
-UNINSTALL_HOOK_EVENTS=""           # space-separated hook events to remove our entries from
-UNINSTALL_NOTIFICATION_MATCHERS="" # space-separated Notification matchers to remove
+UNINSTALL_HOOK_SCRIPTS=""          # space-separated hook script basenames whose entries to remove (any event)
 UNINSTALL_PERMISSIONS_REMOVE=false # whether to subtract permissions entries
 UNINSTALL_PERMISSIONS_ALLOW='[]'   # JSON array of allow entries to subtract
 UNINSTALL_PERMISSIONS_DENY='[]'    # JSON array of deny entries to subtract
