@@ -1291,11 +1291,17 @@ id()        { echo 424242; }
         self.assertTrue(any(c.startswith("loginctl enable-linger") for c in calls), calls)
 
     def test_disable_also_stops_the_unit(self):
+        # The caller's own XDG_RUNTIME_DIR must not decide the outcome: this
+        # passed from an agent's shell (none set) and failed from a login one.
+        setup = self._STUBS + (
+            'unset XDG_RUNTIME_DIR\n'
+            f'EXT_RUNTIME_DIR_BASE="{self.tmp_home}/no-runtime-dirs-here"\n'
+        )
         result = run_ext_call(
             self.tmp_home,
             'ext_systemd_disable "claude-questions-listen.service"',
             no_external=False,
-            extra_setup=self._STUBS,
+            extra_setup=setup,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -1778,6 +1784,56 @@ class TestPermissionsMerge(InstallerTestBase):
         # The project's .claude/settings.json has entries — at least one should be added
         self.assertGreater(len(allow), 0,
                            "Project allow entries must be added by union install")
+
+    #: What an unattended session needs to use async questions without a
+    #: prompt (task 48).  The shell rule is scoped to the one command.
+    QUESTION_TOOL_RULES = [
+        "mcp__questions__ask",
+        "mcp__questions__notify",
+        "mcp__questions__claim",
+        "mcp__questions__withdraw",
+        "Bash(claude-questions:*)",
+    ]
+
+    def test_question_tool_rules_reach_every_host(self):
+        """The allow rules for the question tools ship in the project config,
+        so the allowlist feature installs them wherever claude-hooks is
+        installed; they are recorded as added (so uninstall subtracts them)
+        and a second install adds nothing twice."""
+        _write_settings(self.tmp_home, self._settings_with_allow([]))
+        for _ in range(2):
+            result = run_installer(self.tmp_home,
+                                   extra_args=["--only", "permissions-allowlist"])
+            self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        allow = read_settings(self.tmp_home).get("permissions", {}).get("allow", [])
+        for rule in self.QUESTION_TOOL_RULES:
+            self.assertEqual(allow.count(rule), 1, rule)
+        # Scoped to the command: no rule lets a broader shell pattern through
+        # on the question tool's account.
+        shell_rules = [r for r in allow if "claude-questions" in r]
+        self.assertEqual(shell_rules, ["Bash(claude-questions:*)"])
+
+        # The second install added nothing; what the first added must still be
+        # on record, or uninstall would leave it behind.
+        added = read_manifest(self.tmp_home)["features"]["permissions-allowlist"]["added_allow"]
+        for rule in self.QUESTION_TOOL_RULES:
+            self.assertIn(rule, added)
+
+    def test_uninstall_after_a_reinstall_removes_what_was_added_and_only_that(self):
+        mine = "Bash(my-own-tool:*)"
+        _write_settings(self.tmp_home, self._settings_with_allow([mine]))
+        for _ in range(2):
+            result = run_installer(self.tmp_home,
+                                   extra_args=["--only", "permissions-allowlist"])
+            self.assertEqual(result.returncode, 0, result.stderr[:300])
+        result = run_installer(self.tmp_home, extra_args=["--uninstall", "permissions-allowlist"])
+        self.assertEqual(result.returncode, 0, result.stderr[:300])
+
+        allow = read_settings(self.tmp_home).get("permissions", {}).get("allow", [])
+        self.assertIn(mine, allow, "a rule the user had before is not the installer's to remove")
+        for rule in self.QUESTION_TOOL_RULES:
+            self.assertNotIn(rule, allow)
 
     def test_union_no_double_add(self):
         """

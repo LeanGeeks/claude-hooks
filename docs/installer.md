@@ -153,6 +153,24 @@ to install.
 - `~/.claude/settings.json` — `permissions.allow` and `permissions.deny` keys
   (union-mode: set-union with any existing entries, deduplicated;
    or overwrite-mode: full replacement — chosen at install time)
+- The rules come from this repository's `.claude/settings.json`.  Among them,
+  the ones an unattended session needs to use async questions without stopping
+  at a prompt (task 48):
+
+  ```
+  mcp__questions__ask        mcp__questions__notify
+  mcp__questions__claim      mcp__questions__withdraw
+  Bash(claude-questions:*)
+  ```
+
+  The shell rule covers the `claude-questions` command and nothing wider.
+  They belong to this feature, not to `questions`: every host that installs
+  the allowlist gets them, re-installing adds nothing twice, and uninstalling
+  the allowlist removes exactly the rules it added (they are recorded in the
+  manifest).  Note what they permit: in a workspace with
+  `[questions] sync = "push"`, `claim`, `withdraw` and `claude-questions
+  --sync` commit and push queue files without a prompt
+  (`docs/async-questions.md`, "Reliable ids").
 
 **`context-mcp`**
 - `~/.claude.json` — registers the `context-usage` MCP server

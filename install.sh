@@ -1345,6 +1345,16 @@ manifest_write() {
         state="${FEATURE_STATE[$id]:-skipped}"
         if [[ "$id" == "permissions-allowlist" && "$state" == "installed" ]]; then
             # Record union-mode additions so uninstall (29-05) can subtract exactly them.
+            # A re-install adds only what is new *this run*; what earlier runs
+            # added is carried forward from the manifest being replaced, or a
+            # second install would forget it and uninstall would leave it behind.
+            local prev_allow='[]' prev_deny='[]'
+            if [[ "${PERMISSIONS_ALLOWLIST_MODE:-union}" != "overwrite" && -f "$MANIFEST_FILE" ]]; then
+                prev_allow=$(jq -c '.features["permissions-allowlist"].added_allow // [] | if type == "array" then . else [] end' "$MANIFEST_FILE" 2>/dev/null || echo '[]')
+                prev_deny=$(jq -c '.features["permissions-allowlist"].added_deny // [] | if type == "array" then . else [] end' "$MANIFEST_FILE" 2>/dev/null || echo '[]')
+                [[ -n "$prev_allow" ]] || prev_allow='[]'
+                [[ -n "$prev_deny" ]] || prev_deny='[]'
+            fi
             features_json=$(echo "$features_json" | jq \
                 --arg  id           "$id" \
                 --arg  state        "$state" \
@@ -1352,7 +1362,11 @@ manifest_write() {
                 --arg  mode         "${PERMISSIONS_ALLOWLIST_MODE:-union}" \
                 --argjson added_allow "${PERMISSIONS_ADDED_ALLOW:-[]}" \
                 --argjson added_deny  "${PERMISSIONS_ADDED_DENY:-[]}" \
-                '. + {($id): {state: $state, at: $at, artifacts: [], options: {mode: $mode}, added_allow: $added_allow, added_deny: $added_deny}}')
+                --argjson prev_allow  "$prev_allow" \
+                --argjson prev_deny   "$prev_deny" \
+                '. + {($id): {state: $state, at: $at, artifacts: [], options: {mode: $mode},
+                              added_allow: (($prev_allow + $added_allow) | unique),
+                              added_deny:  (($prev_deny  + $added_deny)  | unique)}}')
         else
             # Build options JSON from sub-toggle states for this feature
             local opts_json="{}"
