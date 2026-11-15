@@ -228,6 +228,29 @@ def test_cancel_message_sends_final_text_when_given() -> None:
     assert captured["body"] == {"final_text": "<b>bye</b>"}
 
 
+def test_cancel_message_returns_how_the_final_text_was_shown() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"final_text_shown": "reply"})
+
+    rc = _make_client(handler)
+    try:
+        assert rc.cancel_message(9, final_text="bye") == {"final_text_shown": "reply"}
+    finally:
+        rc.close()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [httpx.Response(200, json={}), httpx.Response(200), httpx.Response(200, json=[1])],
+)
+def test_cancel_message_returns_empty_dict_for_an_older_relay(response) -> None:
+    rc = _make_client(lambda request: response)
+    try:
+        assert rc.cancel_message(9, final_text="bye") == {}
+    finally:
+        rc.close()
+
+
 # ---- wait_for_answer -------------------------------------------------------
 
 

@@ -14,7 +14,7 @@ from relay_server.config import RelayConfig, load_config
 from relay_server.db import connect
 from relay_server.reaper import _row_nudge_schedule
 from relay_server.render import TAG, TAG_LINE, TELEGRAM_TEXT_LIMIT
-from relay_server.telegram_backend import FakeTelegramBackend
+from relay_server.telegram_backend import FakeTelegramBackend, TelegramApiError
 
 from tests.conftest import _run_lifespan, make_test_config  # type: ignore[attr-defined]
 
@@ -227,6 +227,229 @@ async def test_no_final_text_traffic_identical_to_legacy(
     assert [method for method, _text, _kb in traffic] == ["edit_message", "edit_reply_markup"]
     assert all(kb is None for _method, _text, kb in traffic)
     assert "#unanswered" not in (traffic[0][1] or "")
+
+
+# ---- a question without buttons -------------------------------------------
+#
+# No keyboard + a typed answer wanted is sent with Telegram's force_reply
+# prompt, and Telegram refuses every edit of such a message ("message can't be
+# edited"). FakeTelegramBackend refuses them the same way.
+
+
+def _free_text(text: str = "What colour?", **extra: object) -> dict:
+    return {
+        "kind": "question", "text": text, "keyboard": None,
+        "reply_required": True, "ttl_sec": 600, **extra,
+    }
+
+
+async def _create_free_text(client, seeded, **extra) -> int:
+    r = await client.post(
+        "/v1/messages", headers=_auth(seeded), json=_free_text(**extra)
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["message_id"]
+
+
+@pytest.mark.asyncio
+async def test_question_without_buttons_cannot_be_edited(
+    app_client, seeded, backend, db_path
+) -> None:
+    """The premise of this section, pinned: the PATCH a client used to send
+    first is refused, and leaves the message open."""
+    mid = await _create_free_text(app_client, seeded)
+    assert backend.sent[-1].message_id in backend.uneditable
+    r = await app_client.patch(
+        f"/v1/messages/{mid}", headers=_auth(seeded), json={"text": "Withdrawn"}
+    )
+    assert r.status_code == 502
+    assert _row(db_path, mid)["state"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_question_without_buttons_closes_it_and_replies(
+    app_client, seeded, backend, db_path
+) -> None:
+    mid = await _create_free_text(
+        app_client, seeded, nudge_schedule="1d,3d", escalate_after_sec=3600,
+        escalate_to_token=seeded["token"],
+    )
+    tg_id = backend.sent[-1].message_id
+    before = _row(db_path, mid)
+    assert before["next_nudge_at"] is not None and before["escalate_at"] is not None
+
+    end = "<b>Withdrawn</b> - went ahead"
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded), json={"final_text": end}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"final_text_shown": "reply"}
+
+    row = _row(db_path, mid)
+    assert row["state"] == "cancelled"
+    assert row["next_nudge_at"] is None, "no reminder may fire for a closed row"
+    assert json.loads(row["payload_json"])["text"] == end
+    # The human is told under the original, since it cannot be edited.
+    assert [(rp.reply_to_message_id, rp.text) for rp in backend.replies] == [(tg_id, end)]
+
+    # Closed means closed: a second cancel is a quiet success and says nothing
+    # in the chat a second time.
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded), json={"final_text": end}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"final_text_shown": "already_closed"}
+    assert len(backend.replies) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_question_without_buttons_is_not_escalated_or_nudged(
+    app_client, seeded, backend, db_path
+) -> None:
+    """What the caller relies on: after the cancel neither the reminder pass
+    nor the escalation pass has anything to pick up."""
+    mid = await _create_free_text(
+        app_client, seeded, nudge_schedule="1d,3d", escalate_after_sec=3600,
+        escalate_to_token=seeded["token"],
+    )
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "Withdrawn"},
+    )
+    assert r.status_code == 200
+    conn = connect(db_path)
+    try:
+        due = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE state = 'open'"
+            " AND (next_nudge_at IS NOT NULL OR escalate_at IS NOT NULL)"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert due == 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_question_without_buttons_reaches_the_escalated_copy(
+    app_client, seeded, backend, db_path
+) -> None:
+    mid = await _create_free_text(app_client, seeded)
+    cid = _add_child(db_path, seeded, mid, tg_id=5010)
+    end = "<b>Withdrawn</b>"
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded), json={"final_text": end}
+    )
+    assert r.status_code == 200
+    assert _row(db_path, cid)["state"] == "cancelled"
+    # The copy is an ordinary message: it is edited, not replied to.
+    assert ("edit_message", 5010, end) in _cancel_calls(backend, 5010)
+    assert [rp.reply_to_message_id for rp in backend.replies] == [
+        backend.sent[-1].message_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plain_cancel_of_question_without_buttons_is_quiet(
+    app_client, seeded, backend, db_path
+) -> None:
+    """No ``final_text`` = nothing to tell the human: no reply, no error."""
+    mid = await _create_free_text(app_client, seeded)
+    r = await app_client.post(f"/v1/messages/{mid}/cancel", headers=_auth(seeded))
+    assert r.status_code == 200, r.text
+    assert r.json() == {}
+    assert _row(db_path, mid)["state"] == "cancelled"
+    assert backend.replies == []
+
+
+@pytest.mark.asyncio
+async def test_cancel_of_answered_question_without_buttons_is_a_success(
+    app_client, seeded, backend, db_path
+) -> None:
+    """A withdrawal retried after the human answered: nothing to change, and
+    in particular not a 502 for a keyboard that was never there."""
+    mid = await _create_free_text(app_client, seeded)
+    conn = connect(db_path)
+    with conn:
+        conn.execute("UPDATE messages SET state='answered' WHERE id=?", (mid,))
+    conn.close()
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "late"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"final_text_shown": "already_closed"}
+    assert _row(db_path, mid)["state"] == "answered"
+    assert backend.replies == []
+
+
+@pytest.mark.asyncio
+async def test_failed_reply_does_not_fail_the_cancel(
+    app_client, seeded, backend, db_path
+) -> None:
+    mid = await _create_free_text(app_client, seeded)
+
+    async def _raise(**_kwargs):
+        raise RuntimeError("telegram is down")
+
+    backend.send_reply = _raise  # type: ignore[method-assign]
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "Withdrawn"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"final_text_shown": "refused"}
+    assert _row(db_path, mid)["state"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_final_text_on_question_with_buttons_reports_edit(
+    app_client, seeded, backend, db_path
+) -> None:
+    mid = await _create(app_client, seeded)
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "Withdrawn"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"final_text_shown": "edit"}
+    assert backend.replies == []
+
+
+@pytest.mark.asyncio
+async def test_final_text_edit_that_fails_for_a_passing_reason_reports_failed(
+    app_client, seeded, backend, db_path
+) -> None:
+    """Not "can't be edited": the message is editable and Telegram stumbled.
+    The row is closed all the same, and the caller is told the text did not
+    land so it can send it again."""
+    mid = await _create(app_client, seeded)
+
+    async def _raise(**_kwargs):
+        raise TelegramApiError(500, "Internal Server Error")
+
+    backend.edit_message = _raise  # type: ignore[method-assign]
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "Withdrawn"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json() == {"final_text_shown": "failed"}
+    assert _row(db_path, mid)["state"] == "cancelled"
+    assert backend.replies == [], "a reply is only for a message that cannot be edited"
+
+
+@pytest.mark.asyncio
+async def test_final_text_on_already_cancelled_row_reports_already_closed(
+    app_client, seeded, backend, db_path
+) -> None:
+    mid = await _create(app_client, seeded)
+    r = await app_client.post(f"/v1/messages/{mid}/cancel", headers=_auth(seeded))
+    assert r.status_code == 200
+    r = await app_client.post(
+        f"/v1/messages/{mid}/cancel", headers=_auth(seeded),
+        json={"final_text": "Withdrawn"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"final_text_shown": "already_closed"}
 
 
 # ---- nudge_message_max -----------------------------------------------------

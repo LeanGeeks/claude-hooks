@@ -67,6 +67,7 @@ from .telegram_backend import (
     TelegramApiError,
     TelegramBackend,
     TelegramForbidden,
+    is_not_editable as _is_not_editable,
     is_not_modified as _is_not_modified,
 )
 from .tokens import hash_token
@@ -916,6 +917,30 @@ def create_app(
             raise HTTPException(status_code=409, detail="not_bound")
         return Response(status_code=204)
 
+    async def _reply_final_text(
+        backend: TelegramBackend, row: sqlite3.Row, text: str, message_id: int
+    ) -> bool:
+        """Post *text* as a reply under a message Telegram will not edit.
+
+        Best-effort like the edit it stands in for: the row is already closed,
+        so a failed send is logged and reported, never raised.
+        """
+        try:
+            await backend.send_reply(
+                chat_id=int(row["telegram_chat_id"]),
+                text=text,
+                reply_to_message_id=int(row["telegram_message_id"]),
+            )
+            return True
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "cancel_message: could not post the final text under %s"
+                " (best-effort, continuing)",
+                message_id,
+                exc_info=True,
+            )
+            return False
+
     async def _cancel_final_text(request: Request) -> str | None:
         """Parse the cancel call's optional ``{"final_text": ...}`` body."""
         raw = await request.body()
@@ -983,7 +1008,20 @@ def create_app(
                 return cur.rowcount
 
         flipped = await run_in_thread(_cancel)
+        # What became of the caller's ``final_text`` in the chat. Reported back
+        # only to a caller that sent one:
+        #   "edit"            the message itself now reads that way
+        #   "reply"           Telegram refuses every edit of this message, so
+        #                     the text went out as a reply under it
+        #   "refused"         as "reply", but the reply could not be sent
+        #   "failed"          the edit failed for another reason; the caller
+        #                     may send the text again with a PATCH
+        #   "already_closed"  this call did not close the row (it was already
+        #                     cancelled, answered or expired), so the text it
+        #                     had was deliberately left alone
+        shown = "already_closed"
         if flipped:
+            shown = "failed"
             # Drop the tag by re-rendering the canonical body. Re-read *after*
             # the flip: the row loaded above still says 'open' and would render
             # the tag straight back on. Best-effort — a failed edit must never
@@ -1000,9 +1038,25 @@ def create_app(
                         text=body_text,
                         keyboard=None,
                     )
+                    shown = "edit"
                 except TelegramApiError as exc:
-                    # An already-untagged body is the common case, not a fault.
-                    if not _is_not_modified(exc):
+                    if _is_not_modified(exc):
+                        # An already-untagged body is the common case, not a
+                        # fault: the message reads the way the caller wants.
+                        shown = "edit"
+                    elif _is_not_editable(exc):
+                        # A question with no buttons went out with Telegram's
+                        # force_reply prompt, and Telegram never lets a bot edit
+                        # such a message. With a ``final_text`` the human must
+                        # still learn the question is closed, so say it under
+                        # the original. Without one there is nothing to say: the
+                        # edit would only have re-rendered the same body.
+                        shown = "refused"
+                        if end_text is not None and await _reply_final_text(
+                            backend, fresh, body_text, message_id
+                        ):
+                            shown = "reply"
+                    else:
                         logger.warning(
                             "cancel_message: telegram rejected text edit for"
                             " %s: %s",
@@ -1055,7 +1109,14 @@ def create_app(
             # cancel to flip the state. That second call *always* lands here on
             # the happy path, so treating it as an error made every finalize
             # log a 500 while behaving perfectly — see 15-07's error-log delta.
-            if not _is_not_modified(exc):
+            #
+            # "message can't be edited" is the same success in other clothes: a
+            # message sent with the force_reply prompt (a question with no
+            # buttons) carries no inline keyboard, and Telegram refuses every
+            # edit of it. The row is closed and its reminders are gone, which is
+            # what the caller asked for; a 502 here told callers the cancel had
+            # failed when it had not.
+            if not (_is_not_modified(exc) or _is_not_editable(exc)):
                 waiters.notify(message_id)
                 logger.warning(
                     "cancel_message: telegram rejected keyboard strip for %s: %s",
@@ -1064,6 +1125,8 @@ def create_app(
                 )
                 raise HTTPException(status_code=502, detail="telegram_error")
         waiters.notify(message_id)
+        if end_text is not None:
+            return {"final_text_shown": shown}
         return {}
 
     @app.get("/v1/messages/{message_id}/answer")

@@ -291,17 +291,33 @@ class RelayClient:
         resp = self._request("DELETE", f"/v1/messages/{message_id}")
         self._raise_for_error(resp)
 
-    def cancel_message(self, message_id: int, final_text: str | None = None) -> None:
+    def cancel_message(
+        self, message_id: int, final_text: str | None = None
+    ) -> dict[str, Any]:
         """Cancel a message; ``final_text`` is the body the chat should end on.
 
         The JSON body is sent only when ``final_text`` is given, so an older
         relay (which ignores bodies) and every existing caller behave as before.
+
+        Returns the relay's reply. With ``final_text`` a current relay answers
+        ``{"final_text_shown": ...}``: ``"edit"`` (the message was edited),
+        ``"reply"`` (Telegram refuses to edit it, so the text was posted as a
+        reply under it), ``"refused"`` (as before, but the reply could not be
+        sent), ``"failed"`` (the edit failed for another reason; a PATCH may
+        still deliver the text) or ``"already_closed"`` (the message was closed
+        before this call and its text was left alone). An older relay answers
+        ``{}``.
         """
         kwargs: dict[str, Any] = {}
         if final_text is not None:
             kwargs["json_body"] = {"final_text": final_text}
         resp = self._request("POST", f"/v1/messages/{message_id}/cancel", **kwargs)
         self._raise_for_error(resp)
+        try:
+            data = resp.json()
+        except Exception:  # noqa: BLE001 — an empty or non-JSON body is "{}"
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def get_answers(
         self,

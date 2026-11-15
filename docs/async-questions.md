@@ -121,9 +121,30 @@ is refused and changes nothing:
 | answered / resolved / any other status | `withdrawn: false`, `status` = what it found |
 | no such id, or two entries with that id | `withdrawn: false`, `error` |
 
-**A failed relay call** leaves a withdrawn entry whose buttons are still live:
-`relay_cancelled: false` plus an `error`.  Run the withdrawal again — the second
-row of the table is the retry.
+**`relay_cancelled`** says whether the message is closed on the relay.  True
+means no reminder and no escalation will fire for it, and a tap or a reply no
+longer counts as an answer.  That is the fact to act on; how the chat shows the
+withdrawal comes second and is reported in `note` (the text was posted as a
+reply, could not be shown, or the message was already closed and was left as it
+was).
+
+**A failed relay call** leaves a withdrawn entry whose message is still live
+(buttons, reminders, escalation): `relay_cancelled: false` plus an `error`.  Run
+the withdrawal again — the second row of the table is the retry.
+
+**A question without options** cannot be edited once sent: Telegram refuses
+every edit of a message that went out with its reply prompt, which is how a
+question asking for a typed answer is sent.  The withdrawal still closes it on
+the relay, and the withdrawn text is posted as a reply under the question
+instead of replacing it.  The result says so in `note`.  An escalated copy is an
+ordinary message and is edited as usual.  Against a relay from before this was
+handled, the message is still closed and `relay_cancelled` is true, but the chat
+keeps the original text; `note` says that too.
+
+**A message that was already closed** when the withdrawal reached the relay
+(the human answered a moment earlier, or an earlier attempt had cancelled it)
+keeps the text it has: it may be the answer.  `relay_cancelled` is true and
+`note` says the message was already closed.
 
 **An answer that races the withdrawal.**  The file decides, and nothing is ever
 discarded:

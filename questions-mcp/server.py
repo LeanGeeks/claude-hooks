@@ -166,10 +166,15 @@ def withdraw(
         status          — the status word now on the entry
         file            — queue-file path relative to the workspace root
         message_id      — relay message id, when the question was dispatched
-        relay_cancelled — true when the Telegram message lost its buttons
+        relay_cancelled — true when the message is closed on the relay: no
+                          reminder and no escalation will fire for it, and a
+                          tap or reply no longer counts as an answer
         sync            — present only when the workspace has git sync on
         note            — present when there is something to know that is not
-                          an error ("already withdrawn", "never dispatched")
+                          an error ("already withdrawn", "never dispatched", or
+                          that the withdrawal was posted as a reply because
+                          Telegram does not let a question without buttons be
+                          edited)
         error           — present only when something went wrong
     """
     return _dumps(lib.withdraw(reason=reason, id=id, message_id=message_id))

@@ -105,9 +105,13 @@ Rules worth knowing:
 - If an answer arrives *after* the withdrawal, it is kept: recorded under the
   entry as a **late answer**, status unchanged.  Look for it before assuming a
   withdrawn question has nothing to say.
+- `relay_cancelled: true` means no reminder and no escalation will fire for the
+  question any more.  A `note` beside it is information, not a failure (for
+  example: a question without options cannot be edited in Telegram, so the
+  withdrawal was posted as a reply under it).
 - `relay_cancelled: false` with an `error` means the file is withdrawn but
-  Telegram could not be reached.  Call `withdraw` again later with the same id;
-  it changes nothing in the file and retries the Telegram side.
+  the message is still live in Telegram.  Call `withdraw` again later with the
+  same id; it changes nothing in the file and retries the Telegram side.
 - For a `notify(ack=True)` that has gone stale, pass its `message_id` instead of
   an `id`.
 

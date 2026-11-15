@@ -1928,6 +1928,7 @@ class TestListenerAndOpsWithGit(GitSyncTestCase):
 
             def cancel_message(self, mid, final_text=None):
                 calls.append(("cancel", mid))
+                return {"final_text_shown": "edit"}
 
         bindings = qops.roles_config.Bindings(
             server_url="http://relay.test", default_token="rly_default_token",
@@ -1944,7 +1945,7 @@ class TestListenerAndOpsWithGit(GitSyncTestCase):
             )
         self.assertTrue(result["withdrawn"], result)
         self.assertTrue(result["relay_cancelled"], result)
-        self.assertEqual(calls, [("edit", 4187), ("cancel", 4187)])
+        self.assertEqual(calls, [("cancel", 4187)])
         self.assertTrue(result["sync"]["pushed"])
         self.assertEqual(result["sync"]["mode"], "push")
         self.assertEqual(self.remote_log()[0], "chore(questions): withdraw Q-002")

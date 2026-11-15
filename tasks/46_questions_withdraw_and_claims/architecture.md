@@ -418,7 +418,9 @@ into the checkout and committed inside a question's commit.
   1. `questions_git.run(store, lambda s: s.withdraw(…), summary="withdraw <id>")`
   2. `withdrawn` or `already_withdrawn` → resolve the token from the index entry
      (fallback: the entry's role through the role catalog) and call
-     `edit_message(text)` then `cancel_message(final_text=text)`.
+     `cancel_message(final_text=text)`; `edit_message(text)` follows only for a
+     relay that does not report how the text was shown (task 49 reversed the
+     original order, in which a refused edit kept the cancel from being sent).
   3. Return the brd §4 shape. `relay_cancelled` is false with an `error` when the
      relay call failed; calling again retries it (brd D4).
 

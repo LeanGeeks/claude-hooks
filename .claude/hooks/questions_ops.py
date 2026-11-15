@@ -15,11 +15,14 @@ Order of work in :func:`withdraw` — the file first, the relay second:
 
 1. ``questions_store.withdraw`` through ``questions_git.run``.  The file is the
    durable act and the one that decides a race with an answer (brd D5).
-2. ``PATCH`` the Telegram message to the withdrawn text, then ``cancel`` it —
+2. ``cancel`` the Telegram message on the relay, with the withdrawn text —
    which strips the keyboard, retires the nudge ladder, prevents escalation and
-   (relay ≥ task 46-01) does the same to an escalated copy.
+   (relay ≥ task 46-01) does the same to an escalated copy.  The cancel is the
+   act; the text is a courtesy Telegram may refuse (it never lets a bot edit a
+   question sent without buttons), so a refused edit never fails a withdrawal
+   (task 49, see ``_relay_withdraw``).
 
-A relay failure leaves a withdrawn entry whose buttons are still live; calling
+A relay failure leaves a withdrawn entry whose message is still live; calling
 ``withdraw`` again is a no-op on the file and retries the relay (brd D4).
 """
 
@@ -128,14 +131,103 @@ def _role_of_file(store: qs.QuestionsStore, rel_path: str) -> str | None:
     return None
 
 
-def _relay_withdraw(client: Any, message_id: int, text: str) -> None:
-    """PATCH the text, then cancel.  Raises whatever the client raises."""
-    client.edit_message(message_id, text=text)
+_NOTE_REPLIED = (
+    "Telegram does not let a bot edit a question that was sent without buttons, "
+    "so the withdrawal was posted as a reply under it."
+)
+_CLOSED = "the relay closed the message, so its reminders and escalation are cancelled, "
+_NOTE_REFUSED = _CLOSED + (
+    "but the chat still shows the original text: Telegram does not let a bot "
+    "edit a question that was sent without buttons, and the reply that should "
+    "have said so under it could not be sent."
+)
+_NOTE_ALREADY_CLOSED = (
+    "the message was already closed on the relay (cancelled, answered or expired) "
+    "before this call, so no reminder or escalation is pending and its text was "
+    "left as it was."
+)
+_NOTE_502 = _CLOSED + (
+    "but Telegram refused to change the message itself (the relay answered 502), "
+    "so the chat may still show the original text.  A question sent without "
+    "buttons can never be edited; this relay does not yet post the withdrawal "
+    "as a reply instead."
+)
+
+
+def _closed_on_relay(client: Any, message_id: int) -> bool:
+    """True when the relay says the message can no longer be answered.
+
+    A closed message (cancelled, answered or expired) has no reminder and no
+    escalation left, whatever the last call's status was.  Any doubt is False.
+    """
     try:
-        client.cancel_message(message_id, final_text=text)
-    except TypeError:
-        # A relay client from before task 46-01 has no ``final_text``.
-        client.cancel_message(message_id)
+        answer = client.wait_for_answer(message_id, timeout=1.0, long_poll_chunk=1)
+    except Exception:  # noqa: BLE001 — unknown is "not known to be closed"
+        return False
+    return getattr(answer, "state", None) in ("cancelled", "answered", "expired")
+
+
+def _send_text(client: Any, message_id: int, text: str) -> str:
+    """PATCH the withdrawn text onto a message the relay has already closed.
+
+    Returns a note; "" when the message now reads withdrawn.  Never raises: the
+    cancel stands whatever becomes of the text.
+    """
+    try:
+        client.edit_message(message_id, text=text)
+    except Exception as exc:  # noqa: BLE001
+        return _CLOSED + f"but its text could not be updated: {exc}"
+    return ""
+
+
+def _relay_withdraw(client: Any, message_id: int, text: str) -> str:
+    """Cancel the message on the relay and make the chat say so.
+
+    Returns a note for the caller ("" when the message itself now reads
+    withdrawn).  Raises what the client raises when the message is **not**
+    closed on the relay: that, and only that, is a failed cancel.
+
+    The cancel goes first and carries the text.  It is the act that matters:
+    it takes the reminders, the escalation and any escalated copy with it.  The
+    text is a courtesy on top, and Telegram can refuse it: a question with no
+    buttons is sent with a reply prompt, and a bot may never edit such a
+    message.  So a refused edit never decides the outcome.
+
+    Three relays are possible:
+
+    * current: says what became of the text (``final_text_shown``, see
+      ``RelayClient.cancel_message``).  Only ``"failed"`` (an edit that failed
+      for a passing reason) is followed by an edit of our own.
+    * from before that reply existed: answers ``{}``, or 502 on a message it
+      cannot edit although it closed it.  Ask whether the message is closed.
+    * from before task 46-01: ignores the text (or its client has no
+      ``final_text``), so the text is sent as a separate edit afterwards.
+    """
+    reply: Any = None
+    try:
+        try:
+            reply = client.cancel_message(message_id, final_text=text)
+        except TypeError:
+            # A relay client from before task 46-01 has no ``final_text``.
+            reply = client.cancel_message(message_id)
+    except Exception as exc:  # noqa: BLE001 — re-raised unless the relay closed it
+        if getattr(exc, "status_code", None) != 502 or not _closed_on_relay(client, message_id):
+            raise
+        # No edit of our own: Telegram has just refused one.
+        return _NOTE_502
+
+    shown = reply.get("final_text_shown") if isinstance(reply, dict) else None
+    if shown == "edit":
+        return ""
+    if shown == "reply":
+        return _NOTE_REPLIED
+    if shown == "refused":
+        return _NOTE_REFUSED
+    if shown == "already_closed":
+        # Its text may be an answer someone gave; it is not ours to replace.
+        return _NOTE_ALREADY_CLOSED
+    # "failed", or no word on the text at all (an older relay): send it.
+    return _send_text(client, message_id, text)
 
 
 def _relay_failure(exc: BaseException, role: str | None) -> str:
@@ -216,10 +308,12 @@ def withdraw(
             out["error"] = f"no installation token for role '{entry.role}' on this machine."
             return out
         try:
-            _relay_withdraw(client_for(token), int(mid), withdrawn_text("", reason, None, workspace_id))
+            note = _relay_withdraw(client_for(token), int(mid), withdrawn_text("", reason, None, workspace_id))
         except Exception as exc:  # noqa: BLE001 — reported, retryable
             out["error"] = f"relay cancel failed: {_relay_failure(exc, entry.role)}"
             return out
+        if note:
+            out["note"] = note
         out["withdrawn"] = True
         out["relay_cancelled"] = True
         return out
@@ -287,13 +381,16 @@ def withdraw(
         return out
     text = withdrawn_text(result.title, reason, result.qid, workspace_id)
     try:
-        _relay_withdraw(client_for(token), int(mid), text)
+        note = _relay_withdraw(client_for(token), int(mid), text)
     except Exception as exc:  # noqa: BLE001 — reported, retryable
         out["error"] = (
             "withdrawn in the file, but the relay cancel failed — the Telegram "
-            f"buttons are still live.  {_relay_failure(exc, role)}"
+            "message is still live (buttons, reminders and escalation).  "
+            f"{_relay_failure(exc, role)}"
         )
         return out
+    if note:
+        out["note"] = (out["note"] + "  " if out.get("note") else "") + note
     out["relay_cancelled"] = True
     return out
 

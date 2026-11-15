@@ -67,6 +67,21 @@ def is_not_modified(exc: TelegramApiError) -> bool:
     return "not modified" in (exc.description or "").lower()
 
 
+def is_not_editable(exc: TelegramApiError) -> bool:
+    """True for Telegram's "message can't be edited" 400.
+
+    Telegram refuses every edit (text and reply markup alike) of a message a
+    bot sent with a reply markup that is not an inline keyboard. The relay
+    sends exactly that for a question with no buttons: the ``force_reply``
+    prompt of :meth:`HttpTelegramBackend.send_message`. Such a message has no
+    inline keyboard to strip, so for a keyboard strip this is the success case;
+    for a text edit it means the text has to be shown some other way.
+
+    Matched on the description, like :func:`is_not_modified`.
+    """
+    return "message can't be edited" in (exc.description or "").lower()
+
+
 @dataclass
 class SentMessage:
     chat_id: int
@@ -180,7 +195,16 @@ class FakeTelegramBackend:
     # ordinary ``sent`` shape has no room for, and the reaper tests assert on
     # both the target and the text.
     replies: list[SentReply] = field(default_factory=list)
+    # Telegram message ids sent with the ``force_reply`` prompt (no buttons, a
+    # typed answer wanted). The real Bot API refuses every edit of those with
+    # "message can't be edited"; the fake does the same so no test can pass on
+    # an edit the chat would never show.
+    uneditable: set[int] = field(default_factory=set)
     _ids: itertools.count = field(default_factory=lambda: itertools.count(1000))
+
+    def _refuse_edit_of_force_reply(self, telegram_message_id: int) -> None:
+        if telegram_message_id in self.uneditable:
+            raise TelegramApiError(400, "Bad Request: message can't be edited")
 
     async def send_message(
         self,
@@ -215,6 +239,10 @@ class FakeTelegramBackend:
                 reply_required=reply_required,
             )
         )
+        # Mirrors HttpTelegramBackend.send_message: no buttons + a typed answer
+        # wanted = the force_reply prompt.
+        if not keyboard and reply_required and force_reply:
+            self.uneditable.add(tg_id)
         return tg_id
 
     async def send_text(self, *, chat_id: int, text: str) -> None:
@@ -267,6 +295,7 @@ class FakeTelegramBackend:
                 },
             )
         )
+        self._refuse_edit_of_force_reply(telegram_message_id)
 
     async def delete_message(
         self, *, chat_id: int, telegram_message_id: int
@@ -300,6 +329,7 @@ class FakeTelegramBackend:
                 },
             )
         )
+        self._refuse_edit_of_force_reply(telegram_message_id)
 
     async def answer_callback_query(
         self, *, callback_query_id: str, text: str | None = None
