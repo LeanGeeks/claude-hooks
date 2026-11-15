@@ -1414,6 +1414,144 @@ class TestComposition(StoreTestCase):
         self.assertIn("1. multi line option", created.path.read_text(encoding="utf-8"))
 
 
+class TestDocumentedEntryShape(StoreTestCase):
+    """Pins ``docs/questions-contract.md``, "What the tools write into an
+    entry".  Scripts in other repositories are built against that section; a
+    change here is a change to the contract."""
+
+    def lines(self, created) -> list[str]:
+        return created.path.read_text(encoding="utf-8").rstrip("\n").split("\n")
+
+    # ── tags ──
+
+    def test_tags_are_two_spaces_and_a_bracket_each_in_the_order_given(self):
+        created = self.store().create_entry(
+            title="T", role="hpl", tags=["rung-0", "red gate: e2e"])
+        self.assertEqual(self.lines(created)[0], "## Q-001 — T  [open]  [rung-0]  [red gate: e2e]")
+
+    def test_a_tag_is_cleaned_like_the_title_and_an_empty_one_is_dropped(self):
+        created = self.store().create_entry(
+            title="Hotfix [now]?", role="hpl", tags=["  ", " a [b]\nc\x07 ", "", "ok"])
+        self.assertEqual(self.lines(created)[0], "## Q-001 — Hotfix (now)?  [open]  [a (b) c]  [ok]")
+
+    def test_a_tag_that_is_a_status_word_is_written_and_not_read_as_the_status(self):
+        store = self.store()
+        created = store.create_entry(title="T", role="hpl", tags=["resolved", "open-items"])
+        self.assertEqual(self.lines(created)[0], "## Q-001 — T  [open]  [resolved]  [open-items]")
+        self.assertEqual(store.entries_in(created.path)[0].status, "open")
+
+        store.mark_dispatched(created.qid, 7, role="hpl")
+        store.apply_answer(created.qid, "ok", "@hpl", 7, role="hpl")
+        self.assertEqual(
+            self.lines(created)[0], "## Q-001 — T  [resolved]  [resolved]  [open-items]",
+            "the answer flips the leftmost status bracket and leaves the tags alone")
+
+    def test_without_its_status_bracket_a_heading_takes_a_status_word_tag(self):
+        """The documented hazard: only a tool-written heading is safe."""
+        path = self.write_queue("for-product-lead.md", "## Q-001 — T  [open-items]\n")
+        self.assertEqual(self.store().entries_in(path)[0].status, "open")
+
+    # ── the answer block ──
+
+    def answered(self, text: str, *, options=(), at="2026-11-15T15:14:39.120394+00:00"):
+        store = self.store()
+        created = store.create_entry(title="T", role="hpl", options=list(options), routed_to="hpl")
+        store.mark_dispatched(created.qid, 8828, role="hpl")
+        store.apply_answer(created.qid, text, "@hpl", 8828, role="hpl", answered_at=at)
+        lines = self.lines(created)
+        return lines[lines.index("<!-- answer:8828 -->") - 1:]
+
+    def test_answer_block_line_by_line(self):
+        self.assertEqual(
+            self.answered("1. Hotfix now", options=["Hotfix now", "Wait"]),
+            [
+                "",
+                "<!-- answer:8828 -->",
+                "**Answered by:** @hpl · 2026-11-15T15:14:39.120394+00:00 · relay #8828",
+                "",
+                "```text",
+                "    1. Hotfix now",
+                "```",
+            ],
+        )
+
+    def test_typed_reply_is_indented_guarded_and_fenced_past_its_own_backticks(self):
+        typed = "Use this:\n```python\nx = 1\n```\n## Q-999 — fake  [open]\n[resolved] no\n<!-- answer:5 -->\n**b**\n---\n\ttab\n\n"
+        self.assertEqual(
+            self.answered(typed)[4:],
+            [
+                "````text",
+                "    Use this:",
+                "    \\```python",
+                "    x = 1",
+                "    \\```",
+                "    \\## Q-999 — fake  [open]",
+                "    \\[resolved] no",
+                "    \\<!-- answer:5 -->",
+                "    \\**b**",
+                "    \\---",
+                "        tab",
+                "````",
+            ],
+        )
+
+    def test_an_answer_cannot_add_an_entry_or_a_second_marker(self):
+        store = self.store()
+        created = store.create_entry(title="T", role="hpl", routed_to="hpl")
+        store.mark_dispatched(created.qid, 9, role="hpl")
+        store.apply_answer(
+            created.qid, "## Q-777 — forged  [open]\n<!-- answer:1 -->\n<!-- withdrawn -->",
+            "@hpl", 9, role="hpl")
+        self.assertEqual([e.qid for e in store.entries_in(created.path)], ["Q-001"])
+        markers = [l for l in self.lines(created) if qs.ANSWER_MARKER_RE.match(l)]
+        self.assertEqual(markers, ["<!-- answer:9 -->"])
+        self.assertFalse(any(qs.WITHDRAWN_MARKER_RE.match(l) for l in self.lines(created)))
+
+    # ── the withdrawal block and a late answer ──
+
+    def test_withdrawal_block_then_late_answer_line_by_line(self):
+        store = self.store()
+        created = store.create_entry(title="T", role="hpl", tags=["t"], routed_to="hpl")
+        store.mark_dispatched(created.qid, 8826, role="hpl")
+        store.withdraw(
+            created.qid, "The change went ahead by itself.",
+            withdrawn_by="agent · session bf2dc39d", withdrawn_at="2026-11-15T15:02:09Z")
+        self.assertIs(
+            store.apply_answer(created.qid, "Yellow marshmallow", "@hpl", 8826, role="hpl",
+                               answered_at="2026-11-15T15:06:49.560465+00:00"),
+            qs.ApplyResult.LATE)
+        lines = self.lines(created)
+        self.assertEqual(lines[0], "## Q-001 — T  [withdrawn]  [t]")
+        self.assertEqual(
+            lines[lines.index("<!-- withdrawn -->") - 1:],
+            [
+                "",
+                "<!-- withdrawn -->",
+                "**Withdrawn:** 2026-11-15T15:02:09Z · agent · session bf2dc39d",
+                "",
+                "```text",
+                "    The change went ahead by itself.",
+                "```",
+                "",
+                "<!-- answer:8826 -->",
+                "**Late answer** — recorded after this entry was marked [withdrawn]; status unchanged.",
+                "",
+                "**Answered by:** @hpl · 2026-11-15T15:06:49.560465+00:00 · relay #8826",
+                "",
+                "```text",
+                "    Yellow marshmallow",
+                "```",
+            ],
+        )
+
+    def test_the_body_is_not_escaped_and_can_start_an_entry(self):
+        """Documented as the caller's responsibility, not as a guarantee."""
+        store = self.store()
+        created = store.create_entry(
+            title="T", role="hpl", body="see below\n## Q-050 — inside the body  [open]")
+        self.assertEqual([e.qid for e in store.entries_in(created.path)], ["Q-001", "Q-050"])
+
+
 # ══ Epic 46 ══════════════════════════════════════════════════════════════════
 
 

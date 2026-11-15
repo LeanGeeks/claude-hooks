@@ -92,6 +92,199 @@ store leaves it exactly as it found it.
 
 ---
 
+## What the tools write into an entry
+
+The six rules say what the parser *reads*.  This section says what the tools
+*write*, line by line, so a script can be built against it.  Everything here is
+pinned by `tests/test_unit_questions_store.py` (`TestDocumentedEntryShape`).
+It describes the default `heading` and `answer_template`; a workspace that
+overrides either gets what it asked for instead.
+
+### The entry as `ask` composes it
+
+```text
+## Q-593 — Red gate on main  [open]  [rung-0]  [red-gate]
+                                                          (blank)
+<the body, exactly as given>
+                                                          (blank)
+**Options:**                                              only with options
+1. Hotfix now
+2. Wait
+                                                          (blank)
+**Routed to:** @htl
+                                                          (blank)
+**Dispatched:** 2026-11-15T15:02:02Z · relay #8826        added once sent
+```
+
+- The frame is the heading, `**Options:**` with a numbered list, `**Routed
+  to:**` and `**Dispatched:**`.  Nothing else.
+- **The title** is made one line (line breaks become a space, control
+  characters are dropped) and `[` `]` are written as `(` `)`.
+- **Each option** is made one line the same way; brackets are kept.
+- **The body is written as given and is not escaped.**  A body line that looks
+  like an entry heading starts a new entry; a body line that looks like a
+  marker is read as one.  Whoever calls `ask` owns that; nothing a human types
+  in Telegram reaches the file unescaped (see the answer block).
+- `**Dispatched:**` carries a UTC time to the second with `Z`.  It is absent on
+  an entry whose send failed.  Re-sending replaces the line, it never adds one.
+
+### Tags
+
+Each tag is written after the status bracket as two spaces and one bracket:
+
+```text
+ask(tags=["rung-0", "red gate: e2e"])  →  …  [open]  [rung-0]  [red gate: e2e]
+```
+
+- Order is the order given.  A tag that is empty after cleaning is left out.
+- **Allowed characters: anything.**  The tool does not validate a tag.  It
+  cleans it the way it cleans the title: line breaks become a space, control
+  characters are dropped, leading and trailing space is trimmed, and `[` `]`
+  become `(` `)`.  Spaces, colons and punctuation stay.  There is no length
+  limit.
+- **A tag is not checked against the status words.**  `tags=["resolved"]`
+  writes `[open]  [resolved]`.  Rule 3 takes the *leftmost* bracket whose first
+  word is a status word, and in a heading the tool wrote that is always the
+  real one: it comes before every tag, and the title cannot contain a bracket.
+  So a tag is never mistaken for the status on a tool-written heading.  It
+  *is* mistaken for it if a human later deletes or misspells the status
+  bracket, or if a custom `heading` puts `{tags}` before `[{status}]`.
+  "First word" is the leading run of letters, digits and `_`, so
+  `[open-items]` and `[resolved: yes]` both count.  The safe habit is not to
+  begin a tag with a status word.
+- To read tags back: every bracket to the right of the status bracket.
+
+### The answer block
+
+Written by the listener at the end of the entry, after one blank line.  The heading's status word changes
+from the open word to the second status word, in place; text after the word
+inside the bracket, and every tag, is left alone.
+
+```text
+<!-- answer:8828 -->
+**Answered by:** @htl · 2026-11-15T15:14:39.120394+00:00 · relay #8828
+                                                          (blank)
+```text
+    1. Hotfix now
+```
+```
+
+Line by line:
+
+1. `<!-- answer:N -->`.  `N` is the relay message id.  Always written, whatever
+   `answer_template` says, and written once per `N`: applying the same answer
+   again changes nothing.
+2. `**Answered by:** <who> · <when> · relay #N`.
+   - `<who>` is `@<role>`: the role the message was sent as.  It names the
+     chat the question went to, not the person who answered.  It is `telegram`
+     when the role was not recorded.
+   - `<when>` is the relay's own timestamp, copied as given: UTC with
+     microseconds and `+00:00`.  When the relay supplied none it is the
+     listener's clock: UTC to the second with `Z`.  **Two shapes**; parse both.
+3. A blank line.
+4. The answer, in a fenced block with the info string `text`.
+
+The answer text inside the fence:
+
+- **A button answer** is the button's label: `N. ` and the option's text **cut
+  to 64 characters** (Telegram's limit for a button).  The number is the
+  reliable part; the full text is item `N` of the entry's `**Options:**` list.
+- **A typed reply** is the reply's text.  It is written for a question with
+  buttons too, when the human uses Telegram's Reply on the message instead of
+  tapping.
+- Every line is indented four spaces.  Tabs become four spaces, control
+  characters are dropped, trailing empty lines are dropped.
+- A line that would begin with `#`, `<!--`, `**`, a code fence (three backticks
+  or `~~~`), a status bracket such as `[resolved]`, or that is only `---`,
+  `===` or `___`, gets a backslash in front.
+- **The fence is not always three backticks.**  It is one backtick longer than
+  the longest run of backticks in the answer, and at least three.  Read the
+  block from the opening fence to the next line that is exactly the same run
+  of backticks.
+
+So an answer cannot start an entry, close its own fence or forge a marker, and
+the price is that the text is **not byte-for-byte** what was typed:
+
+```text
+typed:                          written:
+Use this:                       `````text
+```python                           Use this:
+x = 1                               \```python
+```                                 x = 1
+## Q-999 — fake  [open]             \```
+                                    \## Q-999 — fake  [open]
+                                `````
+```
+
+To recover the text, drop four spaces from each line and one leading backslash
+where what follows is one of the guarded openings.  That is exact except for
+one case the file cannot tell apart: a typed line that itself began with a
+backslash followed by a guarded opening.
+
+#### A late answer
+
+An answer that arrives when the entry is no longer open (withdrawn, or given
+another status by hand) is recorded, and the heading is not touched.  One line
+and a blank go between the marker and `**Answered by:**`:
+
+```text
+<!-- answer:8826 -->
+**Late answer** — recorded after this entry was marked [withdrawn]; status unchanged.
+                                                          (blank)
+**Answered by:** @htl · 2026-11-15T15:06:49.560465+00:00 · relay #8826
+                                                          (blank)
+```text
+    Yellow marshmallow
+```
+```
+
+The bracketed word is the status the entry carried, in lower case.
+
+### The withdrawal block
+
+Written by `withdraw` at the end of the entry, after one blank line.  The
+heading's status word changes from the open word to the withdrawn word.
+
+```text
+<!-- withdrawn -->
+**Withdrawn:** 2026-11-15T15:02:09Z · agent · session bf2dc39d
+                                                          (blank)
+```text
+    The change went ahead by itself.
+```
+```
+
+1. `<!-- withdrawn -->`.  This marker, not the status word, is what makes an
+   entry withdrawn.
+2. `**Withdrawn:** <when>` and, when known, ` · <who>`.  `<when>` is UTC to the
+   second with `Z`.  `<who>` is free text: `agent · session <8 characters>` or
+   `agent` from the MCP tool, `<user> (claude-questions)` from the command.
+3. A blank line and the reason, fenced and escaped exactly like an answer.  The
+   tools always require a reason.
+
+A withdrawn entry can carry a late answer after this block, as above.
+
+### What a reader may rely on
+
+- Both markers count only at the start of a line (up to three spaces of
+  indent).  Inside a fence they are indented four spaces and carry a backslash,
+  so they never match.
+- **Answered:** the entry contains `<!-- answer:N -->`.  An entry can contain
+  more than one, with different `N`; the first that is not a late answer is
+  the one that changed the status.
+- **Withdrawn:** the entry contains `<!-- withdrawn -->`.
+- **Answered and not yet acted on** is not something these tools record.  They
+  write the marker and the block and then never touch the entry again.  A line
+  such as `**Answer:**` or `**Status:**` under the block is the workspace's own
+  convention, written by a person or a session when the answer is folded in.
+  "Marker present, no such line after it" is a sound test exactly as far as
+  the workspace keeps to its convention.
+- Blocks are appended in the order things happened, each before the entry's
+  boundary (rule 4).  Nothing the tools wrote is ever rewritten, except the
+  status word on the heading and the `**Dispatched:**` line.
+
+---
+
 ## `[questions.format]` overrides
 
 Declare your workspace's vocabulary in `.claude/roles.toml` rather than
