@@ -1,6 +1,6 @@
 # Task 47 — Async questions: follow-ups filed from the first adoption
 
-**Status:** draft · **Type:** follow-up · **Created:** 2026-11-15 · **Rev:** 2
+**Status:** draft · **Type:** follow-up · **Created:** 2026-11-15 · **Rev:** 3
 
 Found while `hyppie-flow` adopted epic 23 (2026-11-15). Tasks 45 and epic 46
 took what was cheap or asked for; these are left, with what is known.
@@ -86,3 +86,27 @@ loses a question or an answer.
   removed after the question was sent (epic 23 behaviour): the cancel then
   fails with a 404 that is explained, but the fallback itself is not reported
   at resolve time.
+
+## 6. The relay keeps the escalation token in clear in its database
+
+Found while reading a row for task 49. `POST /v1/messages` hashes
+`escalate_to_token` into the `escalate_to_token_hash` column, and then stores
+the whole request body, token included, as `payload_json`
+(`relay_server/app.py`: `payload_json = body.model_dump_json()`). Installation
+tokens are otherwise kept only as hashes, so a copy of the relay database gives
+away every token that was ever named as an escalation target.
+
+Nothing reads the token back from the payload (the reaper resolves the target
+by the hash). Fix: drop `escalate_to_token` from the dumped payload at insert,
+and blank it in existing rows with a one-off migration. Not done under task 49:
+it changes stored data on a deployed service and wants its own review.
+
+## 7. A question without buttons is never finalized in the chat
+
+Task 49 dealt with the withdrawal. The same Telegram rule (a message sent with
+the reply prompt cannot be edited) means the listener's `✅ <answer>` edit and
+the relay's `#unanswered` tag are refused for such a question too. Both are
+best-effort and nothing is lost (the human's reply sits under the question),
+but each answer logs a failed finalize. Options: stop sending the edit for a
+message known to have no buttons, or stop using the reply prompt for questions
+sent by `ask` and rely on Telegram's Reply.
