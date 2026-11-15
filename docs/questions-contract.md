@@ -160,14 +160,14 @@ Written by the listener at the end of the entry, after one blank line.  The head
 from the open word to the second status word, in place; text after the word
 inside the bracket, and every tag, is left alone.
 
-```text
+~~~text
 <!-- answer:8828 -->
 **Answered by:** @htl · 2026-11-15T15:14:39.120394+00:00 · relay #8828
                                                           (blank)
 ```text
     1. Hotfix now
 ```
-```
+~~~
 
 Line by line:
 
@@ -205,16 +205,30 @@ The answer text inside the fence:
 So an answer cannot start an entry, close its own fence or forge a marker, and
 the price is that the text is **not byte-for-byte** what was typed:
 
-```text
-typed:                          written:
-Use this:                       `````text
-```python                           Use this:
-x = 1                               \```python
-```                                 x = 1
-## Q-999 — fake  [open]             \```
-                                    \## Q-999 — fake  [open]
-                                `````
+What was typed:
+
+<!-- example: typed reply -->
+~~~text
+Use this:
+```python
+x = 1
 ```
+## Q-999 — fake  [open]
+~~~
+
+What is written under `**Answered by:**` (the longest run of backticks in the
+reply is three, so the fence is four):
+
+<!-- example: written answer -->
+~~~text
+````text
+    Use this:
+    \```python
+    x = 1
+    \```
+    \## Q-999 — fake  [open]
+````
+~~~
 
 To recover the text, drop four spaces from each line and one leading backslash
 where what follows is one of the guarded openings.  That is exact except for
@@ -227,7 +241,7 @@ An answer that arrives when the entry is no longer open (withdrawn, or given
 another status by hand) is recorded, and the heading is not touched.  One line
 and a blank go between the marker and `**Answered by:**`:
 
-```text
+~~~text
 <!-- answer:8826 -->
 **Late answer** — recorded after this entry was marked [withdrawn]; status unchanged.
                                                           (blank)
@@ -236,7 +250,7 @@ and a blank go between the marker and `**Answered by:**`:
 ```text
     Yellow marshmallow
 ```
-```
+~~~
 
 The bracketed word is the status the entry carried, in lower case.
 
@@ -245,14 +259,14 @@ The bracketed word is the status the entry carried, in lower case.
 Written by `withdraw` at the end of the entry, after one blank line.  The
 heading's status word changes from the open word to the withdrawn word.
 
-```text
+~~~text
 <!-- withdrawn -->
 **Withdrawn:** 2026-11-15T15:02:09Z · agent · session bf2dc39d
                                                           (blank)
 ```text
     The change went ahead by itself.
 ```
-```
+~~~
 
 1. `<!-- withdrawn -->`.  This marker, not the status word, is what makes an
    entry withdrawn.

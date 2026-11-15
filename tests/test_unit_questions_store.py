@@ -15,6 +15,7 @@ Isolation rules:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1506,6 +1507,23 @@ class TestDocumentedEntryShape(StoreTestCase):
         markers = [l for l in self.lines(created) if qs.ANSWER_MARKER_RE.match(l)]
         self.assertEqual(markers, ["<!-- answer:9 -->"])
         self.assertFalse(any(qs.WITHDRAWN_MARKER_RE.match(l) for l in self.lines(created)))
+
+    def test_the_example_printed_in_the_contract_is_what_the_store_writes(self):
+        """Reads the two example blocks out of the document itself, so the
+        example and the rule beside it cannot drift apart."""
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "questions-contract.md").read_text(
+            encoding="utf-8")
+
+        def block(name: str) -> str:
+            m = re.search(
+                r"<!-- example: " + re.escape(name) + r" -->\n~~~text\n(.*?)\n~~~\n", doc, re.S)
+            self.assertIsNotNone(m, f"the contract no longer carries the '{name}' example")
+            return m.group(1)
+
+        typed, written = block("typed reply"), block("written answer")
+        self.assertEqual(self.answered(typed)[4:], written.split("\n"))
+        self.assertEqual(qs.escape_answer_text(typed), written.split("\n"))
+        self.assertEqual(written.split("\n")[0], "````text", "three backticks typed, four in the fence")
 
     # ── the withdrawal block and a late answer ──
 
