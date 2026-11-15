@@ -58,6 +58,9 @@ Settings are read from `/etc/relay/config.toml` (override path with
 | `db_path`           | `RELAY_DB_PATH`         | no       | `relay.db`            | Path to the SQLite database file                    |
 | `listen`            | `RELAY_LISTEN`          | no       | `127.0.0.1:8080`      | Address:port for uvicorn                            |
 | `reaper_interval`   | `RELAY_REAPER_INTERVAL` | no       | `30`                  | Seconds between expired-message cleanup ticks       |
+| `nudge_default_schedule` | — (TOML only)     | no       | `15m,45m,3h`          | Ladder for a chat with nudges on and no `/nudge` schedule |
+| `nudge_max`         | `RELAY_NUDGE_MAX`       | no       | `3`                   | Max rungs in a per-chat ladder (`/nudge`, admin CLI) |
+| `nudge_message_max` | `RELAY_NUDGE_MESSAGE_MAX` | no     | `8`                   | Max rungs in a per-message `nudge_schedule` (422 if exceeded) |
 
 Annotated config template: `deploy/config.toml.example`.
 

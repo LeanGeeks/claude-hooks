@@ -59,6 +59,7 @@ What it does each tick
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -222,7 +223,7 @@ def _row_nudge_schedule(
     if override:
         try:
             schedule, repeats = parse_nudge_schedule_with_repeat(
-                override, max(1, int(config.nudge_max))
+                override, max(1, int(config.nudge_message_max))
             )
             return schedule, repeats
         except ValueError:
@@ -335,8 +336,13 @@ async def cancel_escalated_children(
     conn,  # sqlite3.Connection — typed loosely to avoid a circular import
     backend: TelegramBackend,
     parent_id: int,
+    *,
+    final_text: str | None = None,
 ) -> None:
     """Cancel any open escalated copies of *parent_id*.
+
+    With *final_text* each child's body becomes that text (stored untagged in
+    its payload) instead of a re-render of the child's own text.
 
     Called when the parent is answered or expires so the duplicate(s) no longer
     show an active keyboard in the escalation chat.  Best-effort: a failed edit
@@ -356,14 +362,23 @@ async def cancel_escalated_children(
     for child in children:
         child_id = int(child["id"])
 
+        child_payload = payload_for(child)
+        if final_text is not None:
+            child_payload["text"] = strip_tag(final_text)
+
         def _cancel_child(cid: int = child_id) -> None:
             with conn:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE messages SET state = 'cancelled',"
                     " next_nudge_at = NULL, render_dirty = 0"
                     " WHERE id = ? AND state = 'open'",
                     (cid,),
                 )
+                if cur.rowcount and final_text is not None:
+                    conn.execute(
+                        "UPDATE messages SET payload_json = ? WHERE id = ?",
+                        (json.dumps(child_payload), cid),
+                    )
 
         try:
             await run_in_thread(_cancel_child)
@@ -376,7 +391,7 @@ async def cancel_escalated_children(
         tg_msg_id = int(child["telegram_message_id"])
         if tg_msg_id > 0:
             # Only edit Telegram messages that were actually sent.
-            body = render_body(payload_for(child), "cancelled")
+            body = render_body(child_payload, "cancelled")
             if body.strip():
                 try:
                     await backend.edit_message(

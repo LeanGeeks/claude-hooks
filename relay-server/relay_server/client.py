@@ -291,8 +291,16 @@ class RelayClient:
         resp = self._request("DELETE", f"/v1/messages/{message_id}")
         self._raise_for_error(resp)
 
-    def cancel_message(self, message_id: int) -> None:
-        resp = self._request("POST", f"/v1/messages/{message_id}/cancel")
+    def cancel_message(self, message_id: int, final_text: str | None = None) -> None:
+        """Cancel a message; ``final_text`` is the body the chat should end on.
+
+        The JSON body is sent only when ``final_text`` is given, so an older
+        relay (which ignores bodies) and every existing caller behave as before.
+        """
+        kwargs: dict[str, Any] = {}
+        if final_text is not None:
+            kwargs["json_body"] = {"final_text": final_text}
+        resp = self._request("POST", f"/v1/messages/{message_id}/cancel", **kwargs)
         self._raise_for_error(resp)
 
     def get_answers(

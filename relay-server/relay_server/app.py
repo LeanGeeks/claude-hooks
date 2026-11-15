@@ -59,6 +59,7 @@ from .render import (
     render_body,
     render_body_row,
     strip_tag,
+    TELEGRAM_TEXT_LIMIT,
 )
 from .telegram_backend import (
     FakeTelegramBackend,
@@ -686,15 +687,20 @@ def create_app(
             nudge_schedule_override: str | None = None
             if body.nudge_schedule:
                 cfg = getattr(request.app.state, "config", None)
-                nudge_max = int(cfg.nudge_max) if cfg else 10
+                message_max = int(cfg.nudge_message_max) if cfg else 10
                 try:
-                    parse_nudge_schedule_with_repeat(body.nudge_schedule, max(1, nudge_max))
+                    parse_nudge_schedule_with_repeat(
+                        body.nudge_schedule, max(1, message_max)
+                    )
                 except ValueError as exc:
                     if idempotency_key:
                         await _idem_abandon(conn, installation_id, idempotency_key)
                     raise HTTPException(
                         status_code=422,
-                        detail=f"invalid nudge_schedule: {exc}",
+                        detail=(
+                            f"invalid nudge_schedule: {exc}"
+                            f" (nudge_message_max={max(1, message_max)})"
+                        ),
                     ) from exc
                 nudge_schedule_override = body.nudge_schedule
             # ---- End per-message escalation --------------------------------
@@ -910,6 +916,31 @@ def create_app(
             raise HTTPException(status_code=409, detail="not_bound")
         return Response(status_code=204)
 
+    async def _cancel_final_text(request: Request) -> str | None:
+        """Parse the cancel call's optional ``{"final_text": ...}`` body."""
+        raw = await request.body()
+        if not raw.strip():
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="invalid JSON body") from exc
+        if data is None:
+            return None
+        if not isinstance(data, dict):
+            raise HTTPException(status_code=422, detail="body must be a JSON object")
+        text = data.get("final_text")
+        if text is None or text == "":
+            return None
+        if not isinstance(text, str):
+            raise HTTPException(status_code=422, detail="final_text must be a string")
+        if len(text) > TELEGRAM_TEXT_LIMIT:
+            raise HTTPException(
+                status_code=422,
+                detail=f"final_text exceeds {TELEGRAM_TEXT_LIMIT} characters",
+            )
+        return text
+
     @app.post("/v1/messages/{message_id}/cancel")
     async def cancel_message(
         message_id: int,
@@ -920,6 +951,9 @@ def create_app(
         backend: TelegramBackend = request.app.state.backend
         waiters: WaiterRegistry = request.app.state.waiters
         installation_id = installation["id"]
+        # Optional body ``{"final_text": "<html>"}``. No body, an empty body or
+        # no ``final_text`` is the legacy call and changes nothing.
+        end_text = await _cancel_final_text(request)
         row = await _load_message(conn, message_id, installation_id)
 
         # The flip retires the nudge ladder and clears ``render_dirty`` in the
@@ -933,6 +967,19 @@ def create_app(
                     " WHERE id=? AND state='open'",
                     (message_id,),
                 )
+                if cur.rowcount and end_text is not None:
+                    # Only the call that flipped the row owns its text; a row
+                    # that was already terminal keeps what it has.
+                    current = conn.execute(
+                        "SELECT payload_json FROM messages WHERE id=?",
+                        (message_id,),
+                    ).fetchone()
+                    payload = _payload_for(current)
+                    payload["text"] = strip_tag(end_text)
+                    conn.execute(
+                        "UPDATE messages SET payload_json=? WHERE id=?",
+                        (json.dumps(payload), message_id),
+                    )
                 return cur.rowcount
 
         flipped = await run_in_thread(_cancel)
@@ -944,13 +991,13 @@ def create_app(
             # a late cancel cannot overwrite an answer another path baked in
             # (group finalization writes text the payload does not carry).
             fresh = await _load_message(conn, message_id, installation_id)
-            final_text = render_body_row(fresh)
-            if final_text.strip():
+            body_text = render_body_row(fresh)
+            if body_text.strip():
                 try:
                     await backend.edit_message(
                         chat_id=fresh["telegram_chat_id"],
                         telegram_message_id=fresh["telegram_message_id"],
-                        text=final_text,
+                        text=body_text,
                         keyboard=None,
                     )
                 except TelegramApiError as exc:
@@ -982,6 +1029,12 @@ def create_app(
             message_id=message_id,
             chat_id=int(row["telegram_chat_id"]),
             nudge_tg_message_id=row["nudge_tg_message_id"],
+        )
+        # A child never outlives its parent: cancel any open escalated copy on
+        # every call (not only the one that flipped the parent) so a retry
+        # cleans up after a cancel that predates the cascade. Best-effort.
+        await _cancel_escalated_children(
+            conn, backend, message_id, final_text=end_text
         )
         try:
             # Strip the inline keyboard via the dedicated Bot-API-shaped method.
@@ -1247,7 +1300,7 @@ async def _seed_next_nudge_at(
             # human's chat-level preference (task §2, invariant 9).
             try:
                 schedule, _ = parse_nudge_schedule_with_repeat(
-                    body.nudge_schedule, max(1, int(config.nudge_max))
+                    body.nudge_schedule, max(1, int(config.nudge_message_max))
                 )
             except ValueError:
                 logger.warning(

@@ -198,6 +198,36 @@ def test_cancel_message_posts_cancel() -> None:
     assert captured["url"].endswith("/v1/messages/9/cancel")
 
 
+def test_cancel_message_sends_no_body_by_default() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["content"] = request.content
+        return httpx.Response(200, json={})
+
+    rc = _make_client(handler)
+    try:
+        rc.cancel_message(9)
+    finally:
+        rc.close()
+    assert captured["content"] == b""
+
+
+def test_cancel_message_sends_final_text_when_given() -> None:
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})
+
+    rc = _make_client(handler)
+    try:
+        rc.cancel_message(9, final_text="<b>bye</b>")
+    finally:
+        rc.close()
+    assert captured["body"] == {"final_text": "<b>bye</b>"}
+
+
 # ---- wait_for_answer -------------------------------------------------------
 
 

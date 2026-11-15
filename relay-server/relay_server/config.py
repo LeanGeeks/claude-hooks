@@ -49,6 +49,11 @@ class RelayConfig:
     #   A /nudge command with more entries is rejected, not truncated.
     nudge_default_schedule: str = "15m,45m,3h"
     nudge_max: int = 3
+    # nudge_message_max — maximum number of rungs in a *per-message*
+    #   ``nudge_schedule`` (the send-time override).  Separate from
+    #   ``nudge_max`` so a client's multi-rung ladder is not held to the cap
+    #   for a human's ``/nudge`` command.  Default: 8.
+    nudge_message_max: int = 8
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -60,11 +65,15 @@ _ENV_MAP = {
     "RELAY_DB_PATH": "db_path",
     "RELAY_LISTEN": "listen",
     "RELAY_REAPER_INTERVAL": "reaper_interval",
+    "RELAY_NUDGE_MAX": "nudge_max",
+    "RELAY_NUDGE_MESSAGE_MAX": "nudge_message_max",
 }
 
 # Type coercions for env vars whose field type is not str.
 _ENV_COERCE: dict[str, Any] = {
     "reaper_interval": float,
+    "nudge_max": int,
+    "nudge_message_max": int,
 }
 
 

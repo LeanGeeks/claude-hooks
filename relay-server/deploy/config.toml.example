@@ -29,3 +29,20 @@ listen = "127.0.0.1:8080"
 # Default: 30
 # Env: RELAY_REAPER_INTERVAL
 reaper_interval = 30
+
+# Default nudge ladder for a chat that has nudges on but no /nudge schedule of
+# its own.  Comma-separated durations in active time.
+# Default: "15m,45m,3h"
+# nudge_default_schedule = "15m,45m,3h"
+
+# Maximum rungs in a per-chat ladder (/nudge command, admin CLI).  A longer
+# ladder is rejected, not truncated.
+# Default: 3
+# Env: RELAY_NUDGE_MAX
+# nudge_max = 3
+
+# Maximum rungs in a per-message nudge_schedule supplied at send time
+# (POST /v1/messages).  Independent of nudge_max.  Longer is rejected with 422.
+# Default: 8
+# Env: RELAY_NUDGE_MESSAGE_MAX
+# nudge_message_max = 8
