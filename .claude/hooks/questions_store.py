@@ -31,10 +31,16 @@ exactly:
    does not begin with a well-formed id is not an entry and is left exactly as
    it was found.
 
-Write discipline (architecture.md §3.3): every mutation takes ``flock`` on
-``<dir>/.lock``, reads, modifies in memory, writes a temp file in the same
+Write discipline (architecture.md §3.3): every mutation takes the store lock
+(``flock``), reads, modifies in memory, writes a temp file in the same
 directory and ``os.replace``s it into place, then releases.  Never a partial
-write, never truncate-then-write.
+write, never truncate-then-write.  In a git workspace the lock file lives in
+the repository's common git dir, not in the working tree (epic 46 D14).
+
+Epic 46 adds withdrawal, the claims ledger, the "an answer flips only an open
+entry" rule and a *capture* overlay — a way to run any mutation without
+touching the disk, so ``questions_git`` can have the upstream accept a change
+before it is written locally.  The module itself is still pure: no subprocess.
 
 Answer escaping (architecture.md §3.4, state.md invariant 11): answer text is
 human free-form from Telegram and lands in a file agents later read *as
@@ -46,7 +52,8 @@ Public API
 load_questions_config  — parse ``[questions]`` out of a workspace roles.toml
 resolve_anchor         — the architecture §3.1 ladder; pure, no side effects
 open_store             — config + anchor → QuestionsStore, or None when inert
-QuestionsStore         — allocate/compose/append, mark_dispatched, apply_answer
+QuestionsStore         — allocate/compose/append, mark_dispatched, apply_answer,
+                         withdraw, claim, capture/materialize
 escape_answer_text     — the invariant-11 escaper, exposed for tests and tools
 parse_entries          — the contract's entry parser, exposed for diagnostics
 """
@@ -54,9 +61,11 @@ parse_entries          — the contract's entry parser, exposed for diagnostics
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import os
 import re
 import tempfile
+import threading
 
 try:
     import tomllib  # Python 3.11+ stdlib
@@ -81,9 +90,18 @@ DEFAULT_ESCALATE_AFTER = "24h"
 DEFAULT_MAX_OPEN = 20
 DEFAULT_MIN_INTERVAL_S = 30.0
 
+# Epic 46 — git sync (off unless a workspace asks for it) and the claims ledger.
+SYNC_MODES = ("off", "commit", "push")
+DEFAULT_SYNC = "off"
+DEFAULT_CLAIMS = "claims.md"
+DEFAULT_GIT_RETRIES = 5
+DEFAULT_GIT_MESSAGE = "chore(questions): {summary}"
+
 # ``[questions.format]`` defaults
 DEFAULT_ID = "Q-{n:03d}"
 DEFAULT_STATUS: tuple[str, ...] = ("open", "resolved")
+#: The status word a withdrawal writes (epic 46 D2).  Always recognised.
+DEFAULT_WITHDRAWN = "withdrawn"
 DEFAULT_HEADING = "## {id} — {title}  [{status}]{tags}"
 DEFAULT_ANSWER_TEMPLATE = (
     "**Answered by:** {answered_by} · {answered_at} · relay #{message_id}\n"
@@ -101,7 +119,11 @@ DEFAULT_FILE = "questions.md"
 #: by 23-05's sidecar fallback.
 ANSWERED_DIRNAME = "answered"
 
+#: The lock file's name when the queue is **not** in a git work tree — and the
+#: legacy location (``<dir>/.lock``) everywhere.  See :meth:`QuestionsStore.lock`.
 LOCK_FILENAME = ".lock"
+#: The lock file's name inside a repository's common git dir (epic 46 D14).
+GIT_LOCK_FILENAME = "claude-questions.lock"
 
 # ── Errors and results ────────────────────────────────────────────────────────
 
@@ -123,6 +145,20 @@ class ApplyResult(str, Enum):
     APPLIED = "applied"
     NOT_FOUND = "not_found"
     CONFLICT = "conflict"
+    #: The answer was written under the entry but the status was **not**
+    #: flipped, because the entry was no longer open (withdrawn, resolved by
+    #: hand, superseded …).  A success: the decision is on record (epic 46 D5).
+    LATE = "late"
+
+
+class WithdrawOutcome(str, Enum):
+    """Outcome of :meth:`QuestionsStore.withdraw` (epic 46 architecture §3.2)."""
+
+    WITHDRAWN = "withdrawn"
+    ALREADY_WITHDRAWN = "already_withdrawn"
+    NOT_OPEN = "not_open"
+    NOT_FOUND = "not_found"
+    CONFLICT = "conflict"
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -137,6 +173,7 @@ class QuestionsFormat:
     heading: str = DEFAULT_HEADING
     answer_template: str = DEFAULT_ANSWER_TEMPLATE
     glob: str = DEFAULT_GLOB
+    withdrawn: str = DEFAULT_WITHDRAWN
 
     # ── derived ──
     @property
@@ -155,8 +192,15 @@ class QuestionsFormat:
         return self.status[1] if len(self.status) > 1 else self.status[0]
 
     @property
+    def withdrawn_status(self) -> str:
+        """The token :meth:`QuestionsStore.withdraw` flips to."""
+        return self.withdrawn
+
+    @property
     def status_set(self) -> frozenset[str]:
-        return frozenset(s.lower() for s in self.status)
+        """Every recognised status word — the declared set plus the withdrawn
+        word, so a withdrawn entry never reads as "no status"."""
+        return frozenset(s.lower() for s in (*self.status, self.withdrawn))
 
     @property
     def level(self) -> int:
@@ -177,6 +221,19 @@ class QuestionsConfig:
     file: str = DEFAULT_FILE
     max_open: int = DEFAULT_MAX_OPEN
     min_interval_s: float = DEFAULT_MIN_INTERVAL_S
+    #: ``off`` | ``commit`` | ``push`` — whether (and how far) ``questions_git``
+    #: publishes what the tools write.  ``off`` starts no git process at all.
+    sync: str = DEFAULT_SYNC
+    #: The id ledger, a file name inside ``dir`` (epic 46 D11).
+    claims: str = DEFAULT_CLAIMS
+    git_remote: str = ""
+    git_branch: str = ""
+    git_retries: int = DEFAULT_GIT_RETRIES
+    git_message: str = DEFAULT_GIT_MESSAGE
+    #: Register a merge driver for the queue files in the repository's local
+    #: git configuration, so the operator's own ``git pull`` merges them entry
+    #: by entry (epic 46 D15).  Only ever acted on when ``sync`` is not off.
+    git_merge_driver: bool = True
     fmt: QuestionsFormat = field(default_factory=QuestionsFormat)
     workspace_id: str = ""
     default_role: str | None = None
@@ -292,6 +349,53 @@ def load_questions_config(
     max_open = int(_number("max_open", DEFAULT_MAX_OPEN))
     min_interval_s = _number("min_interval_s", DEFAULT_MIN_INTERVAL_S)
 
+    sync = _str("sync", DEFAULT_SYNC).strip().lower()
+    if sync not in SYNC_MODES:
+        errors.append(
+            f"[questions].sync: unknown value {sync!r} (expected one of "
+            f"{', '.join(SYNC_MODES)}), using {DEFAULT_SYNC!r}"
+        )
+        sync = DEFAULT_SYNC
+
+    claims = _str("claims", DEFAULT_CLAIMS).strip()
+    if not claims or "/" in claims or "\\" in claims or claims.startswith("."):
+        errors.append(
+            f"[questions].claims: expected a plain file name inside dir, using {DEFAULT_CLAIMS!r}"
+        )
+        claims = DEFAULT_CLAIMS
+
+    git_remote, git_branch = "", ""
+    git_retries, git_message = DEFAULT_GIT_RETRIES, DEFAULT_GIT_MESSAGE
+    git_merge_driver = True
+    raw_git = section.get("git", {})
+    if isinstance(raw_git, dict):
+        raw_driver = raw_git.get("merge_driver", True)
+        if isinstance(raw_driver, bool):
+            git_merge_driver = raw_driver
+        else:
+            errors.append("[questions.git].merge_driver: expected true or false, using true")
+        for key in ("remote", "branch"):
+            value = raw_git.get(key, "")
+            if not isinstance(value, str):
+                errors.append(f"[questions.git].{key}: expected a string, ignored")
+                value = ""
+            if key == "remote":
+                git_remote = value.strip()
+            else:
+                git_branch = value.strip()
+        raw_retries = raw_git.get("retries", DEFAULT_GIT_RETRIES)
+        if isinstance(raw_retries, bool) or not isinstance(raw_retries, int):
+            errors.append(f"[questions.git].retries: expected an integer, using {DEFAULT_GIT_RETRIES}")
+        else:
+            git_retries = max(0, min(10, raw_retries))
+        raw_message = raw_git.get("message", DEFAULT_GIT_MESSAGE)
+        if not isinstance(raw_message, str) or "{summary}" not in raw_message:
+            errors.append("[questions.git].message: must be a string containing {summary}, using the default")
+        else:
+            git_message = raw_message
+    elif raw_git:
+        errors.append("[questions.git]: expected a table, ignored")
+
     fmt = _load_format(section.get("format"), errors)
 
     # workspace_id: the role catalog owns it when there is one (it survives a
@@ -317,6 +421,13 @@ def load_questions_config(
         file=flat_file,
         max_open=max_open,
         min_interval_s=min_interval_s,
+        sync=sync,
+        claims=claims,
+        git_remote=git_remote,
+        git_branch=git_branch,
+        git_retries=git_retries,
+        git_message=git_message,
+        git_merge_driver=git_merge_driver,
         fmt=fmt,
         workspace_id=workspace_id,
         default_role=default_role,
@@ -371,12 +482,25 @@ def _load_format(raw: object, errors: list[str]) -> QuestionsFormat:
         errors.append(f"[questions.format].glob: invalid pattern {glob!r}, using {DEFAULT_GLOB!r}")
         glob = DEFAULT_GLOB
 
+    withdrawn = raw.get("withdrawn", DEFAULT_WITHDRAWN)
+    if (
+        not isinstance(withdrawn, str)
+        or not re.fullmatch(r"[A-Za-z0-9_]+", withdrawn)
+        or withdrawn.lower() == status[0].lower()
+    ):
+        errors.append(
+            f"[questions.format].withdrawn: expected one status word other than "
+            f"the open word {status[0]!r}, using {DEFAULT_WITHDRAWN!r}"
+        )
+        withdrawn = DEFAULT_WITHDRAWN
+
     return QuestionsFormat(
         id=id_template,
         status=status,
         heading=heading,
         answer_template=answer_template,
         glob=glob,
+        withdrawn=withdrawn,
     )
 
 
@@ -582,6 +706,17 @@ _GUARD_RULE_RE = re.compile(r"^(?:-{3,}|={3,}|_{3,})\s*$")
 _STATUS_BRACKET_RE = re.compile(r"^\[([A-Za-z0-9_]+)")
 
 ANSWER_MARKER_RE = re.compile(r"^ {0,3}<!--\s*answer:(\d+)\s*-->\s*$")
+
+#: The withdrawal marker.  Like the answer marker it is only ever recognised
+#: anchored at line start, and :func:`escape_answer_text` guards any line that
+#: begins with ``<!--`` — so neither an answer nor a withdrawal reason can
+#: forge it (epic 46 architecture §3.2).
+WITHDRAWN_MARKER = "<!-- withdrawn -->"
+WITHDRAWN_MARKER_RE = re.compile(r"^ {0,3}<!--\s*withdrawn\s*-->\s*$")
+
+#: The line :meth:`QuestionsStore.mark_dispatched` writes; ``--reindex`` and
+#: ``withdraw`` both read the relay message id back out of it.
+DISPATCHED_RE = re.compile(r"^\s*\*\*Dispatched:\*\*\s+(\S+)\s+·\s+relay #(\d+)")
 
 
 def _answer_marker(message_id: int | str) -> str:
@@ -813,6 +948,20 @@ def _is_bare(common_dir: Path) -> bool:
     return result
 
 
+def git_common_dir_for(start: Path) -> Path | None:
+    """The common git dir of the repository containing *start*, or ``None``.
+
+    Filesystem only (no ``git`` binary) — the same reading of ``.git`` that
+    anchor resolution uses.  Where the store keeps its lock, and where
+    ``questions_git`` keeps its sync state.
+    """
+    found = _find_git(Path(start))
+    if found is None:
+        return None
+    common = _git_common_dir(found[0])
+    return common if common.is_dir() else None
+
+
 def _nearest_marker_root(start: Path) -> Path:
     """Nearest ancestor carrying ``.claude`` (the non-git fall-back), else cwd."""
     current = start
@@ -891,6 +1040,48 @@ class NewEntry:
     workspace_id: str
 
 
+@dataclass(frozen=True)
+class WithdrawResult:
+    """What :meth:`QuestionsStore.withdraw` found and did.
+
+    Carries everything the caller needs to finish the withdrawal on the relay —
+    the title for the Telegram text and the relay message id from the entry's
+    ``**Dispatched:**`` line — read under the same lock as the write.
+    """
+
+    outcome: WithdrawOutcome
+    qid: str = ""
+    status: str | None = None      # the status word now on the heading (lowercased)
+    title: str = ""
+    rel_path: str = ""
+    message_id: int | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True when the entry is withdrawn after the call, by it or before it."""
+        return self.outcome in (
+            WithdrawOutcome.WITHDRAWN,
+            WithdrawOutcome.ALREADY_WITHDRAWN,
+        )
+
+
+class Capture:
+    """The overlay behind :meth:`QuestionsStore.capture`.
+
+    ``writes`` maps a file to the text it *would* hold.  Reads made by the
+    store while the capture is active see these texts instead of the disk.
+    """
+
+    def __init__(self) -> None:
+        self.writes: dict[Path, str] = {}
+        #: Paths the mutation itself wrote, as opposed to ones only seeded.
+        self.touched: set[Path] = set()
+
+    def seed(self, path: Path, text: str) -> None:
+        """Pretend *path* holds *text* (e.g. the upstream's copy of the file)."""
+        self.writes[Path(path)] = text
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -937,6 +1128,12 @@ class QuestionsStore:
     def __init__(self, config: QuestionsConfig, root: Path) -> None:
         self.config = config
         self.root = Path(root)
+        #: Lower bound on the id high-water mark.  ``questions_git`` sets it to
+        #: the highest id the upstream branch contains, so an id is allocated
+        #: above everything known anywhere, not just in this checkout.
+        self.id_floor = 0
+        self._local = threading.local()
+        self._lock_path_cache: Path | None = None
 
     # ── layout ──
 
@@ -956,6 +1153,11 @@ class QuestionsStore:
     @property
     def answered_dir(self) -> Path:
         return self.queue_dir / ANSWERED_DIRNAME
+
+    @property
+    def claims_path(self) -> Path:
+        """The id ledger (epic 46 D11)."""
+        return self.queue_dir / self.config.claims
 
     def rel_path(self, path: Path) -> str:
         """The path of *path* relative to the anchor root (index-friendly)."""
@@ -993,6 +1195,15 @@ class QuestionsStore:
                     found[path] = None
         except OSError:
             pass
+        # A file that exists only in an active capture (seeded from the
+        # upstream, not yet on disk) is part of the queue set too.
+        capture = self._capture
+        if capture is not None:
+            for path in capture.writes:
+                if path.parent == self.queue_dir and fnmatch.fnmatch(path.name, self.fmt.glob):
+                    found[path] = None
+        # The ledger is never a queue file, whatever the glob says.
+        found.pop(self.claims_path, None)
         return list(found)
 
     def scan_files(self) -> list[Path]:
@@ -1017,7 +1228,12 @@ class QuestionsStore:
 
         ``"\\n".join(read_lines(p)) == p.read_text()`` exactly, so a rewrite
         preserves every byte this module did not deliberately change.
+
+        Inside a :meth:`capture`, a captured file is read from the overlay.
         """
+        capture = self._capture
+        if capture is not None and path in capture.writes:
+            return capture.writes[path].split("\n")
         try:
             # newline="" disables universal-newline translation: a CRLF file must
             # round-trip byte-for-byte, not be silently rewritten to LF.
@@ -1069,6 +1285,16 @@ class QuestionsStore:
         """
         return format_id(self.fmt, self._max_number() + 1)
 
+    def high_water_mark(self) -> int:
+        """The highest id number in use or reserved (public face of the scan)."""
+        return self._max_number()
+
+    def read_text(self, path: Path) -> str | None:
+        """The store's view of *path* — the capture overlay first, then the
+        disk — or ``None`` when the file does not exist."""
+        lines = self._read_lines(path)
+        return None if lines is None else "\n".join(lines)
+
     def _max_number(self) -> int:
         """High-water mark across the queue set and ``answered/``.
 
@@ -1081,6 +1307,9 @@ class QuestionsStore:
         * headings only, never body text — the escaper guarantees no answer
           text can produce a line starting with ``#``, so a hostile answer
           cannot inflate the counter.
+
+        Epic 46 adds two more sources: every id in the claims ledger, and
+        :attr:`id_floor`.
         """
         scan_re = _id_scan_re(self.fmt)
         any_heading_re = re.compile(r"^ {0,3}#{1,6}(?!#)(?:\s|$)")
@@ -1097,36 +1326,168 @@ class QuestionsStore:
             m = scan_re.match(path.stem)
             if m is not None and m.end() == len(path.stem):
                 highest = max(highest, int(m.group("num")))
-        return highest
+        for number, _variant in self.claimed_ids():
+            highest = max(highest, number)
+        return max(highest, int(self.id_floor))
 
     # ── locking ──
 
+    @property
+    def lock_path(self) -> Path:
+        """Where the store's ``flock`` file lives.
+
+        In a git work tree: ``<common git dir>/claude-questions.lock`` — one
+        lock per repository, shared by every worktree, and invisible to
+        ``git status`` (``<dir>/.lock`` showed up as an untracked file in every
+        adopting repository).  Anywhere else: ``<dir>/.lock``, as before.
+        """
+        if self._lock_path_cache is None:
+            common = git_common_dir_for(self.queue_dir)
+            self._lock_path_cache = (
+                common / GIT_LOCK_FILENAME if common is not None
+                else self.queue_dir / LOCK_FILENAME
+            )
+        return self._lock_path_cache
+
+    @property
+    def legacy_lock_path(self) -> Path:
+        return self.queue_dir / LOCK_FILENAME
+
+    @property
+    def _capture(self) -> Capture | None:
+        return getattr(self._local, "capture", None)
+
     @contextmanager
     def lock(self) -> Iterator[None]:
-        """Exclusive ``flock`` on ``<dir>/.lock`` for the whole critical section.
+        """Exclusive ``flock`` for the whole critical section.
 
         Every mutation — and the whole of [scan → allocate → compose → append →
         fsync] — happens inside this, which is what makes id allocation safe
         under parallelism (brd §2.7).
+
+        **Re-entrant** per store instance and thread: ``questions_git`` holds
+        it across a whole transaction (fetch, allocate, push, write) and the
+        mutators it calls take it again.
+
+        **Dual locking** (epic 46 D14): while a legacy ``<dir>/.lock`` exists,
+        it is locked as well.  A ``questions`` MCP server started before the
+        upgrade keeps running the old code, which knows only that file; taking
+        both keeps the two generations mutually exclusive.  The legacy file is
+        never *created* here, so deleting it ends the dual locking.
         """
-        directory = self.queue_dir
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise QuestionsStoreError(f"{directory} could not be created: {exc}") from exc
-        lock_path = directory / LOCK_FILENAME
-        try:
-            handle = open(lock_path, "a+")
-        except OSError as exc:
-            raise QuestionsStoreError(f"{lock_path} could not be opened: {exc}") from exc
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        depth = getattr(self._local, "lock_depth", 0)
+        if depth:
+            self._local.lock_depth = depth + 1
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                self._local.lock_depth -= 1
+            return
+
+        primary = self.lock_path
+        legacy = self.legacy_lock_path
+        handles = []
+        try:
+            try:
+                primary.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(primary, "a+")
+            except OSError as exc:
+                if primary == legacy:
+                    raise QuestionsStoreError(f"{primary} could not be opened: {exc}") from exc
+                # The git directory is not writable from here — a sandboxed
+                # session, a linked worktree whose common dir is outside the
+                # sandbox.  Fall back to the file beside the queue rather than
+                # refuse to write at all: that is where the lock always was,
+                # and a workspace that never asked for git sync must keep
+                # working exactly as before (epic 46 D13).  The cost is that
+                # this process and one that *can* reach the git directory no
+                # longer exclude each other; the dual locking below closes
+                # that gap from the other side as soon as this file exists.
+                try:
+                    legacy.parent.mkdir(parents=True, exist_ok=True)
+                    handle = open(legacy, "a+")
+                except OSError as exc2:
+                    raise QuestionsStoreError(
+                        f"neither {primary} ({exc}) nor {legacy} ({exc2}) could be opened"
+                    ) from exc2
+                primary = legacy
+                self._lock_path_cache = legacy
+            handles.append(handle)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+            if legacy != primary and legacy.is_file():
+                try:
+                    legacy_handle = open(legacy, "r+")
+                except OSError:
+                    legacy_handle = None     # removed between the check and the open
+                if legacy_handle is not None:
+                    handles.append(legacy_handle)
+                    fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_EX)
+
+            self._local.lock_depth = 1
+            try:
+                yield
+            finally:
+                self._local.lock_depth = 0
         finally:
-            handle.close()
+            for handle in reversed(handles):
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                handle.close()
+
+    # ── capture (epic 46 architecture §3.6) ──
+
+    @contextmanager
+    def capture(self) -> Iterator[Capture]:
+        """Run mutations against an overlay instead of the disk.
+
+        Inside the block every write the store makes lands in
+        ``Capture.writes`` and every read sees those texts first; nothing
+        touches a file until :meth:`materialize`.  That lets a caller learn
+        exactly what a mutation *would* write — and have another party accept
+        it — before committing to it locally.
+
+        Holds the store lock for the duration; not nestable.
+        """
+        if self._capture is not None:
+            raise QuestionsStoreError("a capture is already active on this store")
+        with self.lock():
+            capture = Capture()
+            self._local.capture = capture
+            try:
+                yield capture
+            finally:
+                self._local.capture = None
+
+    def materialize(self, capture: Capture) -> list[Path]:
+        """Write every captured file to disk, atomically, one by one.
+
+        Returns the paths whose content actually changed.  Must not be called
+        inside the capture it materializes.
+        """
+        written: list[Path] = []
+        with self.lock():
+            for path, text in capture.writes.items():
+                try:
+                    with open(path, "r", encoding="utf-8", newline="") as fh:
+                        if fh.read() == text:
+                            continue
+                except (OSError, UnicodeDecodeError):
+                    pass
+                _atomic_write(path, text)
+                written.append(path)
+        return written
+
+    def _write(self, path: Path, text: str) -> None:
+        """The single write path: the overlay when capturing, else the disk."""
+        capture = self._capture
+        if capture is not None:
+            capture.writes[path] = text
+            capture.touched.add(path)
+            return
+        _atomic_write(path, text)
 
     # ── composition (invariant 6: frame only) ──
 
@@ -1198,11 +1559,17 @@ class QuestionsStore:
         tags: Sequence[str] = (),
         routed_to: str | None = None,
         path: Path | None = None,
+        qid: str | None = None,
     ) -> NewEntry:
         """Allocate an id, compose the entry and append it — all under the lock.
 
         The critical section spans [scan → allocate → compose → append → fsync]
         so ``max + 1`` cannot be observed twice by two writers.
+
+        *qid* asks for a specific id instead of the next one.  It is accepted
+        only if the claims ledger holds it and nothing uses it yet (epic 46
+        D11) — an explicit id that was never claimed is exactly how two
+        sessions end up with the same one.
         """
         target = path if path is not None else self.queue_file_for_role(role)
         if target is None:
@@ -1211,7 +1578,10 @@ class QuestionsStore:
             )
 
         with self.lock():
-            qid = format_id(self.fmt, self._max_number() + 1)
+            if qid is not None:
+                qid = self._check_claimed_id(qid)
+            else:
+                qid = format_id(self.fmt, self._max_number() + 1)
             entry_text = self.compose_entry(
                 qid=qid,
                 title=title,
@@ -1230,7 +1600,7 @@ class QuestionsStore:
                 kept.append("" + suffix)  # exactly one blank line between entries
             kept.extend(line + suffix for line in entry_text.split("\n"))
             kept.append("")               # the file's trailing newline
-            _atomic_write(target, "\n".join(kept))
+            self._write(target, "\n".join(kept))
 
         return NewEntry(
             qid=qid,
@@ -1269,11 +1639,11 @@ class QuestionsStore:
                     if lines[index] == marker:
                         return ApplyResult.APPLIED
                     lines[index] = marker + ("\r" if lines[index].endswith("\r") else "")
-                    _atomic_write(located.path, "\n".join(lines))
+                    self._write(located.path, "\n".join(lines))
                     return ApplyResult.APPLIED
 
             lines = _insert_before_boundary(lines, entry, [marker])
-            _atomic_write(located.path, "\n".join(lines))
+            self._write(located.path, "\n".join(lines))
             return ApplyResult.APPLIED
 
     def apply_answer(
@@ -1297,6 +1667,13 @@ class QuestionsStore:
         Idempotent on *message_id*: an answer block already citing it makes the
         call a no-op success (invariant 3).  ``not_found`` and ``conflict`` are
         normal outcomes routed to ``pending`` by the caller, never exceptions.
+
+        **An answer flips the status only from the open word** (epic 46 D5).
+        If the entry is withdrawn, or carries any other status — resolved by
+        hand, ``[SUPERSEDED by Q-269]`` — the heading is left exactly as it is,
+        the answer is still written under the entry with a one-line note, and
+        the result is :attr:`ApplyResult.LATE`.  Nothing a human said is ever
+        dropped, and no status a human set is ever overwritten.
         """
         stamp = answered_at or _utc_now()
 
@@ -1312,7 +1689,11 @@ class QuestionsStore:
             entry = located.entry
             lines = list(located.lines)
 
-            if entry.status_token is not None:
+            withdrawn = _has_withdrawn_marker(lines, entry)
+            is_open = entry.status == self.fmt.open_status.lower()
+            late = withdrawn or (entry.status is not None and not is_open)
+
+            if entry.status_token is not None and not late:
                 token = entry.status_token
                 heading = lines[entry.start]
                 lines[entry.start] = (
@@ -1329,9 +1710,191 @@ class QuestionsStore:
                 message_id=int(message_id),
                 answered_at=stamp,
             )
+            if late:
+                found = entry.status or self.fmt.withdrawn_status
+                note = (
+                    f"**Late answer** — recorded after this entry was marked "
+                    f"[{found}]; status unchanged."
+                )
+                # After the idempotency marker, before the template's own lines.
+                block = [block[0], note, "", *block[1:]]
             lines = _insert_before_boundary(lines, entry, block)
-            _atomic_write(located.path, "\n".join(lines))
-            return ApplyResult.APPLIED
+            self._write(located.path, "\n".join(lines))
+            return ApplyResult.LATE if late else ApplyResult.APPLIED
+
+    # ── withdrawal (epic 46 architecture §3.2) ──
+
+    def withdraw(
+        self,
+        qid: str,
+        reason: str,
+        *,
+        withdrawn_by: str = "",
+        rel_path: str | None = None,
+        role: str | None = None,
+        withdrawn_at: str | None = None,
+    ) -> WithdrawResult:
+        """Mark an open question as withdrawn, with the reason.
+
+        Flips the status token to the withdrawn word and inserts a
+        ``<!-- withdrawn -->`` block before the entry's boundary.  Only an
+        **open** entry can be withdrawn: an answered one reports ``not_open``
+        with the status it carries and is left alone (D4).  A second call on a
+        withdrawn entry is ``already_withdrawn`` and writes nothing.
+
+        The reason is escaped exactly like an answer, so it cannot forge a
+        heading, a status token or either marker.
+        """
+        stamp = withdrawn_at or _utc_now()
+
+        with self.lock():
+            located = self._locate(qid, rel_path=rel_path, role=role)
+            if located.result is ApplyResult.CONFLICT:
+                return WithdrawResult(WithdrawOutcome.CONFLICT, qid=qid)
+            if located.result is not ApplyResult.APPLIED or located.entry is None:
+                return WithdrawResult(WithdrawOutcome.NOT_FOUND, qid=qid)
+            assert located.path is not None and located.lines is not None
+
+            entry = located.entry
+            lines = list(located.lines)
+            common = dict(
+                qid=entry.qid,
+                title=_entry_title(entry, self.fmt),
+                rel_path=self.rel_path(located.path),
+                message_id=_dispatched_message_id(lines, entry),
+            )
+
+            if _has_withdrawn_marker(lines, entry):
+                return WithdrawResult(
+                    WithdrawOutcome.ALREADY_WITHDRAWN, status=entry.status, **common
+                )
+            if entry.status_token is None or entry.status != self.fmt.open_status.lower():
+                return WithdrawResult(WithdrawOutcome.NOT_OPEN, status=entry.status, **common)
+
+            token = entry.status_token
+            heading = lines[entry.start]
+            lines[entry.start] = (
+                heading[: token.start] + self.fmt.withdrawn_status + heading[token.end:]
+            )
+
+            who = _sanitise_inline(withdrawn_by)
+            header = f"**Withdrawn:** {_sanitise_inline(stamp)}"
+            if who:
+                header += f" · {who}"
+            block = [WITHDRAWN_MARKER, header]
+            if reason.strip():
+                block += ["", *escape_answer_text(reason, self.fmt)]
+            lines = _insert_before_boundary(lines, entry, block)
+            self._write(located.path, "\n".join(lines))
+            return WithdrawResult(
+                WithdrawOutcome.WITHDRAWN,
+                status=self.fmt.withdrawn_status.lower(),
+                **common,
+            )
+
+    # ── claims ledger (epic 46 architecture §3.4) ──
+
+    def claim_line_re(self) -> re.Pattern[str]:
+        """Matches a ledger line: a list item that starts with a well-formed id."""
+        spec = _parse_id_template(self.fmt.id) or _parse_id_template(DEFAULT_ID)
+        assert spec is not None
+        return re.compile(r"^\s{0,3}[-*+]\s+" + _id_body(spec) + _ID_TAIL)
+
+    def claimed_ids(self) -> dict[tuple[int, str], str]:
+        """``{(number, variant): line}`` for every id in the ledger.
+
+        Only an id at the start of a list item counts; prose that mentions an
+        id reserves nothing.  A missing or unreadable ledger is an empty one —
+        it must never stop a question being asked.
+        """
+        try:
+            lines = self._read_lines(self.claims_path)
+        except QuestionsStoreError:
+            return {}
+        if lines is None:
+            return {}
+        claim_re = self.claim_line_re()
+        claimed: dict[tuple[int, str], str] = {}
+        for line in lines:
+            m = claim_re.match(line)
+            if m is not None:
+                claimed[(int(m.group("num")), (m.group("var") or "").lower())] = line
+        return claimed
+
+    def claim(
+        self,
+        count: int = 1,
+        *,
+        note: str = "",
+        claimed_by: str = "",
+        claimed_at: str | None = None,
+    ) -> list[str]:
+        """Reserve the next *count* ids in the ledger and return them.
+
+        For a question a session files by hand: the id is taken here, on the
+        queue's own branch, before the entry exists anywhere.  Allocation
+        reads the ledger, so a claimed id is never handed out again.
+        """
+        count = int(count)
+        if count < 1 or count > 50:
+            raise QuestionsStoreError("claim: count must be between 1 and 50")
+        stamp = _sanitise_inline(claimed_at or _utc_now())
+        who = _sanitise_inline(claimed_by)
+        clean_note = _sanitise_inline(note)
+
+        with self.lock():
+            first = self._max_number() + 1
+            ids = [format_id(self.fmt, first + offset) for offset in range(count)]
+
+            existing = self._read_lines(self.claims_path)
+            if existing is None:
+                kept = [
+                    "# Question id claims",
+                    "",
+                    "<!-- One line per reserved id, written by `claude-questions --claim` and",
+                    "     the questions MCP `claim` tool.  An id listed here is never",
+                    "     allocated again; lines may be pruned once the entry exists. -->",
+                    "",
+                ]
+                suffix = ""
+            else:
+                kept = list(existing)
+                suffix = _eol_suffix(kept)
+                while kept and kept[-1].strip() == "":
+                    kept.pop()
+            for token in ids:
+                fields = [token, stamp]
+                if who:
+                    fields.append(who)
+                if clean_note:
+                    fields.append(clean_note)
+                kept.append("- " + " · ".join(fields) + suffix)
+            kept.append("")
+            self._write(self.claims_path, "\n".join(kept))
+        return ids
+
+    def _check_claimed_id(self, qid: str) -> str:
+        """Validate an explicit id for :meth:`create_entry`; return it normalised."""
+        key = parse_id(self.fmt, qid)
+        if key is None:
+            raise QuestionsStoreError(f"{qid!r} is not a well-formed id for this workspace")
+        if key not in self.claimed_ids():
+            raise QuestionsStoreError(
+                f"{qid} has not been claimed — claim it first "
+                "(claude-questions --claim, or the claim tool), or omit id to have one allocated"
+            )
+        for entry in self.all_entries():
+            if entry.key == key:
+                raise QuestionsStoreError(
+                    f"{qid} already heads an entry in {self.rel_path(entry.path) if entry.path else '?'}"
+                )
+        try:
+            for path in self.answered_dir.glob("*.md"):
+                if parse_id(self.fmt, path.stem) == key:
+                    raise QuestionsStoreError(f"{qid} is already archived as {path.name}")
+        except OSError:
+            pass
+        return format_id(self.fmt, key[0], key[1])
 
     # ── locating ──
 
@@ -1427,6 +1990,41 @@ def _has_answer_marker(lines: Sequence[str], message_id: int) -> bool:
         if m is not None and m.group(1) == wanted:
             return True
     return False
+
+
+def _has_withdrawn_marker(lines: Sequence[str], entry: Entry) -> bool:
+    """True when the withdrawal marker sits inside *entry*'s own line range.
+
+    Scoped to the entry on purpose: one withdrawn question must not make its
+    neighbours in the same file look withdrawn.
+    """
+    return any(
+        WITHDRAWN_MARKER_RE.match(lines[index].rstrip("\r"))
+        for index in range(entry.start + 1, min(entry.end, len(lines)))
+    )
+
+
+def _dispatched_message_id(lines: Sequence[str], entry: Entry) -> int | None:
+    """The relay message id on the entry's ``**Dispatched:**`` line, if any."""
+    found: int | None = None
+    for index in range(entry.start + 1, min(entry.end, len(lines))):
+        m = DISPATCHED_RE.match(lines[index])
+        if m is not None:
+            found = int(m.group(2))
+    return found
+
+
+def _entry_title(entry: Entry, fmt: QuestionsFormat) -> str:
+    """The heading text without its id, brackets and separator — display only."""
+    text = entry.heading.rstrip("\r")
+    hm = _entry_heading_re(fmt.level).match(text)
+    if hm is not None:
+        text = text[hm.end():]
+    im = _id_start_re(fmt).match(text)
+    if im is not None:
+        text = text[im.end():]
+    text = re.sub(r"\[[^\]\n]*\]", "", text)
+    return re.sub(r"^[\s—–:-]+", "", text).strip()
 
 
 def _insert_before_boundary(

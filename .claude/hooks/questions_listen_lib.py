@@ -114,6 +114,7 @@ _HERE = str(Path(__file__).resolve().parent)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import questions_git as qg  # noqa: E402
 import questions_store as qs  # noqa: E402
 import roles_config  # noqa: E402
 
@@ -485,6 +486,23 @@ AUTH_RETRY_S = 300.0
 
 #: Telegram's text limit is 4096; leave room for the provenance line.
 _FINALIZE_TEXT_BUDGET = 3500
+
+#: How often, per repository, the listener retries a git sync the tools still
+#: owe (epic 46 architecture §4.5).  Only repositories whose sync-state file
+#: says ``pending`` are touched, so an idle one costs a file read.
+SYNC_RETRY_INTERVAL_S = 300.0
+
+#: The listener's git budget (epic 46).  It applies answers for every
+#: workspace on the machine from one single-threaded loop, and it holds each
+#: repository's lock while it syncs — so it gets a much tighter allowance than
+#: an interactive ``ask``: one short fetch, one short push, one re-try after a
+#: lost race.  An answer is therefore written after at most
+#: ``2 × LISTENER_GIT_TIMEOUT_S × (1 + LISTENER_GIT_RETRIES)`` seconds of git
+#: (32 s, and only against a remote that stalls on every call); when a
+#: repository's last attempt failed within the retry interval, the listener
+#: does not try the network at all and writes at once.
+LISTENER_GIT_TIMEOUT_S = 8.0
+LISTENER_GIT_RETRIES = 1
 
 
 # ── Relay client bootstrap (same shape as questions_mcp_lib) ──────────────────
@@ -965,6 +983,11 @@ class Listener:
         self.started_at = self._now_iso()
         self.last_applied: dict[str, Any] | None = None
         self.cycles = 0
+        #: Repositories that still owe a git sync after the last retry pass,
+        #: and when each was last looked at (epic 46 architecture §4.5).
+        self.sync_pending: list[dict[str, Any]] = []
+        self._sync_checked: dict[tuple[str, str], float] = {}
+        self._sync_warned: dict[tuple[str, str], float] = {}
 
     # ── clocks ──
 
@@ -1067,6 +1090,9 @@ class Listener:
             self.poll_feed(feed, wait)
             polled += 1
 
+        # After the poll, so a debt this very cycle created is already visible
+        # in ``--status`` (its first retry waits out the interval).
+        self.retry_sync_pending()
         self.write_status()
         return polled
 
@@ -1151,11 +1177,11 @@ class Listener:
             return "acked"
 
         # ── steps 3 + 4: re-resolve now, then apply ──
-        error = self._apply(entry, message_id, answer_text, answered_at)
+        error, late = self._apply(entry, message_id, answer_text, answered_at)
 
         # ── step 5: finalize the Telegram message ──
         if error is None:
-            self._finalize(feed, message_id, answer_text, entry)
+            self._finalize(feed, message_id, answer_text, entry, late=late)
             self._record_applied(entry, message_id)
 
         # ── step 6: terminal record + watermark, one atomic write ──
@@ -1174,42 +1200,68 @@ class Listener:
         message_id: int,
         answer_text: str,
         answered_at: str,
-    ) -> str | None:
-        """Steps 3 + 4.  Returns ``None`` on success, else the failure reason.
+    ) -> tuple[str | None, bool]:
+        """Steps 3 + 4.  Returns ``(error, late)``.
+
+        ``error`` is ``None`` on success, else the failure reason.  ``late`` is
+        True when the answer was recorded under an entry that was no longer
+        open — withdrawn, or resolved by hand — and so did not change its
+        status (epic 46 D5).  A late answer is a success: it is on record.
 
         Every store call is wrapped: ``QuestionsStoreError`` (a corrupt or
         unreadable queue file — the 23-03 obligation), ``not_found`` and
         ``conflict`` all become a reason string and route to ``pending``.  None
         of them may escape into the loop, and none of them is ever treated as an
         apply.
+
+        The write goes through ``questions_git.run``, so in a workspace with
+        ``[questions] sync`` on, **the listener commits and pushes what it
+        writes** (epic 46 D12) — an answer that arrives with no session running
+        does not sit uncommitted in the primary checkout.  ``run`` never raises
+        for a git reason: whatever git could not do is recorded in the
+        repository's sync state and retried by :meth:`retry_sync_pending`.
+
+        Git gets a short, fixed budget here (:data:`LISTENER_GIT_TIMEOUT_S`),
+        and none at all while a repository's last attempt is known to have
+        failed: the answer is the point, the commit can follow.
         """
         qid = entry.qid or ""
         try:
             store = resolve_target(entry)
         except ResolveError as exc:
-            return f"workspace not resolvable: {exc}"
+            return f"workspace not resolvable: {exc}", False
         except qs.QuestionsStoreError as exc:
-            return f"store error while resolving: {exc}"
+            return f"store error while resolving: {exc}", False
         except OSError as exc:
-            return f"io error while resolving: {exc}"
+            return f"io error while resolving: {exc}", False
         except Exception as exc:  # noqa: BLE001 — see below
             logger.exception("unexpected error resolving message %s", message_id)
-            return f"unexpected error while resolving: {type(exc).__name__}: {exc}"
+            return f"unexpected error while resolving: {type(exc).__name__}: {exc}", False
 
         try:
-            result = store.apply_answer(
-                qid,
-                answer_text,
-                self._answered_by(entry),
-                message_id,
-                rel_path=entry.rel_path or None,
-                role=entry.role,
-                answered_at=answered_at,
+            result, report = qg.run(
+                store,
+                lambda s: s.apply_answer(
+                    qid,
+                    answer_text,
+                    self._answered_by(entry),
+                    message_id,
+                    rel_path=entry.rel_path or None,
+                    role=entry.role,
+                    answered_at=answered_at,
+                ),
+                summary=f"answer {qid} (relay #{message_id})",
+                network_timeout=LISTENER_GIT_TIMEOUT_S,
+                retries=LISTENER_GIT_RETRIES,
+                # A repository that failed to sync within the last interval is
+                # not asked again now: a batch of answers during an outage must
+                # cost one timeout, not one each.
+                offline=self._sync_failed_recently((entry.workspace_id, entry.root)),
             )
         except qs.QuestionsStoreError as exc:
-            return f"store error: {exc}"
+            return f"store error: {exc}", False
         except OSError as exc:
-            return f"io error: {exc}"
+            return f"io error: {exc}", False
         except Exception as exc:  # noqa: BLE001
             # The catch-all is deliberate and loud.  This is the component whose
             # whole job is to never lose a human decision: an unforeseen error
@@ -1217,16 +1269,34 @@ class Listener:
             # entry, not the death of the resident loop.  ``logger.exception``
             # keeps the traceback in the journal, so it is surfaced, not masked.
             logger.exception("unexpected error applying message %s", message_id)
-            return f"unexpected error: {type(exc).__name__}: {exc}"
+            return f"unexpected error: {type(exc).__name__}: {exc}", False
+
+        if report is not None and report.pending:
+            # The answer *is* in the file; only the commit or the push is owed.
+            # Whatever blocked git a moment ago is still there, so the retry
+            # pass waits out a full interval before trying again.
+            self._sync_checked[(entry.workspace_id, entry.root)] = self._now()
+            logger.warning(
+                "answer %s applied to %s but not fully synced (%s); will retry",
+                message_id, qid, report.reason,
+            )
+        elif report is not None:
+            self._sync_checked.pop((entry.workspace_id, entry.root), None)
 
         if result is qs.ApplyResult.APPLIED:
-            return None
+            return None, False
+        if result is qs.ApplyResult.LATE:
+            logger.info(
+                "answer %s recorded under %s as a late answer; the entry was no longer open",
+                message_id, qid,
+            )
+            return None, True
         if result is qs.ApplyResult.CONFLICT:
             # Two entries claim this id in the target file.  The store refuses
             # to guess and so does this: retryable, kept in ``pending``, visible
             # in ``pending_answers``.  Never silently applied to a guess.
-            return f"conflict: more than one entry for {qid} in {entry.rel_path or '(queue set)'}"
-        return f"not_found: no entry for {qid} in {entry.rel_path or '(queue set)'}"
+            return f"conflict: more than one entry for {qid} in {entry.rel_path or '(queue set)'}", False
+        return f"not_found: no entry for {qid} in {entry.rel_path or '(queue set)'}", False
 
     @staticmethod
     def _answered_by(entry: IndexEntry) -> str:
@@ -1239,6 +1309,7 @@ class Listener:
         message_id: int,
         answer_text: str,
         entry: IndexEntry | None,
+        late: bool = False,
     ) -> bool:
         """Step 5 — ``PATCH /v1/messages/{id}`` to ``✅ <answer>``.
 
@@ -1257,7 +1328,7 @@ class Listener:
                 message_id,
             )
             return False
-        text = self._finalize_text(answer_text, entry)
+        text = self._finalize_text(answer_text, entry, late=late)
         try:
             self.client_for(feed).edit_message(message_id, text=text)
             return True
@@ -1268,13 +1339,27 @@ class Listener:
         return False
 
     @staticmethod
-    def _finalize_text(answer_text: str, entry: IndexEntry | None) -> str:
-        """``✅ <answer>`` plus a provenance line, HTML-escaped for Telegram."""
+    def _finalize_text(
+        answer_text: str,
+        entry: IndexEntry | None,
+        late: bool = False,
+    ) -> str:
+        """``✅ <answer>`` plus a provenance line, HTML-escaped for Telegram.
+
+        A *late* answer says so: the human should know the question had been
+        withdrawn (or otherwise closed) and that their reply was kept on record
+        without reopening it.
+        """
         body = answer_text.strip()
         if len(body) > _FINALIZE_TEXT_BUDGET:
             body = body[:_FINALIZE_TEXT_BUDGET] + "…"
         escaped = html.escape(body, quote=False) or "(answered)"
         line = f"✅ {escaped}"
+        if late:
+            line += (
+                "\n\n<i>Recorded as a late answer — this question was no longer "
+                "open (withdrawn or already closed), so its status was not changed.</i>"
+            )
         if entry is None:
             return line
         parts = [p for p in (entry.qid or "", entry.workspace_id or "") if p]
@@ -1407,14 +1492,14 @@ class Listener:
                 )
                 continue
 
-            error = self._apply(
+            error, late = self._apply(
                 entry,
                 pending.message_id,
                 pending.answer,
                 pending.answered_at or self._now_iso(),
             )
             if error is None:
-                self._finalize(feed, pending.message_id, pending.answer, entry)
+                self._finalize(feed, pending.message_id, pending.answer, entry, late=late)
                 self._record_applied(entry, pending.message_id)
                 self._drop_pending(pending.message_id)
                 applied += 1
@@ -1429,6 +1514,82 @@ class Listener:
                 error = f"{error}; sidecar failed: {side_error}"
             self._bump_pending(pending.message_id, error)
         return applied
+
+    def _sync_failed_recently(self, key: tuple[str, str]) -> bool:
+        last = self._sync_checked.get(key)
+        return last is not None and self._now() - last < SYNC_RETRY_INTERVAL_S
+
+    def retry_sync_pending(self) -> int:
+        """Pay the git debts the tools left behind.  Returns how many syncs ran.
+
+        A degraded transaction — no network at ``ask`` time, a rebase in
+        progress when an answer landed — writes the file and marks its
+        repository *pending*.  This pass retries those, and only those: a
+        repository whose sync-state file does not say ``pending`` is never
+        touched.  (That bounds *when* the listener syncs, not *what* a sync
+        carries: paying a debt publishes every queue file that differs from the
+        upstream, a hand edit sitting in one included.)
+
+        At most once per :data:`SYNC_RETRY_INTERVAL_S` per repository, and no
+        failure escapes: ``questions_git`` reports, and anything else is logged.
+        """
+        now = self._now()
+        targets: dict[tuple[str, str], IndexEntry] = {}
+        for entry in read_index(self.index_path).messages.values():
+            if entry.qid:
+                targets.setdefault((entry.workspace_id, entry.root), entry)
+
+        ran = 0
+        owed: list[dict[str, Any]] = []
+        for key, entry in targets.items():
+            try:
+                store = resolve_target(entry)
+                if store.config.sync not in ("commit", "push") or not qg.is_pending(store):
+                    continue
+                last = self._sync_checked.get(key)
+                if last is not None and now - last < SYNC_RETRY_INTERVAL_S:
+                    # Owed, but not due: report it, do not retry it yet.
+                    owed.append({
+                        "key": list(key),
+                        "workspace_id": entry.workspace_id,
+                        "root": str(store.root),
+                        "reason": str(qg.read_state(store).get("pending_reason") or ""),
+                    })
+                    continue
+                self._sync_checked[key] = now
+                report = qg.sync(
+                    store,
+                    network_timeout=LISTENER_GIT_TIMEOUT_S,
+                    retries=LISTENER_GIT_RETRIES,
+                )
+                ran += 1
+            except Exception as exc:  # noqa: BLE001 — never into the loop
+                # Once per interval, not once per cycle: a workspace that
+                # cannot even be resolved (moved, deleted) fails here on every
+                # pass, before the throttle above is reached.
+                warned = self._sync_warned.get(key)
+                if warned is None or now - warned >= SYNC_RETRY_INTERVAL_S:
+                    logger.warning("sync retry for %s failed: %s", entry.workspace_id, exc)
+                    self._sync_warned[key] = now
+                continue
+            if report is not None and report.pending:
+                owed.append({
+                    "key": list(key),
+                    "workspace_id": entry.workspace_id,
+                    "root": str(store.root),
+                    "reason": report.reason,
+                })
+                logger.info("sync still pending for %s: %s", entry.workspace_id, report.reason)
+            elif report is not None:
+                # Paid.  Forget the failure, or the next answer would be
+                # written "offline" for no reason.
+                self._sync_checked.pop(key, None)
+                logger.info(
+                    "sync retry for %s done (committed=%s pushed=%s)",
+                    entry.workspace_id, report.committed, report.pushed,
+                )
+        self.sync_pending = owed
+        return ran
 
     def _bump_pending(self, message_id: int, error: str) -> None:
         now_iso = self._now_iso()
@@ -1552,6 +1713,9 @@ class Listener:
             ),
             "config": self.config.redacted(),
             "index_path": str(self.index_path),
+            "sync_pending": [
+                {k: v for k, v in item.items() if k != "key"} for item in self.sync_pending
+            ],
         }
 
     def write_status(self) -> None:
@@ -1719,6 +1883,13 @@ def format_status(
         )
     else:
         lines.append("  last applied:   (none)")
+
+    for item in (status or {}).get("sync_pending") or []:
+        if isinstance(item, dict):
+            lines.append(
+                f"  git sync owed:  {item.get('workspace_id', '?')} "
+                f"({item.get('root', '?')}) — {item.get('reason') or 'no reason recorded'}"
+            )
 
     lines.append(f"  pending:        {len(index.pending)}")
     if index.pending:

@@ -4,14 +4,17 @@
 # ///
 """Questions MCP server — async agent↔human question and notification tools.
 
-Epic 23 task 23-04.  Two tools:
+Epic 23 task 23-04, extended by epic 46.  Four tools:
 
-* ``ask``    — write a question entry into the workspace queue file, send it
-               to Telegram as a ``kind=question`` message (``never_expires``),
-               and return the allocated id immediately.
-* ``notify`` — send an async statement; with ``ack=True`` it carries an
-               ``[ Acknowledge ]`` button so the nudge ladder has something to
-               chase (brd D7); with ``ack=False`` it is fire-and-forget.
+* ``ask``      — write a question entry into the workspace queue file, send it
+                 to Telegram as a ``kind=question`` message (``never_expires``),
+                 and return the allocated id immediately.
+* ``notify``   — send an async statement; with ``ack=True`` it carries an
+                 ``[ Acknowledge ]`` button so the nudge ladder has something to
+                 chase (brd D7); with ``ack=False`` it is fire-and-forget.
+* ``withdraw`` — close a question that has become moot: the entry is marked
+                 withdrawn, the Telegram message loses its buttons.
+* ``claim``    — reserve the next id(s) for a question filed by hand.
 
 All logic lives in ``questions_mcp_lib``; this file only registers tools, so
 the behaviour is testable with the repo's plain-``python3`` suite while the
@@ -53,6 +56,7 @@ def ask(
     options: Optional[List[str]] = None,
     role: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    id: Optional[str] = None,
 ) -> str:
     """Ask a human an async question — write to the queue, send to Telegram.
 
@@ -94,6 +98,12 @@ def ask(
             Unresolvable roles (no token on this machine) are refused before
             any write — no dangling entry is created.
         tags: Optional list of tags appended to the heading in square brackets.
+        id: Use this id instead of allocating the next one.  Only an id you
+            reserved with ``claim`` is accepted.  Normally omit it.
+
+    **If the question becomes moot**, call ``withdraw`` with the returned id —
+    do not edit the heading by hand: that leaves the Telegram buttons live and
+    the reminders running.
 
     Returns a JSON string with:
         id            — allocated question id (Q-NNN)
@@ -101,6 +111,13 @@ def ask(
         dispatched    — true when the relay call succeeded
         message_id    — relay message id (null when dispatched is false)
         pending_answers — count of unapplied answers in the local index
+        sync          — present only when the workspace has git sync on: what
+                        was committed and pushed.  ``sync.pushed`` false means
+                        the id is NOT yet claimed for other checkouts; the
+                        ``reason`` says why, and it is retried automatically.
+                        ``sync.dispatch_marker`` appears only if the second
+                        commit (the Dispatched line) fared differently.
+        warnings      — present only when the send succeeded in a degraded form
         error         — present only when something went wrong
     """
     return _dumps(lib.ask(
@@ -109,7 +126,84 @@ def ask(
         options=options,
         role=role,
         tags=tags,
+        id=id,
     ))
+
+
+@mcp.tool()
+def withdraw(
+    reason: str,
+    id: Optional[str] = None,
+    message_id: Optional[int] = None,
+) -> str:
+    """Withdraw a question that no longer needs an answer.
+
+    Use it when a question you (or an earlier session) asked has become moot —
+    the change went ahead, the blocker disappeared, the question was wrong.
+    It marks the queue entry withdrawn with your reason, replaces the Telegram
+    message with "Withdrawn — <reason>", and removes its buttons, reminders and
+    escalation.  (A copy that was *already* escalated to another chat loses its
+    buttons too only if the relay is recent enough; otherwise a tap there is
+    simply dropped.)
+
+    Only an **open** question can be withdrawn.  If the human has already
+    answered, the call is refused and the answer stands.  If an answer arrives
+    after the withdrawal, it is recorded under the entry as a late answer and
+    the status stays withdrawn — nothing a human said is discarded.
+
+    Calling it again on a withdrawn question is harmless and retries the
+    Telegram side, which is what to do when ``relay_cancelled`` came back false.
+
+    Args:
+        reason: Why the question is moot.  Required; the human sees it.
+        id: The question id (``Q-042``).
+        message_id: Instead of ``id``: the relay message id of an
+            acknowledge-notification (``notify(ack=True)``) to cancel.
+
+    Returns a JSON string with:
+        id              — the question id
+        withdrawn       — true when the entry is withdrawn after this call
+        status          — the status word now on the entry
+        file            — queue-file path relative to the workspace root
+        message_id      — relay message id, when the question was dispatched
+        relay_cancelled — true when the Telegram message lost its buttons
+        sync            — present only when the workspace has git sync on
+        note            — present when there is something to know that is not
+                          an error ("already withdrawn", "never dispatched")
+        error           — present only when something went wrong
+    """
+    return _dumps(lib.withdraw(reason=reason, id=id, message_id=message_id))
+
+
+@mcp.tool()
+def claim(count: int = 1, note: str = "") -> str:
+    """Reserve the next question id(s) without asking anything.
+
+    For a question you are going to write into a queue file by hand, or need to
+    cite before it exists.  ``ask`` allocates its own id — you do not need
+    ``claim`` first.  Never pick an id yourself by reading the files: an id on a
+    branch that has not landed, or on another machine, is invisible from here,
+    and that is how two questions end up with one id.
+
+    The reservation is a line in the workspace's claims ledger.  With git sync
+    on it is committed and pushed, which is what makes it binding for every
+    other checkout; read ``claimed_on_remote`` to know whether that happened.
+
+    To *ask* with a claimed id later, pass it as ``ask(id=…)``.
+
+    Args:
+        count: How many consecutive ids to reserve (1–50).
+        note: What the id is for (a branch, a task) — written into the ledger.
+
+    Returns a JSON string with:
+        ids               — the reserved ids
+        file              — the ledger, relative to the workspace root
+        claimed_on_remote — true when the reservation reached the upstream
+        sync              — present only when the workspace has git sync on
+        note              — present when the reservation is local only, with why
+        error             — present only when something went wrong
+    """
+    return _dumps(lib.claim(count=count, note=note))
 
 
 @mcp.tool()

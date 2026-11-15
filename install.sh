@@ -144,6 +144,8 @@ REQUIRED_HOOKS=(
     "lifecycle_events.py"
     "roles_config.py"
     "questions_store.py"
+    "questions_git.py"
+    "questions_ops.py"
     "questions_listen_lib.py"
 )
 
@@ -986,7 +988,7 @@ feature_questions_title()      { echo "Async questions"; }
 feature_questions_writes()     { echo "~/.local/bin/claude-questions, ~/.local/bin/questions-listen, systemd unit file"; }
 feature_questions_default()    { echo "skip"; }  # D14: defaults OFF
 feature_questions_requires()   { echo "telegram"; }
-feature_questions_modules()    { echo "roles_config.py questions_store.py questions_listen_lib.py"; }
+feature_questions_modules()    { echo "roles_config.py questions_store.py questions_git.py questions_ops.py questions_listen_lib.py"; }
 feature_questions_suboptions() { echo "questions-listen"; }
 
 feature_questions_probe() {
@@ -1232,6 +1234,8 @@ declare -A MODULE_OWNERS=(
     [spawn_producer_hook.py]="amux"
     [keep_awake_hook.py]="keep-awake"
     [questions_store.py]="questions"
+    [questions_git.py]="questions"
+    [questions_ops.py]="questions"
     [questions_listen_lib.py]="questions"
 )
 

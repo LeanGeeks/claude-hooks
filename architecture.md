@@ -43,21 +43,23 @@ relay HTTP API itself.
     posttool_hook.py             PostToolUse: cancel relay msg when terminal resolved
     notification_hook.py         Notification(idle_prompt): forward last msg to Telegram
     roles_config.py              role catalog + binding loader; roles_report, format_roles_table
-    questions_store.py           queue-file engine: anchor resolution, id allocation, compose, apply_answer
-    questions_listen_lib.py      index + listener runtime: poll loop, watermark, pending retry
+    questions_store.py           queue-file engine: anchor resolution, id allocation, compose, apply_answer, withdraw, claims ledger (pure: no subprocess)
+    questions_git.py             the only module that runs git: claims an id on the upstream, commits/pushes queue files (opt-in, [questions] sync)
+    questions_ops.py             withdraw / claim / sync — shared by the MCP server and claude-questions
+    questions_listen_lib.py      index + listener runtime: poll loop, watermark, pending retry, git-sync retry
   bin/
     questions-listen             listener process lifecycle (systemd ExecStart); logic lives in questions_listen_lib.py
   settings.json                  permissions allow/deny (+ statusline); hooks merged in by installer
 questions-mcp/
-  server.py                      questions MCP server: ask + notify tools (uv --script, registered user-scoped)
-  questions_mcp_lib.py           ask/notify logic: role resolution, write-then-send, index write
+  server.py                      questions MCP server: ask, notify, withdraw, claim (uv --script, registered user-scoped)
+  questions_mcp_lib.py           ask/notify logic: role resolution, write-then-send, index write; withdraw/claim delegate to questions_ops
 install.sh                       interactive installer — selects features, merges permissions, wires hooks (see docs/installer.md)
 shell/
   profiles.example.toml          shipped template for ~/.claude/profiles.toml
   amux-spawn.bash                shell integration: auto-generates aliases from profiles
   amux-spawn-completion.bash     bash completion for amux-spawn + profile names
   claude-roles                   diagnostic: per-role destination + errors (claude-roles --help)
-  claude-questions               diagnostic: queue state, listener state, --check, --check-contract, --reindex
+  claude-questions               queue state, listener state, --check, --check-contract, --reindex; --withdraw, --claim, --sync
 docs/
   roles.example.toml             copy-paste template for .claude/roles.toml
   roles-prompt-example.md        agent-facing prose to adapt into CLAUDE.md
@@ -683,7 +685,7 @@ probes the relay for each distinct token and reports `bound` / `not bound` /
 
 ---
 
-## Async question path (epic 23)
+## Async question path (epics 23, 46)
 
 A separate, non-blocking channel: an agent writes a question to a workspace
 queue file and sends it to Telegram in one MCP call, then exits.  The answer
@@ -727,6 +729,41 @@ agent ──mcp__questions__ask──► questions-mcp/server.py
 - **Absent `[questions]`, nothing changes** — every existing flow is byte-identical
   with the listener stopped and no config present.
 
+### Withdrawal, and ids that hold across machines (epic 46)
+
+- **`withdraw`** is the only way to close a question without an answer: the
+  store flips the status to the workspace's withdrawn word and records the
+  reason; `questions_ops` then patches and cancels the relay message, and the
+  relay's cancel reaches an escalated copy.  The file is written first and
+  decides a race: an answer applied first makes the withdrawal a refusal; an
+  answer that arrives afterwards is recorded as a *late answer* and changes no
+  status.  More generally, **an answer flips the status only from open.**
+- **`[questions] sync`** (`off` by default) puts git under the tools.  With
+  `push`, `questions_git.run` wraps each store mutation: fetch, run the mutation
+  in a *capture* (an overlay — nothing reaches the disk), build a commit on the
+  upstream tip with a private index, push it by hash, and only then write the
+  file and `git commit --only` it.  A rejected push re-allocates the id for
+  free.  **Only queue files are ever pushed and the checkout is only touched
+  through a pathspec** — the local branch is never pushed, checked out, rebased
+  or merged.  Every degraded state (detached HEAD, a rebase in progress, no
+  network, the primary checkout on another branch) writes the entry anyway,
+  reports why, and marks the repository pending in
+  `<git-dir>/claude-questions-sync.json`; the listener and
+  `claude-questions --sync` retry.
+- **`claim`** reserves ids in a ledger file for questions filed by hand; the
+  ledger is synced like any other write and read by allocation.
+- **`questions_store.py` is still pure** — files only.  `questions_git.py` is
+  the one module that starts a subprocess, and with `sync = "off"` it starts
+  none.
+- The store's lock lives in the git directory, not the queue directory.
+- With `sync` on, the engine registers a **merge driver** for the queue files
+  in the clone's local git configuration (`.git/config`,
+  `.git/info/attributes`; nothing tracked), so the operator's own `git pull`
+  merges them entry by entry.  `[questions.git] merge_driver = false` turns
+  that off.
+
+Design detail: `tasks/46_questions_withdraw_and_claims/`.
+
 ### The listener index
 
 `~/.claude/async_questions.json` maps relay message ids to workspace routing
@@ -741,7 +778,8 @@ than trusting a captured absolute path.
 state and watermark, and any pending applies.  `--check` probes the relay for
 each distinct token.  `--check-contract` reports queue-file conformance.
 `--reindex` rebuilds missing index entries from `**Dispatched:**` markers in the
-queue files — the recovery path for a failed index write.
+queue files — the recovery path for a failed index write.  `--withdraw`,
+`--claim` and `--sync` are the operator's face of the epic-46 operations.
 
 Full reference: `docs/async-questions.md` (operator guide),
 `docs/questions-contract.md` (adopter contract),

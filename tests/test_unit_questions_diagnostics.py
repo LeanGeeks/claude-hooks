@@ -28,7 +28,8 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from unittest.mock import patch
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -376,6 +377,164 @@ class TestCheckContractFencedExamples(unittest.TestCase):
         self.assertEqual(cq._fenced_lines(["a", "```", "## Q-NNN x", "b"]), {1, 2, 3})
         # A backtick fence whose info string contains a backtick is not a fence.
         self.assertEqual(cq._fenced_lines(["``` a`b", "## Q-NNN x"]), set())
+
+
+class TestOperationFlags(unittest.TestCase):
+    """Epic 46: ``--withdraw``, ``--claim`` and ``--sync`` — the CLI face of
+    ``questions_ops``.  Driven through ``main(argv)`` so the argument wiring is
+    under test, not just the functions behind it."""
+
+    def setUp(self):
+        self.ws = _make_workspace(_ROLES_TOML_QUESTIONS, _CONFORMING_QUEUE)
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.state = Path(tempfile.mkdtemp(prefix="qs-diag-state-"))
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        for name, value in (
+            ("INDEX_PATH", self.state / "async_questions.json"),
+            ("_LOCK_PATH", self.state / "async_questions.json.lock"),
+        ):
+            patcher = patch.object(qll, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.ws)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _main(self, *argv: str):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = cq.main(["--workspace-dir", str(self.ws), *argv])
+            except SystemExit as exc:           # argparse's parser.error
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def _queue(self) -> str:
+        return (self.ws / "docs" / "questions" / "for-product-lead.md").read_text(encoding="utf-8")
+
+    def test_claim_prints_the_ids_one_per_line(self):
+        rc, out, err = self._main("--claim", "2", "--note", "hf-123")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.splitlines(), ["Q-003", "Q-004"], "stdout is the ids and nothing else")
+        self.assertIn("this checkout only", err)
+        ledger = (self.ws / "docs" / "questions" / "claims.md").read_text(encoding="utf-8")
+        self.assertIn("- Q-003 · ", ledger)
+        self.assertIn("(claude-questions) · hf-123", ledger)
+
+    def test_claim_defaults_to_one_and_emits_json(self):
+        rc, out, _err = self._main("--claim", "--json")
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(data["ids"], ["Q-003"])
+        self.assertFalse(data["claimed_on_remote"])
+
+    def test_withdraw_an_undispatched_question(self):
+        rc, out, err = self._main("--withdraw", "Q-001", "--reason", "No longer needed")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("Q-001: withdrawn  [withdrawn]", out)
+        self.assertIn("never dispatched", out)
+        text = self._queue()
+        self.assertIn("## Q-001 — Should we use async queues?  [withdrawn]", text)
+        self.assertIn("    No longer needed", text)
+
+    def test_withdraw_needs_a_reason(self):
+        rc, _out, err = self._main("--withdraw", "Q-001")
+        self.assertEqual(rc, 2)
+        self.assertIn("--withdraw needs --reason", err)
+        self.assertIn("[open]", self._queue())
+
+    def test_withdraw_refusals_exit_2_and_change_nothing(self):
+        before = self._queue()
+        rc, out, err = self._main("--withdraw", "Q-002", "--reason", "x")     # [resolved …]
+        self.assertEqual(rc, 2)
+        self.assertIn("Q-002: not withdrawn", out)
+        self.assertIn("only an open question can be withdrawn", err)
+        rc, _out, err = self._main("--withdraw", "Q-404", "--reason", "x")
+        self.assertEqual(rc, 2)
+        self.assertIn("No entry for Q-404", err)
+        self.assertEqual(self._queue(), before)
+
+    def test_withdraw_relay_form_is_parsed(self):
+        for spelling in ("relay:9999", "relay:#9999", "RELAY:9999"):
+            rc, out, _err = self._main("--withdraw", spelling, "--reason", "x", "--json")
+            data = json.loads(out)
+            self.assertEqual(rc, 2, "an unknown relay message is a refusal")
+            self.assertEqual(data["message_id"], 9999, spelling)
+            self.assertNotIn("id", data, "it must not have been read as a question id")
+
+    def test_claim_stdout_is_ids_only_even_with_sync_on(self):
+        """Scripts capture it: ``ID=$(claude-questions --claim)``.  With sync
+        on there is a git line to print — it belongs on stderr."""
+        roles = self.ws / ".claude" / "roles.toml"
+        roles.write_text(
+            roles.read_text(encoding="utf-8").replace(
+                'dir    = "docs/questions"', 'dir    = "docs/questions"\nsync   = "commit"'
+            ),
+            encoding="utf-8",
+        )
+        rc, out, err = self._main("--claim", "2")
+        self.assertEqual(out.splitlines(), ["Q-003", "Q-004"])
+        self.assertIn("git:", err, "the sync report is printed — to stderr")
+        self.assertIn("mode=commit", err)
+
+    def test_operations_cannot_be_combined_or_given_stray_arguments(self):
+        before = self._queue()
+        for argv in (
+            ("--withdraw", "Q-001", "--reason", "x", "--claim"),
+            ("--claim", "--sync"),
+            ("--claim", "--check"),
+            ("--sync", "--status"),
+            ("--note", "orphan"),
+            ("--reason", "orphan"),
+        ):
+            rc, _out, err = self._main(*argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertTrue(err.strip(), argv)
+        self.assertEqual(self._queue(), before)
+        self.assertFalse((self.ws / "docs" / "questions" / "claims.md").exists())
+
+    def test_a_workspace_named_on_the_command_line_beats_the_environment(self):
+        """``find_roles_file`` reads only $CLAUDE_PROJECT_DIR when it is set.
+        These commands write (and can commit and push), so the workspace the
+        user named must be the one acted on."""
+        other = _make_workspace(_ROLES_TOML_QUESTIONS, _CONFORMING_QUEUE)
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(other)}):
+            rc, out, _err = self._main("--claim")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.split(), ["Q-003"])
+        self.assertTrue((self.ws / "docs" / "questions" / "claims.md").is_file())
+        self.assertFalse((other / "docs" / "questions" / "claims.md").exists(),
+                         "the environment's workspace must be left alone")
+
+    def test_an_explicit_dot_is_a_workspace_named_on_the_command_line_too(self):
+        """``--workspace-dir .`` typed out is not the default: it must win over
+        the environment exactly as any other path does."""
+        other = _make_workspace(_ROLES_TOML_QUESTIONS, _CONFORMING_QUEUE)
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(self.ws)
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(other)}), \
+             redirect_stdout(out), redirect_stderr(err):
+            rc = cq.main(["--workspace-dir", ".", "--claim"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertTrue((self.ws / "docs" / "questions" / "claims.md").is_file())
+        self.assertFalse((other / "docs" / "questions" / "claims.md").exists())
+
+    def test_sync_with_sync_off_exits_2_with_the_reason(self):
+        rc, _out, err = self._main("--sync")
+        self.assertEqual(rc, 2)
+        self.assertIn("sync is off", err)
+
+    def test_overview_reports_sync_and_claims(self):
+        self._main("--claim")
+        with patch.object(qll, "load_listen_config", return_value=qll.ListenConfig()), \
+             patch.object(qll, "listener_running", return_value=False):
+            rc, out, _err = self._main()
+        self.assertIn("sync:        off", out)
+        self.assertIn("claims:      claims.md  (1 id(s) reserved)", out)
 
 
 class TestCheckContractNoQuestions(unittest.TestCase):

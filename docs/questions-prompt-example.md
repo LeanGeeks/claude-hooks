@@ -76,6 +76,75 @@ The id is allocated by the store and guaranteed unique across the queue set and
 
 ---
 
+## Withdrawing a question that has become moot
+
+If a question you asked no longer needs an answer — the change went ahead, the
+blocker disappeared, you found the answer in the spec — **withdraw it**:
+
+```python
+mcp__questions__withdraw(
+    id="Q-042",
+    reason="The migration ran clean on staging, so no decision is needed.",
+)
+# → { id, withdrawn: true, status: "withdrawn", file, message_id, relay_cancelled: true }
+```
+
+That marks the entry `[withdrawn]` with your reason, replaces the Telegram
+message with "Withdrawn — <reason>", and removes its buttons, its reminders and
+its escalation.  The human reads the reason, so write it for them.
+
+Do **not** edit the heading by hand to close a question.  A hand-edited
+`[resolved]` leaves the Telegram buttons live, the reminders running and the
+escalation armed, and a late tap is then written into the entry.
+
+Rules worth knowing:
+
+- Only an **open** question can be withdrawn.  If the human already answered,
+  the call is refused (`withdrawn: false`, `status: "resolved"`) and the answer
+  stands — read it instead.
+- If an answer arrives *after* the withdrawal, it is kept: recorded under the
+  entry as a **late answer**, status unchanged.  Look for it before assuming a
+  withdrawn question has nothing to say.
+- `relay_cancelled: false` with an `error` means the file is withdrawn but
+  Telegram could not be reached.  Call `withdraw` again later with the same id;
+  it changes nothing in the file and retries the Telegram side.
+- For a `notify(ack=True)` that has gone stale, pass its `message_id` instead of
+  an `id`.
+
+A pattern this enables: ask "this change is waiting on you" with buttons, carry
+on, and withdraw the question if the change goes ahead by itself.
+
+---
+
+## Never pick a question id yourself
+
+`ask` allocates the id.  If you are writing an entry into a queue file **by
+hand** — or need to cite an id before the entry exists — reserve it first:
+
+```python
+mcp__questions__claim(count=1, note="hf-123 design halt")
+# → { ids: ["Q-591"], file: "docs/questions/claims.md", claimed_on_remote: true }
+```
+
+Reading the queue files and taking "highest + 1" is how two questions end up
+with the same id: an id used on a branch that has not landed, or on another
+machine, is not in the files you can see.  A claim is a line in the ledger on
+the queue's own branch; with `[questions] sync = "push"` it is committed and
+pushed, which is what makes it binding everywhere.
+
+- `claimed_on_remote: false` means the reservation exists only in this
+  checkout (sync is off, or the push did not happen — the `note` says why).
+  Treat the id as provisional and say so.
+- To *ask* with an id you claimed earlier, pass it: `ask(id="Q-591", …)`.  An
+  id that was never claimed, or is already used, is refused.
+- From a shell: `claude-questions --claim` prints the id.
+
+When the workspace has sync on, do not `git commit` or `git push` queue files
+yourself after a tool call — the tool already did.  After editing a queue file
+by hand, run `claude-questions --sync` rather than committing it.
+
+---
+
 ## Routing to a role
 
 `role` is the role_id from `.claude/roles.toml` (e.g. `hpl`, `htl`, `ux`).
@@ -95,10 +164,20 @@ independently, make two separate calls.
 3. `ask` returns `{ id, file, dispatched, message_id, pending_answers }`.
 4. `pending_answers > 0` means previous answers have not yet been applied;
    this is visible on every call as an early warning of a backlog.
+5. In a workspace with git sync on, the result also carries `sync`:
+   `{ mode, committed, pushed, commit, upstream, … }`.  `pushed: true` means the
+   id is claimed for every checkout.  `pushed: false` comes with a `reason`
+   (no network, the checkout is mid-rebase, the primary checkout is on another
+   branch, …): the question **was still written and sent**, the id is
+   provisional, and the push is retried automatically — report the reason in
+   your halt message rather than trying to fix git yourself.
+6. `warnings`, when present, means the question was sent in a degraded form
+   (today: the relay refused the reminder ladder).  It is not an error.
 
 The answer arrives later, applied by the listener `questions-listen` with no
 session running and no AI in the loop.  It is written back to the same queue
-entry by flipping the status token and inserting an answer block.
+entry by flipping the status token and inserting an answer block — and, with
+git sync on, committed and pushed by the listener.
 
 ---
 

@@ -6,7 +6,7 @@ can be unit-tested with the repo's plain-``python3`` suite while ``server.py``
 stays a thin tool-registration shell (it is a ``uv`` single-file script and
 its dependency is only installed inside uv's environment).
 
-Two tools:
+Four tools:
 
 * ``ask`` — write a question entry into the workspace queue file, send it to
   Telegram as a ``kind=question`` message (``never_expires=True``), record the
@@ -17,6 +17,17 @@ Two tools:
   ``kind=question`` with a single ``[ Acknowledge ]`` button so the nudge
   ladder has something to chase (invariant 10 / brd D7).  With ``ack=False``
   it is fire-and-forget and records nothing.
+
+* ``withdraw`` — close a question that has become moot (epic 46).  The logic is
+  ``questions_ops.withdraw``, shared with ``claude-questions --withdraw``.
+
+* ``claim`` — reserve the next id(s) without asking anything (epic 46), for a
+  question a session files by hand.  ``questions_ops.claim``.
+
+Both of ``ask``'s file writes go through ``questions_git.run``: with
+``[questions] sync = "push"`` the id is claimed by a commit on the upstream
+branch before the entry exists locally; with the default ``sync = "off"`` it
+is a plain store call and no git process starts.
 
 Identity and config are resolved **per call**, not at startup (architecture
 §4): the server is long-lived and may serve sessions in different workspaces.
@@ -79,7 +90,9 @@ if str(HOOKS_DIR) not in sys.path:
     sys.path.insert(0, str(HOOKS_DIR))
 
 import questions_store as qs  # noqa: E402
+import questions_git as qg  # noqa: E402
 import questions_listen_lib as qll  # noqa: E402
+import questions_ops as qops  # noqa: E402
 import roles_config  # noqa: E402
 
 
@@ -282,7 +295,7 @@ def _send_async_question(
     text: str,
     keyboard: Optional[List[List[Dict[str, str]]]],
     token: str,
-    nudge_schedule: str,
+    nudge_schedule: Optional[str],
     escalate_after_sec: Optional[int],
     escalate_to_token: Optional[str],
     idempotency_key: str,
@@ -330,6 +343,14 @@ def _send_notification(
         kw["nudge_schedule"] = nudge_schedule
     handle = _client(token).send_message(**kw)
     return handle.message_id
+
+
+def _is_ladder_rejection(exc: BaseException) -> bool:
+    """True for the relay's HTTP 422 ``invalid nudge_schedule: …``."""
+    return (
+        getattr(exc, "status_code", None) == 422
+        and "nudge_schedule" in str(exc)
+    )
 
 
 def _send_error_text(exc: BaseException, *, bind_hint: bool = False) -> str:
@@ -418,6 +439,7 @@ def ask(
     options: Optional[List[str]] = None,
     role: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    id: Optional[str] = None,  # noqa: A002 — the tool's public argument name
 ) -> Dict[str, Any]:
     """Write a question to the workspace queue, send it to Telegram, return id.
 
@@ -441,6 +463,9 @@ def ask(
     tags:
         Optional list of tags appended to the heading (e.g. ``["blocks:
         phase-0.2"]``).
+    id:
+        Use this id instead of allocating the next one.  Accepted only if it
+        was reserved with ``claim`` and nothing uses it yet (epic 46 D11).
 
     Returns
     -------
@@ -450,6 +475,9 @@ def ask(
         dispatched  — ``True`` when the relay call succeeded
         message_id  — relay message id (``None`` when ``dispatched=False``)
         pending_answers — count of unapplied answers in the index
+        sync        — what git did with the entry; present only when the
+                      workspace's ``[questions] sync`` is not ``"off"``
+        warnings    — present only when the send was degraded but succeeded
         error       — present (with a string) only when something went wrong
     """
     workspace_dir = _resolve_workspace_dir()
@@ -560,15 +588,25 @@ def ask(
     # ── 2. Write entry (invariant 1 — write before send) ─────────────────────
     routed_alias = dest.role_id
     tags_list: List[str] = list(tags) if tags else []
+    explicit_id = (id or "").strip() or None
     try:
-        new_entry = store.create_entry(
-            title=title,
-            body=body,
-            role=dest.role_id,
-            options=opts,
-            tags=tags_list,
-            routed_to=routed_alias,
-            path=queue_file,
+        # With sync = "push" this is the *claim*: the entry is composed against
+        # the upstream's content and pushed before it is written here, so the
+        # id is taken everywhere or nowhere (epic 46 D6).  With sync = "off" it
+        # is exactly the store call it always was.
+        new_entry, sync_report = qg.run(
+            store,
+            lambda s: s.create_entry(
+                title=title,
+                body=body,
+                role=dest.role_id,
+                options=opts,
+                tags=tags_list,
+                routed_to=routed_alias,
+                path=queue_file,
+                qid=explicit_id,
+            ),
+            summary=lambda e: f"ask {e.qid}",
         )
     except qs.QuestionsStoreError as exc:
         # Nothing was written — the error happened before or during the
@@ -590,7 +628,16 @@ def ask(
     if escalate_after_sec is not None and not dest.is_default:
         # Escalation goes to the default role.
         default_dest = roles_config.resolve_destination(wc.catalog, wc.bindings, None)
-        escalate_to_token = default_dest.token  # may still be None (fine, skip)
+        escalate_to_token = default_dest.token
+    if escalate_to_token is None:
+        # Nobody to escalate to — the question is already going to the default
+        # role, or the default role has no token here.  The relay takes
+        # ``escalate_after_sec`` and ``escalate_to_token`` together or not at
+        # all (HTTP 422 otherwise), so the delay must go when the target does.
+        # Before this, every ``ask`` to a workspace's default role was written
+        # to the queue and then rejected by the relay — the greenfield setup in
+        # the docs never sent a message.  Found by the first live run.
+        escalate_after_sec = None
 
     # ── 4. Build Telegram body + keyboard ────────────────────────────────────
     notes_list = list(dest.notes)
@@ -609,17 +656,42 @@ def ask(
     message_id: Optional[int] = None
     dispatched = False
     send_error: Optional[str] = None
+    warnings: List[str] = []
 
     try:
-        message_id = _send_async_question(
-            text=body_html,
-            keyboard=keyboard,
-            token=dest.token,
-            nudge_schedule=wc.qs_config.nudge,
-            escalate_after_sec=escalate_after_sec,
-            escalate_to_token=escalate_to_token,
-            idempotency_key=idempotency_key,
-        )
+        try:
+            message_id = _send_async_question(
+                text=body_html,
+                keyboard=keyboard,
+                token=dest.token,
+                nudge_schedule=wc.qs_config.nudge,
+                escalate_after_sec=escalate_after_sec,
+                escalate_to_token=escalate_to_token,
+                idempotency_key=idempotency_key,
+            )
+        except RelayError as exc:
+            if not _is_ladder_rejection(exc):
+                raise
+            # The relay refused the *ladder*, not the question (a relay from
+            # before task 46-01 caps a per-message ladder at its per-chat
+            # ``nudge_max``, 3, and the stock ladder has 4 rungs).  Leaving a
+            # written entry with no message helps nobody: send it with the
+            # chat's own ladder and say so.
+            message_id = _send_async_question(
+                text=body_html,
+                keyboard=keyboard,
+                token=dest.token,
+                nudge_schedule=None,
+                escalate_after_sec=escalate_after_sec,
+                escalate_to_token=escalate_to_token,
+                idempotency_key=idempotency_key + ":no-ladder",
+            )
+            warnings.append(
+                f"the relay rejected the nudge ladder {wc.qs_config.nudge!r} ({exc}); "
+                "the question was sent with the chat's default reminders instead, which "
+                "do not repeat.  Shorten [questions].nudge or raise the relay's "
+                "nudge_message_max."
+            )
         dispatched = True
     except Exception as exc:  # noqa: BLE001
         send_error = _send_error_text(exc, bind_hint=True)
@@ -665,9 +737,14 @@ def ask(
             )
 
     # ── 7. mark_dispatched (best-effort — entry and message already exist) ────
+    marker_report = None
     if dispatched and message_id is not None:
         try:
-            store.mark_dispatched(qid, message_id, rel_path=rel_path)
+            _stamped, marker_report = qg.run(
+                store,
+                lambda s: s.mark_dispatched(qid, message_id, rel_path=rel_path),
+                summary=f"dispatched {qid} (relay #{message_id})",
+            )
         except qs.QuestionsStoreError as exc:
             # Stamp failed — notable but not fatal; entry and message still exist.
             send_error = (
@@ -684,11 +761,58 @@ def ask(
         "message_id": message_id,
         "pending_answers": pending_count,
     }
+    if sync_report is not None:
+        # Present only when the workspace asked for git sync; a sync = "off"
+        # workspace gets the result shape it always had.
+        result["sync"] = sync_report.to_dict()
+        if marker_report is not None and (
+            marker_report.pending or marker_report.pushed != sync_report.pushed
+        ):
+            # The entry and its **Dispatched:** line are two commits; say so
+            # only when the second fared differently from the first.
+            result["sync"]["dispatch_marker"] = marker_report.to_dict()
+    if warnings:
+        result["warnings"] = warnings
     if index_routing_failed:
         result["index_routing_failed"] = True
     if send_error:
         result["error"] = send_error
     return result
+
+
+def withdraw(
+    reason: str,
+    id: Optional[str] = None,  # noqa: A002 — the tool's public argument name
+    message_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Withdraw a question that has become moot (epic 46).
+
+    Thin wrapper: the operation is ``questions_ops.withdraw``, the same function
+    ``claude-questions --withdraw`` calls.
+    """
+    return qops.withdraw(
+        _resolve_workspace_dir(),
+        qid=(id or "").strip() or None,
+        message_id=message_id,
+        reason=reason,
+        by=_caller(),
+        client_for=_client,
+    )
+
+
+def claim(count: int = 1, note: str = "") -> Dict[str, Any]:
+    """Reserve the next question id(s) without asking anything (epic 46)."""
+    return qops.claim(_resolve_workspace_dir(), count=count, note=note, by=_caller())
+
+
+def _caller() -> str:
+    """Who is acting, for the provenance line a withdrawal or a claim leaves.
+
+    The session id (shortened) when Claude Code exports one to its MCP
+    servers; otherwise just "agent".  Never anything secret.
+    """
+    session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return f"agent · session {session[:8]}" if session else "agent"
 
 
 def notify(

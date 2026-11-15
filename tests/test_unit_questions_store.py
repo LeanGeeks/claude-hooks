@@ -326,10 +326,28 @@ class TestRule3Status(StoreTestCase):
         self.assertEqual([e.status for e in store.entries_in(path)], ["answered", "superseded", "closed"])
 
     def test_declared_vocabulary_flips_to_the_second_token(self):
-        path = self.write_queue("for-product-lead.md", "## Q-016 — Handwritten  [answered]\n")
+        path = self.write_queue("for-product-lead.md", "## Q-016 — Handwritten  [open]\n")
         store = self.store(WIDE_STATUS_TOML)
         store.apply_answer("Q-016", "x", "@hpl", 42, role="hpl")
         self.assertIn("## Q-016 — Handwritten  [resolved]", path.read_text(encoding="utf-8"))
+
+    def test_an_answer_never_rewrites_a_status_that_is_not_open(self):
+        """Epic 46 D5.  Before it, this entry became ``[resolved]`` — and
+        ``[SUPERSEDED by Q-269]`` became ``[resolved by Q-269]``."""
+        path = self.write_queue(
+            "for-product-lead.md",
+            "## Q-016 — Handwritten  [answered]\n\n## Q-017 — Old  [SUPERSEDED by Q-269]\n",
+        )
+        store = self.store(WIDE_STATUS_TOML)
+        self.assertIs(store.apply_answer("Q-016", "x", "@hpl", 42, role="hpl"), qs.ApplyResult.LATE)
+        self.assertIs(store.apply_answer("Q-017", "y", "@hpl", 43, role="hpl"), qs.ApplyResult.LATE)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("## Q-016 — Handwritten  [answered]", text)
+        self.assertIn("## Q-017 — Old  [SUPERSEDED by Q-269]", text)
+        # …and neither answer was dropped.
+        self.assertIn("<!-- answer:42 -->", text)
+        self.assertIn("<!-- answer:43 -->", text)
+        self.assertIn("**Late answer** — recorded after this entry was marked [answered]", text)
 
     def test_default_set_does_not_recognise_an_undeclared_token(self):
         path = self.write_queue("for-product-lead.md", "## Q-016 — Handwritten  [answered]\n")
@@ -1394,6 +1412,488 @@ class TestComposition(StoreTestCase):
             title="T", role="hpl", options=["multi\nline option"], routed_to="hpl"
         )
         self.assertIn("1. multi line option", created.path.read_text(encoding="utf-8"))
+
+
+# ══ Epic 46 ══════════════════════════════════════════════════════════════════
+
+
+TWO_OPEN = """\
+    # Questions
+
+    ## Q-001 — First question  [open]  [blocks: phase-1]
+
+    Body one.
+
+    **Routed to:** @hpl
+
+    **Dispatched:** 2026-11-15T10:00:00Z · relay #4187
+
+    ## Q-002 — Second question  [open]
+
+    Body two.
+    """
+
+
+class TestWithdraw(StoreTestCase):
+
+    def test_withdraw_flips_the_status_and_records_the_reason(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        result = store.withdraw(
+            "Q-001", "The change went ahead by itself.",
+            withdrawn_by="session abc", role="hpl", withdrawn_at="2026-11-15T12:00:00Z",
+        )
+        self.assertIs(result.outcome, qs.WithdrawOutcome.WITHDRAWN)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "withdrawn")
+        self.assertEqual(result.title, "First question")
+        self.assertEqual(result.message_id, 4187)
+        self.assertEqual(result.rel_path, "docs/questions/for-product-lead.md")
+
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("## Q-001 — First question  [withdrawn]  [blocks: phase-1]", text)
+        self.assertIn("<!-- withdrawn -->\n**Withdrawn:** 2026-11-15T12:00:00Z · session abc\n", text)
+        self.assertIn("    The change went ahead by itself.", text)
+        # The neighbour is untouched, and the block sits inside Q-001.
+        self.assertIn("## Q-002 — Second question  [open]", text)
+        self.assertLess(text.index("<!-- withdrawn -->"), text.index("## Q-002"))
+
+    def test_a_withdrawn_entry_frees_a_max_open_slot(self):
+        self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        self.assertEqual(store.count_open(), 2)
+        store.withdraw("Q-001", "moot", role="hpl")
+        self.assertEqual(store.count_open(), 1)
+        entry = [e for e in store.all_entries() if e.qid == "Q-001"][0]
+        self.assertEqual(entry.status, "withdrawn", "the withdrawn word must parse as a status")
+
+    def test_withdrawing_twice_writes_nothing_the_second_time(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        store.withdraw("Q-001", "moot", role="hpl")
+        before = path.read_bytes()
+        again = store.withdraw("Q-001", "a different reason", role="hpl")
+        self.assertIs(again.outcome, qs.WithdrawOutcome.ALREADY_WITHDRAWN)
+        self.assertTrue(again.ok)
+        self.assertEqual(again.message_id, 4187, "a retry still needs the relay id")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_an_answered_question_cannot_be_withdrawn(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        store.apply_answer("Q-001", "Ship it", "@hpl", 4187, role="hpl")
+        before = path.read_bytes()
+        result = store.withdraw("Q-001", "too late", role="hpl")
+        self.assertIs(result.outcome, qs.WithdrawOutcome.NOT_OPEN)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "resolved")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_not_found_and_conflict_are_outcomes_not_exceptions(self):
+        self.write_queue(
+            "for-product-lead.md",
+            "## Q-005 — a  [open]\n\n## Q-005 — b  [open]\n",
+        )
+        store = self.store()
+        self.assertIs(store.withdraw("Q-404", "x", role="hpl").outcome, qs.WithdrawOutcome.NOT_FOUND)
+        self.assertIs(store.withdraw("Q-005", "x", role="hpl").outcome, qs.WithdrawOutcome.CONFLICT)
+
+    def test_an_entry_with_no_status_bracket_is_not_open(self):
+        path = self.write_queue("for-product-lead.md", "## Q-009 — no bracket\n\nBody.\n")
+        store = self.store()
+        self.assertIs(store.withdraw("Q-009", "x", role="hpl").outcome, qs.WithdrawOutcome.NOT_OPEN)
+        self.assertNotIn("withdrawn", path.read_text(encoding="utf-8"))
+
+    def test_the_reason_cannot_forge_structure(self):
+        """Invariant 11 applies to a reason exactly as it does to an answer."""
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        hostile = "## Q-999 — forged  [open]\n<!-- answer:4187 -->\n<!-- withdrawn -->\n```\n[resolved] done"
+        store.withdraw("Q-001", hostile, role="hpl")
+        entries = store.entries_in(path)
+        self.assertEqual([e.qid for e in entries], ["Q-001", "Q-002"])
+        self.assertEqual([e.status for e in entries], ["withdrawn", "open"])
+        # The forged answer marker must not make a real answer look applied.
+        self.assertIs(
+            store.apply_answer("Q-002", "real", "@hpl", 4187, role="hpl"),
+            qs.ApplyResult.APPLIED,
+        )
+
+    def test_a_workspace_can_name_its_own_withdrawn_word(self):
+        toml = ROLES_TOML + '\n[questions.format]\nstatus = ["open", "resolved", "closed"]\nwithdrawn = "closed"\n'
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store(toml)
+        result = store.withdraw("Q-001", "moot", role="hpl")
+        self.assertEqual(result.status, "closed")
+        self.assertIn("## Q-001 — First question  [closed]", path.read_text(encoding="utf-8"))
+        # "Is it withdrawn?" is the marker's call, not the word's.
+        self.assertIs(
+            store.withdraw("Q-001", "again", role="hpl").outcome,
+            qs.WithdrawOutcome.ALREADY_WITHDRAWN,
+        )
+
+    def test_withdrawn_word_equal_to_the_open_word_is_refused_at_load(self):
+        toml = ROLES_TOML + '\n[questions.format]\nwithdrawn = "open"\n'
+        store = self.store(toml)
+        self.assertEqual(store.fmt.withdrawn, "withdrawn")
+        self.assertTrue(any("withdrawn" in e for e in store.config.errors))
+
+    def test_crlf_file_stays_crlf(self):
+        path = self.ws / "docs" / "questions" / "for-product-lead.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("## Q-001 — a  [open]\r\n\r\nBody.\r\n")
+        self.store().withdraw("Q-001", "moot", role="hpl")
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
+        self.assertIn("## Q-001 — a  [withdrawn]\r\n", text)
+        self.assertIn("<!-- withdrawn -->\r\n", text)
+        self.assertNotIn("-->\n", text.replace("\r\n", ""))
+
+
+class TestAnswerRacesWithdrawal(StoreTestCase):
+    """Epic 46 D5 — the file decides, and nothing is discarded."""
+
+    def test_withdrawn_first_then_answer_is_recorded_late(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        store.withdraw("Q-001", "moot", role="hpl")
+        result = store.apply_answer("Q-001", "Option 2", "@hpl", 4187, role="hpl")
+        self.assertIs(result, qs.ApplyResult.LATE)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("## Q-001 — First question  [withdrawn]", text, "status must not flip")
+        self.assertIn("<!-- answer:4187 -->", text)
+        self.assertIn("**Late answer** — recorded after this entry was marked [withdrawn]", text)
+        self.assertIn("    Option 2", text)
+
+    def test_late_answer_is_idempotent(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        store.withdraw("Q-001", "moot", role="hpl")
+        store.apply_answer("Q-001", "Option 2", "@hpl", 4187, role="hpl")
+        before = path.read_bytes()
+        self.assertIs(
+            store.apply_answer("Q-001", "Option 2", "@hpl", 4187, role="hpl"),
+            qs.ApplyResult.APPLIED,   # the marker short-circuit: provably done
+        )
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_answer_first_then_withdrawal_is_refused(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        self.assertIs(
+            store.apply_answer("Q-001", "Ship it", "@hpl", 4187, role="hpl"),
+            qs.ApplyResult.APPLIED,
+        )
+        self.assertIs(store.withdraw("Q-001", "moot", role="hpl").outcome, qs.WithdrawOutcome.NOT_OPEN)
+        self.assertIn("## Q-001 — First question  [resolved]", path.read_text(encoding="utf-8"))
+
+    def test_marker_in_a_neighbour_does_not_leak(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        store = self.store()
+        store.withdraw("Q-001", "moot", role="hpl")
+        self.assertIs(
+            store.apply_answer("Q-002", "yes", "@hpl", 4200, role="hpl"),
+            qs.ApplyResult.APPLIED,
+        )
+        self.assertIn("## Q-002 — Second question  [resolved]", path.read_text(encoding="utf-8"))
+
+
+class TestClaims(StoreTestCase):
+
+    def test_claim_reserves_the_next_ids_and_ask_skips_them(self):
+        self.write_queue("for-product-lead.md", "## Q-041 — a  [open]\n")
+        store = self.store()
+        ids = store.claim(2, note="hf-123 design halt", claimed_by="session abc",
+                          claimed_at="2026-11-15T12:00:00Z")
+        self.assertEqual(ids, ["Q-042", "Q-043"])
+        ledger = store.claims_path.read_text(encoding="utf-8")
+        self.assertIn("- Q-042 · 2026-11-15T12:00:00Z · session abc · hf-123 design halt\n", ledger)
+        self.assertIn("- Q-043 · ", ledger)
+        self.assertEqual(store.next_id(), "Q-044")
+        self.assertEqual(store.create_entry(title="t", role="hpl").qid, "Q-044")
+        self.assertEqual(store.claim()[0], "Q-045")
+
+    def test_the_ledger_is_not_a_queue_file_even_under_a_wide_glob(self):
+        toml = ROLES_TOML + '\n[questions.format]\nglob = "*.md"\n'
+        store = self.store(toml)
+        store.claim()
+        self.assertNotIn(store.claims_path, store.queue_files())
+        self.assertEqual(store.count_open(), 0)
+
+    def test_only_a_list_item_that_starts_with_an_id_reserves_it(self):
+        self.write_queue("claims.md", """\
+            # Question id claims
+
+            See Q-900 for background; Q-901 is mentioned too.
+            - Q-050 · 2026-11-15T12:00:00Z
+            -Q-060 not a list item
+            - see Q-070
+            """)
+        store = self.store()
+        self.assertEqual(sorted(store.claimed_ids()), [(50, "")])
+        self.assertEqual(store.next_id(), "Q-051")
+
+    def test_explicit_id_must_be_claimed_and_unused(self):
+        self.write_queue("for-product-lead.md", "## Q-041 — a  [open]\n")
+        store = self.store()
+        with self.assertRaises(qs.QuestionsStoreError) as ctx:
+            store.create_entry(title="t", role="hpl", qid="Q-099")
+        self.assertIn("has not been claimed", str(ctx.exception))
+
+        claimed = store.claim()[0]
+        self.assertEqual(claimed, "Q-042")
+        # Spelling is not identity: Q-42 is Q-042.
+        self.assertEqual(store.create_entry(title="t", role="hpl", qid="Q-42").qid, "Q-042")
+        with self.assertRaises(qs.QuestionsStoreError) as ctx:
+            store.create_entry(title="again", role="hpl", qid="Q-042")
+        self.assertIn("already heads an entry", str(ctx.exception))
+        with self.assertRaises(qs.QuestionsStoreError):
+            store.create_entry(title="t", role="hpl", qid="not-an-id")
+
+    def test_claim_count_is_bounded(self):
+        store = self.store()
+        for bad in (0, -1, 51):
+            with self.assertRaises(qs.QuestionsStoreError):
+                store.claim(bad)
+
+    def test_id_floor_raises_the_high_water_mark(self):
+        self.write_queue("for-product-lead.md", "## Q-041 — a  [open]\n")
+        store = self.store()
+        store.id_floor = 600
+        self.assertEqual(store.create_entry(title="t", role="hpl").qid, "Q-601")
+        store.id_floor = 10           # a floor below the mark changes nothing
+        self.assertEqual(store.next_id(), "Q-602")
+
+
+def _git_init(path: Path) -> None:
+    """A minimal repository layout — the store reads ``.git`` metadata itself
+    and needs no git binary (and no git state worth the name)."""
+    (path / ".git").mkdir()
+    (path / ".git" / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+
+
+class TestLockLocation(StoreTestCase):
+    """Epic 46 D14."""
+
+    def test_no_git_keeps_the_lock_beside_the_queue(self):
+        store = self.store()
+        self.assertEqual(store.lock_path, store.queue_dir / qs.LOCK_FILENAME)
+
+    def test_in_a_repository_the_lock_leaves_the_working_tree(self):
+        _git_init(self.ws)
+        store = self.store()
+        self.assertEqual(store.lock_path, self.ws / ".git" / qs.GIT_LOCK_FILENAME)
+        store.create_entry(title="x", role="hpl")
+        self.assertTrue((self.ws / ".git" / qs.GIT_LOCK_FILENAME).exists())
+        self.assertFalse(
+            (store.queue_dir / qs.LOCK_FILENAME).exists(),
+            "the store must not create an untracked file in the queue directory",
+        )
+
+    def test_a_linked_worktree_shares_the_repository_lock(self):
+        _git_init(self.ws)
+        linked = self.ws / "wt"
+        gitdir = self.ws / ".git" / "worktrees" / "wt"
+        gitdir.mkdir(parents=True)
+        (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+        (linked / ".claude").mkdir(parents=True)
+        (linked / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+        (linked / ".claude" / "roles.toml").write_text(ROLES_TOML, encoding="utf-8")
+        config = qs.load_questions_config(str(linked), roles_path=linked / ".claude" / "roles.toml")
+        store = qs.store_for_root(config, linked)
+        self.assertEqual(store.lock_path, (self.ws / ".git").resolve() / qs.GIT_LOCK_FILENAME)
+
+    def test_a_legacy_lock_is_taken_too_and_never_created(self):
+        """A pre-upgrade MCP server process still locks ``<dir>/.lock``; both
+        generations must exclude each other until that file is deleted."""
+        import fcntl
+
+        _git_init(self.ws)
+        store = self.store()
+        legacy = store.queue_dir / qs.LOCK_FILENAME
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text("", encoding="utf-8")
+
+        with store.lock():
+            with open(legacy, "r+") as other:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Released afterwards.
+        with open(legacy, "r+") as other:
+            fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+        legacy.unlink()
+        with store.lock():
+            pass
+        self.assertFalse(legacy.exists(), "the legacy file must never be re-created")
+
+    def test_an_unwritable_git_dir_falls_back_to_the_lock_beside_the_queue(self):
+        """A sandboxed session cannot write into ``.git``.  Before epic 46 the
+        lock was beside the queue and such a session could ask; it still must."""
+        import builtins
+        import fcntl
+        from unittest.mock import patch
+
+        _git_init(self.ws)
+        store = self.store()
+        git_lock = self.ws / ".git" / qs.GIT_LOCK_FILENAME
+        real_open = builtins.open
+
+        def sandboxed_open(file, *args, **kwargs):
+            if Path(file) == git_lock:
+                raise PermissionError(13, "Read-only file system", str(file))
+            return real_open(file, *args, **kwargs)
+
+        with patch.object(qs, "open", sandboxed_open, create=True):
+            self.assertEqual(store.create_entry(title="x", role="hpl").qid, "Q-001")
+        beside = store.queue_dir / qs.LOCK_FILENAME
+        self.assertTrue(beside.exists())
+        self.assertFalse(git_lock.exists())
+        self.assertEqual(store.lock_path, beside)
+
+        # A process that *can* reach .git then takes both files, so the two
+        # generations of lock still exclude each other.
+        other = self.store()
+        self.assertEqual(other.lock_path, git_lock)
+        with other.lock():
+            with real_open(beside, "r+") as fh:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_lock_is_reentrant(self):
+        store = self.store()
+        with store.lock():
+            with store.lock():
+                self.assertEqual(store.create_entry(title="x", role="hpl").qid, "Q-001")
+        # …and fully released: a second store (a second fd) can take it.
+        other = self.store()
+        with other.lock():
+            pass
+
+
+class TestCapture(StoreTestCase):
+    """Epic 46 architecture §3.6 — a mutation that never reaches the disk."""
+
+    def test_capture_writes_nothing_until_materialized(self):
+        path = self.write_queue("for-product-lead.md", "## Q-041 — a  [open]\n")
+        before = path.read_bytes()
+        store = self.store()
+        with store.capture() as cap:
+            entry = store.create_entry(title="captured", role="hpl")
+            # Reads inside the capture see the overlay…
+            self.assertEqual(store.next_id(), "Q-043")
+            self.assertEqual(len(store.entries_in(path)), 2)
+        self.assertEqual(entry.qid, "Q-042")
+        self.assertEqual(path.read_bytes(), before, "…but the disk is untouched")
+        self.assertEqual(list(cap.writes), [path])
+        self.assertEqual(cap.touched, {path})
+
+        self.assertEqual(store.materialize(cap), [path])
+        self.assertIn("## Q-042 — captured  [open]", path.read_text(encoding="utf-8"))
+        self.assertEqual(store.materialize(cap), [], "an identical file is not rewritten")
+
+    def test_discarding_a_capture_leaves_no_trace(self):
+        path = self.write_queue("for-product-lead.md", "## Q-041 — a  [open]\n")
+        store = self.store()
+        with store.capture():
+            store.create_entry(title="lost race", role="hpl")
+        # A second attempt allocates the same id again: nothing was consumed.
+        self.assertEqual(store.next_id(), "Q-042")
+        self.assertEqual(len(store.entries_in(path)), 1)
+        # No temp file, no ledger — only the queue file and (outside a
+        # repository) the lock.
+        self.assertEqual(
+            sorted(p.name for p in path.parent.iterdir() if p.name != qs.LOCK_FILENAME),
+            ["for-product-lead.md"],
+        )
+
+    def test_a_seeded_file_is_what_the_mutation_builds_on(self):
+        path = self.write_queue("for-product-lead.md", "## Q-041 — local  [open]\n")
+        store = self.store()
+        with store.capture() as cap:
+            cap.seed(path, "## Q-041 — local  [open]\n\n## Q-042 — from upstream  [open]\n")
+            entry = store.create_entry(title="mine", role="hpl")
+        self.assertEqual(entry.qid, "Q-043", "allocation must see the seeded upstream entry")
+        self.assertIn("## Q-042 — from upstream", cap.writes[path])
+        self.assertIn("## Q-043 — mine", cap.writes[path])
+
+    def test_a_file_that_exists_only_in_the_capture_joins_the_queue_set(self):
+        store = self.store()
+        new_file = store.queue_dir / "for-designer.md"
+        with store.capture() as cap:
+            cap.seed(new_file, "## Q-700 — upstream only  [open]\n")
+            self.assertIn(new_file, store.queue_files())
+            self.assertEqual(store.next_id(), "Q-701")
+
+    def test_every_mutator_honours_the_capture(self):
+        path = self.write_queue("for-product-lead.md", TWO_OPEN)
+        before = path.read_bytes()
+        store = self.store()
+        with store.capture() as cap:
+            store.mark_dispatched("Q-002", 5000, role="hpl")
+            store.apply_answer("Q-002", "yes", "@hpl", 5000, role="hpl")
+            store.withdraw("Q-001", "moot", role="hpl")
+            store.claim()
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(store.claims_path.exists())
+        self.assertEqual(set(cap.writes), {path, store.claims_path})
+        self.assertIn("[withdrawn]", cap.writes[path])
+        self.assertIn("<!-- answer:5000 -->", cap.writes[path])
+
+    def test_captures_do_not_nest(self):
+        store = self.store()
+        with store.capture():
+            with self.assertRaises(qs.QuestionsStoreError):
+                with store.capture():
+                    pass
+
+
+class TestSyncConfig(StoreTestCase):
+
+    def test_defaults_are_off(self):
+        config = self.store().config
+        self.assertEqual(config.sync, "off")
+        self.assertEqual(config.claims, "claims.md")
+        self.assertEqual(config.git_remote, "")
+        self.assertEqual(config.git_branch, "")
+        self.assertEqual(config.git_retries, 5)
+        self.assertEqual(config.git_message, "chore(questions): {summary}")
+        self.assertTrue(config.git_merge_driver)
+        self.assertEqual(config.errors, ())
+
+    def test_merge_driver_can_be_turned_off_and_rejects_non_booleans(self):
+        off = self.store(ROLES_TOML + "\n[questions.git]\nmerge_driver = false\n").config
+        self.assertFalse(off.git_merge_driver)
+        self.assertEqual(off.errors, ())
+        bad = self.store(ROLES_TOML + '\n[questions.git]\nmerge_driver = "no"\n').config
+        self.assertTrue(bad.git_merge_driver)
+        self.assertEqual(len(bad.errors), 1, bad.errors)
+
+    def test_full_section_parses(self):
+        toml = ROLES_TOML.replace(
+            'anchor = "worktree"\n',
+            'anchor = "worktree"\nsync = "push"\nclaims = "ids.md"\n',
+        ) + '\n[questions.git]\nremote = "upstream"\nbranch = "main"\nretries = 5\nmessage = "docs(q): {summary}"\n'
+        config = self.store(toml).config
+        self.assertEqual(
+            (config.sync, config.claims, config.git_remote, config.git_branch,
+             config.git_retries, config.git_message),
+            ("push", "ids.md", "upstream", "main", 5, "docs(q): {summary}"),
+        )
+        self.assertEqual(config.errors, ())
+
+    def test_bad_values_fall_back_and_are_reported(self):
+        toml = ROLES_TOML.replace(
+            'anchor = "worktree"\n',
+            'anchor = "worktree"\nsync = "yolo"\nclaims = "../escape.md"\n',
+        ) + '\n[questions.git]\nretries = "many"\nmessage = "no placeholder"\nremote = 3\n'
+        config = self.store(toml).config
+        self.assertEqual(config.sync, "off", "an unknown mode must never switch git on")
+        self.assertEqual(config.claims, "claims.md")
+        self.assertEqual(config.git_retries, 5)
+        self.assertEqual(config.git_message, "chore(questions): {summary}")
+        self.assertEqual(len(config.errors), 5, config.errors)
 
 
 if __name__ == "__main__":

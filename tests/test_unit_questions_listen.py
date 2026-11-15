@@ -1316,6 +1316,209 @@ class TestListenConfig(unittest.TestCase):
         self.assertIn(qll.token_fingerprint("rly_supersecret"), blob)
 
 
+# ── Epic 46: late answers and the sync retry pass ────────────────────────────
+
+
+class TestLateAnswer(ListenerTestCase):
+    """brd D5 — an answer that reaches a withdrawn question is kept, the status
+    is not changed, and the human is told."""
+
+    def _withdraw(self, qid: str = "Q-001") -> None:
+        config = qs.load_questions_config(str(self.ws), roles_path=self.ws / ".claude" / "roles.toml")
+        store = qs.store_for_root(config, self.ws)
+        self.assertTrue(store.withdraw(qid, "went ahead by itself", role="hpl").ok)
+
+    def test_answer_after_withdrawal_is_recorded_and_finalized_as_late(self):
+        self._withdraw()
+        self.add_index_entry(4187, qid="Q-001")
+        client = self.client_for()
+        client.rows.append(_answer_row(4187, "Option 2"))
+
+        listener = self.make_listener()
+        listener.run_cycle()
+
+        text = self.queue_text()
+        self.assertIn("## Q-001 — Should we ship on Friday?  [withdrawn]", text)
+        self.assertEqual(self.marker_count(4187), 1)
+        self.assertIn("**Late answer** — recorded after this entry was marked [withdrawn]", text)
+        self.assertIn("    Option 2", text)
+        # A late answer is an apply, not a failure: nothing pends, the feed moves on.
+        self.assertEqual(self.index().pending, [])
+        self.assertEqual(self.index().watermark, 4187)
+        self.assertEqual(listener.last_applied["qid"], "Q-001")
+        # The human sees their answer and learns it did not reopen anything.
+        self.assertEqual(len(client.edits), 1)
+        mid, shown = client.edits[0]
+        self.assertEqual(mid, 4187)
+        self.assertTrue(shown.startswith("✅ Option 2"))
+        self.assertIn("Recorded as a late answer", shown)
+
+    def test_replay_of_a_late_answer_does_not_duplicate_it(self):
+        self._withdraw()
+        self.add_index_entry(4187, qid="Q-001")
+        self.client_for().rows.append(_answer_row(4187, "Option 2"))
+        self.make_listener().run_cycle()
+        before = self.queue_text()
+
+        fresh = self.make_listener()
+        self.assertEqual(
+            fresh.process_answer(fresh.feeds[0], _answer_row(4187, "Option 2")), "applied"
+        )
+        self.assertEqual(self.queue_text(), before)
+
+    def test_an_ordinary_answer_is_not_called_late(self):
+        self.add_index_entry(4187, qid="Q-001")
+        client = self.client_for()
+        client.rows.append(_answer_row(4187, "Ship it"))
+        self.make_listener().run_cycle()
+        self.assertNotIn("late answer", client.edits[0][1].lower())
+        self.assertIn("[resolved]", self.queue_text())
+
+
+class TestSyncRetryPass(ListenerTestCase):
+    """Architecture §4.5 — the listener pays the tools' git debts, and only those."""
+
+    def _enable_sync(self) -> None:
+        roles = self.ws / ".claude" / "roles.toml"
+        roles.write_text(
+            roles.read_text(encoding="utf-8").replace(
+                'dir    = "docs/questions"', 'dir    = "docs/questions"\nsync   = "push"'
+            ),
+            encoding="utf-8",
+        )
+
+    def test_sync_off_workspace_is_never_synced(self):
+        self.add_index_entry(4187, qid="Q-001")
+        with patch.object(qll.qg, "sync", side_effect=AssertionError("must not sync")), \
+             patch.object(qll.qg, "is_pending", return_value=True):
+            self.assertEqual(self.make_listener().retry_sync_pending(), 0)
+
+    def test_a_repository_that_owes_nothing_is_not_touched(self):
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        with patch.object(qll.qg, "sync", side_effect=AssertionError("must not sync")), \
+             patch.object(qll.qg, "is_pending", return_value=False):
+            self.assertEqual(self.make_listener().retry_sync_pending(), 0)
+
+    def test_a_pending_repository_is_retried_once_per_interval_and_reported(self):
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        self.add_index_entry(4188, qid="Q-002")      # same repository: one retry, not two
+        self.add_index_entry(4190, qid=None)         # an ack-notification has no repository
+        still_owed = qll.qg.SyncReport(mode="push", pending=True, reason="fetch failed: no route")
+        listener = self.make_listener()
+
+        with patch.object(qll.qg, "is_pending", return_value=True), \
+             patch.object(qll.qg, "sync", return_value=still_owed) as sync:
+            self.assertEqual(listener.retry_sync_pending(), 1)
+            self.assertEqual(listener.retry_sync_pending(), 0, "throttled within the interval")
+            self.assertEqual(sync.call_count, 1)
+            self.assertEqual(len(listener.sync_pending), 1, "the debt stays visible while throttled")
+
+            self.now += qll.SYNC_RETRY_INTERVAL_S + 1
+            self.assertEqual(listener.retry_sync_pending(), 1)
+            self.assertEqual(sync.call_count, 2)
+            self.assertEqual(len(listener.sync_pending), 1)
+
+        status = listener.status_dict()
+        self.assertEqual(status["sync_pending"], [{
+            "workspace_id": "test-ws",
+            "root": str(self.ws),
+            "reason": "fetch failed: no route",
+        }])
+        rendered = qll.format_status(status, self.index(), running=True, config=self.config)
+        self.assertIn("git sync owed:  test-ws", rendered)
+        self.assertIn("fetch failed: no route", rendered)
+
+    def test_a_paid_debt_disappears_from_status(self):
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        listener = self.make_listener()
+        with patch.object(qll.qg, "is_pending", return_value=True), \
+             patch.object(qll.qg, "sync", return_value=qll.qg.SyncReport(mode="push", pending=True, reason="x")):
+            listener.retry_sync_pending()
+        self.assertEqual(len(listener.sync_pending), 1)
+        self.now += qll.SYNC_RETRY_INTERVAL_S + 1
+        with patch.object(qll.qg, "is_pending", return_value=True), \
+             patch.object(qll.qg, "sync", return_value=qll.qg.SyncReport(mode="push", committed=True, pushed=True)):
+            listener.retry_sync_pending()
+        self.assertEqual(listener.sync_pending, [])
+
+    def test_answers_get_a_short_git_budget_and_none_after_a_failure(self):
+        """An answer must not wait long for git: the listener passes a tight
+        budget, and once a repository has failed it writes the next answers
+        without trying the network at all — a batch during an outage costs one
+        timeout, not one each."""
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        self.add_index_entry(4188, qid="Q-002")
+        calls = []
+
+        def fake_run(store, op, **kwargs):
+            calls.append(kwargs)
+            return op(store), qll.qg.SyncReport(mode="push", pending=True, reason="fetch failed: timeout")
+
+        listener = self.make_listener()
+        with patch.object(qll.qg, "run", side_effect=fake_run):
+            listener.process_answer(listener.feeds[0], _answer_row(4187, "one"))
+            listener.process_answer(listener.feeds[0], _answer_row(4188, "two"))
+
+        self.assertEqual(self.marker_count(4187) + self.marker_count(4188), 2)
+        self.assertEqual([c["offline"] for c in calls], [False, True])
+        for call in calls:
+            self.assertEqual(call["network_timeout"], qll.LISTENER_GIT_TIMEOUT_S)
+            self.assertEqual(call["retries"], qll.LISTENER_GIT_RETRIES)
+        self.assertLessEqual(
+            2 * qll.LISTENER_GIT_TIMEOUT_S * (1 + qll.LISTENER_GIT_RETRIES), 40,
+            "the documented worst case for one answer",
+        )
+
+    def test_a_paid_debt_ends_the_offline_period(self):
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        self.add_index_entry(4188, qid="Q-002")
+        calls = []
+        outcome = {"report": qll.qg.SyncReport(mode="push", pending=True, reason="x")}
+
+        def fake_run(store, op, **kwargs):
+            calls.append(kwargs["offline"])
+            return op(store), outcome["report"]
+
+        listener = self.make_listener()
+        with patch.object(qll.qg, "run", side_effect=fake_run):
+            listener.process_answer(listener.feeds[0], _answer_row(4187, "one"))
+            self.now += qll.SYNC_RETRY_INTERVAL_S + 1
+            with patch.object(qll.qg, "is_pending", return_value=True), \
+                 patch.object(qll.qg, "sync", return_value=qll.qg.SyncReport(mode="push", pushed=True, committed=True)):
+                self.assertEqual(listener.retry_sync_pending(), 1)
+            outcome["report"] = qll.qg.SyncReport(mode="push", pushed=True, committed=True)
+            listener.process_answer(listener.feeds[0], _answer_row(4188, "two"))
+        self.assertEqual(calls, [False, False])
+
+    def test_an_unresolvable_workspace_is_warned_about_once_per_interval(self):
+        gone = self.tmp / "moved-away"
+        self.add_index_entry(4187, qid="Q-001", root=gone, anchor="worktree")
+        listener = self.make_listener()
+        with self.assertLogs("questions_listen", level="WARNING") as logs:
+            listener.retry_sync_pending()
+            listener.retry_sync_pending()
+            listener.retry_sync_pending()
+        self.assertEqual(len([r for r in logs.records if "sync retry" in r.getMessage()]), 1)
+        self.now += qll.SYNC_RETRY_INTERVAL_S + 1
+        with self.assertLogs("questions_listen", level="WARNING") as logs:
+            listener.retry_sync_pending()
+        self.assertEqual(len(logs.records), 1)
+
+    def test_a_failing_sync_never_reaches_the_loop(self):
+        self._enable_sync()
+        self.add_index_entry(4187, qid="Q-001")
+        self.client_for().rows.append(_answer_row(4187, "Ship it"))
+        with patch.object(qll.qg, "is_pending", return_value=True), \
+             patch.object(qll.qg, "sync", side_effect=RuntimeError("boom")):
+            self.make_listener().run_cycle()          # must not raise
+        self.assertEqual(self.marker_count(4187), 1, "the answer is applied regardless")
+
+
 # ── --status ──────────────────────────────────────────────────────────────────
 
 

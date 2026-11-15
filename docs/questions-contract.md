@@ -108,6 +108,33 @@ The **first** token is what a freshly composed entry carries.
 The **second** is what `apply_answer` flips to when the human answers.
 Additional tokens are recognised (rule 3) but never written by the store.
 
+**An answer flips the status only from the first (open) token.**  An entry that
+carries any other status when its answer arrives — withdrawn, resolved by hand,
+`[SUPERSEDED by Q-269]` — keeps its heading exactly as it is; the answer is
+still written under it, marked as a late answer.  The store never overwrites a
+status a human set.
+
+#### The withdrawn word
+
+```toml
+[questions.format]
+withdrawn = "withdrawn"     # the default
+```
+
+`withdraw` flips an open entry to this word and inserts a `<!-- withdrawn -->`
+block carrying who, when and why.  The word is **always** part of the
+recognised status set, listed in `status` or not, so a withdrawn entry never
+reads as "no status".  Rules: one word, and not the open word.
+
+If your vocabulary already has a word for "closed without an answer", name it
+here (`withdrawn = "closed"`) rather than adding a new one.  Whether an entry
+*is* withdrawn is decided by the marker, not by the word, so hand-written
+entries that use the same word are unaffected.
+
+For an adopter this is the only new thing to check: if any existing heading
+has a bracket whose first word is your withdrawn word (default `withdrawn`), it
+now parses as that entry's status.
+
 **Worked example — the reference workspace:**
 
 The reference workspace (`hyppie-flow`) uses `answered` as a live token for 25
@@ -118,6 +145,20 @@ status = ["open", "resolved", "answered"]
 ```
 
 makes all 290 entries conformant with zero heading edits.
+
+### Files beside the queue
+
+Two files that are not queue files can appear in the queue directory:
+
+- **`claims.md`** (`[questions] claims`) — the id ledger written by `claim`.
+  One list item per reserved id.  Allocation reads it; it is never parsed for
+  entries and is excluded from the queue set even under a wide `glob`.  Commit
+  it.
+- **`.lock`** — the store's lock file, *only* outside a git repository, or left
+  over from before epic 46.  In a git workspace the lock now lives in the git
+  directory and nothing untracked is created in the working tree.  A leftover
+  `.lock` can be deleted once every session started before the upgrade has
+  ended (see `docs/async-questions.md`, "The lock file"); do not commit it.
 
 ### Id shape
 

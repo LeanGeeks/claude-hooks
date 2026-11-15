@@ -35,6 +35,12 @@ anchor = "repo"
 # nudge: the relay nudge ladder for unanswered questions.
 # A trailing * repeats the last rung indefinitely (async questions never expire,
 # so without * the ladder goes silent after the last rung — brd §2.4).
+#
+# The relay caps a per-message ladder at `nudge_message_max` rungs (default 8).
+# A relay deployed before epic 46 capped it at 3 and rejects this four-rung
+# ladder; `ask` then sends the question with the chat's own reminders and says
+# so in `warnings`.  If you see that warning and cannot redeploy the relay, use
+# three rungs: nudge = "1d,3d,7d*".
 nudge = "4h,1d,3d,7d*"
 
 # escalate_after: how long to wait before duplicating the question to the
@@ -48,6 +54,48 @@ max_open = 20
 # min_interval_s: minimum seconds between two ask calls for this workspace.
 # Prevents burst loops from flooding a queue in one session.
 min_interval_s = 30
+
+# sync: whether the tools publish what they write through git (epic 46).
+#
+#   "off"     — the default.  Files are written; git is never started.  Ids are
+#               allocated from this checkout alone, so an id used on a branch
+#               that has not landed, or on another machine, can be handed out
+#               twice.
+#   "commit"  — every tool write is committed in the primary checkout with
+#               `git commit --only -- <queue file>`.  Nothing is pushed.
+#   "push"    — an id is claimed by a commit on the upstream branch *before*
+#               the entry is written locally; a push that loses a race
+#               re-allocates the id.  The pushed commit touches only queue
+#               files and is pushed by hash, so unpushed commits on your branch
+#               stay unpublished.
+#
+# Turning this on lets the tools commit — and with "push", push to your shared
+# branch — WITHOUT the approval an agent's own `git push` would need.  That is
+# why it is off unless you write it down here.  Read "Reliable ids" in
+# docs/async-questions.md first: it covers what the operator's next
+# `git pull --rebase` looks like.
+# sync = "push"
+
+# claims: the id ledger, a file inside dir.  `claude-questions --claim` and the
+# `claim` tool reserve ids here for questions filed by hand; allocation never
+# reuses an id listed in it.
+# claims = "claims.md"
+
+# [questions.git] — tuning for sync = "commit" / "push".  All optional.
+#
+# [questions.git]
+# branch  = "main"      # the branch the queue lives on.  Default: the remote's
+#                       # default branch, else the checkout's current branch.
+#                       # If the primary checkout is on any other branch, the
+#                       # entry is written and nothing is committed or pushed.
+# remote  = "origin"    # default: that branch's configured remote, else "origin"
+# retries = 5           # id re-allocations after a lost push race
+# merge_driver = true   # register a merge driver for the queue files in this
+#                       # clone's .git/config + .git/info/attributes (nothing
+#                       # tracked), so your own `git pull` merges them entry by
+#                       # entry instead of conflicting after two machines asked
+# message = "chore(questions): {summary}"   # commit subject; {summary} is e.g.
+#                                           # "ask Q-042", "answer Q-042 (relay #4187)"
 
 # [questions.format] — override the default parse contract vocabulary.
 # See docs/questions-contract.md for the six contract rules and full examples.
@@ -65,6 +113,12 @@ id = "Q-{n:03d}"
 # Example (for a workspace that already uses "answered" and "closed"):
 # status = ["open", "resolved", "answered", "closed"]
 status = ["open", "resolved"]
+
+# withdrawn: the status word `withdraw` flips an open entry to (epic 46).  One
+# word, not the open word.  It is always recognised as a status, whether or not
+# it is listed in `status` above.  A workspace that already has a word for this
+# can reuse it — e.g. withdrawn = "closed".
+# withdrawn = "withdrawn"
 
 # heading: the heading template for new entries.  Must start with #-marks.
 # {id}, {title}, {status} and {tags} are substituted.  The status placeholder

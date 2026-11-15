@@ -1,13 +1,39 @@
 #!/usr/bin/env python3
-"""Diagnostic tool for async question queues (epic 23).
+"""Diagnostic and operator tool for async question queues (epics 23, 46).
 
 Usage:
     claude-questions [--workspace-dir DIR] [--check] [--check-contract [DIR]]
                      [--reindex] [--status] [--json]
+    claude-questions --withdraw ID --reason TEXT
+    claude-questions --claim [N] [--note TEXT]
+    claude-questions --sync
 
 Offline by default: reads the workspace ``[questions]`` config, the listener
 index at ``~/.claude/async_questions.json``, and the listener status file.
 Never prints token material.
+
+The three operations below the line are the only ones that write.  Each is the
+same function the ``questions`` MCP server calls (``questions_ops``), so a
+human at a shell and a session get identical behaviour.
+
+--withdraw ID --reason TEXT
+    Withdraw an open question that has become moot.  The entry is marked
+    withdrawn with the reason, the Telegram message is replaced by "Withdrawn"
+    and loses its buttons, reminders and escalation.  Refused for a question
+    that is not open; repeating it retries the Telegram side.  ``ID`` may also
+    be ``relay:<N>`` to cancel an acknowledge-notification.  Exit 2 on refusal
+    or when the relay could not be reached.
+
+--claim [N] [--note TEXT]
+    Reserve the next N ids (default 1) in the claims ledger without asking
+    anything — for a question filed by hand.  With ``[questions] sync = "push"``
+    the reservation is committed and pushed.  Prints the ids, one per line.
+    Exit 2 when the workspace wanted the claim pushed and it was not.
+
+--sync
+    Commit and push whatever the queue files owe (``[questions] sync`` must be
+    on).  Use it after a hand edit, or after a result reported ``pending``.
+    Exit 2 when something is still owed afterwards.
 
 --check
     Probe each distinct installation token against the relay (network required).
@@ -37,13 +63,16 @@ Exit codes:
     1  config or catalog errors
     2  (--check) any token unbound or invalid
     2  (--check-contract) non-conforming entries found
+    2  (--withdraw / --claim / --sync) refused, or not fully carried out
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
 import importlib.util
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -76,14 +105,19 @@ _ensure_hooks_on_path()
 
 try:
     import questions_store as qs
+    import questions_git as qg
     import questions_listen_lib as qll
+    import questions_ops as qops
     import roles_config as rc
 except ImportError as _import_err:
     print(
         f"error: {_import_err} — run install.sh --yes first",
         file=sys.stderr,
     )
-    sys.exit(1)
+    # As git's merge driver, only two statuses mean "the result is written"
+    # (questions_git.MERGE_DRIVER_MERGED / _CONFLICT).  Nothing was: any other
+    # status makes the driver command fall back on git's own merge.
+    sys.exit(3 if "--merge-driver" in sys.argv[1:] else 1)
 
 
 # ── Conformance checker (--check-contract) ─────────────────────────────────────
@@ -719,6 +753,34 @@ def _format_workspace(
     except Exception:  # noqa: BLE001
         lines.append("  next id:     (could not determine)")
 
+    # Git sync (epic 46)
+    if config.sync == "off":
+        lines.append("  sync:        off  (ids are allocated from this checkout only)")
+    else:
+        state = qg.read_state(store)
+        target = state.get("upstream") or (
+            "/".join(p for p in (config.git_remote, config.git_branch) if p) or "upstream"
+        )
+        line = f"  sync:        {config.sync}"
+        if config.sync == "push":
+            line += f"  → {target}"
+        lines.append(line)
+        if state.get("pending"):
+            lines.append(
+                f"    OWED since {state.get('pending_since') or '?'}: "
+                f"{state.get('pending_reason') or '(no reason recorded)'}"
+            )
+            lines.append("    → run: claude-questions --sync")
+    if store.claims_path.is_file():
+        lines.append(f"  claims:      {config.claims}  ({len(store.claimed_ids())} id(s) reserved)")
+    if config.sync != "off" or store.lock_path != store.legacy_lock_path:
+        legacy = store.legacy_lock_path
+        if legacy.is_file() and legacy != store.lock_path:
+            lines.append(
+                f"  note:        {legacy.name} in the queue directory is the pre-epic-46 lock file; "
+                "delete it once every session started before the upgrade has ended"
+            )
+
     # Config errors
     for err in config.errors:
         lines.append(f"  config warn: {err}")
@@ -756,13 +818,130 @@ def _format_listener(
     return lines
 
 
+# ── Operations (epic 46): --withdraw, --claim, --sync ────────────────────────
+
+
+def _operator() -> str:
+    try:
+        return f"{getpass.getuser()} (claude-questions)"
+    except Exception:  # noqa: BLE001 — no passwd entry, no tty
+        return "claude-questions"
+
+
+def _print_sync(sync: dict[str, Any] | None, file: Any = None) -> None:
+    """Print the git half of a result.  ``--claim`` passes ``sys.stderr``: its
+    stdout is the ids and nothing else, because scripts capture it."""
+    out = file if file is not None else sys.stdout
+    if not sync:
+        return
+    parts = [f"mode={sync.get('mode')}",
+             f"committed={'yes' if sync.get('committed') else 'no'}",
+             f"pushed={'yes' if sync.get('pushed') else 'no'}"]
+    if sync.get("commit"):
+        parts.append(f"commit={sync['commit']}")
+    if sync.get("upstream"):
+        parts.append(f"upstream={sync['upstream']}")
+    if sync.get("twin"):
+        parts.append("twin")
+    if sync.get("carried_local_changes"):
+        parts.append("carried-local-changes")
+    print("  git:     " + "  ".join(parts), file=out)
+    if sync.get("reason"):
+        print(f"  git:     {sync['reason']}", file=out)
+    if sync.get("pending"):
+        print("  git:     OWED — retried by the listener, or run: claude-questions --sync", file=out)
+
+
+def cmd_withdraw(workspace_dir: str, target: str, reason: str, *, json_out: bool = False) -> int:
+    """``--withdraw ID --reason TEXT``.  Exit 0 only when fully carried out."""
+    kwargs: dict[str, Any] = {}
+    relay = re.fullmatch(r"relay:#?(\d+)", target.strip(), re.I)
+    if relay:
+        kwargs["message_id"] = int(relay.group(1))
+    else:
+        kwargs["qid"] = target.strip()
+    result = qops.withdraw(workspace_dir, reason=reason, by=_operator(), **kwargs)
+
+    if json_out:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        label = result.get("id") or (f"relay #{result.get('message_id')}" if result.get("message_id") else target)
+        if result.get("withdrawn"):
+            print(f"{label}: withdrawn" + (f"  [{result['status']}]" if result.get("status") else ""))
+            if result.get("file"):
+                print(f"  file:    {result['file']}")
+            if result.get("message_id") is not None:
+                state = "cancelled — buttons, reminders and escalation removed" \
+                    if result.get("relay_cancelled") else "NOT cancelled"
+                print(f"  relay:   #{result['message_id']} {state}")
+        else:
+            print(f"{label}: not withdrawn")
+        _print_sync(result.get("sync"))
+        if result.get("note"):
+            print(f"  note:    {result['note']}")
+        if result.get("error"):
+            print(f"  error:   {result['error']}", file=sys.stderr)
+
+    if not result.get("withdrawn") or result.get("error"):
+        return 2
+    return 0
+
+
+def cmd_claim(workspace_dir: str, count: int, note: str, *, json_out: bool = False) -> int:
+    """``--claim [N]``.  Prints the ids; exit 2 if a wanted push did not happen."""
+    result = qops.claim(workspace_dir, count=count, note=note, by=_operator())
+    if json_out:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for qid in result.get("ids") or []:
+            print(qid)
+        if result.get("ids"):
+            where = "on the upstream" if result.get("claimed_on_remote") else "in this checkout only"
+            print(f"  reserved {where}  ({result.get('file')})", file=sys.stderr)
+        _print_sync(result.get("sync"), file=sys.stderr)
+        if result.get("note"):
+            print(f"  note:    {result['note']}", file=sys.stderr)
+        if result.get("error"):
+            print(f"  error:   {result['error']}", file=sys.stderr)
+    if result.get("error") or not result.get("ids"):
+        return 2
+    sync = result.get("sync") or {}
+    if sync.get("mode") == "push" and not result.get("claimed_on_remote"):
+        return 2
+    return 0
+
+
+def cmd_sync(workspace_dir: str, *, json_out: bool = False) -> int:
+    """``--sync``.  Exit 2 when something is still owed."""
+    result = qops.sync(workspace_dir)
+    if json_out:
+        print(json.dumps(result, ensure_ascii=False))
+    elif result.get("error"):
+        print(f"error: {result['error']}", file=sys.stderr)
+    else:
+        sync = result.get("sync") or {}
+        if sync.get("changed") is False and not sync.get("pending"):
+            print("queue files are in sync — nothing to commit or push")
+        else:
+            print("synced" if not sync.get("pending") else "sync incomplete")
+            for name in sync.get("files") or []:
+                print(f"  file:    {name}")
+        _print_sync(sync)
+    if result.get("error"):
+        return 2
+    return 2 if (result.get("sync") or {}).get("pending") else 0
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="claude-questions",
-        description="Inspect and diagnose async question queues for a workspace.",
+        description=(
+            "Inspect and diagnose async question queues for a workspace; "
+            "withdraw a question, claim an id, sync the queue files."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "exit 0: clean (including no [questions] configured)\n"
@@ -772,9 +951,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--workspace-dir",
-        default=".",
+        default=None,
         metavar="DIR",
         help="workspace to inspect (default: current directory)",
+    )
+    parser.add_argument(
+        "--merge-driver",
+        nargs="+",
+        metavar="FILE",
+        help=argparse.SUPPRESS,   # run by git: %%O %%A %%B %%P (docs/async-questions.md)
     )
     parser.add_argument(
         "--check",
@@ -797,14 +982,95 @@ def main() -> int:
         help="print detailed listener status (pending applies, watermarks)",
     )
     parser.add_argument(
+        "--withdraw",
+        metavar="ID",
+        help="withdraw an open question (Q-042), or relay:<N> for a notification; needs --reason",
+    )
+    parser.add_argument(
+        "--reason",
+        metavar="TEXT",
+        help="why the question is moot (with --withdraw); the human sees it",
+    )
+    parser.add_argument(
+        "--claim",
+        nargs="?",
+        const=1,
+        type=int,
+        metavar="N",
+        help="reserve the next N ids (default 1) without asking anything",
+    )
+    parser.add_argument(
+        "--note",
+        default="",
+        metavar="TEXT",
+        help="what a claimed id is for (with --claim); written into the ledger",
+    )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="commit and push what the queue files owe ([questions] sync must be on)",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="json_out",
         help="emit machine-readable JSON instead of a table",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    workspace_dir = str(Path(args.workspace_dir).resolve())
+    if args.merge_driver is not None:
+        # git's merge driver for queue files.  No workspace lookup of ours: git
+        # runs it from the top of the work tree being merged.
+        files = args.merge_driver
+        if len(files) < 3:
+            parser.error("--merge-driver takes the three files git passes: %O %A %B [%P]")
+        try:
+            return qg.merge_driver(files[0], files[1], files[2], files[3] if len(files) > 3 else "")
+        except Exception as exc:  # noqa: BLE001 — "nothing written" must not look like a result
+            print(f"claude-questions --merge-driver: {exc}", file=sys.stderr)
+            return 3
+
+    explicit_workspace = args.workspace_dir is not None
+    workspace_dir = str(Path(args.workspace_dir or ".").resolve())
+
+    # ``roles_config.find_roles_file`` looks only at $CLAUDE_PROJECT_DIR when it
+    # is set and ignores the directory it is given.  A workspace named on the
+    # command line must win over one inherited from the environment — these
+    # commands commit and push.
+    env_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+    if explicit_workspace and env_dir:
+        try:
+            same = Path(env_dir).resolve() == Path(workspace_dir)
+        except OSError:
+            same = False
+        if not same:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+
+    # ── operations that write (epic 46) ────────────────────────────────────────
+    operations = [
+        name for name, given in (
+            ("--withdraw", args.withdraw is not None),
+            ("--claim", args.claim is not None),
+            ("--sync", args.sync),
+        ) if given
+    ]
+    if len(operations) > 1:
+        parser.error(f"{' and '.join(operations)} cannot be combined; run them one at a time")
+    if operations and (args.check or args.check_contract or args.reindex or args.status):
+        parser.error(f"{operations[0]} cannot be combined with a diagnostic flag")
+    if args.reason and args.withdraw is None:
+        parser.error("--reason is only meaningful with --withdraw")
+    if args.note and args.claim is None:
+        parser.error("--note is only meaningful with --claim")
+
+    if args.withdraw is not None:
+        if not (args.reason or "").strip():
+            parser.error("--withdraw needs --reason TEXT")
+        return cmd_withdraw(workspace_dir, args.withdraw, args.reason, json_out=args.json_out)
+    if args.claim is not None:
+        return cmd_claim(workspace_dir, args.claim, args.note, json_out=args.json_out)
+    if args.sync:
+        return cmd_sync(workspace_dir, json_out=args.json_out)
 
     # Load workspace config and listener config.
     config = qs.load_questions_config(workspace_dir)

@@ -21,6 +21,7 @@ here touches the developer's real ~/.claude, the network, or a real bot.
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -995,6 +996,284 @@ class TestServerDeclaresWhatTheRelayClientImports(unittest.TestCase):
         self.assertTrue(third_party, "expected the relay client to import httpx")
         self.assertEqual(third_party - declared, set(),
                          f"server.py must declare {sorted(third_party - declared)}")
+
+
+# ── Epic 46: ask(id=…), the ladder fallback, withdraw/claim wrappers ─────────
+
+
+class _LadderRejection(Exception):
+    """Shaped like ``RelayError`` for an HTTP 422 from ``POST /v1/messages``."""
+
+    def __init__(self, message, status_code=422):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TestAskEpic46(QuestionsLibTestCase):
+
+    def _ask_with_client(self, client, **kwargs) -> dict:
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}), \
+             patch.object(roles_config, "load_bindings", return_value=_make_fake_bindings()), \
+             patch.object(lib, "_client", return_value=client), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            return lib.ask(**kwargs)
+
+    def test_result_shape_is_unchanged_when_sync_is_off(self):
+        """Invariant: a workspace that did not ask for git sync gets exactly
+        the keys it always got — no ``sync``, no ``warnings``."""
+        result = self._call_ask(title="Plain")
+        self.assertEqual(
+            sorted(result), ["dispatched", "file", "id", "message_id", "pending_answers"]
+        )
+
+    def test_explicit_id_must_have_been_claimed(self):
+        client = MagicMock()
+        client.send_message.return_value = _make_fake_handle(999)
+        refused = self._ask_with_client(client, title="Mine", id="Q-077")
+        self.assertIn("has not been claimed", refused["error"])
+        self.assertNotIn("id", refused)
+        client.send_message.assert_not_called()
+        self.assertFalse((self.ws.q_dir / "for-product-lead.md").exists(), "nothing may be written")
+
+    def test_a_claimed_id_is_used_and_then_spent(self):
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}):
+            claimed = lib.claim(count=1, note="for the test")
+        self.assertEqual(claimed["ids"], ["Q-001"])
+        self.assertFalse(claimed["claimed_on_remote"])
+
+        client = MagicMock()
+        client.send_message.return_value = _make_fake_handle(999)
+        first = self._ask_with_client(client, title="Uses the claim", id="Q-001")
+        self.assertEqual(first["id"], "Q-001")
+        self.assertTrue(first["dispatched"])
+
+        with lib._rate_lock:
+            lib._last_ask_time.clear()
+        again = self._ask_with_client(client, title="Again", id="Q-001")
+        self.assertIn("already heads an entry", again["error"])
+        # …and an ordinary ask allocates past the claim.
+        with lib._rate_lock:
+            lib._last_ask_time.clear()
+        self.assertEqual(self._ask_with_client(client, title="Next")["id"], "Q-002")
+
+    def test_a_rejected_ladder_is_retried_without_it_and_reported(self):
+        """brd D10: a relay that caps per-message ladders at 3 rungs rejects the
+        stock 4-rung ladder with 422.  Before this, ``ask`` returned
+        ``dispatched: false`` and left an entry no human would ever be told of."""
+        client = MagicMock()
+        client.send_message.side_effect = [
+            _LadderRejection("relay HTTP 422: invalid nudge_schedule: nudge schedule has 4 entries; server cap is 3"),
+            _make_fake_handle(1234),
+        ]
+        with patch.object(lib, "RelayError", _LadderRejection):
+            result = self._ask_with_client(client, title="Ladder too long")
+
+        self.assertTrue(result["dispatched"])
+        self.assertEqual(result["message_id"], 1234)
+        self.assertNotIn("error", result)
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("rejected the nudge ladder '4h,1d,3d,7d*'", result["warnings"][0])
+
+        first, second = client.send_message.call_args_list
+        self.assertEqual(first.kwargs["nudge_schedule"], "4h,1d,3d,7d*")
+        self.assertIsNone(second.kwargs["nudge_schedule"])
+        self.assertTrue(second.kwargs["never_expires"], "the retry is still a never-expiring question")
+        self.assertNotEqual(first.kwargs["idempotency_key"], second.kwargs["idempotency_key"])
+        self.assertIn("relay #1234", (self.ws.q_dir / "for-product-lead.md").read_text(encoding="utf-8"))
+
+    def test_any_other_422_is_not_retried(self):
+        client = MagicMock()
+        client.send_message.side_effect = _LadderRejection("relay HTTP 422: escalation_token_not_bound")
+        with patch.object(lib, "RelayError", _LadderRejection):
+            result = self._ask_with_client(client, title="Other 422")
+        self.assertFalse(result["dispatched"])
+        self.assertEqual(client.send_message.call_count, 1)
+        self.assertNotIn("warnings", result)
+
+    def test_escalation_fields_are_sent_together_or_not_at_all(self):
+        """The relay answers HTTP 422 to ``escalate_after_sec`` without
+        ``escalate_to_token``.  A question to the *default* role has nobody to
+        escalate to, so it must carry neither — it used to carry the delay
+        alone, and every such ``ask`` was written and then refused."""
+        client = MagicMock()
+        client.send_message.return_value = _make_fake_handle(999)
+
+        default = self._ask_with_client(client, title="To the default role")     # hpl is default
+        self.assertTrue(default["dispatched"])
+        kwargs = client.send_message.call_args.kwargs
+        self.assertIsNone(kwargs["escalate_after_sec"])
+        self.assertIsNone(kwargs["escalate_to_token"])
+
+        with lib._rate_lock:
+            lib._last_ask_time.clear()
+        self._ask_with_client(client, title="To another role", role="htl")
+        kwargs = client.send_message.call_args.kwargs
+        self.assertEqual(kwargs["escalate_after_sec"], 24 * 3600)
+        self.assertEqual(kwargs["escalate_to_token"], "rly_hpl_token")
+
+    def test_withdraw_goes_through_the_shared_operation(self):
+        asked = self._call_ask(title="To be withdrawn", message_id=4321)
+        relay = MagicMock()
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}), \
+             patch.object(roles_config, "load_bindings", return_value=_make_fake_bindings()), \
+             patch.object(lib, "_client", return_value=relay), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            result = lib.withdraw(reason="went ahead", id=asked["id"])
+
+        self.assertTrue(result["withdrawn"])
+        self.assertTrue(result["relay_cancelled"])
+        self.assertEqual(result["message_id"], 4321)
+        relay.edit_message.assert_called_once()
+        relay.cancel_message.assert_called_once()
+        self.assertEqual(relay.cancel_message.call_args.args[0], 4321)
+        text = (self.ws.q_dir / "for-product-lead.md").read_text(encoding="utf-8")
+        self.assertIn("[withdrawn]", text)
+        self.assertIn("    went ahead", text)
+
+    def test_a_withdrawn_question_frees_its_max_open_slot(self):
+        toml = ROLES_TOML_HPL.replace('anchor         = "worktree"', 'anchor         = "worktree"\nmax_open       = 1')
+        self.ws.roles_path.write_text(toml, encoding="utf-8")
+        first = self._call_ask(title="One", message_id=1)
+        with lib._rate_lock:
+            lib._last_ask_time.clear()
+        self.assertIn("Too many open questions", self._call_ask(title="Two")["error"])
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}), \
+             patch.object(roles_config, "load_bindings", return_value=_make_fake_bindings()), \
+             patch.object(lib, "_client", return_value=MagicMock()), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            lib.withdraw(reason="moot", id=first["id"])
+        with lib._rate_lock:
+            lib._last_ask_time.clear()
+        with lib._ws_lock:
+            lib._ws_cache.clear()
+        self.assertEqual(self._call_ask(title="Two")["id"], "Q-002")
+
+    def test_caller_names_the_session_without_leaking_it_whole(self):
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "1350e006-43b2-43fb-b1da-ba703a1b4e41"}):
+            self.assertEqual(lib._caller(), "agent · session 1350e006")
+        without = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
+        with patch.dict(os.environ, without, clear=True):
+            self.assertEqual(lib._caller(), "agent")
+
+
+
+# ── ask with [questions] sync = "push" (epic 46, review round 1 issue 6) ──────
+
+_GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+}
+
+ROLES_TOML_SYNC_PUSH = ROLES_TOML_HPL.replace(
+    'anchor         = "worktree"', 'anchor         = "worktree"\nsync           = "push"'
+)
+
+
+def _git(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True, timeout=60,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed in {cwd}:\n{proc.stdout}\n{proc.stderr}")
+    return proc.stdout.strip()
+
+
+class TestAskWithSyncPush(QuestionsLibTestCase):
+    """The whole ``ask`` path against a real repository and a real remote:
+    the entry and its Dispatched line are both on the upstream when ``ask``
+    returns, and nothing else is."""
+
+    QUEUE = "docs/questions/for-product-lead.md"
+
+    def setUp(self):
+        super().setUp()
+        self.ws.cleanup()
+        patcher = patch.dict(os.environ, _GIT_ENV)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.assertIn('sync           = "push"', ROLES_TOML_SYNC_PUSH)
+        self.tmp = Path(tempfile.mkdtemp(prefix="qs-mcp-git-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.remote = self.tmp / "remote.git"
+        _git(self.tmp, "init", "--quiet", "--bare", "-b", "main", str(self.remote))
+        self.repo = self.tmp / "ws"
+        _git(self.tmp, "clone", "--quiet", str(self.remote), str(self.repo))
+        _git(self.repo, "checkout", "--quiet", "-b", "main")
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "roles.toml").write_text(ROLES_TOML_SYNC_PUSH, encoding="utf-8")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "app.txt").write_text("v1\n", encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "--quiet", "-m", "base")
+        _git(self.repo, "push", "--quiet", "-u", "origin", "main")
+
+    def _ask(self, client, **kwargs) -> dict:
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.repo)}), \
+             patch.object(roles_config, "load_bindings", return_value=_make_fake_bindings()), \
+             patch.object(lib, "_client", return_value=client), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            return lib.ask(**kwargs)
+
+    def _remote_file(self) -> str:
+        return subprocess.run(
+            ["git", "show", f"main:{self.QUEUE}"], cwd=str(self.remote),
+            capture_output=True, text=True, check=True,
+        ).stdout
+
+    def test_the_entry_and_its_dispatch_line_reach_the_upstream(self):
+        # An unrelated local commit and an unrelated dirty file: neither may
+        # travel with the question.
+        (self.repo / "src" / "app.txt").write_text("v2\n", encoding="utf-8")
+        _git(self.repo, "commit", "--quiet", "-am", "local work, not pushed")
+        (self.repo / "notes.txt").write_text("scratch\n", encoding="utf-8")
+
+        client = MagicMock()
+        client.send_message.return_value = _make_fake_handle(4242)
+        result = self._ask(client, title="Synced question", body="Body.")
+
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["id"], "Q-001")
+        self.assertTrue(result["dispatched"])
+        self.assertTrue(result["sync"]["pushed"], result["sync"])
+        self.assertNotIn("dispatch_marker", result["sync"],
+                         "the marker commit fared the same as the claim: nothing to add")
+
+        upstream = self._remote_file()
+        self.assertIn("## Q-001", upstream)
+        self.assertIn("4242", upstream, "the Dispatched line must be upstream too")
+        with open(self.repo / self.QUEUE, encoding="utf-8", newline="") as fh:
+            self.assertEqual(fh.read(), upstream, "local and upstream copies agree")
+
+        # Only the queue file was published.
+        names = _git(self.remote, "log", "--name-only", "--format=", "main").split()
+        self.assertEqual(set(names) - {".claude/roles.toml", "src/app.txt"}, {self.QUEUE})
+        self.assertEqual(_git(self.remote, "show", "main:src/app.txt"), "v1")
+        # The checkout: the queue file is clean, the stranger is untouched.
+        status = _git(self.repo, "status", "--porcelain").splitlines()
+        self.assertEqual(status, ["?? notes.txt"])
+
+    def test_an_unreachable_remote_still_writes_sends_and_says_so(self):
+        _git(self.repo, "remote", "set-url", "origin", str(self.tmp / "gone.git"))
+        client = MagicMock()
+        client.send_message.return_value = _make_fake_handle(4243)
+        result = self._ask(client, title="Offline question", body="Body.")
+
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["id"], "Q-001")
+        self.assertTrue(result["dispatched"], "a git failure never stops the question")
+        self.assertFalse(result["sync"]["pushed"])
+        self.assertTrue(result["sync"]["pending"])
+        self.assertTrue(result["sync"]["reason"])
+        with open(self.repo / self.QUEUE, encoding="utf-8") as fh:
+            self.assertIn("## Q-001", fh.read())
+        client.send_message.assert_called_once()
 
 
 if __name__ == "__main__":
