@@ -157,6 +157,38 @@ def _id_scan_re(fmt: qs.QuestionsFormat) -> re.Pattern[str]:
     )
 
 
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _fenced_lines(lines: list[str]) -> set[int]:
+    """Indexes of lines inside a fenced code block, the fence lines included.
+
+    CommonMark's rule, which is all a queue file needs: a fence opens on a line
+    of three or more backticks or tildes (indented at most three spaces) and
+    closes on a line of **at least as many of the same character** and nothing
+    else.  An unclosed fence runs to the end of the file.
+    """
+    inside: set[int] = set()
+    fence_char = ""
+    fence_len = 0
+    for index, line in enumerate(lines):
+        m = _FENCE_RE.match(line.rstrip("\r"))
+        if not fence_char:
+            if m is not None and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence_char, fence_len = m.group(1)[0], len(m.group(1))
+                inside.add(index)
+            continue
+        inside.add(index)
+        if (
+            m is not None
+            and m.group(1)[0] == fence_char
+            and len(m.group(1)) >= fence_len
+            and not m.group(2).strip()
+        ):
+            fence_char, fence_len = "", 0
+    return inside
+
+
 def _check_contract_one_file(
     path: Path,
     fmt: qs.QuestionsFormat,
@@ -180,7 +212,13 @@ def _check_contract_one_file(
     # Rule 6: the store ignores these.  We report them so adopters can decide
     # whether they are template examples (move to a fenced block) or typos
     # (fix the id spelling).
+    fenced = _fenced_lines(lines)
     for lineno, line in enumerate(lines):
+        if lineno in fenced:
+            # Already where the guidance below says to put it.  The store
+            # ignores a malformed id inside a fence exactly as it does outside
+            # one (rule 6), so there is nothing to report and nothing to edit.
+            continue
         hm = heading_re.match(line)
         if hm is None:
             continue
@@ -814,14 +852,12 @@ def main() -> int:
             if not running and listen_config.enabled:
                 print(
                     "\n  listener is enabled but not running — "
-                    "start it with: systemctl --user start claude-questions-listen"
+                    "start it with: systemctl --user restart claude-questions-listen"
                 )
             if not listen_config.enabled:
                 print(
-                    "\n  listener not enabled — "
-                    "add [questions_listen] enabled = true to "
-                    "~/.config/claude-tg-relay/config.toml and re-run "
-                    "install.sh --yes"
+                    "\n  listener not enabled — run, in the claude-hooks "
+                    "checkout:  ./install.sh enable questions-listen"
                 )
         return 0
 

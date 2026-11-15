@@ -902,5 +902,100 @@ class TestIndexHelpers(unittest.TestCase):
             self.assertEqual(qll.count_pending(self.idx_path), 2)
 
 
+# ── Task 45: a missing relay client must name itself ─────────────────────────
+
+
+class TestRelayClientUnavailable(QuestionsLibTestCase):
+    """The defect: inside the MCP server's uv environment ``httpx`` was missing,
+    ``relay_server.client`` failed to import, the fallback aliased
+    ``NotBoundError`` to ``Exception`` — and every send reported
+    "Relay refused: installation not bound".  Nothing had been refused; nothing
+    had been sent."""
+
+    def _notify_with_no_client(self, **kwargs) -> dict:
+        fake_bindings = _make_fake_bindings()
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}), \
+             patch.object(roles_config, "load_bindings", return_value=fake_bindings), \
+             patch.object(lib, "RelayClient", None), \
+             patch.object(lib, "RELAY_IMPORT_ERROR", "ModuleNotFoundError: No module named 'httpx'"), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            return lib.notify(**kwargs)
+
+    def test_notify_reports_the_import_error_not_a_refusal(self):
+        result = self._notify_with_no_client(text="hello", ack=False)
+        self.assertFalse(result["dispatched"])
+        self.assertIn("No module named 'httpx'", result["error"])
+        self.assertIn("could not be imported", result["error"])
+        self.assertNotIn("not bound", result["error"])
+        self.assertNotIn("Relay refused", result["error"])
+
+    def test_ask_reports_the_import_error_and_keeps_the_entry(self):
+        fake_bindings = _make_fake_bindings()
+        with patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}), \
+             patch.object(roles_config, "load_bindings", return_value=fake_bindings), \
+             patch.object(lib, "RelayClient", None), \
+             patch.object(lib, "RELAY_IMPORT_ERROR", "ModuleNotFoundError: No module named 'httpx'"), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            result = lib.ask(title="Still written?", body="b")
+        self.assertFalse(result["dispatched"])
+        self.assertEqual(result["id"], "Q-001")      # write-before-send still holds
+        self.assertIn("No module named 'httpx'", result["error"])
+        self.assertNotIn("not bound", result["error"])
+
+    def test_a_real_not_bound_refusal_still_reads_as_one(self):
+        """The fix must not blur the genuine case."""
+        result = self._call_notify(
+            text="x", ack=False, relay_raises=lib.NotBoundError("not_bound"),
+        )
+        self.assertIn("installation not bound", result["error"])
+
+    def test_fallback_exception_types_are_distinct(self):
+        """Whatever the import outcome, ``except NotBoundError`` may never be a
+        catch-all: it must be a strict subclass of ``RelayError``, which must
+        not be ``Exception`` itself."""
+        self.assertIsNot(lib.NotBoundError, Exception)
+        self.assertIsNot(lib.RelayError, Exception)
+        self.assertTrue(issubclass(lib.NotBoundError, lib.RelayError))
+        self.assertFalse(issubclass(lib.RelayUnavailableError, lib.RelayError))
+
+
+class TestServerDeclaresWhatTheRelayClientImports(unittest.TestCase):
+    """``server.py`` runs under ``uv run --script`` with only its declared
+    dependencies.  Every third-party module ``relay_server/client.py`` imports
+    at module scope must therefore be declared there — ``mcp`` 2.x stopped
+    bringing ``httpx`` along, and nothing noticed."""
+
+    def test_script_dependencies_cover_the_relay_client(self):
+        import ast
+        import re as _re
+
+        server = (_REPO_ROOT / "questions-mcp" / "server.py").read_text(encoding="utf-8")
+        block = _re.search(r"^# /// script\n(.*?)^# ///$", server, _re.S | _re.M)
+        self.assertIsNotNone(block, "PEP 723 script block not found")
+        deps_line = _re.search(r"^# dependencies = \[(.*)\]$", block.group(1), _re.M)
+        self.assertIsNotNone(deps_line)
+        declared = {
+            _re.split(r"[<>=!~\[ ]", d.strip().strip('"\''), maxsplit=1)[0].lower()
+            for d in deps_line.group(1).split(",") if d.strip()
+        }
+
+        client = (_REPO_ROOT / "relay-server" / "relay_server" / "client.py").read_text(encoding="utf-8")
+        imported = set()
+        for node in ast.parse(client).body:
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                imported.add(node.module.split(".")[0])
+        third_party = {
+            m for m in imported
+            if m not in sys.stdlib_module_names and m not in ("relay_server", "tomli")
+        }
+        self.assertTrue(third_party, "expected the relay client to import httpx")
+        self.assertEqual(third_party - declared, set(),
+                         f"server.py must declare {sorted(third_party - declared)}")
+
+
 if __name__ == "__main__":
     unittest.main()

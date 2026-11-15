@@ -15,9 +15,16 @@ Usage::
     questions-listen --status     # print state without holding the lock
     questions-listen --config P   # use P instead of the default config.toml
 
-Exit codes are deliberately forgiving: **0** for "disabled", "another listener
-is already running" and a clean shutdown alike.  A unit that restarts forever
-because the feature is switched off would be worse than useless.
+There is no "enabled" check in here.  The listener is switched on and off with
+the installer's ``questions-listen`` sub-toggle, which enables the systemd unit;
+once started, it runs.  (``[questions_listen] enabled`` in config.toml was the
+earlier opt-in and is inert.)
+
+Exit codes: **0** for "another listener is already running" and a clean
+shutdown; **78** (``EX_CONFIG``) when the relay config has no token or no
+``server_url``.  The unit is ``Restart=on-failure`` with
+``RestartPreventExitStatus=78``, so neither a second copy nor an unconfigured
+machine turns into a restart loop.
 """
 
 from __future__ import annotations
@@ -136,27 +143,22 @@ def main(argv: list[str] | None = None) -> int:
         # the most common answer to "why didn't my answer arrive?".
         return cmd_status(config)
 
-    if not config.enabled:
-        # Absent or false, the binary exits 0 immediately so the systemd unit
-        # can be installed without being active (task §2).
-        logging.getLogger("questions_listen").info(
-            "[questions_listen] not enabled in %s; exiting",
-            config.config_path or lib.RELAY_CONFIG_PATH,
-        )
-        return 0
-
+    # No ``enabled`` gate: whether this process is started at all is the
+    # installer's ``questions-listen`` sub-toggle (systemd enable), and a
+    # listener that *has* been started runs.  The old
+    # ``[questions_listen] enabled`` key is inert (docs/async-questions.md).
     if not config.tokens:
         logging.getLogger("questions_listen").error(
             "no installation token in %s; nothing to poll",
             config.config_path or lib.RELAY_CONFIG_PATH,
         )
-        return 1
+        return lib.EXIT_CONFIG
     if not config.server_url:
         logging.getLogger("questions_listen").error(
             "server_url not configured in %s; nothing to poll",
             config.config_path or lib.RELAY_CONFIG_PATH,
         )
-        return 1
+        return lib.EXIT_CONFIG
 
     return cmd_run(config, once=args.once)
 

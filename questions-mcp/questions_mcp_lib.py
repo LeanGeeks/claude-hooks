@@ -111,16 +111,46 @@ def _ensure_relay_server_on_path() -> None:
 
 _ensure_relay_server_on_path()
 
+#: Why the relay client could not be imported, or ``None`` when it could.
+#: Reported verbatim by every send so that a broken environment (the classic:
+#: ``httpx`` missing from the MCP server's uv environment) names itself instead
+#: of masquerading as an unbound installation (task 45).
+RELAY_IMPORT_ERROR: Optional[str] = None
+
 try:
     from relay_server.client import (  # type: ignore[import-not-found]
         RelayClient,
         NotBoundError,
         RelayError,
     )
-except Exception:  # noqa: BLE001
+except Exception as _relay_import_exc:  # noqa: BLE001
+    RELAY_IMPORT_ERROR = (
+        f"{type(_relay_import_exc).__name__}: {_relay_import_exc}"
+    )
     RelayClient = None  # type: ignore[assignment]
-    NotBoundError = Exception  # type: ignore[assignment,misc]
-    RelayError = Exception  # type: ignore[assignment,misc]
+
+    class RelayError(Exception):  # type: ignore[no-redef]
+        """Stand-in so the module imports without the relay client present."""
+
+        def __init__(self, message: str, *, status_code: Optional[int] = None) -> None:
+            super().__init__(message)
+            self.status_code = status_code
+
+    class NotBoundError(RelayError):  # type: ignore[no-redef]
+        """Stand-in; never raised, because nothing can reach the relay.
+
+        It must stay a *distinct subclass*: aliasing it to ``Exception`` made
+        ``except NotBoundError`` swallow every failure and report "installation
+        not bound" for what was an import error.
+        """
+
+
+class RelayUnavailableError(Exception):
+    """The relay client cannot be used on this machine at all.
+
+    Deliberately not a ``RelayError``: it is a local installation fault, not
+    something the relay said, and the message must say so.
+    """
 
 _RELAY_CONFIG_FILE = Path.home() / ".config" / "claude-tg-relay" / "config.toml"
 
@@ -135,10 +165,18 @@ def _client(token: str) -> Any:
     with _clients_lock:
         if token not in _clients:
             if RelayClient is None:
-                raise RelayError("relay_server package not importable")
+                raise RelayUnavailableError(
+                    "the relay client could not be imported "
+                    f"({RELAY_IMPORT_ERROR or 'unknown import error'}). "
+                    "This is a broken installation, not a relay refusal: "
+                    "re-run ./install.sh --yes in the claude-hooks checkout and "
+                    "restart the session so its questions MCP server is rebuilt."
+                )
             bindings = roles_config.load_bindings(_RELAY_CONFIG_FILE)
             if not bindings.server_url:
-                raise RelayError("server_url not configured in config.toml")
+                raise RelayUnavailableError(
+                    f"server_url is not configured in {_RELAY_CONFIG_FILE}"
+                )
             _clients[token] = RelayClient(bindings.server_url, token)
         return _clients[token]
 
@@ -292,6 +330,22 @@ def _send_notification(
         kw["nudge_schedule"] = nudge_schedule
     handle = _client(token).send_message(**kw)
     return handle.message_id
+
+
+def _send_error_text(exc: BaseException, *, bind_hint: bool = False) -> str:
+    """One wording for every way a relay send can fail.
+
+    The order matters: a missing relay client is checked first so it can never
+    be reported as something the relay said.
+    """
+    if isinstance(exc, RelayUnavailableError):
+        return f"Relay client unavailable: {exc}"
+    if isinstance(exc, NotBoundError):
+        hint = "  Run relay-client bind." if bind_hint else ""
+        return f"Relay refused: installation not bound ({exc}).{hint}"
+    if isinstance(exc, RelayError):
+        return f"Relay send failed: {exc}"
+    return f"Unexpected error during relay send: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -567,12 +621,8 @@ def ask(
             idempotency_key=idempotency_key,
         )
         dispatched = True
-    except NotBoundError as exc:
-        send_error = f"Relay refused: installation not bound ({exc}).  Run relay-client bind."
-    except RelayError as exc:
-        send_error = f"Relay send failed: {exc}"
     except Exception as exc:  # noqa: BLE001
-        send_error = f"Unexpected error during relay send: {exc}"
+        send_error = _send_error_text(exc, bind_hint=True)
 
     # ── 6. Record in index (even if send failed, for future diagnostics) ──────
     index_routing_failed = False
@@ -721,12 +771,8 @@ def notify(
                 idempotency_key=idempotency_key,
             )
             dispatched = True
-        except NotBoundError as exc:
-            send_error = f"Relay refused: installation not bound ({exc})."
-        except RelayError as exc:
-            send_error = f"Relay send failed: {exc}"
         except Exception as exc:  # noqa: BLE001
-            send_error = f"Unexpected error during relay send: {exc}"
+            send_error = _send_error_text(exc)
 
         # Record in index (no qid — listener finalises without file write)
         if dispatched and message_id is not None:
@@ -768,12 +814,8 @@ def notify(
                 idempotency_key=idempotency_key,
             )
             dispatched = True
-        except NotBoundError as exc:
-            send_error = f"Relay refused: installation not bound ({exc})."
-        except RelayError as exc:
-            send_error = f"Relay send failed: {exc}"
         except Exception as exc:  # noqa: BLE001
-            send_error = f"Unexpected error during relay send: {exc}"
+            send_error = _send_error_text(exc)
 
         result = {"dispatched": dispatched, "message_id": message_id}
         if send_error:

@@ -107,17 +107,35 @@ It is **not** enabled automatically.  To opt in:
 ./install.sh enable questions-listen
 ```
 
-This enables the unit and runs `loginctl enable-linger` so it survives logout.
-Then start it:
+This enables the unit, **starts it**, and runs `loginctl enable-linger` so it
+survives logout.  `./install.sh disable questions-listen` disables and stops it.
+Every later `./install.sh --yes` restarts an enabled listener, because the unit
+is a resident process and the run may have just replaced the library it loaded.
 
-```
-systemctl --user start claude-questions-listen
+**That sub-toggle is the only switch.**  A listener that has been started runs;
+there is no second "enabled" check inside it.  All it needs from
+`~/.config/claude-tg-relay/config.toml` is a `server_url` and an installation
+token.  The `[questions_listen]` section is optional tuning:
+
+```toml
+[questions_listen]
+poll_seconds = 25    # long-poll budget per cycle
+max_attempts = 10    # pending-apply retries before the sidecar fallback
 ```
 
-The `[questions_listen] enabled` key in `~/.config/claude-tg-relay/config.toml`
-was the pre-epic opt-in mechanism. It is now inert — the sub-toggle in the
-installer manifest is the setting. Machines upgraded from the old installer will
-have the key migrated automatically on the next `./install.sh` run.
+`[questions_listen] enabled` was the opt-in before the installer had
+sub-toggles.  It is inert: nothing reads it, and `--status` prints a note if it
+is still present.  (Until task 45 the binary did still read it and exited
+whenever the section was missing, while this page said otherwise — an enabled
+unit on a machine with no such section never listened.)
+
+The unit is `Restart=on-failure` with `RestartPreventExitStatus=78`.  The
+listener exits `0` when another copy already holds its lock and `78` when
+`config.toml` has no token or no `server_url`; neither is restarted.
+
+`questions-listen --status` and `claude-questions --status` print `enabled:`
+from the installer manifest (falling back to the systemd `wants` link), without
+calling `systemctl` — they answer from a shell that has no user bus.
 
 ---
 
@@ -221,8 +239,11 @@ claude-questions --status
 
 Look at:
 - `running: no` + `enabled: yes` → start the unit:
-  `systemctl --user start claude-questions-listen`
-- `running: no` + `enabled: no` → opt in via config.toml and re-run the installer
+  `systemctl --user restart claude-questions-listen`
+  (from a shell with no `XDG_RUNTIME_DIR`, prefix
+  `XDG_RUNTIME_DIR=/run/user/$(id -u)`), then read
+  `journalctl --user -u claude-questions-listen -n 20` if it does not stay up
+- `running: no` + `enabled: no` → `./install.sh enable questions-listen`
 - Listener is running → go to step 2
 
 ### Step 2 — Check for pending applies

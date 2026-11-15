@@ -934,7 +934,10 @@ class TestWriteDiscipline(StoreTestCase):
         path.write_text(original, encoding="utf-8", newline="")
         store = self.store()
         store.apply_answer("Q-002", "ok", "@hpl", 111, role="hpl")
-        text = path.read_text(encoding="utf-8", newline="")
+        # ``Path.read_text(newline=…)`` only exists from Python 3.13; this test
+        # errored on 3.11/3.12 and so never checked what it was written for.
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            text = fh.read()
         self.assertIn("CRLF body.\r\n", text)
         self.assertIn("## Q-001 — a  [open]\r\n", text)
 

@@ -73,8 +73,9 @@ Public API — runtime (23-05)
 ----------------------------
 mutate_index       — read → mutate → write, the whole of it under ``flock``
 feed_watermark     — this feed's watermark (``watermarks`` is the truth)
-ListenConfig       — the resolved ``[questions_listen]`` section + its feeds
+ListenConfig       — the feeds to poll, plus optional ``[questions_listen]`` tuning
 load_listen_config — parse ``~/.config/claude-tg-relay/config.toml``
+listener_enabled   — the installer sub-toggle (informational; nothing gates on it)
 Listener           — the loop: poll → apply → PATCH → advance the watermark
 resolve_target     — re-resolve a workspace **now** from the index entry (inv. 7)
 acquire_single_instance — ``flock`` on the listener lock; None when one runs
@@ -447,6 +448,22 @@ STATUS_PATH = Path.home() / ".claude" / "questions-listen.status.json"
 #: The relay client config; the same file epic 16's listener opts in through.
 RELAY_CONFIG_PATH = Path.home() / ".config" / "claude-tg-relay" / "config.toml"
 
+#: Where the installer records the ``questions-listen`` sub-toggle — the one
+#: place the listener is switched on or off (docs/async-questions.md).
+INSTALL_MANIFEST_PATH = Path.home() / ".claude" / "install-manifest.json"
+
+#: What ``systemctl --user enable`` leaves behind; the fallback when a machine
+#: has no manifest (enabled by hand, or installed before the manifest existed).
+SYSTEMD_WANTS_PATH = (
+    Path.home() / ".config" / "systemd" / "user" / "default.target.wants"
+    / "claude-questions-listen.service"
+)
+
+#: Exit status for "cannot run: the relay config has no token / no server_url".
+#: The unit carries ``RestartPreventExitStatus=78`` so a machine that is simply
+#: not set up fails once and visibly instead of restarting every five seconds.
+EXIT_CONFIG = 78
+
 #: Long-poll budget per cycle (architecture §7 — matches the existing chunk).
 LONG_POLL_SECONDS = 25
 
@@ -628,6 +645,10 @@ class ListenConfig:
     that role — the one outcome this component may not produce.
     """
 
+    #: The installer's ``questions-listen`` sub-toggle (see
+    #: :func:`listener_enabled`).  **Informational**: it is what ``--status``
+    #: prints, and nothing in the runtime is gated on it — a listener that has
+    #: been started runs.  Whether it *gets* started is systemd's business.
     enabled: bool = False
     server_url: str | None = None
     tokens: tuple[str, ...] = ()
@@ -635,6 +656,11 @@ class ListenConfig:
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     config_path: Path | None = None
     errors: tuple[str, ...] = ()
+
+    @property
+    def runnable(self) -> bool:
+        """True when there is something to poll: a token and a server."""
+        return bool(self.tokens) and bool(self.server_url)
 
     @property
     def primary_fingerprint(self) -> str:
@@ -653,34 +679,78 @@ class ListenConfig:
         }
 
 
-def load_listen_config(config_path: Path | None = None) -> ListenConfig:
+def listener_enabled(
+    manifest_path: Path | None = None,
+    wants_path: Path | None = None,
+) -> bool:
+    """Is the ``questions-listen`` sub-toggle on?
+
+    The installer manifest is the setting (``./install.sh enable|disable
+    questions-listen`` writes it); the systemd ``wants`` link is the fallback
+    for a machine with no manifest entry.  Filesystem only — no ``systemctl``,
+    so ``--status`` answers from a shell with no user bus.
+    """
+    manifest = manifest_path if manifest_path is not None else INSTALL_MANIFEST_PATH
+    try:
+        with open(manifest, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        value = data["features"]["questions"]["options"]["questions-listen"]
+        if isinstance(value, bool):
+            return value
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    wants = wants_path if wants_path is not None else SYSTEMD_WANTS_PATH
+    return os.path.lexists(wants)
+
+
+def load_listen_config(
+    config_path: Path | None = None,
+    *,
+    manifest_path: Path | None = None,
+    wants_path: Path | None = None,
+) -> ListenConfig:
     """Parse ``~/.config/claude-tg-relay/config.toml`` into a :class:`ListenConfig`.
 
-    A missing file, a missing ``[questions_listen]`` section or
-    ``enabled = false`` all yield ``enabled=False`` — the unit can be installed
-    without being active (task §2), and an unparseable file degrades to disabled
-    with the reason in ``errors`` rather than raising into the loop.
+    The listener needs exactly two things from this file: a ``server_url`` and at
+    least one installation token.  ``[questions_listen]`` is **optional tuning**
+    (``poll_seconds``, ``max_attempts``).  Its ``enabled`` key was the pre-epic-29
+    opt-in and is inert: the switch is the installer's ``questions-listen``
+    sub-toggle, which decides whether systemd starts the unit at all.  A key
+    that is still present is reported as a config note so nobody edits it and
+    wonders why nothing changed.
+
+    A missing or unparseable file yields a config that is not
+    :attr:`~ListenConfig.runnable`, with the reason in ``errors`` — it never
+    raises into the loop.
     """
     path = config_path if config_path is not None else RELAY_CONFIG_PATH
+    enabled = listener_enabled(manifest_path, wants_path)
     errors: list[str] = []
 
     if not path.is_file():
-        return ListenConfig(config_path=path, errors=(f"{path} does not exist",))
+        return ListenConfig(
+            enabled=enabled, config_path=path, errors=(f"{path} does not exist",)
+        )
 
     try:
         with open(path, "rb") as fh:
             raw = tomllib.load(fh)
     except Exception as exc:  # noqa: BLE001 — a bad config disables, never crashes
-        return ListenConfig(config_path=path, errors=(f"Failed to parse {path}: {exc}",))
+        return ListenConfig(
+            enabled=enabled,
+            config_path=path,
+            errors=(f"Failed to parse {path}: {exc}",),
+        )
 
     section = raw.get("questions_listen")
     if not isinstance(section, dict):
-        return ListenConfig(
-            config_path=path,
-            errors=("no [questions_listen] section — listener disabled",),
-        )
+        section = {}
 
-    enabled = bool(section.get("enabled", False))
+    if "enabled" in section:
+        errors.append(
+            "[questions_listen].enabled is inert — switch the listener with "
+            "./install.sh enable|disable questions-listen"
+        )
 
     poll_seconds = LONG_POLL_SECONDS
     raw_poll = section.get("poll_seconds", LONG_POLL_SECONDS)
@@ -715,9 +785,9 @@ def load_listen_config(config_path: Path | None = None) -> ListenConfig:
         for _role, value in sorted(role_map.items()):
             _add(value)
 
-    if enabled and not tokens:
+    if not tokens:
         errors.append("no installation token in config.toml — nothing to poll")
-    if enabled and not bindings.server_url:
+    if not bindings.server_url:
         errors.append("server_url not configured in config.toml")
 
     return ListenConfig(
@@ -1603,7 +1673,12 @@ def format_status(
         cfg_view = status["config"]
 
     if cfg_view is not None:
-        lines.append(f"  enabled:        {'yes' if cfg_view.get('enabled') else 'no'}")
+        if cfg_view.get("enabled"):
+            lines.append("  enabled:        yes")
+        else:
+            lines.append(
+                "  enabled:        no — ./install.sh enable questions-listen"
+            )
         lines.append(f"  server_url:     {cfg_view.get('server_url') or '(unset)'}")
         lines.append(f"  config:         {cfg_view.get('config_path') or '(none)'}")
         lines.append(

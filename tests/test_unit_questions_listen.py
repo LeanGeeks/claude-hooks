@@ -1185,9 +1185,23 @@ class TestSingleInstance(ListenerTestCase):
 
 
 class TestListenConfig(unittest.TestCase):
+    """``[questions_listen] enabled`` is inert (task 45): the installer's
+    ``questions-listen`` sub-toggle decides whether systemd starts the unit, and
+    a listener that has been started runs.  ``ListenConfig.enabled`` only
+    *reports* that toggle."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="qlisten-cfg-"))
+        # Hermetic: never read this machine's manifest or systemd directory.
+        self.manifest = self.tmp / "install-manifest.json"
+        self.wants = self.tmp / "wants" / "claude-questions-listen.service"
+        for name, value in (
+            ("INSTALL_MANIFEST_PATH", self.manifest),
+            ("SYSTEMD_WANTS_PATH", self.wants),
+        ):
+            patcher = patch.object(qll, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1197,23 +1211,71 @@ class TestListenConfig(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_missing_file_is_disabled(self):
+    def _manifest(self, value) -> None:
+        self.manifest.write_text(
+            json.dumps({"features": {"questions": {"options": {"questions-listen": value}}}}),
+            encoding="utf-8",
+        )
+
+    def test_missing_file_is_not_runnable(self):
         config = qll.load_listen_config(self.tmp / "nope.toml")
-        self.assertFalse(config.enabled)
+        self.assertFalse(config.runnable)
         self.assertTrue(config.errors)
 
-    def test_missing_section_is_disabled(self):
+    def test_no_questions_listen_section_is_runnable(self):
+        """The regression: a machine with a token and a server but no
+        ``[questions_listen]`` section used to be 'disabled' and the unit exited
+        on every start, while the docs said the section was not needed."""
         path = self._write('server_url = "http://relay.test"\ninstallation_token = "rly_a"\n')
         config = qll.load_listen_config(path)
-        self.assertFalse(config.enabled)
-        self.assertEqual(config.tokens, ())
+        self.assertTrue(config.runnable)
+        self.assertEqual(config.tokens, ("rly_a",))
+        self.assertEqual(config.server_url, "http://relay.test")
+        self.assertEqual(config.errors, ())
 
-    def test_enabled_false_is_disabled(self):
+    def test_enabled_false_in_config_toml_is_inert_and_says_so(self):
         path = self._write(
             'server_url = "http://relay.test"\ninstallation_token = "rly_a"\n'
             "\n[questions_listen]\nenabled = false\n"
         )
+        config = qll.load_listen_config(path)
+        self.assertTrue(config.runnable, "the config.toml key must not gate the listener")
+        self.assertTrue(
+            any("inert" in e and "install.sh" in e for e in config.errors),
+            config.errors,
+        )
+
+    def test_enabled_reports_the_installer_sub_toggle(self):
+        path = self._write('server_url = "http://relay.test"\ninstallation_token = "rly_a"\n')
+        self.assertFalse(qll.load_listen_config(path).enabled, "no manifest, no wants link")
+        self._manifest(True)
+        self.assertTrue(qll.load_listen_config(path).enabled)
+        self._manifest(False)
         self.assertFalse(qll.load_listen_config(path).enabled)
+
+    def test_enabled_falls_back_to_the_systemd_wants_link(self):
+        path = self._write('server_url = "http://relay.test"\ninstallation_token = "rly_a"\n')
+        self.wants.parent.mkdir(parents=True)
+        os.symlink("/nonexistent/unit", self.wants)   # a dangling link still counts
+        self.assertTrue(qll.load_listen_config(path).enabled)
+        # ...but an explicit manifest entry outranks it.
+        self._manifest(False)
+        self.assertFalse(qll.load_listen_config(path).enabled)
+
+    def test_a_corrupt_manifest_does_not_raise(self):
+        path = self._write('server_url = "http://relay.test"\ninstallation_token = "rly_a"\n')
+        self.manifest.write_text("{not json", encoding="utf-8")
+        config = qll.load_listen_config(path)
+        self.assertFalse(config.enabled)
+        self.assertTrue(config.runnable)
+
+    def test_missing_token_or_server_is_reported_and_not_runnable(self):
+        config = qll.load_listen_config(self._write('server_url = "http://relay.test"\n'))
+        self.assertFalse(config.runnable)
+        self.assertTrue(any("no installation token" in e for e in config.errors))
+        config = qll.load_listen_config(self._write('installation_token = "rly_a"\n'))
+        self.assertFalse(config.runnable)
+        self.assertTrue(any("server_url" in e for e in config.errors))
 
     def test_enabled_collects_every_distinct_token_primary_first(self):
         path = self._write(
@@ -1222,18 +1284,16 @@ class TestListenConfig(unittest.TestCase):
             'hpl = "rly_hpl"\n'
             'htl = "rly_default"\n'          # duplicate of the default
             'ux  = "hpl"\n'                  # a reference, not a token
-            "\n[questions_listen]\nenabled = true\n"
         )
         config = qll.load_listen_config(path)
-        self.assertTrue(config.enabled)
         self.assertEqual(config.tokens, ("rly_default", "rly_hpl"))
         self.assertEqual(config.server_url, "http://relay.test")
         self.assertEqual(config.primary_fingerprint, qll.token_fingerprint("rly_default"))
 
-    def test_unparseable_config_disables_with_a_reason(self):
+    def test_unparseable_config_is_not_runnable_and_gives_a_reason(self):
         path = self._write("this is not = = toml\n")
         config = qll.load_listen_config(path)
-        self.assertFalse(config.enabled)
+        self.assertFalse(config.runnable)
         self.assertTrue(any("Failed to parse" in e for e in config.errors))
 
     def test_tunables_are_clamped(self):
@@ -1323,16 +1383,56 @@ class TestCli(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         return path
 
-    def test_disabled_config_exits_zero_without_touching_the_lock(self):
-        path = self._config('installation_token = "rly_a"\nserver_url = "http://x"\n')
+    def test_no_token_exits_ex_config_without_touching_the_lock(self):
+        """78, not 0 and not 1: the unit has RestartPreventExitStatus=78, so an
+        unconfigured machine fails once instead of restarting every 5 s."""
+        path = self._config('server_url = "http://x"\n')
         lock = self.tmp / "questions-listen.lock"
         with patch.object(qll, "LISTEN_LOCK_PATH", lock):
-            self.assertEqual(cli.main(["--config", str(path)]), 0)
-        self.assertFalse(lock.exists(), "a disabled listener must not take the lock")
+            self.assertEqual(cli.main(["--config", str(path)]), qll.EXIT_CONFIG)
+        self.assertEqual(qll.EXIT_CONFIG, 78)
+        self.assertFalse(lock.exists(), "an unrunnable listener must not take the lock")
 
-    def test_enabled_without_a_token_exits_nonzero(self):
-        path = self._config("[questions_listen]\nenabled = true\n")
-        self.assertEqual(cli.main(["--config", str(path)]), 1)
+    def test_no_server_url_exits_ex_config(self):
+        path = self._config('installation_token = "rly_a"\n')
+        self.assertEqual(cli.main(["--config", str(path)]), qll.EXIT_CONFIG)
+
+    def _run_once(self, config_text: str) -> "FakeRelayClient":
+        path = self._config(config_text)
+        lock = self.tmp / "questions-listen.lock"
+        index_path = self.tmp / "async_questions.json"
+        status_path = self.tmp / "status.json"
+        index_lock = self.tmp / "async_questions.json.lock"
+        client = FakeRelayClient("rly_a")
+
+        real_init = qll.Listener.__init__
+
+        def init(self_listener, config, **kwargs):
+            kwargs.update(
+                index_path=index_path,
+                index_lock_path=index_lock,
+                status_path=status_path,
+                client_factory=lambda url, token: client,
+            )
+            real_init(self_listener, config, **kwargs)
+
+        with patch.object(qll, "LISTEN_LOCK_PATH", lock), \
+             patch.object(qll.Listener, "__init__", init):
+            self.assertEqual(cli.main(["--config", str(path), "--once"]), 0)
+        return client
+
+    def test_runs_with_no_questions_listen_section(self):
+        """The defect of task 45 §2, at the level it was observed: the binary
+        exited at once on a machine whose config.toml had no section."""
+        client = self._run_once('installation_token = "rly_a"\nserver_url = "http://relay.test"\n')
+        self.assertEqual(len(client.get_calls), 1, "the listener must actually poll")
+
+    def test_runs_even_when_config_toml_says_enabled_false(self):
+        client = self._run_once(
+            'installation_token = "rly_a"\nserver_url = "http://relay.test"\n'
+            "\n[questions_listen]\nenabled = false\n"
+        )
+        self.assertEqual(len(client.get_calls), 1)
 
     def test_status_works_when_disabled(self):
         path = self._config('installation_token = "rly_a"\nserver_url = "http://x"\n')
@@ -1345,10 +1445,7 @@ class TestCli(unittest.TestCase):
             self.assertEqual(cli.main(["--config", str(path), "--status"]), 0)
 
     def test_second_instance_exits_zero(self):
-        path = self._config(
-            'installation_token = "rly_a"\nserver_url = "http://x"\n'
-            "\n[questions_listen]\nenabled = true\n"
-        )
+        path = self._config('installation_token = "rly_a"\nserver_url = "http://x"\n')
         lock = self.tmp / "questions-listen.lock"
         held = qll.acquire_single_instance(lock)
         try:

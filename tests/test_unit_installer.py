@@ -1258,6 +1258,78 @@ class TestExtSystemd(InstallerTestBase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("[NO_EXTERNAL]", result.stdout + result.stderr)
 
+    # --- real behaviour, against stub commands (task 45) ---
+    #
+    # `systemctl`, `loginctl` and `id` are replaced by shell functions, so
+    # these run with NO_EXTERNAL off and still cannot reach the real user
+    # manager.  They record what the seam would have executed.
+
+    _STUBS = """
+systemctl() { echo "systemctl XDG=${XDG_RUNTIME_DIR:-unset} $*" >> "$HOME/calls.log"; }
+loginctl()  { echo "loginctl $*" >> "$HOME/calls.log"; }
+id()        { echo 424242; }
+"""
+
+    def _calls(self) -> list:
+        log = self.tmp_home / "calls.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_enable_also_restarts_the_unit(self):
+        """Enabling must (re)start the listener: it is a resident process that
+        imported the hook library an install run may have just replaced, and
+        'enabled but dead until the next login' was the state task 45 found."""
+        result = run_ext_call(
+            self.tmp_home,
+            'ext_systemd_enable "claude-questions-listen.service"',
+            no_external=False,
+            extra_setup=self._STUBS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self._calls()
+        verbs = [c.split()[3] for c in calls if c.startswith("systemctl")]
+        self.assertEqual(verbs, ["enable", "restart"], calls)
+        self.assertTrue(any(c.startswith("loginctl enable-linger") for c in calls), calls)
+
+    def test_disable_also_stops_the_unit(self):
+        result = run_ext_call(
+            self.tmp_home,
+            'ext_systemd_disable "claude-questions-listen.service"',
+            no_external=False,
+            extra_setup=self._STUBS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self._calls(),
+            ["systemctl XDG=unset --user disable --now claude-questions-listen.service"],
+        )
+
+    def test_user_bus_is_found_from_a_shell_with_no_runtime_dir(self):
+        """An agent's tool shell has no XDG_RUNTIME_DIR; without it
+        `systemctl --user` fails with 'Failed to connect to bus' and the
+        installer used to report the unit as not enabled."""
+        runtime = self.tmp_home / "run-user" / "424242"
+        runtime.mkdir(parents=True)
+        setup = self._STUBS + f'unset XDG_RUNTIME_DIR\nEXT_RUNTIME_DIR_BASE="{runtime.parent}"\n'
+        result = run_ext_call(
+            self.tmp_home, "ext_systemd_user is-enabled x.service",
+            no_external=False, extra_setup=setup,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._calls(), [f"systemctl XDG={runtime} --user is-enabled x.service"])
+
+    def test_an_existing_runtime_dir_is_left_alone(self):
+        runtime = self.tmp_home / "run-user" / "424242"
+        runtime.mkdir(parents=True)
+        setup = (
+            self._STUBS
+            + f'export XDG_RUNTIME_DIR=/already/set\nEXT_RUNTIME_DIR_BASE="{runtime.parent}"\n'
+        )
+        run_ext_call(
+            self.tmp_home, "ext_systemd_user is-enabled x.service",
+            no_external=False, extra_setup=setup,
+        )
+        self.assertEqual(self._calls(), ["systemctl XDG=/already/set --user is-enabled x.service"])
+
     def test_daemon_reload_no_external_logs(self):
         """ext_systemd_daemon_reload with NO_EXTERNAL=1 logs and skips."""
         result = self._run("ext_systemd_daemon_reload")

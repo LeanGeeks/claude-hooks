@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=2.0,<3"]
+# dependencies = ["mcp>=2.0,<3", "httpx>=0.26"]
 # ///
 """Questions MCP server — async agent↔human question and notification tools.
 
@@ -20,6 +20,12 @@ the behaviour is testable with the repo's plain-``python3`` suite while the
 Identity and config are resolved **per call** (not at startup): the server is
 long-lived and may serve sessions in different workspaces.
 ``CLAUDE_PROJECT_DIR``/``PWD`` is read per invocation with a short TTL cache.
+
+``httpx`` is declared above because this server — unlike ``context-mcp`` and
+``permissions-mcp`` — talks to the relay, through ``relay_server.client``.
+``mcp`` 2.x depends on ``httpx2`` and no longer brings ``httpx`` with it, so
+without the explicit entry the relay client fails to import inside uv's
+environment and every ``ask``/``notify`` is refused (task 45).
 """
 
 import json

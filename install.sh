@@ -1468,8 +1468,12 @@ After=network-online.target
 
 [Service]
 ExecStart=%h/.local/bin/questions-listen
-Restart=always
+# on-failure, not always: the listener exits 0 when another copy already holds
+# its lock, and 78 (EX_CONFIG) when config.toml has no token or server_url.
+# Neither should be restarted every five seconds.
+Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=default.target
@@ -1968,6 +1972,23 @@ PYEOF
 # §8.4 systemd
 # ---------------------------------------------------------------------------
 
+# ext_systemd_user <systemctl args…>
+# The one place 'systemctl --user' is spelled. A shell that was not started by a
+# login session (an agent's tool shell, cron, ssh without a PAM session) has no
+# XDG_RUNTIME_DIR, and without it the user bus is unreachable even though the
+# user manager is running (linger). Point at the standard runtime dir in that
+# case instead of failing with "Failed to connect to bus".
+# Callers gate on CLAUDE_INSTALL_NO_EXTERNAL themselves; this never runs in tests.
+ext_systemd_user() {
+    # EXT_RUNTIME_DIR_BASE exists for the tests; nothing else sets it.
+    local runtime_dir="${EXT_RUNTIME_DIR_BASE:-/run/user}/$(id -u)"
+    if [[ -z "${XDG_RUNTIME_DIR:-}" && -d "$runtime_dir" ]]; then
+        XDG_RUNTIME_DIR="$runtime_dir" systemctl --user "$@"
+    else
+        systemctl --user "$@"
+    fi
+}
+
 # ext_systemd_daemon_reload
 # Runs 'systemctl --user daemon-reload'. Called after writing a unit file.
 # Gated by CLAUDE_INSTALL_NO_EXTERNAL (systemctl escapes HOME).
@@ -1976,27 +1997,39 @@ ext_systemd_daemon_reload() {
         log_info "[NO_EXTERNAL] ext_systemd_daemon_reload: would run systemctl --user daemon-reload"
         return 0
     fi
-    systemctl --user daemon-reload 2>/dev/null || true
+    ext_systemd_user daemon-reload 2>/dev/null || true
     log_info "systemctl --user daemon-reload: done"
 }
 
 # ext_systemd_enable <unit>
-# Enables a systemd user unit (without --now) and runs loginctl enable-linger.
+# Enables a systemd user unit, (re)starts it, and runs loginctl enable-linger.
 # Called only when the questions-listen sub-toggle is on (architecture §8.4).
+#
+# The restart is not optional: the unit is a resident process that imported the
+# hook library at start, and this very run may have just replaced that library.
+# Enabling without starting (the pre-task-45 behaviour) also left a freshly
+# enabled listener dead until the next login.
 # Gated by CLAUDE_INSTALL_NO_EXTERNAL.
 ext_systemd_enable() {
     local unit="$1"
 
     if [[ "${CLAUDE_INSTALL_NO_EXTERNAL:-}" == "1" ]]; then
-        log_info "[NO_EXTERNAL] ext_systemd_enable: would enable ${unit} and loginctl enable-linger"
+        log_info "[NO_EXTERNAL] ext_systemd_enable: would enable and restart ${unit} and loginctl enable-linger"
         return 0
     fi
 
-    if systemctl --user enable "$unit" 2>/dev/null; then
+    if ext_systemd_user enable "$unit" 2>/dev/null; then
         log_info "Enabled: $unit"
         QUESTIONS_LISTEN_SERVICE_ENABLED=true
     else
         log_warn "systemctl --user enable $unit failed"
+    fi
+
+    if ext_systemd_user restart "$unit" 2>/dev/null; then
+        log_info "Restarted: $unit"
+        QUESTIONS_LISTEN_SERVICE_RUNNING=true
+    else
+        log_warn "systemctl --user restart $unit failed — start it by hand: systemctl --user restart $unit"
     fi
 
     if command -v loginctl >/dev/null 2>&1; then
@@ -2016,8 +2049,10 @@ ext_systemd_disable() {
         return 0
     fi
 
-    systemctl --user disable "$unit" 2>/dev/null || true
-    log_info "Disabled: $unit"
+    # --now: a disabled listener that kept running until logout was a toggle
+    # that did not do what it said.
+    ext_systemd_user disable --now "$unit" 2>/dev/null || true
+    log_info "Disabled and stopped: $unit"
 }
 
 # ext_systemd_is_enabled <unit>
@@ -2031,7 +2066,7 @@ ext_systemd_is_enabled() {
         return 1
     fi
 
-    systemctl --user is-enabled "$unit" >/dev/null 2>&1
+    ext_systemd_user is-enabled "$unit" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -2886,6 +2921,7 @@ PERMISSIONS_MCP_INSTALLED=false
 QUESTIONS_MCP_INSTALLED=false
 QUESTIONS_LISTEN_INSTALLED=false
 QUESTIONS_LISTEN_SERVICE_ENABLED=false
+QUESTIONS_LISTEN_SERVICE_RUNNING=false
 CLAUDE_QUESTIONS_INSTALLED=false
 TMUX_FILE_STATUS="unchanged"
 TMUX_LIVE_STATUS="no running server"
@@ -4414,8 +4450,10 @@ fi
 
 if [[ "$QUESTIONS_LISTEN_INSTALLED" == true ]]; then
     echo "  - questions-listen: installed ($local_user_bin_dir/questions-listen)"
-    if [[ "$QUESTIONS_LISTEN_SERVICE_ENABLED" == true ]]; then
-        echo "    systemd unit enabled — start with: systemctl --user start claude-questions-listen"
+    if [[ "$QUESTIONS_LISTEN_SERVICE_ENABLED" == true && "$QUESTIONS_LISTEN_SERVICE_RUNNING" == true ]]; then
+        echo "    systemd unit enabled and restarted — check with: questions-listen --status"
+    elif [[ "$QUESTIONS_LISTEN_SERVICE_ENABLED" == true ]]; then
+        echo "    systemd unit enabled but NOT running — start with: systemctl --user restart claude-questions-listen"
     else
         echo "    systemd unit installed but NOT enabled"
         echo "    To enable: ./install.sh enable questions-listen"

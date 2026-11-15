@@ -20,12 +20,15 @@ All tests run against temp workspaces; nothing touches ~/.claude or the network.
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -304,6 +307,77 @@ class TestCheckContractNonConforming(unittest.TestCase):
             self.assertIn("no edit needed", m["detail"])
 
 
+#: Schema examples the way a real queue file documents itself: inside fenced
+#: blocks.  ``Q-NNN`` is not a well-formed id, so the store ignores these lines
+#: wherever they are; the checker's own guidance for a malformed id is "move it
+#: to a fenced block" — so it must not go on reporting one that is already there.
+_FENCED_EXAMPLES_QUEUE = """\
+# Questions for Product Lead
+
+Entry format:
+
+```markdown
+## Q-NNN — <short title>  [open]
+```
+
+~~~
+## Q-NNN — tilde fence  [open]
+~~~
+
+````
+```
+## Q-NNN — nested shorter fence does not close the outer one  [open]
+```
+````
+
+## Q-001 — A real entry  [open]
+
+Body.
+"""
+
+
+class TestCheckContractFencedExamples(unittest.TestCase):
+    """Task 45: ``--check-contract`` exited 2 on format examples that were
+    already inside fenced code blocks (three lines in the reference workspace)."""
+
+    def _run(self, queue: str):
+        ws = _make_workspace(_ROLES_TOML_QUESTIONS, queue)
+        self.addCleanup(shutil.rmtree, ws, ignore_errors=True)
+        config = qs.load_questions_config(str(ws), roles_path=ws / ".claude" / "roles.toml")
+        store = qs.QuestionsStore(config, qs.resolve_anchor(str(ws), config).root)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cq.cmd_check_contract(store, str(ws), json_out=True)
+        return rc, json.loads(buf.getvalue())
+
+    def test_fenced_examples_are_not_findings(self):
+        rc, data = self._run(_FENCED_EXAMPLES_QUEUE)
+        malformed = [f for f in data["findings"] if f["category"] == "malformed_id"]
+        self.assertEqual(malformed, [], "a fenced Q-NNN example needs no edit")
+        self.assertEqual(rc, 0)
+
+    def test_the_same_line_outside_a_fence_is_still_reported(self):
+        """The fix must not turn the category off."""
+        rc, data = self._run(
+            "# Q\n\n```\n## Q-NNN — fenced  [open]\n```\n\n"
+            "## Q-NNN — not fenced  [open]\n\n## Q-001 — real  [open]\n"
+        )
+        malformed = [f for f in data["findings"] if f["category"] == "malformed_id"]
+        self.assertEqual(len(malformed), 1, malformed)
+        self.assertEqual(rc, 2)
+
+    def test_fence_tracking(self):
+        lines = _FENCED_EXAMPLES_QUEUE.split("\n")
+        fenced = cq._fenced_lines(lines)
+        inside = [lines[i] for i in sorted(fenced)]
+        self.assertEqual(sum(1 for l in inside if l.startswith("## Q-NNN")), 3)
+        self.assertNotIn("## Q-001 — A real entry  [open]", inside)
+        # An unclosed fence runs to the end of the file.
+        self.assertEqual(cq._fenced_lines(["a", "```", "## Q-NNN x", "b"]), {1, 2, 3})
+        # A backtick fence whose info string contains a backtick is not a fence.
+        self.assertEqual(cq._fenced_lines(["``` a`b", "## Q-NNN x"]), set())
+
+
 class TestCheckContractNoQuestions(unittest.TestCase):
     """--check-contract on a workspace with no [questions] section exits 0 (invariant 9)."""
 
@@ -550,6 +624,21 @@ class TestInstallerContent(unittest.TestCase):
             self.installer_text,
             "systemd unit must have ExecStart=%h/.local/bin/questions-listen",
         )
+
+    def test_systemd_unit_does_not_restart_loop(self):
+        """The unit that reaches disk must not restart a listener that exited
+        on purpose: 0 (another copy holds the lock) or EX_CONFIG (no token).
+        Read from the heredoc the installer writes, not from the file at large."""
+        m = re.search(
+            r"cat > \"\$systemd_user_dir/\$questions_listen_service_name\" << 'EOF'\n(.*?)\nEOF\n",
+            self.installer_text,
+            re.S,
+        )
+        self.assertIsNotNone(m, "unit heredoc not found in install.sh")
+        unit = [l.strip() for l in m.group(1).splitlines() if not l.strip().startswith("#")]
+        self.assertIn("Restart=on-failure", unit)
+        self.assertNotIn("Restart=always", unit)
+        self.assertIn(f"RestartPreventExitStatus={qll.EXIT_CONFIG}", unit)
 
     def test_systemd_enable_conditional(self):
         """The migration Python snippet must return the correct state for both config states."""

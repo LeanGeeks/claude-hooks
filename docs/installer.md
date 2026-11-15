@@ -186,11 +186,19 @@ the parent feature is installed.
 |----|--------|---------|----------------|
 | `profiles-autosource` | `profiles` | off | `~/.bashrc` — one marked sourcing line |
 | `amux-autowrap` | `amux` | off | `~/.bashrc` — one marked sourcing line |
-| `questions-listen` | `questions` | off | `systemctl --user enable claude-questions-listen`, `loginctl enable-linger` |
+| `questions-listen` | `questions` | off | `systemctl --user enable` + `restart claude-questions-listen`, `loginctl enable-linger`; `disable` also stops it |
 | `daily-review-cron` | `daily-review` | off | crontab — one marked `15 6 * * *` line |
 
 `profiles-autosource` and `amux-autowrap` are mutually exclusive: enabling one
 automatically disables the other if it was active.
+
+`questions-listen` is the **only** switch for the answer listener — the
+listener itself has no "enabled" setting (`[questions_listen] enabled` in
+`config.toml` is inert). While it is on, every `./install.sh --yes` restarts the
+unit, since the run may have replaced the library the resident process loaded.
+The installer reaches the user manager from a shell that has no
+`XDG_RUNTIME_DIR` (an agent's tool shell, cron) by pointing at
+`/run/user/<uid>` itself.
 
 Enable or disable a sub-toggle with the `enable`/`disable` subcommands (see
 [below](#enable--disable-subcommands)).
