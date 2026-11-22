@@ -43,7 +43,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | done | 50-05 | D4, D5, M6, m2 |
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | done | 50-04 | P0-7 |
 | 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | done | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
-| 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | todo | 50-06, 50-08 | |
+| 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | done | 50-06, 50-08 | |
 | 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | todo | 50-08, 50-09 | P0-12 (stamps); units |
 | 50-11 | Workstation root setup (sleep lock with no login) | dropped (P0-6) | — | No file. The id is kept so 50-12 keeps its number. |
 | 50-12 | [Live verification](./50-12-live-verification_human.md) | todo | 50-10 | **human** |
@@ -174,3 +174,10 @@ Phase 0 decisions. They stay listed here for the reasoning.
   file byte for byte; notifies have a wall-clock limit. Architecture §16.1 clarified: the first repeat comes 4 h after
   the ladder ends. Nothing on the workstation was enabled or started. The stamps manifest format and the repo-vs-
   installed detection 50-10 must honour are in `agents_output/50-08_implementation_report.md` and `_fix_report.md`.
+- **2026-11-23 — 50-09 done** (2 reviews, 2 fixes; suite 3046 OK, 2 skipped). `docs/prompts/epic-driver-driver.md`
+  and `docs/prompts/epic-driver-worker.md`, with prompt tests (every fenced `verdict` example parses; every force
+  mention is a prohibition; no `git push` without `-C`; untagged verdict-like blocks fail). From review: a per-item-kind
+  list in the driver prompt; review feedback always queued to the step's `worker.implementer`; every closing/push
+  command carries `git -C <worktree>`; merge conflict ⇒ `merge --abort` in the integration worktree and `HALT`; workers
+  may end a rotate turn with `HANDOFF:` (the code already accepted it; now pinned). Architecture §14.3 corrected to
+  `queue <step> --to <role>`. Known limit accepted: the push-without-`-C` test is per-line (a second needle test covers it).

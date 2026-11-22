@@ -2368,6 +2368,49 @@ class TestReconcileVerdicts(_Recon):
         self.assertEqual(res2.state["steps"]["A"]["status"], "verifying")
         self.assertNotIn("halt:A", [c.key for c in edl.step_alarm_conditions(L, res2.state, self.now())])
 
+    def test_worker_handoff_is_valid_only_in_a_rotate_turn(self):
+        """§10/§14.3: a worker may use HANDOFF exactly where the driver may; every other verb stays DONE/HALT."""
+        kw = dict(steps=(), from_driver=False)
+        ok = edl.read_verdict("Written.\nHANDOFF: /x/h.md", rotate=True, **kw)
+        self.assertTrue(ok.valid)
+        self.assertEqual(ok.handoff.text, "/x/h.md")
+        self.assertEqual(edl.read_verdict("HANDOFF: /x/h.md", rotate=False, **kw).invalid, edl.INVALID_HANDOFF)
+        self.assertEqual(edl.read_verdict("HANDOFF: /x/h.md", steps=("W",), from_driver=False).invalid,
+                         edl.INVALID_HANDOFF)
+        # a rotate turn does not widen the worker's other verbs
+        self.assertEqual(edl.read_verdict("ADVANCED: W", steps=("W",), from_driver=False, rotate=True).invalid,
+                         edl.INVALID_WORKER_VERB)
+        self.assertEqual(edl.read_verdict("WAITING: soak", steps=(), from_driver=False, rotate=True).invalid,
+                         edl.INVALID_WORKER_VERB)
+
+    def test_worker_handoff_outside_a_rotate_turn_is_not_applied(self):
+        L, st = self.worker_ledger()
+        self.inflight(st, "W", name="t-w-t-impl-w-g1")
+        entries, events = self.answered_turn("E-3", "HANDOFF: /x/h.md")
+        self.session(st, key="impl:W", name="t-w-t-impl-w-g1", entries=entries, events=events,
+                     rotation={"event": "E-9", "requested_at": "2026-11-24T09:00:00Z", "handoff_path": "/x/h.md"})
+        self.outbox(st, "E-3", name="t-w-t-impl-w-g1", steps=("W",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["outbox"][0]["verdict"]["invalid"], edl.INVALID_HANDOFF)
+        self.assertIsNone(res.state["sessions"]["impl:W"]["rotation"].get("handoff"))
+        self.assertFalse(res.state["outbox"][0]["verdict"]["complete"])
+
+    def test_worker_handoff_in_a_rotate_turn_is_recorded(self):
+        L, st = self.worker_ledger()
+        self.inflight(st, "W", name="t-w-t-impl-w-g1")
+        handoff = self.tmp / "wh.md"
+        handoff.write_text("# Handoff\n")
+        entries, events = self.answered_turn("E-7", f"HANDOFF: {handoff}")
+        self.session(st, key="impl:W", name="t-w-t-impl-w-g1", entries=entries, events=events,
+                     rotation={"event": "E-7", "requested_at": "2026-11-24T09:00:00Z", "handoff_path": str(handoff)})
+        os.utime(str(handoff), (self.epoch("2026-11-24T09:04:00Z"),) * 2)
+        self.outbox(st, "E-7", name="t-w-t-impl-w-g1", steps=(), kinds=("rotate",))
+        res, _ = self.reconcile(L, st)
+        rot = res.state["sessions"]["impl:W"]["rotation"]
+        self.assertEqual(rot["handoff"]["path"], str(handoff))
+        self.assertTrue(res.sessions["impl:W"].rotation_ready)
+        self.assertTrue(res.state["outbox"][0]["verdict"]["complete"])
+
     def test_worker_done_and_halt_route_to_review_and_the_driver(self):
         L, st = self.worker_ledger()
         self.inflight(st, "W", name="t-w-t-impl-w-g1")
@@ -4102,6 +4145,40 @@ class TestRotation(_Disp):
         st3, _, _, _ = self.tick(L, st2, advance=600)
         self.assertEqual(self.world.reaps, ["ws-t-driver-g1"])
         self.assertEqual(st3["sessions"]["driver"]["parked"], [])
+
+    def test_a_worker_rotation_ends_with_handoff_and_spawns_the_next_generation(self):
+        """Pin (50-09 fix 2): the parser, reconcile and dispatch carry a worker's rotation to gen + 1."""
+        L, st = self.worker_ledger()
+        st["steps"]["A"]["status"] = "done"                     # only the worker step is in play
+        wdir = self.tmp / "wt" / "t-w"
+        wdir.mkdir(parents=True)
+        name = "ws-t-impl-w-g1"
+        self.inflight(st, "W", event="E-0", name=name)
+        self.live(st, key="impl:W", name=name,
+                  entries=[u("2026-11-24T09:00:01Z", "EVENT E-0: read /x"),
+                           usage_entry("2026-11-24T09:55:00Z", ctx=260000)])
+        self.world.reply[name] = None                           # the rotate turn is still running
+        edl.queue_request(L, st, "W", "impl", "/f.md", self.now())      # an event is waiting for the worker
+        st1, plan, _, _ = self.tick(L, st, worker_dirs={"W": str(wdir)})
+        self.assertEqual(plan.decisions["impl:W"].action, edl.ACT_ROTATE)
+        rot = st1["sessions"]["impl:W"]["rotation"]
+        hp = rot["handoff_path"]
+        self.assertEqual(self.entry(st1, rot["event"])["kinds"], ["rotate"])
+        # the worker writes the handoff and ends HANDOFF (a worker may, in a rotate turn)
+        self.world.advance(600)
+        Path(hp).parent.mkdir(parents=True, exist_ok=True)
+        Path(hp).write_text("# Handoff\n")
+        os.utime(hp, (self.epoch("2026-11-24T10:07:00Z"),) * 2)
+        self.world.events[name] += [ev("stop", "2026-11-24T10:08:00Z", state="idle", last_message=f"HANDOFF: {hp}")]
+        self.world._append(name, a("2026-11-24T10:08:00Z", f"HANDOFF: {hp}"))
+        self.world._handle(name).update(last_message=f"HANDOFF: {hp}", stopped_at="2026-11-24T10:08:00Z")
+        st2, plan, res, _ = self.tick(L, st1, worker_dirs={"W": str(wdir)})
+        self.assertTrue(res.sessions["impl:W"].rotation_ready)
+        self.assertEqual(plan.decisions["impl:W"].action, edl.ACT_SPAWN_NEXT)
+        self.assertEqual(st2["sessions"]["impl:W"]["gen"], 2)
+        self.assertEqual(self.world.spawns[-1][1], "t-impl-w-g2")
+        seed = next(pe for pe in plan.events if pe.via == "spawn" and pe.to == "impl:W")
+        self.assertEqual([it.kind for it in seed.items][:2], ["role", "handoff"])
 
     def test_no_handoff_after_two_ticks_falls_back_to_reuse(self):
         L, st = self.ledger()
@@ -7963,3 +8040,160 @@ class TestReconcileAlarmsThroughTheTick(_Tick):
         self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
         self.assertEqual(self.active_alarms(), [])
         self.assertEqual(len(self.world.alarm_notifies()), 1)
+
+
+# =============================================================================
+# Role prompts (50-09): every verdict example parses with 50-05's parser
+# =============================================================================
+
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "prompts"
+_ROLE_PROMPTS = ("epic-driver-driver.md", "epic-driver-worker.md")
+
+
+def _prompt_examples(text: str):
+    """``(valid_lines, invalid_lines)`` from the fenced ``verdict`` / ``verdict-invalid`` blocks
+    (the convention documented in each prompt's header comment)."""
+    valid, invalid, current, inside = [], [], None, False
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        if not inside:
+            m = re.match(r"^```(verdict|verdict-invalid)$", line.strip())
+            if m:
+                inside, current = True, (valid if m.group(1) == "verdict" else invalid)
+        elif line.strip() == "```":
+            inside = False
+        elif line.strip():
+            current.append(line.strip())
+    assert not inside, "unterminated example block"
+    return valid, invalid
+
+
+def _prompt_fenced_blocks(text: str):
+    """``[(tag, [lines])]`` for every three-backtick block (the four-backtick wrapper is not one)."""
+    blocks, current, tag = [], None, None
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if current is None:
+            m = re.match(r"^```([\w-]*)$", line)
+            if m:
+                current, tag = [], m.group(1)
+        elif line == "```":
+            blocks.append((tag, current))
+            current = None
+        else:
+            current.append(line)
+    return blocks
+
+
+_PROHIBITION = re.compile(r"\b(never|no|not|forbidden)\b", re.I)
+
+
+def _prompt_lines_with_section(text: str):
+    """``(line, heading)``: each line with the nearest preceding ``## `` heading."""
+    heading = ""
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            heading = line
+        yield line, heading
+
+
+class TestRolePrompts(unittest.TestCase):
+    def text(self, name):
+        return (_PROMPTS_DIR / name).read_text(encoding="utf-8")
+
+    def test_force_flags_are_only_prohibited(self):
+        flag = re.compile(r"--force\b|--force-with-lease|--mirror|(?<![\w-])-f(?![\w-])|(?<![\w`])\+refspec|`\+\w+`")
+        for name in _ROLE_PROMPTS:
+            for line, heading in _prompt_lines_with_section(self.text(name)):
+                if flag.search(line):
+                    with self.subTest(prompt=name, line=line):
+                        self.assertTrue(_PROHIBITION.search(line) or "forbidden" in heading.lower(),
+                                        "a force flag outside a prohibition")
+
+    def test_no_push_without_dash_c(self):
+        for name in _ROLE_PROMPTS:
+            for line, _ in _prompt_lines_with_section(self.text(name)):
+                if "git push" in line:
+                    with self.subTest(prompt=name, line=line):
+                        self.assertTrue("git -C" in line or _PROHIBITION.search(line),
+                                        "git push recommended without -C")
+
+    def test_worker_has_never_commit_rule(self):
+        rule = [x for x in self.text("epic-driver-worker.md").split("\n") if "NEVER COMMIT" in x]
+        self.assertTrue(rule)
+        self.assertIn("git commit", rule[0])
+        self.assertIn("uncommitted", rule[0])
+
+    def test_closing_commands_carry_dash_c(self):
+        driver = self.text("epic-driver-driver.md")
+        for needle in ("git -C <integration worktree> merge --no-ff --no-edit epic-step/<epic>/<step>",
+                       "git -C <integration worktree> push <remote> epic/<epic>",
+                       "git -C <integration worktree> merge --abort", "git -C <step worktree> commit"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, driver)
+
+    def test_verdict_shaped_blocks_are_tagged(self):
+        verb = re.compile(r"^(ADVANCED|WAITING|ASKED|HALT|DONE|HANDOFF):")
+        for name in _ROLE_PROMPTS:
+            for tag, lines in _prompt_fenced_blocks(self.text(name)):
+                if any(verb.match(x) for x in lines) and tag not in ("verdict", "verdict-invalid"):
+                    self.fail(f"{name}: an untagged block holds verdict lines: {lines[:2]}")
+
+    def test_prompts_exist_and_are_short(self):
+        for name in _ROLE_PROMPTS:
+            with self.subTest(prompt=name):
+                self.assertLess(len(self.text(name).splitlines()), 250)
+
+    def test_valid_examples_parse(self):
+        for name in _ROLE_PROMPTS:
+            valid, _ = _prompt_examples(self.text(name))
+            self.assertGreaterEqual(len(valid), 3, name)
+            for line in valid:
+                with self.subTest(prompt=name, line=line):
+                    self.assertIsNotNone(edl.parse_verdict_line(line))
+
+    def test_counter_examples_fail_to_parse(self):
+        for name in _ROLE_PROMPTS:
+            _, invalid = _prompt_examples(self.text(name))
+            self.assertGreaterEqual(len(invalid), 3, name)
+            for line in invalid:
+                with self.subTest(prompt=name, line=line):
+                    self.assertIsNone(edl.parse_verdict_line(line))
+
+    def test_driver_shows_every_verb_but_done(self):
+        valid, _ = _prompt_examples(self.text("epic-driver-driver.md"))
+        verbs = {v.verb for line in valid for v in edl.parse_verdict_line(line)}
+        self.assertEqual(verbs, {"ADVANCED", "WAITING", "ASKED", "HALT", "HANDOFF"})
+        self.assertTrue(any(len(edl.parse_verdict_line(x)) > 1 for x in valid), "a merged example")
+        self.assertTrue(any(any(v.shas and v.shas[0][0] for v in edl.parse_verdict_line(x)) for x in valid))
+
+    def test_worker_examples_are_done_halt_or_a_rotate_handoff(self):
+        valid, _ = _prompt_examples(self.text("epic-driver-worker.md"))
+        for line in valid:
+            with self.subTest(line=line):
+                self.assertTrue(all(v.verb in ("DONE", "HALT", "HANDOFF") for v in edl.parse_verdict_line(line)))
+        self.assertEqual({edl.parse_verdict_line(x)[0].verb for x in valid}, {"DONE", "HALT", "HANDOFF"})
+        # HANDOFF is the rotate turn's verdict (§10, §14.3): the prompt scopes it to section 5
+        for line in valid:
+            if line.startswith("HANDOFF"):
+                self.assertTrue(edl.read_verdict(line, steps=(), from_driver=False, rotate=True).valid)
+        self.assertIn("`HANDOFF:` only in a `rotate` turn", self.text("epic-driver-worker.md"))
+
+    def test_forbidden_tools_and_force_ban_appear(self):
+        for name in _ROLE_PROMPTS:
+            text = self.text(name)
+            for needle in ("amux-spawn", "`amux`", "Monitor", "`watch`", "AskUserQuestion", "sleep",
+                           "--force", "--force-with-lease", "--mirror", "+refspec"):
+                with self.subTest(prompt=name, needle=needle):
+                    self.assertIn(needle, text)
+
+    def test_commands_and_rules_match_the_code(self):
+        driver, worker = self.text("epic-driver-driver.md"), self.text("epic-driver-worker.md")
+        for needle in ("epic-driver mark --grant <approval id> --question Q-<n>",
+                       "epic-driver queue <step> --to <role> --file <path>", "mcp__questions__ask",
+                       "merge --no-ff --no-edit", "epic-step/<epic>/<step>", "Never commit or stage the workspace's question-queue"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, driver)
+        self.assertIn("NEVER COMMIT", worker)
+        self.assertIn("NEVER ASK THE OPERATOR", worker)
+        self.assertIn("DONE: <step>", worker)

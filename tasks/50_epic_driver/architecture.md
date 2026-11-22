@@ -813,8 +813,8 @@ returned.
 2. Implementer `DONE: <step>` ⇒ the tick sends a `review_due` event to the reviewer role (spawn or reuse under
    §11.2). Implementer `HALT` ⇒ `worker_settled` to the driver.
 3. Reviewer `DONE: <step>` (its report at the path the event named) or `HALT` ⇒ `worker_settled` to the driver.
-4. The driver reads the review. Issues ⇒ it writes feedback and runs `epic-driver queue <step> --to implementer
-   --file <path>`; the tick delivers it as a `feedback` event under §11.2 (back into the warm implementer session
+4. The driver reads the review. Issues ⇒ it writes feedback and runs `epic-driver queue <step> --to <role>
+   --file <path>` (`<role>` is the step's `worker.implementer` role name in the ledger; worker steps only); the tick delivers it as a `feedback` event under §11.2 (back into the warm implementer session
    when possible), and the loop returns to step 2. A worker's drafted question ⇒ the driver asks it (§15) and queues
    the answer the same way.
 5. Closing, by the driver, once review has ended: re-run the tests itself; in each step worktree stage paths
