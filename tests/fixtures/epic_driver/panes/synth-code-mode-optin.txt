@@ -1,0 +1,39 @@
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Code Mode (experimental)
+
+ Code Mode lets Claude write and run code to call tools in fewer round trips. It is experimental, and a session
+ started with it can be resumed only with Code Mode on.
+
+ ❯ No, start without it
+   Yes, turn on Code Mode
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

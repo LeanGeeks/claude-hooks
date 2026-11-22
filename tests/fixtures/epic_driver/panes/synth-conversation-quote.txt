@@ -1,0 +1,15 @@
+
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Opus 5.5 with high effort · Claude
+ ▝▝   ▝▝   /tmp/epic-driver-fixture
+
+> please summarise the notes
+  - first point of the summary
+  - second point of the summary
+
+⏺ Here is the summary.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus · high | ctx ?

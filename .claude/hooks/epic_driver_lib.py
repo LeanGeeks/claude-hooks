@@ -16,6 +16,12 @@ Schedule              step state machine, due/dispatchable (§6)   50-04
 Approvals             the selection side of §15.1                 50-04
 Checks and triggers   the runner and its budget (§7)              50-04
 Step alarm conds.     step-level rows of §16.2 (conditions only)  50-04
+Session readings      ``take_readings``: the §11.1 inputs via World 50-05
+Verdicts              the §10 grammar, its checks, its application 50-05
+Delivery (reading)    §9.3 confirmation, "provably did not land"  50-05
+Usage limits          §12.4 classification, reset times, ladder   50-05
+Startup dialogs       §12.11 pane classifier and listed answers   50-05
+Session reconcile     ``reconcile``: §12 facts, conditions, items 50-05
 ====================  ==========================================  ======
 
 Later tasks append their own sections (reconcile §12, dispatch §9/§11,
@@ -62,6 +68,7 @@ except ImportError:  # pragma: no cover - exercised only where PyYAML is absent
     yaml = None  # type: ignore[assignment]
 
 import amux_spawn_lib as asl
+import claude_event_reducer as cer
 
 if yaml is not None:
     class _UniqueKeyLoader(yaml.SafeLoader):
@@ -175,6 +182,21 @@ POINTER_FILE = "epic-driver.run.json"
 
 DAY_S = 86400
 
+# -- 50-05: session reconcile and stalls (§9.3, §10, §11.1, §12, §15.2) --
+TMUX_BIN = "tmux"                    # read-only verbs here: display-message, capture-pane
+TMUX_READ_TIMEOUT_S = 5
+LIFECYCLE_SUFFIX = ".lifecycle.jsonl"  # amux-spawn's per-handle lifecycle log (epic 37)
+TMUX_DISPLAY_FIELDS = ("pane_dead", "pane_in_mode", "session_attached", "pane_pid")
+OPEN_PROMPT_ALARM_S = 10 * 60        # permission prompt / AskUserQuestion open > 10 min (§12.6)
+CLOCK_JUMP_S = 60                    # |Δwall − Δboottime| or Δboottime − Δmonotonic above it (§12.7)
+#: §12.4: the fixed ladder when a limit entry names no reset time (15m, 30m, 1h, 2h, 4h, then 4h).
+LIMIT_LADDER_S = (15 * 60, 30 * 60, 3600, 2 * 3600, 4 * 3600)
+VERDICT_WAIT_TEXT_MAX = 200          # §10: a WAITING text is at most 200 characters
+QUESTION_TEXT_MAX = 8000             # the answer text carried in an `answer` item
+DIALOG_DETAIL_LINES = 2              # the startup_dialog alarm detail: the dialog's first lines
+DIALOG_DETAIL_MAX = 160
+PROMPT_GLYPHS = ("❯", ">")           # the TUI's prompt glyph (input box and menu pointer)
+
 
 # =============================================================================
 # Time
@@ -275,6 +297,51 @@ class World:
         Raises ``ValueError`` for an unknown profile.
         """
         raise NotImplementedError("World.profile_env")
+
+    # -- 50-05: the read-only effects of the session reconcile (§11.1, §12) --
+
+    def tmux_has_session(self, name: str) -> bool:
+        """``amux_spawn_lib.tmux_has_session(name)`` (exact ``=amux-<name>``)."""
+        raise NotImplementedError("World.tmux_has_session")
+
+    def tmux_display(self, name: str, fields: Sequence[str]) -> Optional[Dict[str, str]]:
+        """``tmux display -p -t =amux-<name>: '#{f1}…'`` → ``{field: value}``; None on failure."""
+        raise NotImplementedError("World.tmux_display")
+
+    def capture_pane(self, name: str) -> Optional[str]:
+        """``tmux capture-pane -p -t =amux-<name>:`` (text, no escapes); None on failure."""
+        raise NotImplementedError("World.capture_pane")
+
+    def list_handles(self) -> List[Dict[str, Any]]:
+        """Every amux-spawn handle (``amux_spawn_lib.list_handles``)."""
+        raise NotImplementedError("World.list_handles")
+
+    def lifecycle_events(self, name: str) -> List[Dict[str, Any]]:
+        """The handle's lifecycle log (``<name>.lifecycle.jsonl``) as parsed records, oldest first."""
+        raise NotImplementedError("World.lifecycle_events")
+
+    def amux_names(self) -> List[str]:
+        """Every amux session name (``amux ls``, via ``amux_spawn_lib.list_amux_names``)."""
+        raise NotImplementedError("World.amux_names")
+
+    def process_work(self, pane_pid: int) -> "ProcessWork":
+        """The Claude owner under ``pane_pid`` and whether a tool shell runs under it (§12.3)."""
+        raise NotImplementedError("World.process_work")
+
+    def clock_sample(self) -> "ClockSample":
+        """Boot id, wall clock, ``CLOCK_BOOTTIME`` and ``CLOCK_MONOTONIC`` (§12.7)."""
+        raise NotImplementedError("World.clock_sample")
+
+    def local_timezone(self) -> Any:
+        """The system timezone (a ``tzinfo``) that usage-limit reset times are read in (§12.4)."""
+        raise NotImplementedError("World.local_timezone")
+
+    def question_entries(self, workspace: str) -> Optional["QuestionsSnapshot"]:
+        """The workspace's question queue (``questions_store.open_store(ws).all_entries()``, §15.2).
+
+        None when the workspace declares no ``[questions]`` section.
+        """
+        raise NotImplementedError("World.question_entries")
 
 
 def _git_env() -> Dict[str, str]:
@@ -406,6 +473,116 @@ class RealWorld(World):
 
     def profile_env(self, name: str) -> Dict[str, str]:
         return asl.resolve_profile(name)
+
+    # -- 50-05: read-only tmux, handle, process, clock and queue reads --
+
+    def tmux_has_session(self, name: str) -> bool:
+        return asl.tmux_has_session(name)
+
+    def _tmux_read(self, args: Sequence[str]) -> Optional[str]:
+        argv = [TMUX_BIN, *args]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=TMUX_READ_TIMEOUT_S,
+                                  stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    def tmux_display(self, name: str, fields: Sequence[str]) -> Optional[Dict[str, str]]:
+        fmt = "\t".join("#{%s}" % f for f in fields)
+        out = self._tmux_read(["display-message", "-p", "-t", f"={asl.tmux_session_name(name)}:", fmt])
+        if out is None:
+            return None
+        values = out.rstrip("\n").split("\t")
+        if len(values) != len(fields):
+            return None
+        return dict(zip(fields, values))
+
+    def capture_pane(self, name: str) -> Optional[str]:
+        return self._tmux_read(["capture-pane", "-p", "-t", f"={asl.tmux_session_name(name)}:"])
+
+    def list_handles(self) -> List[Dict[str, Any]]:
+        return asl.list_handles()
+
+    def lifecycle_events(self, name: str) -> List[Dict[str, Any]]:
+        path = asl.SPAWN_DIR / f"{name}{LIFECYCLE_SUFFIX}"
+        events: List[Dict[str, Any]] = []
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return events
+        for line in raw.splitlines():
+            try:
+                ev = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue        # a partial tail line of a live append, or garbage
+            if isinstance(ev, dict):
+                events.append(ev)
+        return events
+
+    def amux_names(self) -> List[str]:
+        return sorted(asl.list_amux_names())
+
+    def process_work(self, pane_pid: int) -> "ProcessWork":
+        kah = importlib.import_module("keep_awake_hook")
+        candidates = [pane_pid, *kah.descendants(pane_pid)]
+        owner = next((p for p in candidates if kah._looks_like_claude(p)), None)
+        if owner is None:
+            return ProcessWork(owner_pid=None, tool_shell=None)
+        tool, _parked = kah.running_work(owner)
+        return ProcessWork(owner_pid=owner, tool_shell=bool(tool))
+
+    def clock_sample(self) -> "ClockSample":
+        try:
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+                boot_id: Optional[str] = f.read().strip() or None
+        except OSError:
+            boot_id = None
+        boottime_clock = getattr(time, "CLOCK_BOOTTIME", None)
+        boottime = time.clock_gettime(boottime_clock) if boottime_clock is not None else time.monotonic()
+        return ClockSample(boot_id=boot_id, wall=time.time(), boottime=boottime,
+                           monotonic=time.monotonic())
+
+    def local_timezone(self) -> Any:
+        return system_timezone()
+
+    def question_entries(self, workspace: str) -> Optional["QuestionsSnapshot"]:
+        qs = importlib.import_module("questions_store")
+        # The workspace's own .claude/roles.toml, found by walking up from it. Passed
+        # explicitly so a CLAUDE_PROJECT_DIR in the caller's environment (a tick run
+        # by hand from a Claude session) cannot point the reader at another queue.
+        roles_path = None
+        for d in (Path(workspace).resolve(), *Path(workspace).resolve().parents):
+            if (d / ".claude" / "roles.toml").is_file():
+                roles_path = d / ".claude" / "roles.toml"
+                break
+        if roles_path is None:
+            return None
+        store = qs.open_store(workspace, roles_path=roles_path)
+        if store is None:
+            return None
+        fmt = store.fmt
+        entries: Dict[str, QuestionEntry] = {}
+        texts: Dict[str, List[str]] = {}
+        for entry in store.all_entries():
+            body = ""
+            if entry.path is not None:
+                key = str(entry.path)
+                if key not in texts:
+                    try:
+                        texts[key] = Path(entry.path).read_text(encoding="utf-8").split("\n")
+                    except (OSError, UnicodeDecodeError):
+                        texts[key] = []
+                body = "\n".join(texts[key][entry.start:entry.end]).strip()[:QUESTION_TEXT_MAX]
+            entries[entry.qid] = QuestionEntry(qid=entry.qid, status=entry.status, text=body,
+                                               path=str(entry.path) if entry.path else None)
+        return QuestionsSnapshot(
+            open_word=fmt.open_status.lower(),
+            resolved_words=tuple(s.lower() for s in fmt.status[1:] if s.lower() != fmt.withdrawn.lower()),
+            withdrawn_word=fmt.withdrawn.lower(),
+            entries=entries,
+        )
 
 
 # =============================================================================
@@ -2081,10 +2258,11 @@ STEP_TRANSITIONS: Dict[str, Tuple[str, ...]] = {
     PENDING: (DUE, WATCHING),
     DUE: (INFLIGHT, PENDING),
     INFLIGHT: (VERIFYING, DONE, WAITING, ASKED, HALTED),     # DONE: a driver step with no check
-    VERIFYING: (DONE, FAILED),
+    VERIFYING: (DONE, FAILED, HALTED),                        # HALTED: a driver HALT (50-05)
     WAITING: (INFLIGHT, VERIFYING, DONE, FAILED, WAITING, ASKED, HALTED),
     ASKED: (INFLIGHT, VERIFYING, WAITING, ASKED, HALTED, DONE),
-    HALTED: (),
+    # §16.2: `halt` clears on "a later verdict on the step, or mark" (50-05).
+    HALTED: (VERIFYING, WAITING, ASKED, HALTED, DONE),
     FAILED: (DUE, INFLIGHT, VERIFYING, WAITING, ASKED, HALTED),
     DONE: (PENDING,),                                         # recurring: next occurrence
     WATCHING: (DONE, FAILED),
@@ -2967,3 +3145,1775 @@ def step_alarm_conditions(ledger: Ledger, state: RunState, now: datetime,
                 out.append(AlarmCondition("due_not_started", step.id,
                                           f"due since {iso(d.due_at)}; " + (why or "not dispatched")))
     return out
+
+
+# =============================================================================
+# Session readings (§11.1, §12) — 50-05
+# =============================================================================
+#
+# ``take_readings`` is the only part of the reconcile that touches the world:
+# tmux, handles, lifecycle logs, the process tree, the clock and the question
+# queue go through ``World``; transcripts are read through the amux_spawn_lib /
+# 50-03 helpers at the paths the handles name. ``reconcile`` (below) is then a
+# pure function of the readings, the ledger, the state and ``now``.
+
+SESSION_RECORD = "record"     # a session the state names (``state.sessions[key]``)
+SESSION_PARKED = "parked"     # an older generation the state keeps parked (§11.3)
+SESSION_FOREIGN = "foreign"   # a handle of this run id that no record names (§12.8)
+
+# The derived session status (§11.1). Liveness comes from tmux (session present,
+# ``pane_dead``) and the reducer; the stored handle state alone never decides it
+# (the 50-02 review note: ``_derive_claude_status`` short-circuits on a stored
+# ``terminated`` until the next prompt hook rewrites it).
+ST_DEAD = "dead"              # tmux session gone or pane dead ⇒ ``died`` (§12.1)
+ST_STARTING = "starting"      # alive, no turn seen since the launch yet
+ST_BUSY = "busy"              # alive, a turn open or background work outstanding
+ST_IDLE = "idle"              # alive, the last turn stopped with nothing outstanding
+
+#: A synthetic assistant entry (API errors) carries this model, never a real one.
+SYNTHETIC_MODEL = "<synthetic>"
+
+
+@dataclass(frozen=True)
+class ProcessWork:
+    """The Claude process under a pane (``owner_pid``) and whether a tool shell runs under it."""
+
+    owner_pid: Optional[int]
+    tool_shell: Optional[bool]      # None: no Claude owner found under the pane
+
+
+@dataclass(frozen=True)
+class ClockSample:
+    """§12.7: ``/proc/sys/kernel/random/boot_id`` and the three clocks, in seconds."""
+
+    boot_id: Optional[str]
+    wall: float
+    boottime: float
+    monotonic: float
+
+    def as_state(self) -> Dict[str, Any]:
+        return {"boot_id": self.boot_id, "wall": self.wall, "boottime": self.boottime,
+                "monotonic": self.monotonic}
+
+
+@dataclass(frozen=True)
+class QuestionEntry:
+    qid: str
+    status: Optional[str]          # the lower-cased status word, None when the heading has none
+    text: str = ""                 # the entry as written in the queue file (heading to boundary)
+    path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class QuestionsSnapshot:
+    """The workspace's queue as the tick read it (§15.2), with its status vocabulary."""
+
+    open_word: str
+    resolved_words: Tuple[str, ...]
+    withdrawn_word: str
+    entries: Dict[str, QuestionEntry]
+
+    def classify(self, qid: str) -> str:
+        """``open`` / ``resolved`` / ``withdrawn``, or ``missing`` when the id is not in the queue."""
+        entry = self.entries.get(qid)
+        if entry is None:
+            return "missing"
+        status = (entry.status or "").lower()
+        if status == self.withdrawn_word:
+            return "withdrawn"
+        if status in self.resolved_words:
+            return "resolved"
+        return "open"
+
+
+@dataclass
+class SessionReading:
+    """Everything measured about one session this pass (§11.1).
+
+    ``kind`` is :data:`SESSION_RECORD`, :data:`SESSION_PARKED` or
+    :data:`SESSION_FOREIGN`; parked and foreign readings carry only the tmux
+    facts and the handle. Timestamps are as the sources wrote them (ISO
+    strings); ``activity_at`` and ``handoff_mtime`` are epoch seconds.
+    """
+
+    name: str
+    kind: str = SESSION_RECORD
+    key: Optional[str] = None
+    handle: Optional[Dict[str, Any]] = None
+    tmux_present: bool = False
+    pane_dead: Optional[bool] = None
+    pane_in_mode: Optional[bool] = None
+    attached: Optional[int] = None
+    pane_pid: Optional[int] = None
+    events: List[Dict[str, Any]] = field(default_factory=list)
+    transcript_path: Optional[str] = None
+    transcript_first_at: Optional[float] = None   # epoch of the earliest entry in the tail that was read
+    assistant: List[Dict[str, Any]] = field(default_factory=list)
+    prompts: List[Dict[str, Any]] = field(default_factory=list)
+    compactions: List[Dict[str, Any]] = field(default_factory=list)
+    context_tokens: Optional[int] = None
+    cache_left_s: Optional[float] = None
+    cache_ttl: Optional[int] = None
+    activity_at: Optional[float] = None
+    owner_pid: Optional[int] = None
+    tool_shell: Optional[bool] = None
+    foreground_tool: Optional[Dict[str, Any]] = None
+    pane_text: Optional[str] = None
+    captured: bool = False
+    expected_model_id: Optional[str] = None
+    handoff_mtime: Optional[float] = None
+
+    @property
+    def alive(self) -> bool:
+        """§11.1: ``tmux_has_session`` and ``#{pane_dead}`` = 0 (an unread pane counts as alive:
+        a resume must never start a second process)."""
+        return self.tmux_present and self.pane_dead is not True
+
+
+@dataclass
+class Readings:
+    """One pass's ground truth: every driven session, the amux names, the clock, the queue."""
+
+    sessions: List[SessionReading] = field(default_factory=list)
+    handle_names: List[str] = field(default_factory=list)
+    amux_names: List[str] = field(default_factory=list)
+    clock: Optional[ClockSample] = None
+    tz: Any = None
+    questions: Optional[QuestionsSnapshot] = None
+    questions_error: Optional[str] = None
+
+    def by_name(self) -> Dict[str, SessionReading]:
+        return {r.name: r for r in self.sessions}
+
+
+def system_timezone() -> Any:
+    """The system timezone: ``$TZ``, else ``/etc/localtime``'s zone, else the current fixed offset."""
+    try:
+        from zoneinfo import ZoneInfo  # Python ≥ 3.9
+    except ImportError:  # pragma: no cover - below the floor
+        ZoneInfo = None  # type: ignore[assignment]
+    if ZoneInfo is not None:
+        candidates = []
+        tz_env = (os.environ.get("TZ") or "").lstrip(":")
+        if tz_env:
+            candidates.append(tz_env)
+        try:
+            link = os.path.realpath("/etc/localtime")
+            if "zoneinfo/" in link:
+                candidates.append(link.split("zoneinfo/", 1)[1])
+        except OSError:
+            pass
+        for key in candidates:
+            try:
+                return ZoneInfo(key)
+            except Exception:  # noqa: BLE001 - unknown key or no tzdata
+                continue
+    return datetime.now().astimezone().tzinfo
+
+
+def _module_beside(name: str, *subdirs: str) -> Any:
+    """Import ``name`` from sys.path, else from a sibling directory of this copy (§17)."""
+    try:
+        return importlib.import_module(name)
+    except ImportError:
+        pass
+    here = Path(__file__).resolve().parent
+    for sub in subdirs:
+        cand = here.parent / sub
+        if (cand / f"{name}.py").is_file():
+            if str(cand) not in sys.path:
+                sys.path.append(str(cand))
+            return importlib.import_module(name)
+    raise ImportError(f"{name} not found")
+
+
+def _statusline() -> Any:
+    """``statusline`` (§17): installed ``~/.claude/statusline``, or the repo's ``.claude/statusline``."""
+    return _module_beside("statusline", "statusline")
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def session_launch_at(rec: Optional[Dict[str, Any]], handle: Optional[Dict[str, Any]] = None) -> Optional[datetime]:
+    """The latest spawn or resume of a session: ``max(spawned_at, resumed_at[-1])``, else the
+    handle's ``created_at``. Model checks, compaction and startup dialogs count from it."""
+    times: List[datetime] = []
+    if rec:
+        t = from_iso(rec.get("spawned_at"))
+        if t is not None:
+            times.append(t)
+        for r in rec.get("resumed_at") or []:
+            t = from_iso(r)
+            if t is not None:
+                times.append(t)
+    if times:
+        return max(times)
+    if handle:
+        return from_iso(handle.get("created_at"))
+    return None
+
+
+def _outbox_for(state: RunState, name: str) -> List[Dict[str, Any]]:
+    return [e for e in state.get("outbox") or [] if e.get("session") == name]
+
+
+_CONFIRMED = object()   # the launch event is no longer in the outbox (completed)
+
+
+def launch_entry(state: RunState, rec: Dict[str, Any]) -> Any:
+    """The outbox entry of the session's seed/resume prompt for its current launch.
+
+    ``rec["launch_event"]`` names it (50-06 writes it with the session record);
+    an event no longer in the outbox was completed. Without the field, the
+    earliest entry for the session sent at or after the launch. None when
+    there is no such prompt.
+    """
+    ev = rec.get("launch_event")
+    name = rec.get("name")
+    if ev:
+        for entry in state.get("outbox") or []:
+            if entry.get("event") == ev:
+                return entry
+        return _CONFIRMED
+    launch = session_launch_at(rec)
+    if launch is None or not name:
+        return None
+    best = None
+    for entry in _outbox_for(state, name):
+        sends = [from_iso(s) for s in entry.get("sends") or []]
+        sends = [s for s in sends if s is not None]
+        if sends and min(sends) >= launch - timedelta(seconds=1):
+            if best is None or min(sends) < best[0]:
+                best = (min(sends), entry)
+    return best[1] if best else None
+
+
+def launch_prompt_unconfirmed(state: RunState, rec: Dict[str, Any]) -> bool:
+    """§12.11: the session's seed/resume prompt is not yet confirmed (§9.3)."""
+    entry = launch_entry(state, rec)
+    if entry is None or entry is _CONFIRMED:
+        return False
+    return not entry.get("confirmed_at")
+
+
+def _needs_capture(state: RunState, rec: Dict[str, Any]) -> bool:
+    """Capture the pane when a startup dialog could be blocking, or a send is unconfirmed."""
+    if launch_prompt_unconfirmed(state, rec):
+        return True
+    return any(e.get("sends") and not e.get("confirmed_at") for e in _outbox_for(state, rec.get("name") or ""))
+
+
+def _read_tmux(world: World, reading: SessionReading) -> None:
+    reading.tmux_present = bool(world.tmux_has_session(reading.name))
+    if not reading.tmux_present:
+        return
+    disp = world.tmux_display(reading.name, TMUX_DISPLAY_FIELDS)
+    if not disp:
+        return
+    dead = disp.get("pane_dead")
+    reading.pane_dead = None if dead is None or dead == "" else dead.strip() == "1"
+    mode = disp.get("pane_in_mode")
+    reading.pane_in_mode = None if mode is None or mode == "" else mode.strip() != "0"
+    reading.attached = _int_or_none(disp.get("session_attached"))
+    reading.pane_pid = _int_or_none(disp.get("pane_pid"))
+
+
+def _read_transcript(reading: SessionReading, now: datetime) -> None:
+    tp = reading.transcript_path
+    if not tp:
+        return
+    assistant = asl.assistant_entries(tp)
+    for a in assistant:       # the limit text is all that is read later; keep the entries small
+        if not a.get("is_api_error") and isinstance(a.get("text"), str):
+            a["text"] = a["text"][-500:]
+    reading.assistant = assistant
+    reading.prompts = asl.user_prompt_entries(tp)
+    reading.transcript_first_at = asl.transcript_tail_first_epoch(tp)
+    reading.compactions = asl.compaction_boundaries(tp)
+    reading.foreground_tool = asl.inflight_foreground_tool(tp)
+    try:
+        measured = _context_mcp_lib().measure_transcript(tp)
+    except ImportError:
+        measured = None
+    if isinstance(measured, dict):
+        reading.context_tokens = _int_or_none((measured.get("latest_turn") or {}).get("effective_context_tokens"))
+    try:
+        left, ttl = _statusline().cache_seconds_left(tp, now.timestamp())
+    except ImportError:
+        left, ttl = None, None
+    reading.cache_left_s = left
+    reading.cache_ttl = ttl
+    try:
+        activity = importlib.import_module("keep_awake_hook").transcript_activity({"transcript_path": tp})
+    except ImportError:
+        activity = 0.0
+    reading.activity_at = activity or None
+
+
+def _read_session(world: World, name: str, kind: str, key: Optional[str],
+                  handle: Optional[Dict[str, Any]], rec: Optional[Dict[str, Any]],
+                  state: RunState, now: datetime) -> SessionReading:
+    reading = SessionReading(name=name, kind=kind, key=key, handle=handle)
+    _read_tmux(world, reading)
+    if kind != SESSION_RECORD:
+        return reading
+    rec = rec or {}
+    reading.events = list(world.lifecycle_events(name))
+    tp = (handle or {}).get("transcript_path") or rec.get("transcript_path")
+    reading.transcript_path = tp if isinstance(tp, str) and tp else None
+    _read_transcript(reading, now)
+    if reading.alive and reading.pane_pid:
+        work = world.process_work(reading.pane_pid)
+        reading.owner_pid, reading.tool_shell = work.owner_pid, work.tool_shell
+    if reading.alive and _needs_capture(state, rec):
+        reading.pane_text = world.capture_pane(name)
+        reading.captured = True
+    model = (handle or {}).get("model")
+    if isinstance(model, str) and model:
+        profile = (handle or {}).get("profile")
+        env: Dict[str, str] = {}
+        if isinstance(profile, str) and profile:
+            try:
+                env = world.profile_env(profile)
+            except (ValueError, OSError):
+                env = {}
+        reading.expected_model_id = asl.expected_model_id(model, env)
+    rotation = rec.get("rotation") or {}
+    hp = rotation.get("handoff_path")
+    if isinstance(hp, str) and hp:
+        try:
+            reading.handoff_mtime = os.stat(hp).st_mtime
+        except OSError:
+            reading.handoff_mtime = None
+    return reading
+
+
+def take_readings(ledger: Ledger, state: RunState, world: World, now: datetime) -> Readings:
+    """Measure every session record, its parked generations and every handle of the run id.
+
+    One ``SessionReading`` per name. Also the amux names (orphans, §12.8), the
+    clock (§12.7), the system timezone (§12.4) and, when a question recorded
+    in the state is still open, the workspace's queue (§15.2). Reads only:
+    nothing is sent, spawned or written.
+    """
+    now = require_aware(now)
+    handles = [asl.upgrade_handle(h) for h in world.list_handles() if isinstance(h, dict)]
+    by_name = {h.get("name"): h for h in handles if isinstance(h.get("name"), str)}
+    out = Readings(handle_names=sorted(by_name))
+    known: set = set()
+    for key, rec in (state.get("sessions") or {}).items():
+        name = rec.get("name")
+        if isinstance(name, str) and name and name not in known:
+            known.add(name)
+            out.sessions.append(_read_session(world, name, SESSION_RECORD, key, by_name.get(name), rec, state, now))
+        for p in rec.get("parked") or []:
+            pname = (p or {}).get("name")
+            if isinstance(pname, str) and pname and pname not in known:
+                known.add(pname)
+                out.sessions.append(_read_session(world, pname, SESSION_PARKED, key, by_name.get(pname),
+                                                  None, state, now))
+    for h in handles:
+        name = h.get("name")
+        if h.get("run_id") == ledger.run_id and isinstance(name, str) and name not in known:
+            known.add(name)
+            out.sessions.append(_read_session(world, name, SESSION_FOREIGN, None, h, None, state, now))
+    out.amux_names = sorted(set(world.amux_names()))
+    out.clock = world.clock_sample()
+    out.tz = world.local_timezone()
+    if any((q or {}).get("status") == "open" for q in (state.get("questions") or {}).values()):
+        try:
+            out.questions = world.question_entries(ledger.workspace)
+        except Exception as exc:  # noqa: BLE001 - a queue the store cannot read is a fact, not a crash
+            out.questions_error = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+# -- derived facts over one reading (pure) --------------------------------------
+
+def _epoch(value: Any) -> Optional[float]:
+    return asl.epoch_of(value)
+
+
+def reduction_of(reading: SessionReading) -> Dict[str, Any]:
+    """The reducer over the reading's lifecycle events (``claude_event_reducer.reduce_events``)."""
+    return cer.reduce_events(list(reading.events))
+
+
+def session_status(reading: SessionReading, reduction: Optional[Dict[str, Any]] = None) -> str:
+    """Dead / starting / busy / idle from tmux and the reducer (``_derive_claude_status`` logic).
+
+    Unlike ``_derive_claude_status``, a stored ``terminated`` never decides:
+    an alive pane whose log still ends in ``session_end`` (a resumed session
+    before its first turn) reads :data:`ST_STARTING`.
+    """
+    if not reading.alive:
+        return ST_DEAD
+    red = reduction if reduction is not None else reduction_of(reading)
+    stored = (reading.handle or {}).get("state")
+    if red.get("terminated"):
+        return ST_STARTING if stored in (None, "spawning", "terminated") else ST_IDLE
+    hint = red.get("state_hint")
+    if hint == "running":
+        return ST_BUSY
+    if hint == "idle":
+        return ST_IDLE
+    if stored in (None, "spawning", "terminated"):
+        return ST_STARTING
+    return ST_BUSY if stored == "running" else ST_IDLE
+
+
+def _events_of(reading: SessionReading, kind: str) -> List[Tuple[float, Dict[str, Any]]]:
+    out = []
+    for ev in reading.events:
+        if isinstance(ev, dict) and ev.get("event") == kind:
+            ts = _epoch(ev.get("ts"))
+            if ts is not None:
+                out.append((ts, ev))
+    out.sort(key=lambda p: p[0])
+    return out
+
+
+def _first_at_or_after(pairs: List[Tuple[float, Dict[str, Any]]], t: float) -> Optional[Tuple[float, Dict[str, Any]]]:
+    for ts, ev in pairs:
+        if ts >= t:
+            return ts, ev
+    return None
+
+
+def permission_open_since(reading: SessionReading) -> Optional[float]:
+    """Epoch of the ``permission_prompt`` event behind a pending prompt, else None."""
+    red = reduction_of(reading)
+    if not red.get("permission_pending"):
+        return None
+    prompts = _events_of(reading, "permission_prompt")
+    return prompts[-1][0] if prompts else _epoch(red.get("last_event_ts"))
+
+
+def last_assistant(reading: SessionReading) -> Optional[Dict[str, Any]]:
+    return reading.assistant[-1] if reading.assistant else None
+
+
+def is_limit_entry(entry: Optional[Dict[str, Any]]) -> bool:
+    """§12.4: ``error == "rate_limit"`` on an API-error entry; never classified by its text."""
+    return bool(entry) and entry.get("error") == "rate_limit" and bool(entry.get("is_api_error"))
+
+
+def first_model_entry(reading: SessionReading, since: datetime) -> Optional[Dict[str, Any]]:
+    """The first real (non-synthetic) assistant entry at or after ``since`` (§12.5)."""
+    t = since.timestamp()
+    for a in reading.assistant:
+        ts = _epoch(a.get("timestamp"))
+        if ts is None or ts < t:
+            continue
+        if a.get("is_api_error") or a.get("model") in (None, "", SYNTHETIC_MODEL):
+            continue
+        return a
+    return None
+
+
+# =============================================================================
+# Verdicts (§10, D6) — 50-05
+# =============================================================================
+
+V_ADVANCED = "ADVANCED"
+V_WAITING = "WAITING"
+V_ASKED = "ASKED"
+V_DONE = "DONE"
+V_HALT = "HALT"
+V_HANDOFF = "HANDOFF"
+VERDICT_VERBS = (V_ADVANCED, V_WAITING, V_ASKED, V_DONE, V_HALT, V_HANDOFF)
+
+_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_QID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+(?:-[A-Za-z]{1,4})?$")
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+#: A worker's ADVANCED shas: ``{"": sha}`` for a bare sha, else ``{repo name: sha}``.
+BARE_SHA = ""
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One verdict of a verdict line (syntax only; ids are checked against the event later)."""
+
+    verb: str
+    id: Optional[str] = None                 # step or approval id (ASKED: the target id)
+    shas: Tuple[Tuple[str, str], ...] = ()   # ADVANCED: ((repo name or BARE_SHA, sha), …)
+    text: str = ""                           # WAITING: the rest; HALT: the text; HANDOFF: the path
+    question: Optional[str] = None           # ASKED: the question id
+    raw: str = ""
+
+
+def _parse_one(part: str) -> Optional[Verdict]:
+    for verb in (V_ADVANCED, V_WAITING, V_ASKED, V_DONE):
+        prefix = verb + ": "
+        if not part.startswith(prefix):
+            continue
+        rest = part[len(prefix):]
+        if not rest or rest != rest.strip():
+            return None
+        if verb == V_ADVANCED:
+            tokens = rest.split(" ")
+            if len(tokens) not in (1, 2) or not STEP_ID_RE.match(tokens[0]):
+                return None
+            shas: List[Tuple[str, str]] = []
+            if len(tokens) == 2:
+                if "=" in tokens[1]:
+                    for pair in tokens[1].split(","):
+                        name, eq, sha = pair.partition("=")
+                        if not eq or not _REPO_NAME_RE.match(name) or not _SHA_RE.match(sha):
+                            return None
+                        shas.append((name, sha))
+                elif _SHA_RE.match(tokens[1]):
+                    shas.append((BARE_SHA, tokens[1]))
+                else:
+                    return None
+            return Verdict(V_ADVANCED, id=tokens[0], shas=tuple(shas), raw=part)
+        if verb == V_WAITING:
+            return Verdict(V_WAITING, text=rest, raw=part)
+        if verb == V_ASKED:
+            tokens = rest.split(" ")
+            if len(tokens) != 2 or not _QID_RE.match(tokens[0]) or not STEP_ID_RE.match(tokens[1]):
+                return None
+            return Verdict(V_ASKED, id=tokens[1], question=tokens[0], raw=part)
+        if verb == V_DONE:
+            if " " in rest or not STEP_ID_RE.match(rest):
+                return None
+            return Verdict(V_DONE, id=rest, raw=part)
+    return None
+
+
+def parse_verdict_line(line: str) -> Optional[List[Verdict]]:
+    """The §10 grammar, syntax only: the verdicts of one line, or None when it does not match.
+
+    ``HALT: <text>`` and ``HANDOFF: <abs path>`` must stand alone; any other
+    line is ``verdict *( "; " verdict )``. Surrounding whitespace is ignored.
+    """
+    if not isinstance(line, str):
+        return None
+    line = line.strip()
+    if line.startswith(V_HALT + ": "):
+        text = line[len(V_HALT) + 2:].strip()
+        return [Verdict(V_HALT, text=text, raw=line)] if text else None
+    if line.startswith(V_HANDOFF + ": "):
+        path = line[len(V_HANDOFF) + 2:].strip()
+        return [Verdict(V_HANDOFF, text=path, raw=line)] if path.startswith("/") else None
+    verdicts: List[Verdict] = []
+    for part in line.split("; "):
+        v = _parse_one(part)
+        if v is None:
+            return None
+        verdicts.append(v)
+    return verdicts or None
+
+
+# Why a verdict line is invalid (invalid = missing, §10).
+INVALID_NONE = "no verdict line"
+INVALID_NO_MATCH = "no match"
+INVALID_FENCE = "inside a code fence"
+INVALID_TWO_LINES = "two verdict lines"
+INVALID_UNKNOWN_ID = "id not in the event"
+INVALID_HANDOFF = "HANDOFF outside a rotate event"
+INVALID_DONE_FROM_DRIVER = "DONE from the driver"
+INVALID_WORKER_VERB = "a worker may end only DONE or HALT (§14.3)"
+INVALID_SHA_MISSING = "a sha missing from the verdict"
+INVALID_WAIT = "a WAITING without a wait, or over 200 characters"
+INVALID_DUPLICATE = "an id covered twice"
+
+
+def verdict_line_of(message: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """``(last non-empty line, why it is invalid or None)`` for a turn's final message (§10)."""
+    lines = [ln.rstrip() for ln in (message or "").replace("\r\n", "\n").split("\n")]
+    idx = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not idx:
+        return None, INVALID_NONE
+    last = idx[-1]
+    line = lines[last].strip()
+    fences = sum(1 for ln in lines[:last] if _FENCE_RE.match(ln))
+    if fences % 2 == 1:
+        return line, INVALID_FENCE
+    if parse_verdict_line(line) is None:
+        return line, INVALID_NO_MATCH
+    if len(idx) >= 2 and parse_verdict_line(lines[idx[-2]]) is not None:
+        return line, INVALID_TWO_LINES
+    return line, None
+
+
+@dataclass
+class VerdictReading:
+    """A turn's verdict checked against its event (§10)."""
+
+    line: Optional[str]
+    invalid: Optional[str] = None
+    verdicts: List[Verdict] = field(default_factory=list)
+    covered: Dict[str, Verdict] = field(default_factory=dict)       # id → the verdict that covers it
+    wait: Dict[str, Tuple[str, Optional[datetime]]] = field(default_factory=dict)  # id → (text, until)
+    unverified: Dict[str, str] = field(default_factory=dict)        # id → why the claim does not hold
+    halt: Optional[Verdict] = None
+    handoff: Optional[Verdict] = None
+
+    @property
+    def valid(self) -> bool:
+        return self.invalid is None
+
+
+def read_verdict(message: Optional[str], *, steps: Sequence[str], approvals: Sequence[str] = (),
+                 from_driver: bool = True, rotate: bool = False,
+                 grants: Optional[Dict[str, Any]] = None,
+                 worker_repos: Optional[Dict[str, Sequence[str]]] = None,
+                 ledger_ids: Iterable[str] = ()) -> VerdictReading:
+    """Check a turn's final message against the event it answers (§10, §14.4, §15.1).
+
+    ``steps``/``approvals`` are the ids the event carries; ``grants`` is
+    ``state.grants`` (an ``ADVANCED: <approval>`` holds only with its grant);
+    ``worker_repos`` maps each worker step of the event to its repo names
+    (its ``ADVANCED`` must carry a sha per repo); ``ledger_ids`` are every
+    step and approval id the ledger knows (a ``WAITING`` prefix naming one
+    that is not in the event is invalid). A structural problem makes the
+    whole line invalid; an approval claimed without a grant only leaves that
+    id uncovered.
+    """
+    line, why = verdict_line_of(message)
+    out = VerdictReading(line=line, invalid=why)
+    if why is not None:
+        return out
+    ids = list(dict.fromkeys([*steps, *approvals]))
+    id_set = set(ids)
+    known = set(ledger_ids) | id_set
+    grants = grants or {}
+    worker_repos = worker_repos or {}
+    verdicts = parse_verdict_line(line) or []
+    out.verdicts = verdicts
+
+    def fail(reason: str) -> VerdictReading:
+        out.invalid = reason
+        out.covered.clear()
+        out.wait.clear()
+        out.unverified.clear()
+        out.halt = out.handoff = None
+        return out
+
+    first = verdicts[0]
+    if first.verb == V_HALT:
+        out.halt = first
+        for i in ids:
+            out.covered[i] = first
+        return out
+    if first.verb == V_HANDOFF:
+        if not rotate:
+            return fail(INVALID_HANDOFF)
+        out.handoff = first
+        for i in ids:
+            out.covered[i] = first
+        return out
+    unprefixed: Optional[Verdict] = None
+    for v in verdicts:
+        if not from_driver and v.verb not in (V_DONE, V_HALT):
+            return fail(INVALID_WORKER_VERB)
+        if v.verb == V_DONE and from_driver:
+            return fail(INVALID_DONE_FROM_DRIVER)
+        target = v.id
+        if v.verb == V_WAITING:
+            head, sep, tail = v.text.partition(" ")
+            if head in id_set:
+                if not sep or not tail:
+                    return fail(INVALID_WAIT)
+                target, wait_text = head, tail
+            elif head in known and sep:
+                return fail(INVALID_UNKNOWN_ID)
+            else:
+                target, wait_text = None, v.text
+            if len(wait_text) > VERDICT_WAIT_TEXT_MAX:
+                return fail(INVALID_WAIT)
+            try:
+                until: Optional[datetime] = parse_utc_time(wait_text)
+            except ValueError:
+                until = None
+            if target is None:
+                if unprefixed is not None:
+                    return fail(INVALID_DUPLICATE)
+                unprefixed = v
+                out.wait[""] = (wait_text, until)
+                continue
+            out.wait[target] = (wait_text, until)
+        if target not in id_set:
+            return fail(INVALID_UNKNOWN_ID)
+        if target in out.covered or target in out.unverified:
+            return fail(INVALID_DUPLICATE)
+        if v.verb == V_DONE and target not in steps:
+            return fail(INVALID_UNKNOWN_ID)
+        if v.verb == V_ADVANCED and target in worker_repos:
+            repos = list(worker_repos[target])
+            named = dict(v.shas)
+            if len(repos) <= 1:
+                ok = len(named) == 1 and (BARE_SHA in named or (repos and repos[0] in named))
+            else:
+                ok = set(named) == set(repos)
+            if not ok:
+                return fail(INVALID_SHA_MISSING)
+        if v.verb == V_ADVANCED and target in approvals and target not in steps:
+            if target not in grants:
+                out.unverified[target] = "no grant in the state"
+                continue
+        out.covered[target] = v
+    if unprefixed is not None:
+        text_until = out.wait.pop("")
+        for i in ids:
+            if i not in out.covered and i not in out.unverified:
+                out.covered[i] = unprefixed
+                out.wait[i] = text_until
+    return out
+
+
+# =============================================================================
+# Delivery confirmation, reading side (§9.3) — 50-05
+# =============================================================================
+
+def _event_id_re(event: str) -> "re.Pattern[str]":
+    return re.compile(r"(?<![A-Za-z0-9-])" + re.escape(event) + r"(?![0-9])")
+
+
+def prompt_with_event(reading: SessionReading, event: str, since: float) -> Optional[Dict[str, Any]]:
+    """The first user prompt at or after ``since`` (epoch) whose text contains ``event``."""
+    pattern = _event_id_re(event)
+    for p in reading.prompts:
+        ts = _epoch(p.get("timestamp"))
+        if ts is not None and ts >= since and pattern.search(str(p.get("text") or "")):
+            return p
+    return None
+
+
+def _first_send(entry: Dict[str, Any]) -> Optional[float]:
+    sends = [_epoch(s) for s in entry.get("sends") or []]
+    sends = [s for s in sends if s is not None]
+    return min(sends) if sends else None
+
+
+def delivery_confirmation(entry: Dict[str, Any], reading: SessionReading) -> Optional[Dict[str, Any]]:
+    """§9.3: a user entry containing ``E-<n>`` at or after the send, and a ``turn_start`` after it.
+
+    Returns ``{"prompt_at", "turn_start_at"}`` (as written by the sources) or None.
+    """
+    t0 = _first_send(entry)
+    event = entry.get("event")
+    if t0 is None or not event:
+        return None
+    prompt = prompt_with_event(reading, event, t0)
+    if prompt is None:
+        return None
+    start = _first_at_or_after(_events_of(reading, "turn_start"), t0)
+    if start is None:
+        return None
+    return {"prompt_at": prompt.get("timestamp"), "turn_start_at": start[1].get("ts")}
+
+
+def delivery_provably_absent(entry: Dict[str, Any], reading: SessionReading) -> bool:
+    """§9.3 retry test (invariant 2): absence must be PROVEN, anything else is False (no retry).
+
+    Provably absent needs all of: a readable transcript whose tail reaches back
+    to the send time (``transcript_first_at <= send``, so the tail is not
+    truncated before it); no user entry with ``E-<n>`` since the send; no
+    ``turn_start`` at or after the send (something started a turn); and a pane
+    that was captured and does not show the id.
+    """
+    t0 = _first_send(entry)
+    event = entry.get("event")
+    if t0 is None or not event or entry.get("confirmed_at"):
+        return False
+    if not reading.transcript_path or reading.transcript_first_at is None or reading.transcript_first_at > t0:
+        return False
+    if _first_at_or_after(_events_of(reading, "turn_start"), t0) is not None:
+        return False
+    if prompt_with_event(reading, event, t0) is not None:
+        return False
+    if not reading.captured or reading.pane_text is None or not reading.pane_text.strip():
+        return False
+    return _event_id_re(event).search(reading.pane_text) is None
+
+
+# =============================================================================
+# Usage limits (§12.4) — 50-05
+# =============================================================================
+
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+_RESET_RE = re.compile(
+    r"\breset(?:s)?\s+(?:at\s+)?"
+    r"(?:(?P<date>\d{4}-\d{2}-\d{2})[ T]"
+    r"|(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})"
+    r"(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?(?::(?P<s>\d{2}))?\s*(?P<ampm>[ap]\.?m\b\.?)?"
+    r"(?:\s*\((?P<tz>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?",
+    re.IGNORECASE)
+
+
+def _zone(name: Optional[str], default: Any) -> Any:
+    if not name:
+        return default
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001 - unknown zone or no tzdata: the system timezone
+        return default
+
+
+def parse_reset_time(text: str, observed_at: datetime, tz: Any) -> Optional[datetime]:
+    """The reset time a limit entry names, as aware UTC, or None (§12.4).
+
+    Forms: ``resets 3pm``, ``resets 3:30pm``, ``resets at 15:00``, with an
+    optional month and day (``resets Nov 25, 5pm``), an optional zone in
+    parentheses (``resets 9:40pm (Asia/Yerevan)``, used when it resolves) and
+    the dated ``reset at 2026-07-02 20:16:08``. Times are read in ``tz`` (the
+    system timezone); a time of day already past at ``observed_at`` (the limit
+    entry's own time) rolls to the next day, a month-day to the next year.
+    """
+    observed_at = require_aware(observed_at)
+    for m in _RESET_RE.finditer(text or ""):
+        ampm = (m.group("ampm") or "").lower().replace(".", "")
+        if not (ampm or m.group("m") or m.group("date")):
+            continue        # "resets 3" alone is not a time
+        hour, minute, second = int(m.group("h")), int(m.group("m") or 0), int(m.group("s") or 0)
+        if ampm:
+            if not 1 <= hour <= 12:
+                continue
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        if hour > 23 or minute > 59 or second > 59:
+            continue
+        zone = _zone(m.group("tz"), tz)
+        local = observed_at.astimezone(zone)
+        try:
+            if m.group("date"):
+                y, mo, d = (int(x) for x in m.group("date").split("-"))
+                return datetime(y, mo, d, hour, minute, second, tzinfo=zone).astimezone(UTC)
+            if m.group("mon"):
+                mo, d = _MONTHS[m.group("mon").lower()[:3]], int(m.group("day"))
+                cand = datetime(local.year, mo, d, hour, minute, second, tzinfo=zone)
+                if cand <= local:
+                    cand = datetime(local.year + 1, mo, d, hour, minute, second, tzinfo=zone)
+                return cand.astimezone(UTC)
+            day = local.date()
+            cand = datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=zone)
+            if cand <= local:
+                day = day + timedelta(days=1)
+                cand = datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=zone)
+            return cand.astimezone(UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def limit_record(entry: Dict[str, Any], prev: Optional[Dict[str, Any]], tz: Any,
+                 session: Optional[str] = None) -> Dict[str, Any]:
+    """The ``limits[<model>]`` record for a new limit entry (§12.4).
+
+    A reset time in the text ⇒ ``source: "reset"``; otherwise the fixed
+    ladder, one step further than the previous record of the same model while
+    it is still held (15m, 30m, 1h, 2h, 4h, then 4h), counted from the entry.
+    """
+    at = from_iso(entry.get("timestamp"))
+    if at is None:
+        raise ValueError("a limit entry without a timestamp")
+    step = int(prev.get("ladder_step", -1)) + 1 if prev else 0
+    until = parse_reset_time(str(entry.get("text") or ""), at, tz)
+    source = "reset"
+    if until is None:
+        source = "ladder"
+        until = at + timedelta(seconds=LIMIT_LADDER_S[min(step, len(LIMIT_LADDER_S) - 1)])
+    return {"until": iso(until), "source": source, "ladder_step": step,
+            "entry_at": entry.get("timestamp"), "session": session,
+            "text": str(entry.get("text") or "")[:200]}
+
+
+# =============================================================================
+# Startup dialogs (§12.11) — 50-05
+# =============================================================================
+#
+# The classifier is pinned by captured panes of the installed Claude Code
+# (tests/fixtures/epic_driver/panes/). On 2.1.330 the input box is the prompt
+# glyph on the row directly under a full-width rule, closed by another rule; a
+# dialog is a selection menu (a pointer row plus its options or its key hint)
+# outside that box.
+
+PANE_NO_DIALOG = "no_dialog"
+PANE_DIALOG = "dialog"
+PANE_UNREADABLE = "unreadable"
+
+_RULE_RE = re.compile(r"^\s*[─━═]{8,}\s*$")
+_GLYPH_ROW_RE = re.compile(r"^\s*[❯>](?:\s|$)")
+# The selection pointer is ❯ (or ›), never ">": ">" is a conversation quote and also the
+# input box's alternative prompt glyph (§9.3).
+_POINTER_RE = re.compile(r"^(\s*)[❯›]\s+(?:(?P<num>\d+)\.\s+)?\S")
+_MENU_HINT_RE = re.compile(r"(enter to (confirm|select|continue)|esc to (cancel|exit|go back)|↑/↓|↑↓)",
+                           re.IGNORECASE)
+_INPUT_BOX_MAX_ROWS = 30
+
+
+@dataclass(frozen=True)
+class PaneClass:
+    kind: str            # PANE_NO_DIALOG / PANE_DIALOG / PANE_UNREADABLE
+    detail: str = ""     # a dialog's first lines (the alarm detail)
+
+
+def _input_box_rows(lines: List[str]) -> set:
+    rows: set = set()
+    for i, ln in enumerate(lines):
+        if i == 0 or not _GLYPH_ROW_RE.match(ln) or not _RULE_RE.match(lines[i - 1]):
+            continue
+        for j in range(i + 1, min(len(lines), i + 1 + _INPUT_BOX_MAX_ROWS)):
+            if _RULE_RE.match(lines[j]):
+                rows.update(range(i - 1, j + 1))
+                break
+    return rows
+
+
+def classify_pane(text: Optional[str]) -> PaneClass:
+    """No dialog / dialog / unreadable, for a captured pane (§12.11).
+
+    A dialog is a pointer row (``❯ <option>``, never ``>``) outside the input
+    box with a menu key hint below it (``Enter to confirm``, ``Esc to cancel``)
+    or a numbered pointer row (``❯ 1. Yes``). The input box, typed text in it included, is not a dialog. A
+    blank pane, or one with neither, is unreadable.
+    """
+    if text is None or not text.strip():
+        return PaneClass(PANE_UNREADABLE)
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
+    box = _input_box_rows(lines)
+    outside = [(i, ln) for i, ln in enumerate(lines) if i not in box]
+    dialog = False
+    for i, ln in outside:
+        if not _POINTER_RE.match(ln):
+            continue
+        # a dialog needs its footer hint below the pointer, or a numbered pointer row; an indented
+        # sibling line alone is not enough (a conversation row followed by a continuation is)
+        hint_below = any(_MENU_HINT_RE.search(l2) for j, l2 in outside if j > i)
+        numbered = _POINTER_RE.match(ln).group("num") is not None
+        if hint_below or numbered:
+            dialog = True
+            break
+    if dialog:
+        head = [ln.strip() for _, ln in outside if ln.strip() and not _RULE_RE.match(ln)]
+        detail = " / ".join(head[:DIALOG_DETAIL_LINES])
+        return PaneClass(PANE_DIALOG, detail[:DIALOG_DETAIL_MAX])
+    if box:
+        return PaneClass(PANE_NO_DIALOG)
+    return PaneClass(PANE_UNREADABLE)
+
+
+def match_startup_dialog(ledger: Ledger, pane_text: str) -> Optional[StartupDialog]:
+    """The first ``startup_dialogs`` entry whose ``match`` matches the capture (§5.2), else None."""
+    for d in ledger.startup_dialogs:
+        if d.matches(pane_text):
+            return d
+    return None
+
+
+def dialog_answered(rec: Dict[str, Any], launch: Optional[datetime], dialog_id: str) -> bool:
+    """Was ``dialog_id`` already answered for this spawn/resume (``rec["dialog_answers"]``)?"""
+    stamp = iso(launch) if launch is not None else None
+    return any((a or {}).get("dialog") == dialog_id and (a or {}).get("launch") == stamp
+               for a in rec.get("dialog_answers") or [])
+
+
+def record_dialog_answer(rec: Dict[str, Any], launch: Optional[datetime], dialog_id: str,
+                         key: str, now: datetime) -> Dict[str, Any]:
+    """The state mutation 50-06 commits before sending a listed dialog's key (invariant 5)."""
+    if key not in STARTUP_DIALOG_KEYS:
+        raise ValueError(f"startup dialog key {key!r} is not one of {STARTUP_DIALOG_KEYS}")
+    answer = {"launch": iso(launch) if launch is not None else None, "dialog": dialog_id,
+              "key": key, "at": iso(now)}
+    rec.setdefault("dialog_answers", []).append(answer)
+    return answer
+
+
+# =============================================================================
+# Session reconcile (§12, §10 application, §15.2) — 50-05
+# =============================================================================
+
+#: Event items for the dispatcher (they go into event files, §9.1).
+ITEM_ANSWER = "answer"
+ITEM_WORKER_SETTLED = "worker_settled"
+ITEM_REVIEW_DUE = "review_due"
+#: Action items: sends that are not events (50-06 commits, then sends).
+ACTION_VERDICT_REMINDER = "verdict_reminder"
+ACTION_STARTUP_DIALOG_ANSWER = "startup_dialog_answer"
+
+
+@dataclass
+class EventItem:
+    """One item of a future event (§9.1): ``to`` is a session key (``driver``, ``<role>:<step>``)."""
+
+    kind: str
+    to: str
+    step: Optional[str] = None
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ActionItem:
+    """A send the dispatcher performs that is not an event (the ``VERDICT?`` line, a dialog key)."""
+
+    kind: str
+    session: str          # the session key
+    name: str             # the session name
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SessionFacts:
+    """What the dispatcher (50-06) needs about one session record (§11.1, §11.2)."""
+
+    key: str
+    name: str
+    alive: bool
+    status: str                         # ST_DEAD / ST_STARTING / ST_BUSY / ST_IDLE
+    died: bool = False                  # was live last pass, dead now (§12.1)
+    came_up: bool = False               # a spawning/resuming record whose session now exists
+    turn_open: bool = False
+    permission_pending: bool = False
+    attached: bool = False
+    pane_in_mode: Optional[bool] = None
+    context_tokens: Optional[int] = None
+    cache_left_s: Optional[float] = None
+    cache_ttl: Optional[int] = None
+    overage: bool = False               # the last call's bucket is 5m (§11.1)
+    launch_at: Optional[str] = None
+    launch_unconfirmed: bool = False
+    pane: Optional[str] = None          # the startup-dialog classification, when classified
+    limited: Optional[str] = None       # the limits key holding this session's model now
+    on_limit_entry: bool = False        # the newest assistant entry is a limit entry
+    model_verified: Optional[bool] = None
+    compacted: bool = False
+    tool_shell: Optional[bool] = None
+    rotation_ready: bool = False        # HANDOFF seen, idle, handoff file newer than the request
+
+
+@dataclass
+class RebootFacts:
+    """§11.4 after a reboot: who resumes at once (a turn was open or a step in flight)."""
+
+    resume_now: List[str] = field(default_factory=list)
+    resume_lazily: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ReconcileResult:
+    """The output of one pure reconcile pass. ``state`` is a new state; the input is untouched."""
+
+    state: RunState
+    conditions: List[AlarmCondition] = field(default_factory=list)
+    items: List[EventItem] = field(default_factory=list)
+    actions: List[ActionItem] = field(default_factory=list)
+    sessions: Dict[str, SessionFacts] = field(default_factory=dict)
+    reboot: Optional[RebootFacts] = None
+    clock_jump: Optional[str] = None
+    confirmed: List[str] = field(default_factory=list)       # events confirmed this pass
+    verdicts: List[Dict[str, Any]] = field(default_factory=list)   # the verdicts read this pass
+    notes: List[str] = field(default_factory=list)
+
+    def condition_keys(self) -> List[str]:
+        return [c.key for c in self.conditions]
+
+
+def _role_of(key: str) -> Tuple[str, Optional[str]]:
+    role, _, step = key.partition(":")
+    return role, (step or None)
+
+
+def _limit_key(role: Optional[Role]) -> Optional[str]:
+    """The ``limits`` key of a role's model: its expected id, else the alias (§12.4)."""
+    if role is None:
+        return None
+    return role.expected_model_id or role.model
+
+
+def _alarm_active(state: RunState, alarm_id: str, subject: str) -> bool:
+    rec = (state.get("alarms") or {}).get(f"{alarm_id}:{subject}")
+    return bool(rec) and not rec.get("cleared_at")
+
+
+def run_name_patterns(ledger: Ledger) -> List["re.Pattern[str]"]:
+    """Every session name this run's grammar can produce (§3, P0-1), with ``g<gen>`` free.
+
+    The driver: ``basename(workspace)-<epic>-driver-g<n>``. A worker step:
+    ``<epic>-<step>-<epic>-<role>-<step>-g<n>`` for its implementer and reviewer.
+    """
+    def pattern(prefix: str, role: str, step: Optional[str]) -> str:
+        suffix = session_suffix(ledger.epic, role, step, 1)
+        return re.escape(f"{prefix}-{suffix[:-1]}") + r"\d+"
+
+    pats = [pattern(os.path.basename(ledger.workspace.rstrip("/")), "driver", None)]
+    for step in ledger.steps:
+        if step.worker is not None:
+            d = worker_dir_name(ledger.epic, step.id)
+            for role in (step.worker.implementer, step.worker.reviewer):
+                pats.append(pattern(d, role, step.id))
+    return [re.compile(f"^{p}$") for p in dict.fromkeys(pats)]
+
+
+def _turn_message(reading: SessionReading, stop: Tuple[float, Dict[str, Any]],
+                  stops: List[Tuple[float, Dict[str, Any]]]) -> Optional[str]:
+    """The final message of the turn that ``stop`` closed.
+
+    The handle's ``last_message`` (§10) when that stop is the latest one;
+    otherwise (a later turn, e.g. the operator's own, has rewritten the
+    handle) the stop record's ``last_message``, whose tail the lifecycle log
+    keeps.
+    """
+    handle = reading.handle or {}
+    if stops and stop is stops[-1]:
+        msg = handle.get("last_message")
+        stopped = _epoch(handle.get("stopped_at"))
+        if isinstance(msg, str) and (stopped is None or stopped >= stop[0] - 2):
+            return msg
+    msg = stop[1].get("last_message")
+    return msg if isinstance(msg, str) else None
+
+
+def _turn_limited(reading: SessionReading, start: float, end: Optional[float]) -> Optional[Dict[str, Any]]:
+    """The limit entry a turn ended on (§12.4: checked before the missing-verdict rule), else None."""
+    within = []
+    for a in reading.assistant:
+        ts = _epoch(a.get("timestamp"))
+        if ts is None or ts < start or (end is not None and ts > end + 2):
+            continue
+        within.append(a)
+    if within and is_limit_entry(within[-1]):
+        return within[-1]
+    return None
+
+
+class _Pass:
+    """The working set of one :func:`reconcile` call."""
+
+    def __init__(self, ledger: Ledger, state: RunState, readings: Readings, now: datetime) -> None:
+        self.ledger = ledger
+        self.state = state
+        self.readings = readings
+        self.now = now
+        self.by_name = readings.by_name()
+        self.result = ReconcileResult(state=state)
+        self.reductions: Dict[str, Dict[str, Any]] = {}
+
+    def cond(self, alarm_id: str, subject: str, detail: str = "") -> None:
+        self.result.conditions.append(AlarmCondition(alarm_id, subject, detail))
+
+    def red(self, reading: SessionReading) -> Dict[str, Any]:
+        if reading.name not in self.reductions:
+            self.reductions[reading.name] = reduction_of(reading)
+        return self.reductions[reading.name]
+
+    def records(self) -> List[Tuple[str, Dict[str, Any], Optional[SessionReading]]]:
+        out = []
+        for key, rec in (self.state.get("sessions") or {}).items():
+            name = rec.get("name")
+            out.append((key, rec, self.by_name.get(name) if isinstance(name, str) else None))
+        return out
+
+
+def _reconcile_clock(p: _Pass) -> bool:
+    """§12.7. Returns True when stuck alarms are suppressed this pass (a jump)."""
+    sample = p.readings.clock
+    if sample is None:
+        return False
+    prev = p.state.get("clock") or {}
+    p.state["clock"] = sample.as_state()
+    if not prev:
+        return False
+    if prev.get("boot_id") and sample.boot_id and prev.get("boot_id") != sample.boot_id:
+        facts = RebootFacts()
+        steps = p.state.get("steps") or {}
+        for key, rec, reading in p.records():
+            name = rec.get("name")
+            in_flight = any((s.get("inflight") or {}).get("session") == name for s in steps.values())
+            turn_open = bool(reading is not None and p.red(reading).get("turn_open"))
+            (facts.resume_now if (in_flight or turn_open) else facts.resume_lazily).append(key)
+        p.result.reboot = facts
+        return True
+    try:
+        d_wall = sample.wall - float(prev["wall"])
+        d_boot = sample.boottime - float(prev["boottime"])
+        d_mono = sample.monotonic - float(prev["monotonic"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if abs(d_wall - d_boot) > CLOCK_JUMP_S:
+        p.result.clock_jump = f"wall clock moved {d_wall - d_boot:+.0f}s against boottime (NTP)"
+    elif d_boot - d_mono > CLOCK_JUMP_S:
+        p.result.clock_jump = f"suspended for about {d_boot - d_mono:.0f}s"
+    return p.result.clock_jump is not None
+
+
+def _reconcile_liveness(p: _Pass) -> None:
+    for key, rec, reading in p.records():
+        name = rec.get("name") or ""
+        if reading is None:
+            reading = SessionReading(name=name, key=key)
+        red = p.red(reading)
+        status = session_status(reading, red)
+        facts = SessionFacts(key=key, name=name, alive=reading.alive, status=status)
+        facts.turn_open = bool(reading.alive and red.get("turn_open"))
+        facts.permission_pending = bool(reading.alive and red.get("permission_pending"))
+        facts.attached = bool(reading.attached and reading.attached > 0)
+        facts.pane_in_mode = reading.pane_in_mode
+        facts.context_tokens = reading.context_tokens
+        facts.cache_left_s = reading.cache_left_s
+        facts.cache_ttl = reading.cache_ttl
+        facts.overage = reading.cache_ttl == 300
+        facts.tool_shell = reading.tool_shell
+        launch = session_launch_at(rec, reading.handle)
+        facts.launch_at = iso(launch)
+        old = rec.get("status")
+        if reading.alive:
+            if old in ("spawning", "resuming"):
+                facts.came_up = True
+            if old != "live":
+                rec["status"] = "live"
+        elif old == "live":
+            rec["status"] = "dead"
+            facts.died = True
+        facts.on_limit_entry = is_limit_entry(last_assistant(reading))
+        facts.compacted = bool(rec.get("compacted"))
+        facts.model_verified = rec.get("model_verified")
+        p.result.sessions[key] = facts
+
+
+def _reconcile_limits(p: _Pass) -> None:
+    """§12.4: limit entries ⇒ ``state.limits``; cleared once reset passed and a turn completed."""
+    limits = p.state.setdefault("limits", {})
+    on_model: Dict[str, List[SessionReading]] = {}
+    for key, rec, reading in p.records():
+        if reading is None:
+            continue
+        role = p.ledger.roles.get(_role_of(key)[0])
+        lim = _limit_key(role)
+        if lim is None:
+            continue
+        on_model.setdefault(lim, []).append(reading)
+        entry = last_assistant(reading)
+        if not is_limit_entry(entry):
+            continue
+        prev = limits.get(lim)
+        entry_at = _epoch(entry.get("timestamp"))
+        if entry_at is None:
+            continue
+        if prev and (_epoch(prev.get("entry_at")) or 0) >= entry_at:
+            continue     # this entry is already counted
+        limits[lim] = limit_record(entry, prev, p.readings.tz or UTC, session=reading.name)
+    for lim in list(limits):
+        rec = limits[lim] or {}
+        until = from_iso(rec.get("until"))
+        if until is not None and p.now >= until:
+            completed = False
+            for reading in on_model.get(lim, []):
+                last = last_assistant(reading)
+                last_ts = _epoch((last or {}).get("timestamp"))
+                stops = _events_of(reading, "stop")
+                if last and not last.get("is_api_error") and last_ts is not None and last_ts >= until.timestamp() \
+                        and stops and stops[-1][0] >= last_ts - 2:
+                    completed = True
+            if completed or lim not in on_model:
+                del limits[lim]
+                continue
+        p.cond("usage_limit", lim, f"until {rec.get('until')} ({rec.get('source')}"
+               + (f", ladder step {rec.get('ladder_step')}" if rec.get("source") == "ladder" else "") + ")")
+    for key, facts in p.result.sessions.items():
+        facts.limited = model_limited(p.ledger, p.state, _role_of(key)[0], p.now)
+
+
+def _reconcile_confirmations(p: _Pass) -> None:
+    for entry in p.state.get("outbox") or []:
+        if entry.get("confirmed_at") or not entry.get("sends"):
+            continue
+        reading = p.by_name.get(entry.get("session"))
+        if reading is None:
+            continue
+        conf = delivery_confirmation(entry, reading)
+        if conf is None:
+            continue
+        entry["confirmed_at"] = iso(from_iso(conf["prompt_at"])) or iso(p.now)
+        p.result.confirmed.append(str(entry.get("event")))
+
+
+def _worker_kind(ledger: Ledger, key: str) -> Optional[str]:
+    """``implementer`` / ``reviewer`` for a worker session key, None for the driver."""
+    role, step_id = _role_of(key)
+    if step_id is None or not ledger.has_step(step_id):
+        return None
+    step = ledger.step(step_id)
+    if step.worker is None:
+        return None
+    if role == step.worker.implementer:
+        return "implementer"
+    if role == step.worker.reviewer:
+        return "reviewer"
+    return None
+
+
+def _session_key_of(state: RunState, name: str) -> Optional[str]:
+    for key, rec in (state.get("sessions") or {}).items():
+        if rec.get("name") == name:
+            return key
+    return None
+
+
+def _apply_step_verdict(p: _Pass, step_id: str, v: Verdict, vr: VerdictReading, event: str,
+                        at: datetime, from_key: str, worker: Optional[str]) -> str:
+    """Apply one covering verdict to a step; returns what happened (for the log)."""
+    ledger, state = p.ledger, p.state
+    if not ledger.has_step(step_id):
+        return "unknown step"
+    step = ledger.step(step_id)
+    rec = _step_state(state, step_id)
+    rec["inflight"] = None
+    rec["last_verdict"] = {"event": event, "line": vr.line, "at": iso(at), "session": from_key}
+    status = rec.get("status", PENDING)
+
+    def move(new: str) -> bool:
+        if can_transition(status, new):
+            set_status(rec, new)
+            return True
+        return False
+
+    if v.verb == V_HALT:
+        if worker is not None:
+            p.result.items.append(EventItem(ITEM_WORKER_SETTLED, "driver", step_id, {
+                "role": _role_of(from_key)[0], "worker": worker, "verdict": vr.line, "event": event}))
+            return "worker HALT → worker_settled"
+        return "halted" if move(HALTED) else f"HALT ignored in {status}"
+    if v.verb == V_DONE:
+        if worker == "implementer" and step.worker is not None:
+            p.result.items.append(EventItem(ITEM_REVIEW_DUE, f"{step.worker.reviewer}:{step_id}", step_id, {
+                "implementer": _role_of(from_key)[0], "verdict": vr.line, "event": event}))
+            return "implementer DONE → review_due"
+        p.result.items.append(EventItem(ITEM_WORKER_SETTLED, "driver", step_id, {
+            "role": _role_of(from_key)[0], "worker": worker, "verdict": vr.line, "event": event}))
+        return "reviewer DONE → worker_settled"
+    if v.verb == V_ADVANCED:
+        if v.shas:
+            rec["shas"] = {name or BARE_SHA: sha for name, sha in v.shas}
+        if status == FAILED:          # §6.1: failed re-enters due on ADVANCED (a retry)
+            if move(DUE):
+                rec["due_since"] = iso(at)
+                return "retry: failed → due"
+            return f"ADVANCED ignored in {status}"
+        if step.check is None and step.role_kind == ROLE_KIND_DRIVER:
+            if move(DONE):              # §5.4: no check ⇒ ADVANCED marks it done (unchecked)
+                rec["done_at"] = iso(at)
+                rec["advanced_at"] = iso(at)
+                rec["by"] = "verdict"
+                return "done (unchecked)"
+            return f"ADVANCED ignored in {status}"
+        if move(VERIFYING):
+            rec["advanced_at"] = iso(at)
+            return "verifying"
+        return f"ADVANCED ignored in {status}"
+    if v.verb == V_WAITING:
+        text, until = vr.wait.get(step_id, (v.text, None))
+        if move(WAITING):
+            rec["wait"] = {"text": text, "until": iso(until), "event": event, "at": iso(at)}
+            return "waiting"
+        return f"WAITING ignored in {status}"
+    if v.verb == V_ASKED:
+        qid = v.question or ""
+        qs = rec.setdefault("questions", [])
+        if qid not in qs:
+            qs.append(qid)
+        state.setdefault("questions", {})[qid] = {
+            "step": step_id, "approval": None, "asked_event": event, "status": "open",
+            "answer_event": None, "asked_at": iso(at)}
+        return "asked" if move(ASKED) else f"ASKED recorded; status stays {status}"
+    if v.verb == V_HANDOFF:
+        return "handoff"
+    return "ignored"
+
+
+def _apply_approval_verdict(p: _Pass, approval_id: str, v: Verdict, event: str, at: datetime) -> str:
+    state = p.state
+    if v.verb == V_ASKED:
+        qid = v.question or ""
+        state["approval_question"] = {"id": approval_id, "question": qid}
+        state.setdefault("questions", {})[qid] = {
+            "step": None, "approval": approval_id, "asked_event": event, "status": "open",
+            "answer_event": None, "asked_at": iso(at)}
+        return "approval asked"
+    if v.verb == V_ADVANCED:
+        return "grant verified"
+    return v.verb.lower()
+
+
+#: A prompt and the ``turn_start`` it opened are at most this far apart (hook vs transcript clocks).
+PROMPT_TURN_SLACK_S = 5.0
+
+
+def _event_turns(reading: SessionReading, entry: Dict[str, Any],
+                 starts: List[Tuple[float, Dict[str, Any]]]) -> List[float]:
+    """The ``turn_start`` times of the turns that answer an event, oldest first.
+
+    The first turn after the first send (the event's own turn), the first one
+    after ``reminded_at`` (the ``VERDICT?`` turn), and any turn whose prompt
+    names the event (an operator turn that does is not exempt). A turn whose
+    prompt carries no event id never answers one (§10 exemptions).
+    """
+    out: List[float] = []
+    t0 = _first_send(entry)
+    if t0 is None:
+        return out
+    first = _first_at_or_after(starts, t0)
+    if first is not None:
+        out.append(first[0])
+    reminded = _epoch(entry.get("reminded_at"))
+    if reminded is not None:
+        rem = _first_at_or_after(starts, reminded)
+        if rem is not None:
+            out.append(rem[0])
+    pattern = _event_id_re(str(entry.get("event")))
+    for prompt in reading.prompts:
+        pts = _epoch(prompt.get("timestamp"))
+        if pts is None or pts < t0 or not pattern.search(str(prompt.get("text") or "")):
+            continue
+        near = [ts for ts, _ in starts if abs(ts - pts) <= PROMPT_TURN_SLACK_S]
+        if near:
+            out.append(min(near, key=lambda ts: abs(ts - pts)))
+    return sorted(set(out))
+
+
+def _reconcile_verdicts(p: _Pass) -> None:
+    """§12.2 + §10: read the verdict of every turn that answers a confirmed outbox entry.
+
+    A turn counts once it has a ``stop`` (it ended). A turn that ended on a
+    usage-limit entry is recorded as ``limited_at`` and never counts as a
+    missing verdict (§12.4 runs first). The entry's ``verdict`` record keeps
+    what was covered across turns, so a reminder turn completes a partial one.
+    """
+    ledger, state = p.ledger, p.state
+    ledger_ids = [s.id for s in ledger.steps] + list(ledger.approvals)
+    for entry in state.get("outbox") or []:
+        if not entry.get("confirmed_at") or entry.get("needs_verdict") is False:
+            continue
+        vstate = entry.get("verdict")
+        if isinstance(vstate, dict) and vstate.get("complete"):
+            continue
+        name = entry.get("session")
+        reading = p.by_name.get(name)
+        key = _session_key_of(state, name) if isinstance(name, str) else None
+        if reading is None or key is None:
+            continue
+        if not isinstance(vstate, dict):
+            vstate = {"line": None, "at": None, "covered": [], "missing": [], "invalid": None,
+                      "turns": [], "after_reminder": False, "limited_at": None, "complete": False}
+        event = str(entry.get("event"))
+        steps = list(entry.get("steps") or [])
+        approvals = list(entry.get("approvals") or [])
+        ids = list(dict.fromkeys([*steps, *approvals]))
+        worker = _worker_kind(ledger, key)
+        kinds = list(entry.get("kinds") or [])
+        worker_repos = {}
+        for sid in steps:
+            if ledger.has_step(sid) and ledger.step(sid).worker is not None:
+                worker_repos[sid] = [r.name for r in ledger.step(sid).worker.repos]
+        starts = _events_of(reading, "turn_start")
+        stops = _events_of(reading, "stop")
+        covered = list(vstate.get("covered") or [])
+        reminded = _epoch(entry.get("reminded_at"))
+        interrupted = False
+        for start in _event_turns(reading, entry, starts):
+            label = "reminder" if reminded is not None and start >= reminded else "event"
+            if any(abs(float(t) - start) < 1e-6 for t in vstate.get("turns") or []):
+                continue
+            stop = _first_at_or_after(stops, start)
+            # Esc fires no Stop: a stop past another turn_start belongs to that later turn. The
+            # interrupted turn is unsettled, no verdict is read from it (and no limit either).
+            nxt = _first_at_or_after(starts, start + 1e-6)
+            if nxt is not None and (stop is None or stop[0] > nxt[0]):
+                interrupted = True
+                continue
+            limit = _turn_limited(reading, start, stop[0] if stop else None)
+            if limit is not None:
+                vstate["limited_at"] = limit.get("timestamp")
+                if stop is not None:
+                    vstate.setdefault("turns", []).append(start)
+                continue
+            if stop is None:
+                continue            # the turn is still open
+            message = _turn_message(reading, stop, stops)
+            vr = read_verdict(message, steps=steps, approvals=approvals, from_driver=worker is None,
+                              rotate="rotate" in kinds, grants=state.get("grants") or {},
+                              worker_repos=worker_repos, ledger_ids=ledger_ids)
+            at = datetime.fromtimestamp(stop[0], UTC)
+            vstate.setdefault("turns", []).append(start)
+            vstate["line"], vstate["invalid"], vstate["at"] = vr.line, vr.invalid, iso(at)
+            if label == "reminder":
+                vstate["after_reminder"] = True
+            applied: Dict[str, str] = {}
+            for i, v in vr.covered.items():
+                if i in covered:
+                    continue
+                if i in steps:
+                    applied[i] = _apply_step_verdict(p, i, v, vr, event, at, key, worker)
+                else:
+                    applied[i] = _apply_approval_verdict(p, i, v, event, at)
+                covered.append(i)
+            if vr.handoff is not None:
+                rec = (state.get("sessions") or {}).get(key) or {}
+                rotation = rec.get("rotation")
+                if isinstance(rotation, dict):
+                    rotation["handoff"] = {"path": vr.handoff.text, "at": iso(at), "event": event}
+            if vr.valid and not ids and (vr.handoff is not None or "rotate" not in kinds):
+                covered.append("*")
+            p.result.verdicts.append({"event": event, "session": key, "line": vr.line,
+                                      "invalid": vr.invalid, "applied": applied,
+                                      "unverified": dict(vr.unverified), "turn": label})
+        vstate["covered"] = covered
+        needed = ids if ids else ["*"]
+        missing = [i for i in needed if i not in covered]
+        vstate["missing"] = missing
+        vstate["complete"] = not missing
+        entry["verdict"] = vstate
+        unanswered = interrupted and _settled_idle(p, reading, starts, stops)
+        if (unanswered and reminded is not None and not vstate.get("after_reminder")
+                and any(ts >= reminded for ts, _ in starts)):
+            # §10: the one reminder was sent and a turn has run since (the reminder turn itself may
+            # have been interrupted): there is no valid verdict after it, so never remind again.
+            vstate["after_reminder"] = True
+        _verdict_followups(p, entry, vstate, key, unanswered=unanswered)
+
+
+def _settled_idle(p: _Pass, reading: SessionReading, starts: List[Tuple[float, Dict[str, Any]]],
+                  stops: List[Tuple[float, Dict[str, Any]]]) -> bool:
+    """The reducer says idle, no turn is open and the latest turn has stopped.
+
+    The reducer check does the work (a stop with background tasks still running leaves the latest
+    turn stopped but the state ``running``). The latest-stop check is normally implied by it; it
+    stays as a cheap guard against a reducer idle with an unstopped latest turn.
+    """
+    red = p.red(reading)
+    if red.get("state_hint") != "idle" or red.get("turn_open") or not starts:
+        return False
+    return _first_at_or_after(stops, starts[-1][0]) is not None
+
+
+def _verdict_followups(p: _Pass, entry: Dict[str, Any], vstate: Dict[str, Any], key: str,
+                       unanswered: bool = False) -> None:
+    """Missing (§10): one reminder, then ``verdict_missing``; a limited turn is never missing.
+
+    ``unanswered``: the event turn was interrupted (a later ``turn_start`` before any stop of it)
+    and the session is idle again. That turn ended without a verdict, so the same one-reminder
+    rule applies (unless a usage limit was seen, §12.4 first).
+    """
+    missing = vstate.get("missing") or []
+    if not missing:
+        return
+    event = str(entry.get("event"))
+    read_turns = (vstate.get("line") is not None or vstate.get("invalid") is not None
+                  or (unanswered and vstate.get("limited_at") is None))
+    if not read_turns:
+        return          # no turn ended yet (or only a limited one): nothing is missing
+    if vstate.get("after_reminder"):
+        p.cond("verdict_missing", event, f"no valid verdict for {', '.join(missing)} after the reminder"
+               + (f" (last line: {vstate.get('line')!r}, {vstate.get('invalid')})" if vstate.get("invalid") else ""))
+        return
+    if not entry.get("reminded_at"):
+        p.result.actions.append(ActionItem(ACTION_VERDICT_REMINDER, key, str(entry.get("session")), {
+            "event": event, "missing": list(missing), "invalid": vstate.get("invalid")}))
+
+
+def _reconcile_stalls(p: _Pass, suppress_stuck: bool) -> None:
+    """§12.3 stuck and §12.6 open prompts, for every live session record."""
+    now_s = p.now.timestamp()
+    for key, rec, reading in p.records():
+        if reading is None or not reading.alive:
+            continue
+        name = reading.name
+        red = p.red(reading)
+        perm_since = permission_open_since(reading)
+        if perm_since is not None and now_s - perm_since > OPEN_PROMPT_ALARM_S:
+            p.cond("permission_open", name,
+                   f"a permission prompt open since {iso(datetime.fromtimestamp(perm_since, UTC))}")
+        fg = reading.foreground_tool or {}
+        ask_since = _epoch(fg.get("timestamp")) if fg.get("tool") == "AskUserQuestion" else None
+        if ask_since is not None and now_s - ask_since > OPEN_PROMPT_ALARM_S:
+            p.cond("ask_user_question_open", name,
+                   f"AskUserQuestion in flight since {iso(datetime.fromtimestamp(ask_since, UTC))}")
+        # Stuck: a turn open, no tool shell under the owner, no transcript or subagent growth for
+        # stuck_after. A prompt waiting on a human, or a turn that ended on a usage limit, has its
+        # own alarm and is not stuck.
+        if not red.get("turn_open") or perm_since is not None or ask_since is not None:
+            continue
+        if is_limit_entry(last_assistant(reading)) or reading.tool_shell is True:
+            continue
+        role = p.ledger.roles.get(_role_of(key)[0])
+        stuck_after = role.stuck_after_s if role is not None else DEFAULT_STUCK_AFTER_S
+        activity = reading.activity_at
+        if activity is None:
+            launch = session_launch_at(rec, reading.handle)
+            activity = launch.timestamp() if launch is not None else None
+        if activity is None or now_s - activity < stuck_after:
+            continue
+        if suppress_stuck and not _alarm_active(p.state, "session_stuck", name):
+            continue        # §12.7: no new stuck alarm in the pass that saw a clock jump
+        p.cond("session_stuck", name,
+               f"turn open, no tool shell, no transcript growth for {format_duration(int(now_s - activity))}")
+
+
+def _reconcile_model_and_compaction(p: _Pass) -> None:
+    """§12.5 (first model after the launch) and §11.6 (a compact boundary after it)."""
+    for key, rec, reading in p.records():
+        if reading is None:
+            continue
+        launch = session_launch_at(rec, reading.handle)
+        if launch is None:
+            continue
+        stamp = iso(launch)
+        handle = reading.handle or {}
+        model = handle.get("model")
+        if isinstance(model, str) and model:     # a legacy handle without a model is skipped
+            check = rec.get("model_check")
+            if not (isinstance(check, dict) and check.get("launch") == stamp):
+                first = first_model_entry(reading, launch)
+                if first is not None:
+                    ok = asl.model_matches(reading.expected_model_id, model, first.get("model"))
+                    check = {"launch": stamp, "ok": ok, "observed": first.get("model"),
+                             "expected": reading.expected_model_id or model}
+                    rec["model_check"] = check
+                    rec["model_verified"] = ok
+            if isinstance(check, dict) and check.get("launch") == stamp and check.get("ok") is False:
+                p.cond("model_mismatch", reading.name,
+                       f"expected {check.get('expected')}, the first reply after {stamp} came from "
+                       f"{check.get('observed')}")
+        after = [b for b in reading.compactions
+                 if (_epoch(b.get("timestamp")) or 0) >= launch.timestamp()]
+        if after and not rec.get("compacted"):
+            rec["compacted"] = True
+            rec["compacted_at"] = after[0].get("timestamp")
+        if rec.get("compacted"):
+            p.cond("compaction", reading.name,
+                   f"compacted at {rec.get('compacted_at')}; the next event rotates")
+        facts = p.result.sessions.get(key)
+        if facts is not None:
+            facts.compacted = bool(rec.get("compacted"))
+            facts.model_verified = rec.get("model_verified")
+
+
+def _reconcile_dialogs(p: _Pass) -> None:
+    """§12.11: a startup dialog on a launched session whose prompt is not confirmed."""
+    for key, rec, reading in p.records():
+        if reading is None or not reading.alive:
+            continue
+        launch = session_launch_at(rec, reading.handle)
+        if launch is None or not launch_prompt_unconfirmed(p.state, rec):
+            continue
+        facts = p.result.sessions.get(key)
+        if facts is not None:
+            facts.launch_unconfirmed = True
+        if not reading.captured:
+            continue
+        cls = classify_pane(reading.pane_text)
+        if facts is not None:
+            facts.pane = cls.kind
+        name = reading.name
+        if cls.kind == PANE_DIALOG:
+            listed = match_startup_dialog(p.ledger, reading.pane_text or "")
+            if listed is not None and not dialog_answered(rec, launch, listed.id):
+                p.result.actions.append(ActionItem(ACTION_STARTUP_DIALOG_ANSWER, key, name, {
+                    "dialog": listed.id, "key": listed.key, "launch": iso(launch), "detail": cls.detail}))
+                continue
+            why = "still showing after its listed key" if listed is not None else "not in startup_dialogs"
+            p.cond("startup_dialog", name, f"{cls.detail} ({why})")
+        elif cls.kind == PANE_UNREADABLE and _alarm_active(p.state, "startup_dialog", name):
+            p.cond("startup_dialog", name, "the pane is unreadable; the dialog was last seen on it")
+
+
+def _reconcile_foreign(p: _Pass) -> None:
+    """§12.8 (review m4): foreign handles and orphan sessions raise alarms; none is adopted."""
+    known: set = set()
+    for _, rec, _ in p.records():
+        if rec.get("name"):
+            known.add(rec.get("name"))
+        for parked in rec.get("parked") or []:
+            if (parked or {}).get("name"):
+                known.add(parked["name"])
+    for reading in p.readings.sessions:
+        if reading.kind == SESSION_FOREIGN and reading.name not in known:
+            p.cond("foreign_handle", reading.name,
+                   f"a handle with run id {p.ledger.run_id} that this run did not create")
+    patterns = run_name_patterns(p.ledger)
+    handles = set(p.readings.handle_names)
+    for name in p.readings.amux_names:
+        if name in known or name in handles:
+            continue
+        if any(pt.match(name) for pt in patterns):
+            p.cond("orphan_session", name, "a session named by this run's grammar with no record and no handle")
+
+
+def _reconcile_questions(p: _Pass) -> None:
+    """§15.2: resolved ⇒ one ``answer`` item (never twice); withdrawn ⇒ closed, no item."""
+    snap = p.readings.questions
+    if snap is None:
+        if p.readings.questions_error:
+            p.result.notes.append(f"question queue unreadable: {p.readings.questions_error}")
+        return
+    state = p.state
+    for qid, q in (state.get("questions") or {}).items():
+        if not isinstance(q, dict) or q.get("status") != "open":
+            continue
+        word = snap.classify(qid)
+        if word == "resolved":
+            q["status"] = "resolved"
+            q["resolved_at"] = iso(p.now)
+            entry = snap.entries.get(qid)
+            p.result.items.append(EventItem(ITEM_ANSWER, "driver", q.get("step"), {
+                "question": qid, "approval": q.get("approval"), "answer": entry.text if entry else "",
+                "path": entry.path if entry else None, "asked_event": q.get("asked_event")}))
+        elif word == "withdrawn":
+            q["status"] = "withdrawn"
+            q["closed_at"] = iso(p.now)
+        else:
+            continue
+        aq = state.get("approval_question") or {}
+        if aq.get("question") == qid:
+            state["approval_question"] = None
+
+
+def _reconcile_rotation(p: _Pass) -> None:
+    for key, rec, reading in p.records():
+        facts = p.result.sessions.get(key)
+        rotation = rec.get("rotation")
+        if facts is None or reading is None or not isinstance(rotation, dict):
+            continue
+        requested = from_iso(rotation.get("requested_at"))
+        facts.rotation_ready = bool(
+            rotation.get("handoff") and facts.status == ST_IDLE and requested is not None
+            and reading.handoff_mtime is not None and reading.handoff_mtime > requested.timestamp())
+
+
+def reconcile(ledger: Ledger, state: RunState, readings: Readings, now: datetime) -> ReconcileResult:
+    """Tick step 2–3 (§23): the session and question reconcile, pure over its inputs.
+
+    Order: clock (§12.7) → liveness (§12.1) → usage limits (§12.4, before any
+    verdict) → delivery confirmations (§9.3) → verdicts and their application
+    (§10, §14.3) → stuck and open prompts (§12.3, §12.6) → model check and
+    compaction (§12.5, §11.6) → startup dialogs (§12.11) → foreign handles and
+    orphans (§12.8) → questions (§15.2) → rotation readiness (§11.3).
+
+    The input ``state`` is not modified: the result carries a new one. Nothing
+    is sent, spawned or notified; the conditions go to the alarm engine
+    (50-08), the items and actions to the dispatcher (50-06).
+    """
+    now = require_aware(now)
+    p = _Pass(ledger, json.loads(json.dumps(state)), readings, now)
+    ensure_step_states(ledger, p.state)
+    suppress = _reconcile_clock(p)
+    _reconcile_liveness(p)
+    _reconcile_limits(p)
+    _reconcile_confirmations(p)
+    _reconcile_verdicts(p)
+    _reconcile_stalls(p, suppress)
+    _reconcile_model_and_compaction(p)
+    _reconcile_dialogs(p)
+    _reconcile_foreign(p)
+    _reconcile_questions(p)
+    _reconcile_rotation(p)
+    return p.result

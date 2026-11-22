@@ -39,7 +39,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-02 | [Lifecycle: clear the `terminated` latch](./50-02-lifecycle-terminated-latch_sonnet.md) | done | Phase 0 | P0-4 |
 | 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | done | Phase 0 | context, cache TTL, compaction, last assistant entry |
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | done | Phase 0 | P0-10, P0-13 (selection side) |
-| 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | todo | 50-01, 50-02, 50-03, 50-04 | |
+| 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | done | 50-01, 50-02, 50-03, 50-04 | |
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | todo | 50-05 | D4, D5, M6, m2 |
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | todo | 50-04 | P0-7 |
 | 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | todo | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
@@ -138,3 +138,13 @@ Phase 0 decisions. They stay listed here for the reasoning.
   the state keys `by` and `check.last_error`. Side edits: `context_mcp_lib` gets `from __future__ import annotations`
   (Python 3.9 import crash), a public epoch helper in `amux_spawn_lib`, and `test_unit_context_mcp` is now registered
   in the runner (it was never run there).
+- **2026-11-22 — 50-05 done** (2 reviews, 3 fixes; suite 2784 OK, 2 skipped). Reconcile pass: session readings, verdict
+  parser, delivery confirmation, stalls, startup-dialog classifier (§12.11), question reconcile, alarm conditions.
+  From review: `delivery_provably_absent` is True only on positive proof (readable transcript covering the send, no
+  `E-<n>` entry, no `turn_start` after the send, pane without the line) — otherwise no retry; an event turn is bounded
+  by the next `turn_start`, and an interrupted one (Esc, then an operator turn) goes down §10's one-reminder /
+  `verdict_missing` path once the session is idle (an interrupted reminder turn ⇒ `verdict_missing`, never a second
+  reminder); the dialog pointer is `❯`/`›` with a hint line or numbered row. Fixtures: the "Code Mode (experimental)"
+  opt-in pane is synthesised (not reproducible here); account details scrubbed. Obligations moved into 50-06's task
+  file: commit `record_dialog_answer`, `launch_event` and `reminded_at` before their sends; `delivery_unconfirmed`
+  with no further sends when absence is unprovable.

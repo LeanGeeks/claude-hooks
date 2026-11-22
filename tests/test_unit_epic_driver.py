@@ -1730,7 +1730,9 @@ class TestModuleContract(unittest.TestCase):
     def test_imports_only_stdlib_pyyaml_and_hook_modules(self):
         src = (_REPO / ".claude" / "hooks" / "epic_driver_lib.py").read_text()
         tops = set(re.findall(r"^(?:import|from) ([A-Za-z_][A-Za-z0-9_]*)", src, re.M))
-        allowed_local = {"amux_spawn_lib", "yaml", "__future__"}
+        # §17's hook modules; 50-05 adds the pure reducer (keep_awake_hook, questions_store,
+        # statusline and context_mcp_lib are imported lazily where they are used).
+        allowed_local = {"amux_spawn_lib", "claude_event_reducer", "yaml", "__future__"}
         stdlib = set(getattr(sys, "stdlib_module_names", ())) or tops - allowed_local
         self.assertEqual(tops - stdlib - allowed_local, set())
 
@@ -1745,9 +1747,13 @@ class TestModuleContract(unittest.TestCase):
         src = (_REPO / ".claude" / "hooks" / "epic_driver_lib.py").read_text()
         code = re.sub(r"#[^\n]*", "", re.sub(r'""".*?"""', "", src, flags=re.S))
         self.assertIn("def run_check", code)   # the stripping kept the code
-        for needle in ('"amux-spawn"', '"amux"', '"tmux"', "send-keys", "questions_mcp_lib", ".notify(",
-                       "systemctl"):
+        for needle in ('"amux-spawn"', '"amux"', "send-keys", "new-session", "kill-session", "questions_mcp_lib",
+                       ".notify(", "systemctl"):
             self.assertNotIn(needle, code, needle)
+        # 50-05: tmux is read only (display-message, capture-pane), and only through RealWorld._tmux_read.
+        self.assertEqual(code.count("TMUX_BIN"), 2, "TMUX_BIN is defined once and used once")
+        verbs = set(re.findall(r'_tmux_read\(\["([a-z-]+)"', code))
+        self.assertEqual(verbs, {"display-message", "capture-pane"})
 
     def test_world_fakes_fail_loudly(self):
         w = edl.World()
@@ -1755,6 +1761,1491 @@ class TestModuleContract(unittest.TestCase):
                      lambda: w.profile_env("x")):
             with self.assertRaises(NotImplementedError):
                 call()
+
+
+# =============================================================================
+# 50-05 — session reconcile and stall detection (§9.3, §10, §11.1, §12, §15.2)
+# =============================================================================
+#
+# Pane fixtures (tests/fixtures/epic_driver/panes/), Claude Code 2.1.330:
+#   cc-2.1.330-folder-trust.txt, -wide.txt   real captures (throwaway session in a fresh,
+#                                             untrusted /var/tmp dir; the path scrubbed)
+#   cc-2.1.330-startup-no-dialog.txt          real capture (fresh session in a trusted dir)
+#   cc-2.1.330-idle-input-box.txt             real bottom rows of an idle session; the
+#                                             conversation text above them replaced
+#   synth-code-mode-optin.txt                 synthesised: the "Code Mode (experimental)"
+#                                             opt-in (Enter = "No, start without it") in the
+#                                             real folder-trust layout (not reproducible here)
+#   synth-input-box-typed.txt, -multiline.txt synthesised from the real idle frame
+#   synth-booting-splash.txt, synth-blank.txt synthesised (splash before the box; blank)
+
+from datetime import timezone as _tz  # noqa: E402
+
+PANES = _REPO / "tests" / "fixtures" / "epic_driver" / "panes"
+UTC = _tz.utc
+CODE_MODE_MATCH = r"Code Mode \(experimental\)\n[\s\S]*❯ No, start without it"
+
+
+def pane(name):
+    return (PANES / name).read_text(encoding="utf-8")
+
+
+def u(ts, text):
+    return {"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}}
+
+
+def a(ts, text="ok", model="claude-opus-5-5", error=None, api=False):
+    d = {"type": "assistant", "timestamp": ts,
+         "message": {"role": "assistant", "model": model, "content": [{"type": "text", "text": text}]}}
+    if error:
+        d["error"] = error
+    if api:
+        d["isApiErrorMessage"] = True
+    return d
+
+
+def tool(ts, name, tid, **inp):
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"role": "assistant", "model": "claude-opus-5-5",
+                        "content": [{"type": "tool_use", "id": tid, "name": name, "input": inp}]}}
+
+
+def compact(ts):
+    return {"type": "system", "subtype": "compact_boundary", "timestamp": ts,
+            "compactMetadata": {"trigger": "auto", "preTokens": 200000}}
+
+
+def ev(kind, ts, **kw):
+    d = {"seq": 0, "ts": ts, "event": kind, "state": "running", "session_id": "s"}
+    d.update(kw)
+    return d
+
+
+def limit(ts, text="You've reached your Fable limit. Run /usage-credits to continue."):
+    return a(ts, text, model="<synthetic>", error="rate_limit", api=True)
+
+
+class ReconWorld(FakeWorld):
+    """A fake World for the reconcile: tmux, handles, lifecycle logs, processes, clock, queue."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.tmux = {}        # name -> {"present", "display", "pane"}
+        self.handles = []
+        self.events = {}
+        self.amux = []
+        self.work = {}
+        self.sample = edl.ClockSample("boot-1", 100000.0, 5000.0, 5000.0)
+        self.tz = UTC
+        self.queue = None
+        self.calls = []
+
+    def tmux_has_session(self, name):
+        self.calls.append(("has_session", name))
+        return bool(self.tmux.get(name, {}).get("present"))
+
+    def tmux_display(self, name, fields):
+        self.calls.append(("display", name))
+        disp = self.tmux.get(name, {}).get("display")
+        return None if disp is None else {f: disp.get(f, "") for f in fields}
+
+    def capture_pane(self, name):
+        self.calls.append(("capture", name))
+        return self.tmux.get(name, {}).get("pane")
+
+    def list_handles(self):
+        return copy.deepcopy(self.handles)
+
+    def lifecycle_events(self, name):
+        return copy.deepcopy(self.events.get(name, []))
+
+    def amux_names(self):
+        return list(self.amux)
+
+    def process_work(self, pane_pid):
+        self.calls.append(("process_work", pane_pid))
+        return self.work.get(pane_pid, edl.ProcessWork(owner_pid=pane_pid + 1, tool_shell=False))
+
+    def clock_sample(self):
+        return self.sample
+
+    def local_timezone(self):
+        return self.tz
+
+    def question_entries(self, workspace):
+        self.calls.append(("questions", workspace))
+        return self.queue
+
+
+class _Recon(_Sched):
+    NOW = "2026-11-24T10:00:00Z"
+    LAUNCH = "2026-11-24T09:00:00Z"
+    SEND = "2026-11-24T09:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.world = ReconWorld(now=T(self.NOW), profiles={
+            "claude": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-opus-5-5"}})
+        self.tdir = self.tmp / "transcripts"
+        self.tdir.mkdir()
+
+    def now(self):
+        return self.world.now()
+
+    def epoch(self, text):
+        return T(text).timestamp()
+
+    def ledger(self, steps=None, **top):
+        L = self.load(self.ledger_dict(steps if steps is not None else [self.driver("A")], **top))
+        return L, edl.new_state(L, T(self.ENABLED))
+
+    def worker_ledger(self, **top):
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        d = self.ledger_dict([self.step("W", role={"worker": {
+            "implementer": "impl", "reviewer": "rev", "repos": [{"path": str(repo), "base_ref": "main"}]}}),
+            self.driver("A")], **top)
+        d["roles"]["impl"] = {"model": "claude-opus-5-5", "effort": "high"}
+        d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+        L = self.load(d)
+        return L, edl.new_state(L, T(self.ENABLED))
+
+    def session(self, st, key="driver", name="ws-t-driver-g1", *, alive=True, status="live",
+                spawned_at=None, entries=(), events=(), display=None, pane=None, state="idle",
+                model="claude-opus-5-5", profile=None, mtime=None, handle=True, run_id="epic-t", **rec_kw):
+        tp = self.tdir / f"{name}.jsonl"
+        tp.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        stamp = mtime if mtime is not None else self.now().timestamp()
+        os.utime(str(tp), (stamp, stamp))
+        rec = {"name": name, "gen": 1, "dir": str(self.ws), "status": status,
+               "spawned_at": spawned_at or self.LAUNCH, "resumed_at": [], "model_verified": None,
+               "compacted": False, "parked": [], "rotation": None}
+        rec.update(rec_kw)
+        if key is not None:
+            st["sessions"][key] = rec
+        h = None
+        if handle:
+            h = {"name": name, "provider": "claude", "run_id": run_id, "transcript_path": str(tp),
+                 "state": state, "model": model, "profile": profile, "created_at": spawned_at or self.LAUNCH,
+                 "last_message": None, "stopped_at": None, "attempt": 1}
+            self.world.handles.append(h)
+        self.world.tmux[name] = {"present": alive,
+                                 "display": display if display is not None else
+                                 {"pane_dead": "0", "pane_in_mode": "0", "session_attached": "0",
+                                  "pane_pid": "4242"},
+                                 "pane": pane}
+        self.world.events[name] = list(events)
+        return rec, h, tp
+
+    def outbox(self, st, event, name="ws-t-driver-g1", steps=("A",), *, approvals=(), kinds=("step_due",),
+               sends=None, confirmed_at=None, **kw):
+        entry = {"event": event, "to": "driver", "session": name, "kinds": list(kinds), "steps": list(steps),
+                 "created_at": self.SEND, "sends": list(sends if sends is not None else [self.SEND]),
+                 "deferrals": 0, "confirmed_at": confirmed_at, "verdict": None, "reminded_at": None}
+        if approvals:
+            entry["approvals"] = list(approvals)
+        entry.update(kw)
+        st["outbox"].append(entry)
+        return entry
+
+    def inflight(self, st, step, event="E-1", name="ws-t-driver-g1"):
+        rec = st["steps"][step]
+        rec["status"] = "inflight"
+        rec["started_at"] = self.SEND
+        rec["inflight"] = {"step": step, "event": event, "started_at": self.SEND, "session": name}
+        return rec
+
+    def answered_turn(self, event, message, start="2026-11-24T09:00:05Z", stop="2026-11-24T09:05:00Z"):
+        """Transcript entries and lifecycle events of one event turn ending with ``message``."""
+        entries = [u(start.replace(":05Z", ":05.100Z"), f"EVENT {event}: read /x/{event}.md"), a(stop, message)]
+        events = [ev("turn_start", start), ev("stop", stop, state="idle", last_message=message)]
+        return entries, events
+
+    def reconcile(self, L, st, world=None):
+        world = world or self.world
+        readings = edl.take_readings(L, st, world, world.now())
+        return edl.reconcile(L, st, readings, world.now()), readings
+
+    def keys(self, res, alarm_id=None):
+        return sorted(c.key for c in res.conditions if alarm_id is None or c.id == alarm_id)
+
+
+# -- verdict grammar (pure) --------------------------------------------------------
+
+class TestVerdictGrammar(unittest.TestCase):
+    def rv(self, msg, steps=("A",), **kw):
+        return edl.read_verdict(msg, steps=list(steps), **kw)
+
+    def test_each_verb_parses(self):
+        cases = {
+            "ADVANCED: A": ("ADVANCED", "A"),
+            "ADVANCED: T1 0123abc": ("ADVANCED", "T1"),
+            "ADVANCED: T1 live-metrics=0123abc,ws=89abcdef0": ("ADVANCED", "T1"),
+            "WAITING: A 2026-11-24T09:28:00Z": ("WAITING", None),
+            "WAITING: rows not pulled yet": ("WAITING", None),
+            "ASKED: Q-17 SA4": ("ASKED", "SA4"),
+            "DONE: T1": ("DONE", "T1"),
+            "HALT: the node did not come back": ("HALT", None),
+            "HANDOFF: /state/handoffs/driver-g1.md": ("HANDOFF", None),
+        }
+        for line, (verb, vid) in cases.items():
+            with self.subTest(line=line):
+                vs = edl.parse_verdict_line(line)
+                self.assertIsNotNone(vs)
+                self.assertEqual(vs[0].verb, verb)
+                self.assertEqual(vs[0].id, vid)
+        self.assertEqual(edl.parse_verdict_line("ADVANCED: T1 a=0123abc,b=fedcba9")[0].shas,
+                         (("a", "0123abc"), ("b", "fedcba9")))
+        self.assertEqual(edl.parse_verdict_line("ASKED: Q-17 SA4")[0].question, "Q-17")
+
+    def test_no_match(self):
+        for line in ("advanced: A", "ADVANCED:A", "ADVANCED: A extra words", "ADVANCED: A 0123ABC",
+                     "ADVANCED: A 012", "DONE: A B", "ASKED: SA4", "ASKED: 17 SA4", "HALT: ",
+                     "HANDOFF: relative/path.md", "ADVANCED: A;WAITING: B x", "ADVANCED: A; HALT: stop",
+                     "WAITING: ", "Done.", ""):
+            with self.subTest(line=line):
+                self.assertIsNone(edl.parse_verdict_line(line))
+
+    def test_last_line_and_trailing_whitespace(self):
+        r = self.rv("I rolled it.\n\nADVANCED: A   \n\n  \n")
+        self.assertTrue(r.valid, r.invalid)
+        self.assertEqual(r.line, "ADVANCED: A")
+        self.assertIn("A", r.covered)
+
+    def test_inside_a_code_fence_is_invalid(self):
+        r = self.rv("Here:\n```\nADVANCED: A")
+        self.assertEqual(r.invalid, edl.INVALID_FENCE)
+        self.assertEqual(r.covered, {})
+        # a closed fence before the line is fine
+        self.assertTrue(self.rv("```\ncode\n```\nADVANCED: A").valid)
+
+    def test_two_verdict_lines_invalid(self):
+        r = self.rv("WAITING: A later\nADVANCED: A")
+        self.assertEqual(r.invalid, edl.INVALID_TWO_LINES)
+        self.assertTrue(self.rv("Not a verdict\nADVANCED: A").valid)
+
+    def test_unknown_step_handoff_done_from_driver(self):
+        self.assertEqual(self.rv("ADVANCED: B").invalid, edl.INVALID_UNKNOWN_ID)
+        self.assertEqual(self.rv("HANDOFF: /x/h.md").invalid, edl.INVALID_HANDOFF)
+        self.assertTrue(self.rv("HANDOFF: /x/h.md", steps=(), rotate=True).valid)
+        self.assertEqual(self.rv("DONE: A").invalid, edl.INVALID_DONE_FROM_DRIVER)
+        self.assertTrue(self.rv("DONE: A", from_driver=False).valid)
+        self.assertEqual(self.rv("ADVANCED: A", from_driver=False).invalid, edl.INVALID_WORKER_VERB)
+        self.assertEqual(self.rv("WAITING: A later", from_driver=False).invalid, edl.INVALID_WORKER_VERB)
+        self.assertTrue(self.rv("HALT: blocked", from_driver=False).valid)
+        self.assertEqual(self.rv("WAITING: B soon", ledger_ids=["A", "B"]).invalid, edl.INVALID_UNKNOWN_ID)
+        self.assertEqual(self.rv("ADVANCED: A; ADVANCED: A").invalid, edl.INVALID_DUPLICATE)
+
+    def test_merged_event_full_and_partial_coverage(self):
+        full = self.rv("ADVANCED: A; WAITING: B 2026-11-24T12:00:00Z; ASKED: Q-3 C", steps=("A", "B", "C"))
+        self.assertTrue(full.valid)
+        self.assertEqual(sorted(full.covered), ["A", "B", "C"])
+        self.assertEqual(full.wait["B"], ("2026-11-24T12:00:00Z", T("2026-11-24T12:00:00Z")))
+        part = self.rv("ADVANCED: A", steps=("A", "B"))
+        self.assertTrue(part.valid)
+        self.assertEqual(sorted(part.covered), ["A"])        # B uncovered = missing for B
+        halt = self.rv("HALT: stop everything", steps=("A", "B"))
+        self.assertEqual(sorted(halt.covered), ["A", "B"])
+        unpref = self.rv("ADVANCED: A; WAITING: until the soak ends", steps=("A", "B"))
+        self.assertEqual(unpref.covered["B"].verb, "WAITING")
+        self.assertEqual(unpref.wait["B"], ("until the soak ends", None))
+
+    def test_waiting_text_limit(self):
+        self.assertTrue(self.rv("WAITING: A " + "x" * 200).valid)
+        self.assertEqual(self.rv("WAITING: A " + "x" * 201).invalid, edl.INVALID_WAIT)
+        self.assertEqual(self.rv("WAITING: A").invalid, edl.INVALID_WAIT)
+
+    def test_advanced_approval_needs_the_grant(self):
+        without = self.rv("ADVANCED: SA4", steps=(), approvals=("SA4",), grants={})
+        self.assertTrue(without.valid)
+        self.assertNotIn("SA4", without.covered)
+        self.assertIn("SA4", without.unverified)
+        with_grant = self.rv("ADVANCED: SA4", steps=(), approvals=("SA4",), grants={"SA4": {"by": "mark"}})
+        self.assertIn("SA4", with_grant.covered)
+
+    def test_worker_step_needs_its_shas(self):
+        one = {"T1": ["live-metrics"]}
+        self.assertTrue(self.rv("ADVANCED: T1 0123abc", steps=("T1",), worker_repos=one).valid)
+        self.assertTrue(self.rv("ADVANCED: T1 live-metrics=0123abc", steps=("T1",), worker_repos=one).valid)
+        self.assertEqual(self.rv("ADVANCED: T1", steps=("T1",), worker_repos=one).invalid, edl.INVALID_SHA_MISSING)
+        two = {"T1": ["a", "b"]}
+        self.assertEqual(self.rv("ADVANCED: T1 a=0123abc", steps=("T1",), worker_repos=two).invalid,
+                         edl.INVALID_SHA_MISSING)
+        self.assertTrue(self.rv("ADVANCED: T1 a=0123abc,b=fedcba9", steps=("T1",), worker_repos=two).valid)
+
+
+def _t(iso_text):
+    return edl._epoch(iso_text)
+
+
+# -- delivery confirmation (§9.3, reading side) --------------------------------------
+
+class TestDeliveryConfirmation(unittest.TestCase):
+    def reading(self, prompts=(), events=(), pane_text=None, captured=False):
+        return edl.SessionReading(name="s", prompts=list(prompts), events=list(events),
+                                  pane_text=pane_text, captured=captured)
+
+    def test_confirmed_needs_the_prompt_and_a_turn_start_after_the_send(self):
+        entry = {"event": "E-41", "sends": ["2026-11-24T09:30:06Z"]}
+        r = self.reading([{"timestamp": "2026-11-24T09:30:07.200Z", "text": "EVENT E-41: read /x"}],
+                         [ev("turn_start", "2026-11-24T09:30:07.100000+00:00")])
+        conf = edl.delivery_confirmation(entry, r)
+        self.assertEqual(conf["prompt_at"], "2026-11-24T09:30:07.200Z")
+        no_turn = self.reading([{"timestamp": "2026-11-24T09:30:07Z", "text": "EVENT E-41: read /x"}])
+        self.assertIsNone(edl.delivery_confirmation(entry, no_turn))
+        before = self.reading([{"timestamp": "2026-11-24T09:29:00Z", "text": "EVENT E-41: read /x"}],
+                              [ev("turn_start", "2026-11-24T09:30:07Z")])
+        self.assertIsNone(edl.delivery_confirmation(entry, before))
+
+    def test_event_id_boundary(self):
+        entry = {"event": "E-4", "sends": ["2026-11-24T09:30:06Z"]}
+        r = self.reading([{"timestamp": "2026-11-24T09:30:07Z", "text": "EVENT E-41: read /x"}],
+                         [ev("turn_start", "2026-11-24T09:30:07Z")])
+        self.assertIsNone(edl.delivery_confirmation(entry, r))
+
+    SEND_ISO = "2026-11-24T09:30:06Z"
+
+    def proven(self, prompts=(), events=(), **kw):
+        """A reading that proves absence: a transcript covering the send, nothing after it, a clean pane."""
+        base = dict(transcript_path="/t.jsonl", transcript_first_at=_t("2026-11-24T09:00:00Z"),
+                    pane_text=pane("cc-2.1.330-idle-input-box.txt"), captured=True)
+        base.update(kw)
+        return edl.SessionReading(name="s", prompts=list(prompts), events=list(events), **base)
+
+    def test_provably_absent(self):
+        entry = {"event": "E-41", "sends": [self.SEND_ISO], "confirmed_at": None}
+        self.assertTrue(edl.delivery_provably_absent(entry, self.proven()))
+        typed = pane("cc-2.1.330-idle-input-box.txt").replace("❯\xa0", "❯\xa0EVENT E-41: read /x", 1)
+        self.assertFalse(edl.delivery_provably_absent(entry, self.proven(pane_text=typed)))
+        self.assertFalse(edl.delivery_provably_absent(entry, self.proven(pane_text=None, captured=False)))
+        landed = self.proven(prompts=[{"timestamp": "2026-11-24T09:30:07Z", "text": "EVENT E-41: read /x"}])
+        self.assertFalse(edl.delivery_provably_absent(entry, landed))
+
+    def test_not_provable_without_a_readable_transcript(self):
+        entry = {"event": "E-41", "sends": [self.SEND_ISO], "confirmed_at": None}
+        self.assertFalse(edl.delivery_provably_absent(entry, self.proven(transcript_path=None)))
+        self.assertFalse(edl.delivery_provably_absent(entry, self.proven(transcript_first_at=None)))
+
+    def test_not_provable_when_the_tail_may_be_truncated_before_the_send(self):
+        entry = {"event": "E-41", "sends": [self.SEND_ISO], "confirmed_at": None}
+        self.assertFalse(edl.delivery_provably_absent(
+            entry, self.proven(transcript_first_at=_t("2026-11-24T09:31:00Z"))))
+
+    def test_not_provable_when_a_turn_started_at_or_after_the_send(self):
+        entry = {"event": "E-41", "sends": [self.SEND_ISO], "confirmed_at": None}
+        for when in ("2026-11-24T09:30:11Z", self.SEND_ISO):
+            with self.subTest(when=when):
+                self.assertFalse(edl.delivery_provably_absent(
+                    entry, self.proven(events=[ev("turn_start", when)])))
+        # the reviewer's reproduction: no transcript at all, a turn 5 s after the send
+        self.assertFalse(edl.delivery_provably_absent(
+            entry, edl.SessionReading(name="s", events=[ev("turn_start", "2026-11-24T09:30:11Z")],
+                                      pane_text=pane("cc-2.1.330-idle-input-box.txt"), captured=True)))
+        # a turn that started before the send does not matter
+        self.assertTrue(edl.delivery_provably_absent(
+            entry, self.proven(events=[ev("turn_start", "2026-11-24T09:20:00Z")])))
+
+
+# -- startup dialogs: the classifier and its fixtures (§12.11) ----------------------
+
+class TestPaneClassifier(unittest.TestCase):
+    def test_fixtures(self):
+        expect = {
+            "cc-2.1.330-folder-trust.txt": edl.PANE_DIALOG,
+            "cc-2.1.330-folder-trust-wide.txt": edl.PANE_DIALOG,
+            "synth-code-mode-optin.txt": edl.PANE_DIALOG,
+            "cc-2.1.330-startup-no-dialog.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-idle-input-box.txt": edl.PANE_NO_DIALOG,
+            "synth-input-box-typed.txt": edl.PANE_NO_DIALOG,
+            "synth-input-box-multiline.txt": edl.PANE_NO_DIALOG,
+            "synth-booting-splash.txt": edl.PANE_UNREADABLE,
+            "synth-blank.txt": edl.PANE_UNREADABLE,
+            "synth-conversation-quote.txt": edl.PANE_NO_DIALOG,
+            "synth-conversation-quote-pointer.txt": edl.PANE_NO_DIALOG,
+        }
+        self.assertEqual(set(expect), {p.name for p in PANES.glob("*.txt")})
+        for name, kind in expect.items():
+            with self.subTest(name=name):
+                self.assertEqual(edl.classify_pane(pane(name)).kind, kind)
+        self.assertEqual(edl.classify_pane(None).kind, edl.PANE_UNREADABLE)
+
+    def test_a_gt_prompt_glyph_input_box_is_not_a_dialog(self):
+        gt = pane("cc-2.1.330-idle-input-box.txt").replace("❯", ">")
+        self.assertEqual(edl.classify_pane(gt).kind, edl.PANE_NO_DIALOG)
+
+    def test_a_gt_quote_is_never_a_pointer_even_with_a_hint(self):
+        text = pane("cc-2.1.330-folder-trust.txt").replace("❯ No, exit", "> No, exit")
+        self.assertNotEqual(edl.classify_pane(text).kind, edl.PANE_DIALOG)
+
+    def test_a_numbered_pointer_row_is_a_dialog_without_the_hint(self):
+        self.assertEqual(edl.classify_pane("\n Pick one\n\n ❯ 1. Yes\n   2. No\n").kind, edl.PANE_DIALOG)
+
+    def test_dialog_detail_is_its_first_lines(self):
+        self.assertEqual(edl.classify_pane(pane("cc-2.1.330-folder-trust.txt")).detail,
+                         "Accessing workspace: / /var/tmp/epic-driver-fixture")
+        self.assertTrue(edl.classify_pane(pane("synth-code-mode-optin.txt")).detail
+                        .startswith("Code Mode (experimental) / "))
+
+    def test_fixtures_are_scrubbed(self):
+        for p in PANES.glob("*.txt"):
+            text = p.read_text(encoding="utf-8")
+            with self.subTest(p=p.name):
+                self.assertNotIn(str(Path.home()), text)
+                self.assertNotIn("edr-trust", text)
+                self.assertNotIn("/home", text)
+                self.assertNotIn("@", text)
+                for word in ("Ultra", "Max", "Pro ", "login", "expires"):
+                    self.assertNotIn(word, text)
+
+    def test_listed_match_needs_the_highlighted_option(self):
+        pat = re.compile(CODE_MODE_MATCH)
+        self.assertTrue(pat.search(pane("synth-code-mode-optin.txt")))
+        # the startup banner "Code Mode (experimental) is on" is not the opt-in
+        self.assertFalse(pat.search(pane("cc-2.1.330-startup-no-dialog.txt")))
+        self.assertFalse(pat.search(pane("cc-2.1.330-folder-trust.txt")))
+
+
+# -- the reconcile pass ---------------------------------------------------------------
+
+class TestReconcileVerdicts(_Recon):
+    def test_advanced_moves_to_verifying_and_clears_inflight(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "Rolled.\nADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        s = res.state["steps"]["A"]
+        self.assertEqual(s["status"], "verifying")
+        self.assertIsNone(s["inflight"])
+        self.assertEqual(s["advanced_at"], "2026-11-24T09:05:00Z")
+        self.assertEqual(s["last_verdict"]["line"], "ADVANCED: A")
+        e = res.state["outbox"][0]
+        self.assertEqual(e["confirmed_at"], "2026-11-24T09:00:05Z")
+        self.assertTrue(e["verdict"]["complete"])
+        self.assertEqual(res.confirmed, ["E-1"])
+        self.assertEqual(res.actions, [])
+        self.assertEqual(st["steps"]["A"]["status"], "inflight")     # the input state is untouched
+
+    def test_unchecked_driver_step_is_done_by_its_verdict(self):
+        L, st = self.ledger([self.step("A", role="driver")])
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "done")
+        self.assertEqual(res.state["steps"]["A"]["by"], "verdict")
+
+    def test_failed_step_re_enters_due_on_advanced(self):
+        L, st = self.ledger()
+        st["steps"]["A"].update(status="failed", attempts=1)
+        entries, events = self.answered_turn("E-2", "ADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-2", kinds=("check_failed",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "due")
+        self.assertEqual(res.state["steps"]["A"]["attempts"], 1)    # counted once, at the failure
+
+    def test_waiting_with_a_time_and_with_text(self):
+        L, st = self.ledger([self.driver("A"), self.driver("B")])
+        self.inflight(st, "A")
+        self.inflight(st, "B")
+        entries, events = self.answered_turn("E-1", "WAITING: A 2026-11-24T12:00:00Z; WAITING: B the soak")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1", steps=("A", "B"))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "waiting")
+        self.assertEqual(res.state["steps"]["A"]["wait"]["until"], "2026-11-24T12:00:00Z")
+        self.assertEqual(res.state["steps"]["B"]["wait"], {"text": "the soak", "until": None, "event": "E-1",
+                                                           "at": "2026-11-24T09:05:00Z"})
+
+    def test_asked_records_the_question(self):
+        L, st = self.ledger(approvals={"SA4": {"conditions": []}})
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ASKED: Q-17 A; ASKED: Q-18 SA4")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1", approvals=("SA4",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "asked")
+        self.assertEqual(res.state["steps"]["A"]["questions"], ["Q-17"])
+        self.assertEqual(res.state["questions"]["Q-17"]["step"], "A")
+        self.assertEqual(res.state["questions"]["Q-18"]["approval"], "SA4")
+        self.assertEqual(res.state["approval_question"], {"id": "SA4", "question": "Q-18"})
+
+    def test_driver_halt_raises_halt_and_a_later_verdict_clears_it(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "HALT: the node did not come back")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "halted")
+        self.assertIn("halt:A", [c.key for c in edl.step_alarm_conditions(L, res.state, self.now())])
+        # a later event on the step (an answer, say) ends with a verdict: the halt clears
+        st2 = res.state
+        entries2 = entries + [u("2026-11-24T09:40:00.200Z", "EVENT E-2: read /x/E-2.md"),
+                              a("2026-11-24T09:45:00Z", "ADVANCED: A")]
+        events2 = events + [ev("turn_start", "2026-11-24T09:40:00Z"),
+                            ev("stop", "2026-11-24T09:45:00Z", last_message="ADVANCED: A")]
+        self.world.handles = []
+        self.session(st2, entries=entries2, events=events2)
+        self.outbox(st2, "E-2", kinds=("answer",), sends=["2026-11-24T09:40:00Z"])
+        res2, _ = self.reconcile(L, st2)
+        self.assertEqual(res2.state["steps"]["A"]["status"], "verifying")
+        self.assertNotIn("halt:A", [c.key for c in edl.step_alarm_conditions(L, res2.state, self.now())])
+
+    def test_worker_done_and_halt_route_to_review_and_the_driver(self):
+        L, st = self.worker_ledger()
+        self.inflight(st, "W", name="t-w-t-impl-w-g1")
+        entries, events = self.answered_turn("E-3", "Implemented.\nDONE: W")
+        self.session(st, key="impl:W", name="t-w-t-impl-w-g1", entries=entries, events=events)
+        self.outbox(st, "E-3", name="t-w-t-impl-w-g1", steps=("W",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual([(i.kind, i.to, i.step) for i in res.items], [("review_due", "rev:W", "W")])
+        self.assertEqual(res.state["steps"]["W"]["status"], "inflight")     # the driver closes it later
+        L, st = self.worker_ledger()
+        self.world.handles = []
+        entries, events = self.answered_turn("E-4", "DONE: W")
+        self.session(st, key="rev:W", name="t-w-t-rev-w-g1", entries=entries, events=events)
+        self.outbox(st, "E-4", name="t-w-t-rev-w-g1", steps=("W",), kinds=("review_due",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual([(i.kind, i.to, i.data["worker"]) for i in res.items], [("worker_settled", "driver", "reviewer")])
+        self.world.handles = []
+        L, st = self.worker_ledger()
+        entries, events = self.answered_turn("E-5", "HALT: the tests need a fixture I cannot create")
+        self.session(st, key="impl:W", name="t-w-t-impl-w-g1", entries=entries, events=events)
+        self.outbox(st, "E-5", name="t-w-t-impl-w-g1", steps=("W",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual([(i.kind, i.data["worker"]) for i in res.items], [("worker_settled", "implementer")])
+        self.assertNotEqual(res.state["steps"]["W"]["status"], "halted")      # a worker HALT is no alarm
+
+    def test_driver_closes_a_worker_step_with_its_sha(self):
+        L, st = self.worker_ledger()
+        self.inflight(st, "W")
+        entries, events = self.answered_turn("E-6", "ADVANCED: W 0123abcd")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-6", steps=("W",), kinds=("worker_settled",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["W"]["status"], "verifying")
+        self.assertEqual(res.state["steps"]["W"]["shas"], {"": "0123abcd"})
+
+    def test_handoff_records_rotation_progress(self):
+        L, st = self.ledger()
+        handoff = self.tmp / "h.md"
+        handoff.write_text("# Handoff\n")
+        entries, events = self.answered_turn("E-7", f"HANDOFF: {handoff}")
+        rec, _, _ = self.session(st, entries=entries, events=events,
+                                 rotation={"event": "E-7", "requested_at": "2026-11-24T09:00:00Z",
+                                           "handoff_path": str(handoff)})
+        os.utime(str(handoff), (self.epoch("2026-11-24T09:04:00Z"),) * 2)
+        self.outbox(st, "E-7", steps=(), kinds=("rotate",))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["sessions"]["driver"]["rotation"]["handoff"]["path"], str(handoff))
+        self.assertTrue(res.sessions["driver"].rotation_ready)
+        self.assertTrue(res.state["outbox"][0]["verdict"]["complete"])
+
+    def test_merged_event_partly_covered_gets_one_reminder_then_verdict_missing(self):
+        L, st = self.ledger([self.driver("A"), self.driver("B")])
+        self.inflight(st, "A")
+        self.inflight(st, "B")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1", steps=("A", "B"))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "verifying")
+        self.assertEqual(res.state["outbox"][0]["verdict"]["missing"], ["B"])
+        self.assertEqual([(x.kind, x.data["event"], x.data["missing"]) for x in res.actions],
+                         [("verdict_reminder", "E-1", ["B"])])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+        # the dispatcher sent the reminder; the reminder turn still does not cover B
+        st2 = res.state
+        st2["outbox"][0]["reminded_at"] = "2026-11-24T09:10:00Z"
+        self.world.events["ws-t-driver-g1"] += [ev("turn_start", "2026-11-24T09:10:01Z"),
+                                                ev("stop", "2026-11-24T09:11:00Z", last_message="Still checking.")]
+        res2, _ = self.reconcile(L, st2)
+        self.assertEqual(self.keys(res2, "verdict_missing"), ["verdict_missing:E-1"])
+        self.assertEqual(res2.actions, [])                          # only one reminder
+        # a later turn naming the event covers B: verdict_missing clears
+        st3 = res2.state
+        self.world.handles = []
+        self.session(st3, entries=entries + [u("2026-11-24T09:20:00.300Z", "E-1 B: what is the verdict?")],
+                     events=self.world.events["ws-t-driver-g1"] + [
+                         ev("turn_start", "2026-11-24T09:20:00Z"),
+                         ev("stop", "2026-11-24T09:21:00Z", last_message="WAITING: B the soak")])
+        res3, _ = self.reconcile(L, st3)
+        self.assertEqual(self.keys(res3, "verdict_missing"), [])
+        self.assertTrue(res3.state["outbox"][0]["verdict"]["complete"])
+
+    def test_invalid_verdict_counts_as_missing(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "Done:\n```\nADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "inflight")
+        self.assertEqual(res.actions[0].data["invalid"], edl.INVALID_FENCE)
+
+    def test_operator_turn_is_exempt_and_the_event_turn_still_counts(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        entries += [u("2026-11-24T09:30:00.100Z", "also tidy the notes, please"), a("2026-11-24T09:31:00Z", "Tidied.")]
+        events += [ev("turn_start", "2026-11-24T09:30:00Z"),
+                   ev("stop", "2026-11-24T09:31:00Z", last_message="Tidied.")]
+        _, h, _ = self.session(st, entries=entries, events=events)
+        h.update(last_message="Tidied.", stopped_at="2026-11-24T09:31:00Z")     # the handle holds the later turn
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "verifying")
+        self.assertEqual(res.actions, [])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+
+    INT_ENTRIES = [u("2026-11-24T09:00:05.100Z", "EVENT E-1: read /x/E-1.md"),
+                   u("2026-11-24T09:10:00.100Z", "never mind, just list the files"),
+                   a("2026-11-24T09:11:00Z", "ADVANCED: A")]
+
+    def interrupted_session(self, st, *, open_turn=False):
+        # the event turn starts at 09:00:05 and is interrupted (Esc fires no Stop); the operator
+        # types another turn whose stop carries a perfectly valid verdict line for the event
+        events = [ev("turn_start", "2026-11-24T09:00:05Z"), ev("turn_start", "2026-11-24T09:10:00Z")]
+        if not open_turn:
+            events.append(ev("stop", "2026-11-24T09:11:00Z", state="idle", last_message="ADVANCED: A"))
+        _, h, _ = self.session(st, entries=list(self.INT_ENTRIES), events=events,
+                               state="running" if open_turn else "idle")
+        if not open_turn:
+            h.update(last_message="ADVANCED: A", stopped_at="2026-11-24T09:11:00Z")
+        return events
+
+    def test_an_interrupted_event_turn_does_not_borrow_the_operator_turns_stop(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        self.interrupted_session(st)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "inflight")      # no verdict read
+        self.assertEqual(res.verdicts, [])
+        self.assertFalse(res.state["outbox"][0]["verdict"]["complete"])
+        self.assertEqual(res.state["outbox"][0]["verdict"]["turns"], [])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+
+    def test_interrupted_event_turn_then_idle_gets_one_reminder_and_the_reminder_settles_it(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        events = self.interrupted_session(st)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        # idle again: one VERDICT? reminder for the event; the operator turn's line is not applied
+        self.assertEqual([(x.kind, x.data["event"], x.data["missing"]) for x in res.actions],
+                         [("verdict_reminder", "E-1", ["A"])])
+        self.assertEqual(res.state["steps"]["A"]["status"], "inflight")
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+        # the dispatcher sent it (reminded_at set); the reminder turn ends with a valid verdict
+        st2 = res.state
+        st2["outbox"][0]["reminded_at"] = "2026-11-24T09:20:00Z"
+        self.world.handles = []
+        _, h, _ = self.session(
+            st2, entries=self.INT_ENTRIES + [u("2026-11-24T09:20:00.100Z", "VERDICT? E-1"),
+                                             a("2026-11-24T09:21:00Z", "ADVANCED: A")],
+            events=events + [ev("turn_start", "2026-11-24T09:20:00Z"),
+                             ev("stop", "2026-11-24T09:21:00Z", state="idle", last_message="ADVANCED: A")])
+        res2, _ = self.reconcile(L, st2)
+        self.assertEqual(res2.state["steps"]["A"]["status"], "verifying")
+        self.assertTrue(res2.state["outbox"][0]["verdict"]["complete"])
+        self.assertEqual(res2.actions, [])
+        self.assertEqual(self.keys(res2, "verdict_missing"), [])
+
+    def test_interrupted_event_turn_while_the_operator_turn_is_open_emits_nothing(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        self.interrupted_session(st, open_turn=True)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.actions, [])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+        self.assertEqual(res.state["steps"]["A"]["status"], "inflight")
+
+    def test_interrupted_event_turn_without_a_verdict_after_the_reminder_raises_verdict_missing(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        events = self.interrupted_session(st)
+        self.outbox(st, "E-1", reminded_at="2026-11-24T09:20:00Z")
+        self.world.handles = []
+        events = events + [ev("turn_start", "2026-11-24T09:20:00Z"),
+                           ev("stop", "2026-11-24T09:21:00Z", state="idle", last_message="Looking.")]
+        entries = self.INT_ENTRIES + [u("2026-11-24T09:20:00.100Z", "VERDICT? E-1"), a("2026-11-24T09:21:00Z", "Looking.")]
+        self.session(st, entries=entries, events=events)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "verdict_missing"), ["verdict_missing:E-1"])
+        self.assertEqual(res.actions, [])                       # only the one reminder
+        # a later turn naming the event with a valid verdict settles it and clears the alarm
+        self.world.handles = []
+        self.session(res.state, entries=entries + [u("2026-11-24T09:30:00.100Z", "E-1 status?"),
+                                                   a("2026-11-24T09:31:00Z", "ADVANCED: A")],
+                     events=events + [ev("turn_start", "2026-11-24T09:30:00Z"),
+                                      ev("stop", "2026-11-24T09:31:00Z", state="idle", last_message="ADVANCED: A")])
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "verdict_missing"), [])
+        self.assertEqual(res2.state["steps"]["A"]["status"], "verifying")
+        self.assertTrue(res2.state["outbox"][0]["verdict"]["complete"])
+
+    def test_interrupted_event_turn_with_background_tasks_running_emits_nothing(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        events = [ev("turn_start", "2026-11-24T09:00:05Z"), ev("turn_start", "2026-11-24T09:10:00Z"),
+                  ev("stop", "2026-11-24T09:11:00Z", state="idle", last_message="Started a build.",
+                     background_tasks_count=1)]
+        _, h, _ = self.session(st, entries=list(self.INT_ENTRIES), events=events, state="running")
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.actions, [])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+
+    def test_interrupted_reminder_turn_raises_verdict_missing_without_a_second_reminder(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        events = self.interrupted_session(st)
+        self.outbox(st, "E-1", reminded_at="2026-11-24T09:20:00Z")
+        self.world.handles = []
+        # the reminder turn (09:20) is interrupted by an operator turn (09:30) that ends idle
+        events = events + [ev("turn_start", "2026-11-24T09:20:00Z"), ev("turn_start", "2026-11-24T09:30:00Z"),
+                           ev("stop", "2026-11-24T09:31:00Z", state="idle", last_message="Tidied.")]
+        entries = self.INT_ENTRIES + [u("2026-11-24T09:20:00.100Z", "VERDICT? E-1"),
+                                      u("2026-11-24T09:30:00.100Z", "just tidy up"), a("2026-11-24T09:31:00Z", "Tidied.")]
+        self.session(st, entries=entries, events=events)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "verdict_missing"), ["verdict_missing:E-1"])
+        self.assertEqual(res.actions, [])
+        self.world.handles = []
+        self.session(res.state, entries=entries + [u("2026-11-24T09:40:00.100Z", "E-1 status?"),
+                                                   a("2026-11-24T09:41:00Z", "ADVANCED: A")],
+                     events=events + [ev("turn_start", "2026-11-24T09:40:00Z"),
+                                      ev("stop", "2026-11-24T09:41:00Z", state="idle", last_message="ADVANCED: A")])
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "verdict_missing"), [])
+        self.assertEqual(res2.actions, [])
+        self.assertEqual(res2.state["steps"]["A"]["status"], "verifying")
+
+    def test_a_normal_turn_followed_by_an_operator_turn_still_settles(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        entries += [u("2026-11-24T09:30:00.100Z", "also tidy the notes"), a("2026-11-24T09:31:00Z", "Tidied.")]
+        events += [ev("turn_start", "2026-11-24T09:30:00Z"), ev("stop", "2026-11-24T09:31:00Z", last_message="Tidied.")]
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "verifying")
+        self.assertTrue(res.state["outbox"][0]["verdict"]["complete"])
+
+    def test_the_reading_records_how_far_back_the_tail_reaches(self):
+        L, st = self.ledger()
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        res, readings = self.reconcile(L, st)
+        r = readings.by_name()["ws-t-driver-g1"]
+        self.assertEqual(r.transcript_first_at, _t("2026-11-24T09:00:05.100Z"))
+
+    def test_the_ping_is_exempt(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        ping = 'PING: no action needed; reply exactly "WAITING: ping"'
+        entries += [u("2026-11-24T09:45:00.100Z", ping), a("2026-11-24T09:45:10Z", "WAITING: ping")]
+        events += [ev("turn_start", "2026-11-24T09:45:00Z"),
+                   ev("stop", "2026-11-24T09:45:10Z", last_message="WAITING: ping")]
+        _, h, _ = self.session(st, entries=entries, events=events)
+        h.update(last_message="WAITING: ping", stopped_at="2026-11-24T09:45:10Z")
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["steps"]["A"]["status"], "verifying")     # not waiting
+        self.assertEqual([v["line"] for v in res.verdicts], ["ADVANCED: A"])
+        # a ping alone, with nothing in the outbox, touches nothing
+        L2, st2 = self.ledger()
+        self.inflight(st2, "A")
+        self.world.handles = []
+        self.session(st2, entries=entries[2:], events=events[2:])
+        res2, _ = self.reconcile(L2, st2)
+        self.assertEqual(res2.state["steps"]["A"], st2["steps"]["A"])
+        self.assertEqual((res2.items, res2.actions, res2.verdicts), ([], [], []))
+
+    def test_limited_turn_is_not_missing_a_verdict(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries = [u("2026-11-24T09:00:05.100Z", "EVENT E-1: read /x"),
+                   limit("2026-11-24T09:01:00Z", "You've hit your session limit · resets 3pm")]
+        events = [ev("turn_start", "2026-11-24T09:00:05Z"),
+                  ev("stop", "2026-11-24T09:01:01Z", last_message="You've hit your session limit · resets 3pm")]
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.actions, [])
+        self.assertEqual(self.keys(res, "verdict_missing"), [])
+        self.assertEqual(res.state["outbox"][0]["verdict"]["limited_at"], "2026-11-24T09:01:00Z")
+        self.assertEqual(self.keys(res, "usage_limit"), ["usage_limit:claude-opus-5-5"])
+
+    def test_unconfirmed_entry_reads_no_verdict(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        self.session(st, entries=[a("2026-11-24T09:05:00Z", "ADVANCED: A")],
+                     events=[ev("stop", "2026-11-24T09:05:00Z", last_message="ADVANCED: A")])
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        self.assertIsNone(res.state["outbox"][0]["confirmed_at"])
+        self.assertEqual(res.state["steps"]["A"]["status"], "inflight")
+
+    def test_a_verdict_is_read_once(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        self.session(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        res, _ = self.reconcile(L, st)
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(res2.verdicts, [])
+        self.assertEqual(res2.state["steps"]["A"], res.state["steps"]["A"])
+
+
+class TestLiveness(_Recon):
+    def test_dead_pane_and_missing_session(self):
+        L, st = self.ledger()
+        self.session(st, display={"pane_dead": "1", "pane_in_mode": "0", "session_attached": "0", "pane_pid": "1"})
+        res, _ = self.reconcile(L, st)
+        f = res.sessions["driver"]
+        self.assertEqual((f.alive, f.status, f.died), (False, edl.ST_DEAD, True))
+        self.assertEqual(res.state["sessions"]["driver"]["status"], "dead")
+        L, st = self.ledger()
+        self.world.handles = []
+        self.session(st, alive=False)
+        self.world.calls = []
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.sessions["driver"].status, edl.ST_DEAD)
+        self.assertEqual(self.world.calls, [("has_session", "ws-t-driver-g1")])   # nothing else read
+
+    def test_a_resumed_session_reads_alive_despite_a_stored_terminated(self):
+        L, st = self.ledger()
+        old = [ev("turn_start", "2026-11-24T08:00:00Z"), ev("stop", "2026-11-24T08:05:00Z"),
+               ev("session_end", "2026-11-24T08:30:00Z")]
+        # resumed, before its first turn: the log still ends in session_end, the handle says terminated
+        self.session(st, events=old, state="terminated", status="resuming")
+        res, _ = self.reconcile(L, st)
+        f = res.sessions["driver"]
+        self.assertTrue(f.alive)
+        self.assertEqual(f.status, edl.ST_STARTING)
+        self.assertTrue(f.came_up)
+        self.assertEqual(res.state["sessions"]["driver"]["status"], "live")
+        # its first turn after the resume clears the latch (50-02): idle, not terminated
+        L, st = self.ledger()
+        self.world.handles = []
+        self.session(st, events=old + [ev("turn_start", "2026-11-24T09:00:10Z"), ev("stop", "2026-11-24T09:02:00Z")],
+                     state="terminated")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.sessions["driver"].status, edl.ST_IDLE)
+
+    def test_busy_attached_overage_and_context(self):
+        L, st = self.ledger()
+        self.session(st, events=[ev("turn_start", "2026-11-24T09:59:00Z")],
+                     display={"pane_dead": "0", "pane_in_mode": "1", "session_attached": "2", "pane_pid": "77"})
+        res, readings = self.reconcile(L, st)
+        f = res.sessions["driver"]
+        self.assertEqual((f.status, f.turn_open, f.attached, f.pane_in_mode), (edl.ST_BUSY, True, True, True))
+        self.assertEqual(readings.sessions[0].pane_pid, 77)
+
+
+class TestStuck(_Recon):
+    def busy(self, st, mtime_ago, **kw):
+        return self.session(st, events=[ev("turn_start", "2026-11-24T09:00:00Z")],
+                            mtime=self.now().timestamp() - mtime_ago, **kw)
+
+    def test_stuck_after_no_growth_and_no_tool_shell(self):
+        L, st = self.ledger()
+        self.busy(st, 31 * 60)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), ["session_stuck:ws-t-driver-g1"])
+        L, st = self.ledger()
+        self.world.handles = []
+        self.busy(st, 29 * 60)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), [])
+
+    def test_a_long_tool_shell_is_not_stuck(self):
+        L, st = self.ledger()
+        self.busy(st, 2 * 3600)
+        self.world.work[4242] = edl.ProcessWork(owner_pid=4243, tool_shell=True)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), [])
+        self.assertIn(("process_work", 4242), self.world.calls)
+
+    def test_subagent_growth_counts_as_activity(self):
+        L, st = self.ledger()
+        _, _, tp = self.busy(st, 2 * 3600)
+        sub = Path(str(tp)[:-len(".jsonl")]) / "subagents"
+        sub.mkdir(parents=True)
+        (sub / "agent-1.jsonl").write_text("{}\n")
+        fresh = self.now().timestamp() - 60
+        os.utime(str(sub / "agent-1.jsonl"), (fresh, fresh))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), [])
+
+    def test_suppressed_for_the_tick_of_a_clock_jump_and_cleared_when_the_turn_closes(self):
+        L, st = self.ledger()
+        self.busy(st, 2 * 3600)
+        st["clock"] = {"boot_id": "boot-1", "wall": 100000.0 - 7800, "boottime": 5000.0 - 600,
+                       "monotonic": 5000.0 - 600}             # wall moved 2 h against boottime's 10 min
+        res, _ = self.reconcile(L, st)
+        self.assertIn("NTP", res.clock_jump)
+        self.assertEqual(self.keys(res, "session_stuck"), [])
+        # the next tick (no jump) raises it
+        self.world.sample = edl.ClockSample("boot-1", 100600.0, 5600.0, 5600.0)
+        res2, _ = self.reconcile(L, res.state)
+        self.assertIsNone(res2.clock_jump)
+        self.assertEqual(self.keys(res2, "session_stuck"), ["session_stuck:ws-t-driver-g1"])
+        # the turn closes: cleared
+        self.world.events["ws-t-driver-g1"].append(ev("stop", "2026-11-24T09:59:00Z"))
+        res3, _ = self.reconcile(L, res2.state)
+        self.assertEqual(self.keys(res3, "session_stuck"), [])
+
+    def test_an_already_raised_stuck_alarm_survives_a_jump(self):
+        L, st = self.ledger()
+        self.busy(st, 2 * 3600)
+        st["alarms"]["session_stuck:ws-t-driver-g1"] = {"id": "session_stuck", "subject": "ws-t-driver-g1",
+                                                       "raised_at": "2026-11-24T09:50:00Z", "cleared_at": None}
+        st["clock"] = {"boot_id": "boot-1", "wall": 100000.0 - 7800, "boottime": 4400.0, "monotonic": 4400.0}
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), ["session_stuck:ws-t-driver-g1"])
+
+
+class TestUsageLimits(_Recon):
+    YEREVAN = None
+
+    def setUp(self):
+        super().setUp()
+        from zoneinfo import ZoneInfo
+        self.yer = ZoneInfo("Asia/Yerevan")     # UTC+4, no DST
+        self.ny = ZoneInfo("America/New_York")
+
+    def reset(self, text, at, tz=None):
+        return edl.parse_reset_time(text, T(at), tz or self.yer)
+
+    def test_reset_times_in_the_system_timezone(self):
+        at = "2026-11-24T08:00:00Z"                              # 12:00 in Yerevan
+        self.assertEqual(self.reset("You've hit your session limit · resets 3pm", at), T("2026-11-24T11:00:00Z"))
+        self.assertEqual(self.reset("resets 3:30pm", at), T("2026-11-24T11:30:00Z"))
+        self.assertEqual(self.reset("resets at 15:00", at), T("2026-11-24T11:00:00Z"))
+        self.assertEqual(self.reset("resets 3pm", at, self.ny), T("2026-11-24T20:00:00Z"))   # EST, UTC-5
+        self.assertEqual(self.reset("Limit reached · resets 12am", at), T("2026-11-24T20:00:00Z"))
+
+    def test_a_past_time_rolls_to_tomorrow(self):
+        self.assertEqual(self.reset("resets 9am", "2026-11-24T08:00:00Z"), T("2026-11-25T05:00:00Z"))
+        self.assertEqual(self.reset("resets at 12:00", "2026-11-24T08:00:00Z"), T("2026-11-25T08:00:00Z"))
+
+    def test_named_zone_dated_and_month_forms(self):
+        self.assertEqual(self.reset("resets 9:40pm (Asia/Yerevan)", "2026-11-24T08:00:00Z", self.ny),
+                         T("2026-11-24T17:40:00Z"))
+        self.assertEqual(self.reset("Your limit will reset at 2026-11-24 20:16:08", "2026-11-24T08:00:00Z"),
+                         T("2026-11-24T16:16:08Z"))
+        self.assertEqual(self.reset("You've hit your weekly limit · resets Nov 27, 5pm", "2026-11-24T08:00:00Z"),
+                         T("2026-11-27T13:00:00Z"))
+
+    def test_no_reset_time(self):
+        for text in ("You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.",
+                     "API Error: Request rejected (429) · All target providers failed.", "resets 3 times", ""):
+            with self.subTest(text=text):
+                self.assertIsNone(self.reset(text, "2026-11-24T08:00:00Z"))
+
+    def test_the_ladder(self):
+        prev = None
+        got = []
+        for i in range(7):
+            entry = {"timestamp": f"2026-11-24T0{i}:00:00Z", "text": "You've reached your Fable limit."}
+            prev = edl.limit_record(entry, prev, self.yer)
+            got.append((edl.from_iso(prev["until"]) - T(entry["timestamp"])).total_seconds())
+            self.assertEqual(prev["source"], "ladder")
+        self.assertEqual(got, [900, 1800, 3600, 7200, 14400, 14400, 14400])
+        rec = edl.limit_record({"timestamp": "2026-11-24T08:00:00Z", "text": "resets 3pm"}, None, self.yer)
+        self.assertEqual((rec["source"], rec["until"]), ("reset", "2026-11-24T11:00:00Z"))
+
+    def test_classification_by_error_field_only(self):
+        L, st = self.ledger()
+        self.session(st, entries=[a("2026-11-24T09:59:00Z", "You've reached your Fable limit. resets 3pm")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "usage_limit"), [])
+        self.assertEqual(res.state["limits"], {})
+        L, st = self.ledger()
+        self.world.handles = []
+        self.session(st, entries=[a("2026-11-24T09:59:00Z", "resets 3pm", error="rate_limit")])  # not an API error
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["limits"], {})
+
+    def test_limit_entry_raises_holds_dispatch_steps_the_ladder_and_clears(self):
+        L, st = self.ledger()
+        self.session(st, entries=[limit("2026-11-24T09:50:00Z")])
+        res, _ = self.reconcile(L, st)
+        lim = res.state["limits"]["claude-opus-5-5"]
+        self.assertEqual((lim["until"], lim["source"], lim["ladder_step"]), ("2026-11-24T10:05:00Z", "ladder", 0))
+        self.assertEqual(self.keys(res, "usage_limit"), ["usage_limit:claude-opus-5-5"])
+        self.assertEqual(res.sessions["driver"].limited, "claude-opus-5-5")
+        self.assertEqual(edl.model_limited(L, res.state, "driver", self.now()), "claude-opus-5-5")
+        # the same entry next pass is not counted again
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(res2.state["limits"]["claude-opus-5-5"]["ladder_step"], 0)
+        # after the reset a retry hits the limit again: one step up the ladder
+        self.world.clock = T("2026-11-24T10:10:00Z")
+        self.world.handles = []
+        self.session(res2.state, entries=[limit("2026-11-24T09:50:00Z"), limit("2026-11-24T10:06:00Z")])
+        res3, _ = self.reconcile(L, res2.state)
+        lim3 = res3.state["limits"]["claude-opus-5-5"]
+        self.assertEqual((lim3["ladder_step"], lim3["until"]), (1, "2026-11-24T10:36:00Z"))
+        # past the reset with a completed turn on the model: cleared
+        self.world.clock = T("2026-11-24T10:50:00Z")
+        self.world.handles = []
+        self.session(res3.state, entries=[limit("2026-11-24T10:06:00Z"), a("2026-11-24T10:40:00Z", "ADVANCED: A")],
+                     events=[ev("turn_start", "2026-11-24T10:39:00Z"), ev("stop", "2026-11-24T10:40:00Z")])
+        res4, _ = self.reconcile(L, res3.state)
+        self.assertEqual(res4.state["limits"], {})
+        self.assertEqual(self.keys(res4, "usage_limit"), [])
+
+    def test_past_the_reset_without_a_completed_turn_stays_raised(self):
+        L, st = self.ledger()
+        st["limits"]["claude-opus-5-5"] = {"until": "2026-11-24T09:00:00Z", "source": "reset", "ladder_step": 0,
+                                           "entry_at": "2026-11-24T08:00:00Z"}
+        self.session(st, entries=[limit("2026-11-24T08:00:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "usage_limit"), ["usage_limit:claude-opus-5-5"])
+        self.assertIsNone(res.sessions["driver"].limited)        # dispatch is no longer held
+
+    def test_a_limited_open_turn_is_not_stuck(self):
+        L, st = self.ledger()
+        self.session(st, entries=[limit("2026-11-24T09:00:30Z")], events=[ev("turn_start", "2026-11-24T09:00:00Z")],
+                     mtime=self.now().timestamp() - 3600)
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "session_stuck"), [])
+
+
+class TestModelCheck(_Recon):
+    def test_alias_through_the_profile_mapping(self):
+        L, st = self.ledger()
+        self.session(st, model="fable", profile="claude",
+                     entries=[limit("2026-11-24T09:00:10Z"), a("2026-11-24T09:01:00Z", model="claude-opus-5-5")])
+        res, readings = self.reconcile(L, st)
+        self.assertEqual(readings.sessions[0].expected_model_id, "claude-opus-5-5")
+        self.assertTrue(res.state["sessions"]["driver"]["model_verified"])
+        self.assertEqual(self.keys(res, "model_mismatch"), [])
+
+    def test_mismatch_raises_and_holds_until_rotated(self):
+        L, st = self.ledger()
+        self.session(st, entries=[a("2026-11-24T08:00:00Z", model="claude-opus-5-5"),      # before the launch
+                                  a("2026-11-24T09:01:00Z", model="claude-sonnet-4-6")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "model_mismatch"), ["model_mismatch:ws-t-driver-g1"])
+        self.assertFalse(res.state["sessions"]["driver"]["model_verified"])
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "model_mismatch"), ["model_mismatch:ws-t-driver-g1"])
+        # rotated: the record names gen 2, which replies on the right model
+        st3 = res2.state
+        self.world.handles = []
+        self.session(st3, name="ws-t-driver-g2", spawned_at="2026-11-24T09:30:00Z",
+                     entries=[a("2026-11-24T09:31:00Z", model="claude-opus-5-5")])
+        res3, _ = self.reconcile(L, st3)
+        self.assertEqual(self.keys(res3, "model_mismatch"), [])
+
+    def test_alias_without_a_mapping_matches_the_family(self):
+        L, st = self.ledger()
+        self.session(st, model="opus", entries=[a("2026-11-24T09:01:00Z", model="claude-opus-5-5")])
+        res, _ = self.reconcile(L, st)
+        self.assertTrue(res.state["sessions"]["driver"]["model_verified"])
+
+    def test_legacy_handle_without_a_model_is_skipped(self):
+        L, st = self.ledger()
+        self.session(st, model=None, entries=[a("2026-11-24T09:01:00Z", model="claude-sonnet-4-6")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "model_mismatch"), [])
+        self.assertIsNone(res.state["sessions"]["driver"]["model_verified"])
+        self.assertNotIn("model_check", res.state["sessions"]["driver"])
+
+    def test_a_resume_is_checked_again(self):
+        L, st = self.ledger()
+        self.session(st, resumed_at=["2026-11-24T09:30:00Z"],
+                     entries=[a("2026-11-24T09:01:00Z", model="claude-opus-5-5"),
+                              a("2026-11-24T09:31:00Z", model="claude-sonnet-4-6")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["sessions"]["driver"]["model_check"]["launch"], "2026-11-24T09:30:00Z")
+        self.assertEqual(self.keys(res, "model_mismatch"), ["model_mismatch:ws-t-driver-g1"])
+
+
+class TestCompaction(_Recon):
+    def test_after_the_spawn_raises_once_before_is_ignored(self):
+        L, st = self.ledger()
+        self.session(st, entries=[compact("2026-11-24T08:00:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "compaction"), [])
+        self.assertFalse(res.state["sessions"]["driver"]["compacted"])
+        L, st = self.ledger()
+        self.world.handles = []
+        self.session(st, entries=[compact("2026-11-24T09:20:00Z"), compact("2026-11-24T09:40:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "compaction"), ["compaction:ws-t-driver-g1"])
+        self.assertEqual(res.state["sessions"]["driver"]["compacted_at"], "2026-11-24T09:20:00Z")
+        self.assertTrue(res.sessions["driver"].compacted)
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "compaction"), ["compaction:ws-t-driver-g1"])   # one condition, still active
+        # the rotation completes: gen 2, not compacted
+        st3 = res2.state
+        self.world.handles = []
+        self.session(st3, name="ws-t-driver-g2", spawned_at="2026-11-24T09:50:00Z")
+        res3, _ = self.reconcile(L, st3)
+        self.assertEqual(self.keys(res3, "compaction"), [])
+
+
+class TestOpenPrompts(_Recon):
+    def test_ask_user_question_in_flight(self):
+        for minutes, raised in ((11, True), (9, False)):
+            with self.subTest(minutes=minutes):
+                L, st = self.ledger()
+                self.world.handles = []
+                at = edl.iso(self.now() - timedelta(minutes=minutes))
+                self.session(st, entries=[u("2026-11-24T09:00:01Z", "EVENT E-1: read /x"),
+                                          tool(at, "AskUserQuestion", "tu_1", questions=[])],
+                             events=[ev("turn_start", "2026-11-24T09:00:00Z")])
+                res, _ = self.reconcile(L, st)
+                self.assertEqual(self.keys(res, "ask_user_question_open"),
+                                 ["ask_user_question_open:ws-t-driver-g1"] if raised else [])
+                self.assertEqual(self.keys(res, "session_stuck"), [])
+
+    def test_answered_ask_user_question_clears(self):
+        L, st = self.ledger()
+        at = edl.iso(self.now() - timedelta(minutes=30))
+        result = {"type": "user", "timestamp": edl.iso(self.now() - timedelta(minutes=1)),
+                  "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_1",
+                                                           "content": "answered"}]}}
+        self.session(st, entries=[u("2026-11-24T09:00:01Z", "EVENT E-1: read /x"),
+                                  tool(at, "AskUserQuestion", "tu_1", questions=[]), result],
+                     events=[ev("turn_start", "2026-11-24T09:00:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "ask_user_question_open"), [])
+
+    def test_permission_prompt(self):
+        for minutes, raised in ((11, True), (9, False)):
+            with self.subTest(minutes=minutes):
+                L, st = self.ledger()
+                self.world.handles = []
+                at = edl.iso(self.now() - timedelta(minutes=minutes))
+                self.session(st, events=[ev("turn_start", "2026-11-24T09:00:00Z"),
+                                         ev("permission_prompt", at, permission_pending=True)],
+                             mtime=self.now().timestamp() - 3600)
+                res, _ = self.reconcile(L, st)
+                self.assertEqual(self.keys(res, "permission_open"),
+                                 ["permission_open:ws-t-driver-g1"] if raised else [])
+                self.assertEqual(self.keys(res, "session_stuck"), [])
+
+    def test_closed_prompt_clears(self):
+        L, st = self.ledger()
+        self.session(st, events=[ev("turn_start", "2026-11-24T09:00:00Z"),
+                                 ev("permission_prompt", "2026-11-24T09:10:00Z", permission_pending=True),
+                                 ev("stop", "2026-11-24T09:20:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "permission_open"), [])
+
+
+class TestClock(_Recon):
+    def test_first_pass_records_the_clock(self):
+        L, st = self.ledger()
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.state["clock"], self.world.sample.as_state())
+        self.assertIsNone(res.clock_jump)
+        self.assertIsNone(res.reboot)
+
+    def test_suspend_is_a_jump(self):
+        L, st = self.ledger()
+        st["clock"] = {"boot_id": "boot-1", "wall": 100000.0 - 4200, "boottime": 5000.0 - 4200,
+                       "monotonic": 5000.0 - 600}
+        res, _ = self.reconcile(L, st)
+        self.assertIn("suspended", res.clock_jump)
+
+    def test_boot_id_change_gives_the_reboot_facts(self):
+        L, st = self.ledger([self.driver("A"), self.driver("B")])
+        st["clock"] = {"boot_id": "boot-0", "wall": 1.0, "boottime": 1.0, "monotonic": 1.0}
+        # driver: a turn was open when the machine went down; a worker with a step in flight; one idle
+        self.session(st, alive=False, events=[ev("turn_start", "2026-11-24T08:00:00Z")])
+        self.session(st, key="impl:A", name="t-a-t-impl-a-g1", alive=False,
+                     events=[ev("turn_start", "2026-11-24T07:00:00Z"), ev("stop", "2026-11-24T07:10:00Z")])
+        self.inflight(st, "A", name="t-a-t-impl-a-g1")
+        self.session(st, key="rev:B", name="t-b-t-rev-b-g1", alive=False,
+                     events=[ev("turn_start", "2026-11-24T07:00:00Z"), ev("stop", "2026-11-24T07:10:00Z")])
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(sorted(res.reboot.resume_now), ["driver", "impl:A"])
+        self.assertEqual(res.reboot.resume_lazily, ["rev:B"])
+        self.assertEqual(res.state["clock"]["boot_id"], "boot-1")
+
+
+class TestForeignAndOrphans(_Recon):
+    def test_foreign_handle_raises_and_clears_when_gone(self):
+        L, st = self.ledger()
+        self.session(st)
+        self.session(st, key=None, name="someone-else-g1")                  # carries run id epic-t
+        self.session(st, key=None, name="unrelated", run_id="other-run")
+        res, readings = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "foreign_handle"), ["foreign_handle:someone-else-g1"])
+        self.assertEqual([r.kind for r in readings.sessions], ["record", "foreign"])
+        self.assertEqual(set(res.state["sessions"]), {"driver"})          # never adopted
+        self.world.handles = [h for h in self.world.handles if h["name"] != "someone-else-g1"]
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "foreign_handle"), [])
+
+    def test_parked_sessions_are_not_foreign(self):
+        L, st = self.ledger()
+        self.session(st, name="ws-t-driver-g2", parked=[{"name": "ws-t-driver-g1", "since": "2026-11-24T09:00:00Z"}])
+        self.session(st, key=None, name="ws-t-driver-g1")
+        res, readings = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "foreign_handle"), [])
+        self.assertEqual([r.kind for r in readings.sessions], ["record", "parked"])
+
+    def test_orphan_session_by_the_grammar(self):
+        L, st = self.worker_ledger()
+        self.session(st)
+        self.world.amux = ["ws-t-driver-g1", "ws-t-driver-g3", "t-w-t-impl-w-g2", "t-w-t-rev-w-g1",
+                           "ws-t-driver-g1-old", "ws-other-g1", "t-w-t-driver-w-g1"]
+        self.world.handles.append({"name": "t-w-t-rev-w-g1", "run_id": "epic-t"})
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "orphan_session"),
+                         ["orphan_session:t-w-t-impl-w-g2", "orphan_session:ws-t-driver-g3"])
+        self.assertEqual(set(res.state["sessions"]), {"driver"})
+        self.world.amux = ["ws-t-driver-g1"]
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(self.keys(res2, "orphan_session"), [])
+
+    def test_name_patterns(self):
+        L, _ = self.worker_ledger()
+        names = [p.pattern for p in edl.run_name_patterns(L)]
+        self.assertEqual(len(names), 3)
+        self.assertTrue(any(re.match(p, "ws-t-driver-g12") for p in names))
+
+
+class TestStartupDialogs(_Recon):
+    def launched(self, st, pane_text, *, launch_event="E-1", confirmed=False, **kw):
+        self.outbox(st, launch_event, confirmed_at="2026-11-24T09:00:05Z" if confirmed else None)
+        return self.session(st, status="spawning", pane=pane_text, launch_event=launch_event, **kw)
+
+    def test_unlisted_dialog_raises_and_is_never_answered(self):
+        L, st = self.ledger()
+        self.launched(st, pane("cc-2.1.330-folder-trust.txt"))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "startup_dialog"), ["startup_dialog:ws-t-driver-g1"])
+        self.assertIn("Accessing workspace:", res.conditions[0].detail)
+        self.assertEqual(res.actions, [])
+        self.assertEqual(res.sessions["driver"].pane, edl.PANE_DIALOG)
+
+    def test_listed_dialog_answered_once_then_the_alarm(self):
+        L, st = self.ledger(startup_dialogs=[{"id": "code-mode", "match": CODE_MODE_MATCH, "key": "Enter"}])
+        self.launched(st, pane("synth-code-mode-optin.txt"))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "startup_dialog"), [])
+        self.assertEqual([(x.kind, x.session, x.data["dialog"], x.data["key"], x.data["launch"]) for x in res.actions],
+                         [("startup_dialog_answer", "driver", "code-mode", "Enter", "2026-11-24T09:00:00Z")])
+        # 50-06 records the answer before it sends the key; the dialog is still there next pass
+        st2 = res.state
+        rec = st2["sessions"]["driver"]
+        edl.record_dialog_answer(rec, edl.session_launch_at(rec), "code-mode", "Enter", self.now())
+        res2, _ = self.reconcile(L, st2)
+        self.assertEqual(res2.actions, [])
+        self.assertEqual(self.keys(res2, "startup_dialog"), ["startup_dialog:ws-t-driver-g1"])
+        self.assertIn("still showing after its listed key", res2.conditions[0].detail)
+        # the dialog is gone: cleared
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("cc-2.1.330-startup-no-dialog.txt")
+        res3, _ = self.reconcile(L, res2.state)
+        self.assertEqual(self.keys(res3, "startup_dialog"), [])
+
+    def test_a_listed_dialog_is_answered_again_after_a_resume(self):
+        L, st = self.ledger(startup_dialogs=[{"id": "code-mode", "match": CODE_MODE_MATCH, "key": "Enter"}])
+        rec, _, _ = self.launched(st, pane("synth-code-mode-optin.txt"))
+        edl.record_dialog_answer(rec, edl.session_launch_at(rec), "code-mode", "Enter", self.now())
+        rec["resumed_at"] = ["2026-11-24T09:50:00Z"]
+        res, _ = self.reconcile(L, st)
+        self.assertEqual([x.data["launch"] for x in res.actions], ["2026-11-24T09:50:00Z"])
+
+    def test_a_confirmed_prompt_classifies_no_capture(self):
+        L, st = self.ledger()
+        self.launched(st, pane("cc-2.1.330-folder-trust.txt"), confirmed=True)
+        res, readings = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "startup_dialog"), [])
+        self.assertNotIn(("capture", "ws-t-driver-g1"), self.world.calls)
+        self.assertIsNone(res.sessions["driver"].pane)
+
+    def test_input_box_and_unreadable_are_not_dialogs(self):
+        for name, kind in (("cc-2.1.330-startup-no-dialog.txt", edl.PANE_NO_DIALOG),
+                           ("synth-input-box-typed.txt", edl.PANE_NO_DIALOG),
+                           ("synth-blank.txt", edl.PANE_UNREADABLE), (None, edl.PANE_UNREADABLE)):
+            with self.subTest(name=name):
+                L, st = self.ledger()
+                self.world.handles = []
+                self.launched(st, pane(name) if name else None)
+                res, _ = self.reconcile(L, st)
+                self.assertEqual(self.keys(res, "startup_dialog"), [])
+                self.assertEqual(res.sessions["driver"].pane, kind)
+
+    def test_an_unreadable_pane_keeps_a_raised_alarm(self):
+        L, st = self.ledger()
+        self.launched(st, pane("synth-blank.txt"))
+        st["alarms"]["startup_dialog:ws-t-driver-g1"] = {"id": "startup_dialog", "subject": "ws-t-driver-g1",
+                                                        "raised_at": "2026-11-24T09:50:00Z", "cleared_at": None}
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(self.keys(res, "startup_dialog"), ["startup_dialog:ws-t-driver-g1"])
+
+    def test_no_default_answers(self):
+        L, st = self.ledger()
+        self.assertEqual(L.startup_dialogs, [])
+        self.launched(st, pane("synth-code-mode-optin.txt"))
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.actions, [])
+        self.assertEqual(self.keys(res, "startup_dialog"), ["startup_dialog:ws-t-driver-g1"])
+
+    def test_record_dialog_answer_refuses_other_keys(self):
+        with self.assertRaises(ValueError):
+            edl.record_dialog_answer({}, None, "x", "y", self.now())
+
+
+class TestQuestionReconcile(_Recon):
+    def snapshot(self, **statuses):
+        return edl.QuestionsSnapshot(
+            open_word="open", resolved_words=("resolved", "answered"), withdrawn_word="withdrawn",
+            entries={q.replace("_", "-"): edl.QuestionEntry(q.replace("_", "-"), s, text=f"## {q} answer: yes",
+                                                            path="/q/for-anton.md")
+                     for q, s in statuses.items()})
+
+    def state_with(self, st):
+        st["questions"] = {
+            "Q-17": {"step": None, "approval": "SA4", "asked_event": "E-3", "status": "open", "answer_event": None},
+            "Q-18": {"step": "A", "approval": None, "asked_event": "E-4", "status": "open", "answer_event": None},
+            "Q-19": {"step": "A", "approval": None, "asked_event": "E-5", "status": "open", "answer_event": None},
+        }
+        st["approval_question"] = {"id": "SA4", "question": "Q-17"}
+
+    def test_resolved_once_withdrawn_closed_open_nothing(self):
+        L, st = self.ledger(approvals={"SA4": {"conditions": []}})
+        self.state_with(st)
+        self.world.queue = self.snapshot(Q_17="resolved", Q_18="withdrawn", Q_19="open")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual([(i.kind, i.to, i.data["question"], i.data["approval"]) for i in res.items],
+                         [("answer", "driver", "Q-17", "SA4")])
+        self.assertEqual(res.items[0].data["answer"], "## Q_17 answer: yes")
+        qs = res.state["questions"]
+        self.assertEqual((qs["Q-17"]["status"], qs["Q-18"]["status"], qs["Q-19"]["status"]),
+                         ("resolved", "withdrawn", "open"))
+        self.assertIsNone(res.state["approval_question"])
+        res2, _ = self.reconcile(L, res.state)
+        self.assertEqual(res2.items, [])
+
+    def test_withdrawn_frees_the_approval_question(self):
+        L, st = self.ledger(approvals={"SA4": {"conditions": []}})
+        self.state_with(st)
+        self.world.queue = self.snapshot(Q_17="withdrawn")
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.items, [])
+        self.assertIsNone(res.state["approval_question"])
+        self.assertEqual(res.state["questions"]["Q-17"]["status"], "withdrawn")
+
+    def test_no_store_and_no_open_question(self):
+        L, st = self.ledger()
+        res, _ = self.reconcile(L, st)
+        self.assertNotIn(("questions", str(self.ws)), self.world.calls)     # nothing open: not read
+        self.state_with(st)
+        self.world.queue = None
+        res, _ = self.reconcile(L, st)
+        self.assertEqual(res.items, [])
+        self.assertEqual(res.state["questions"]["Q-17"]["status"], "open")
+
+    def test_snapshot_vocabulary(self):
+        snap = self.snapshot(Q_1="ANSWERED".lower(), Q_2=None)
+        self.assertEqual(snap.classify("Q-1"), "resolved")
+        self.assertEqual(snap.classify("Q-2"), "open")
+        self.assertEqual(snap.classify("Q-9"), "missing")
+
+    def test_real_store_reading(self):
+        ws = self.tmp / "qws"
+        (ws / "docs" / "questions").mkdir(parents=True)
+        (ws / ".claude").mkdir()
+        (ws / ".claude" / "roles.toml").write_text('[questions]\ndir = "docs/questions"\n')
+        (ws / "docs" / "questions" / "questions.md").write_text(
+            "# Questions\n\n## Q-001 — Grant SA4?  [resolved]\n\nYes, go.\n\n"
+            "## Q-002 — Other?  [withdrawn]\n\nx\n\n## Q-003 — Third?  [open]\n")
+        other = self.tmp / "elsewhere"
+        (other / ".claude").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(other)}):
+            snap = edl.RealWorld().question_entries(str(ws))
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.classify("Q-001"), "resolved")
+        self.assertEqual(snap.classify("Q-002"), "withdrawn")
+        self.assertEqual(snap.classify("Q-003"), "open")
+        self.assertIn("Yes, go.", snap.entries["Q-001"].text)
+
+
+class TestReconcileContract(_Recon):
+    def test_pure_over_readings_ledger_state_and_now(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "ADVANCED: A")
+        self.session(st, entries=entries + [limit("2026-11-24T09:06:00Z")], events=events,
+                     pane=pane("cc-2.1.330-folder-trust.txt"))
+        self.outbox(st, "E-1")
+        readings = edl.take_readings(L, st, self.world, self.now())
+        before = copy.deepcopy(st)
+        r1 = edl.reconcile(L, st, readings, self.now())
+        r2 = edl.reconcile(L, st, readings, self.now())
+        self.assertEqual(st, before)                       # the input state is untouched
+        self.assertEqual(r1.state, r2.state)
+        self.assertEqual(r1.conditions, r2.conditions)
+        self.assertEqual((r1.items, r1.actions), (r2.items, r2.actions))
+        # reconcile itself touches no World: the readings are all it needs
+        r3 = edl.reconcile(L, st, readings, self.now())
+        self.assertEqual(r3.state, r1.state)
+
+    def test_readings_only_read(self):
+        L, st = self.ledger()
+        self.session(st, pane=pane("cc-2.1.330-idle-input-box.txt"))
+        self.outbox(st, "E-1")
+        edl.take_readings(L, st, self.world, self.now())
+        verbs = {c[0] for c in self.world.calls}
+        self.assertLessEqual(verbs, {"has_session", "display", "capture", "process_work", "questions"})
+
+    def test_world_read_methods_fail_loudly_on_the_base_class(self):
+        w = edl.World()
+        for call in (lambda: w.tmux_has_session("x"), lambda: w.tmux_display("x", ["pane_dead"]),
+                     lambda: w.capture_pane("x"), lambda: w.list_handles(), lambda: w.lifecycle_events("x"),
+                     lambda: w.amux_names(), lambda: w.process_work(1), lambda: w.clock_sample(),
+                     lambda: w.local_timezone(), lambda: w.question_entries("/x")):
+            with self.assertRaises(NotImplementedError):
+                call()
+
+    def test_real_world_reads_without_a_tmux_session(self):
+        rw = edl.RealWorld()
+        sample = rw.clock_sample()
+        self.assertGreater(sample.boottime, 0)
+        self.assertIsNotNone(rw.local_timezone())
+        work = rw.process_work(os.getpid())
+        self.assertIsInstance(work, edl.ProcessWork)
+        with mock.patch.object(edl.subprocess, "run", side_effect=OSError("no tmux")):
+            self.assertIsNone(rw.tmux_display("nope", edl.TMUX_DISPLAY_FIELDS))
+            self.assertIsNone(rw.capture_pane("nope"))
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="0\t1\t2\t4242\n", stderr="")
+        with mock.patch.object(edl.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(rw.tmux_display("n", edl.TMUX_DISPLAY_FIELDS),
+                             {"pane_dead": "0", "pane_in_mode": "1", "session_attached": "2", "pane_pid": "4242"})
+        self.assertEqual(calls[0][:4], ["tmux", "display-message", "-p", "-t"])
+        self.assertEqual(calls[0][4], "=amux-n:")
+
+    def test_lifecycle_log_reader_skips_a_partial_tail(self):
+        spawn = self.tmp / "spawn"
+        spawn.mkdir()
+        (spawn / "n.lifecycle.jsonl").write_text(json.dumps(ev("turn_start", "2026-11-24T09:00:00Z")) + "\n{\"ev")
+        with mock.patch.object(edl.asl, "SPAWN_DIR", spawn):
+            got = edl.RealWorld().lifecycle_events("n")
+        self.assertEqual([e["event"] for e in got], ["turn_start"])
 
 
 if __name__ == "__main__":

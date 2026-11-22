@@ -34,12 +34,23 @@ In `epic_driver_lib.py`:
    be parsed defers), deferral counting, the send through `amux send`, the single retry only when the first send
    provably did not land, then no further sends; the `VERDICT?` reminder once. Input-box parsing derived from captured
    panes of the installed Claude Code version and pinned with fixtures.
+   Binding (50-05 second review): (a) the `VERDICT?` send commits the outbox entry's `reminded_at` before the send —
+   50-05's pure pass emits the reminder item on every pass until it is set; test that a pass after the commit emits no
+   reminder and sends nothing. (b) When 50-05's `delivery_provably_absent` is False (absence not provable, e.g. Enter
+   not registered), no retry is sent, and at the following tick the entry still unconfirmed raises
+   `delivery_unconfirmed` with no further sends (invariant 2); test it.
 8. **Commit points** (§23 step 6): event file + outbox entry + inflight markers + session record (`spawning`/
    `resuming`) committed before the side effect, the result committed after. Expressed as a sequence of
    `(state mutation, effect)` pairs that 50-08's tick executes, so a fake `World` can kill the pass between any two.
 9. **Startup-dialog answer** (§12.11): the 50-05 item becomes one `(state mutation, effect)` pair — the dialog id
    recorded as answered in the session record, then one key (`Enter`/`Escape`) sent with `tmux send-keys`. At most
    once per spawn/resume and dialog id; a pane showing a dialog is never a delivery target.
+   Binding (50-05 review): 50-05's pure pass emits the `startup_dialog_answer` item on every pass until the answer is
+   recorded, so the once-only rule rests here — `record_dialog_answer` is committed before the key is sent, and a
+   test proves a second pass after the commit emits no item and sends no key.
+   Also: every spawn and resume writes the session record's `launch_event` (the seed/resume event id) in the same
+   commit as `spawning`/`resuming`; 50-05's startup-dialog capture keys on it (its outbox fallback is a fallback
+   only). Test it for spawn, rotation spawn and resume.
 10. The `feedback` event built from an `epic-driver queue` request (OQ-4) — the request is stored in the state by the
    CLI (50-08); this task turns it into an event under the same policy.
 

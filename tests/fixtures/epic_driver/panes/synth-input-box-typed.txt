@@ -1,0 +1,12 @@
+● The report is written and the suite is green.
+
+  ADVANCED: monterey-export
+
+
+✻ Churned for 23s · done 5:00 PM
+                                                                                            new task? /clear to save 132.9k tokens · ✔ Update installed · /restart to apply
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ please also check the deploy log before you continue
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Opus · high | ctx 13% | cold 49h27m | 7d 9%
+  ⏸ manual mode on · ← 3 agents

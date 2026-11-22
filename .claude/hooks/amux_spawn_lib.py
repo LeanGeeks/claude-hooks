@@ -1156,6 +1156,17 @@ def _tail_entries(transcript_path: str | None, limit: int = MEASURE_TAIL_BYTES) 
     return entries
 
 
+def transcript_tail_first_epoch(transcript_path: str | None) -> float | None:
+    """Epoch of the earliest timestamped entry in the tail :func:`_tail_entries` reads, else None.
+
+    How far back a tail-based reading can see: a send older than this may have
+    been cut off by the tail limit (epic driver, delivery "provably absent").
+    """
+    stamps = [epoch_of(e.get("timestamp")) for e in _tail_entries(transcript_path)]
+    stamps = [t for t in stamps if t is not None]
+    return min(stamps) if stamps else None
+
+
 def _epoch_of(value: Any) -> float | None:
     """Private alias kept for this module's call sites; see :func:`epoch_of`."""
     return epoch_of(value)
@@ -1210,20 +1221,75 @@ def last_assistant_entry(transcript_path: str | None, since: Any = None) -> dict
         chosen = entry
     if chosen is None:
         return None
-    message = chosen.get("message")
+    return _summarise_assistant(chosen)
+
+
+def _summarise_assistant(entry: dict[str, Any]) -> dict[str, Any]:
+    """``{timestamp, model, error, is_api_error, text}`` of one assistant entry."""
+    message = entry.get("message")
     message = message if isinstance(message, dict) else {}
     text = "".join(
         b.get("text", "") for b in _content_blocks(message)
         if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
     )
-    error = chosen.get("error")
+    error = entry.get("error")
     return {
-        "timestamp": chosen.get("timestamp"),
+        "timestamp": entry.get("timestamp"),
         "model": message.get("model"),
         "error": error if isinstance(error, str) and error else None,
-        "is_api_error": bool(chosen.get("isApiErrorMessage")),
+        "is_api_error": bool(entry.get("isApiErrorMessage")),
         "text": text,
     }
+
+
+def assistant_entries(transcript_path: str | None, since: Any = None) -> list[dict[str, Any]]:
+    """Every main-agent assistant entry of the bounded tail, oldest first (epic 50, 50-05).
+
+    Each is the :func:`last_assistant_entry` shape ``{timestamp, model, error,
+    is_api_error, text}``. Sidechain entries are skipped. With ``since`` only
+    entries at or after that time (entries without a parseable timestamp are
+    skipped then). Fail-soft: ``[]`` on any problem.
+    """
+    since_epoch = _epoch_of(since) if since is not None else None
+    if since is not None and since_epoch is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in _tail_entries(transcript_path):
+        if entry.get("type") != "assistant" or entry.get("isSidechain") is True:
+            continue
+        if since_epoch is not None:
+            ts = _epoch_of(entry.get("timestamp"))
+            if ts is None or ts < since_epoch:
+                continue
+        out.append(_summarise_assistant(entry))
+    return out
+
+
+def user_prompt_entries(transcript_path: str | None, since: Any = None) -> list[dict[str, Any]]:
+    """Genuine user prompts of the bounded tail as ``{timestamp, text}``, oldest first (50-05).
+
+    A prompt is a real user turn (:func:`_is_real_user_turn`: not a tool result,
+    not a meta or sidechain entry, not a background-task notification); ``text``
+    joins its text blocks. With ``since`` only prompts at or after that time.
+    Fail-soft: ``[]`` on any problem.
+    """
+    since_epoch = _epoch_of(since) if since is not None else None
+    if since is not None and since_epoch is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in _tail_entries(transcript_path):
+        if not _is_real_user_turn(entry):
+            continue
+        if since_epoch is not None:
+            ts = _epoch_of(entry.get("timestamp"))
+            if ts is None or ts < since_epoch:
+                continue
+        text = "\n".join(
+            str(b.get("text", "")) for b in _content_blocks(entry.get("message"))
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        out.append({"timestamp": entry.get("timestamp"), "text": text})
+    return out
 
 
 def compaction_boundaries(transcript_path: str | None, since: Any = None) -> list[dict[str, Any]]:
@@ -1406,9 +1472,11 @@ def detect_open_turn(transcript_path: str | None, max_lines: int = TRANSCRIPT_TA
 def inflight_foreground_tool(transcript_path: str | None, max_lines: int = TRANSCRIPT_TAIL_LINES) -> dict[str, Any] | None:
     """Return the last in-flight foreground ``tool_use`` (no matching result), or None.
 
-    Shape: ``{tool, command, tool_use_id}``. ``command`` is best-effort from the
-    tool input (Bash ``command``, file ``file_path``, else None). Reason-context
-    pairs this with the frozen transcript mtime (age) at the call site.
+    Shape: ``{tool, command, tool_use_id, timestamp}``. ``command`` is best-effort
+    from the tool input (Bash ``command``, file ``file_path``, else None).
+    ``timestamp`` is the tool_use entry's own timestamp (or None), which the epic
+    driver ages for its open-prompt rule (epic 50, 50-05). Reason-context pairs
+    this with the frozen transcript mtime (age) at the call site.
 
     Like :func:`detect_open_turn`, only entries AFTER the last main-agent
     assistant-text boundary (the last ``Stop``) are scanned.  This avoids a
@@ -1430,7 +1498,7 @@ def inflight_foreground_tool(transcript_path: str | None, max_lines: int = TRANS
         return None
 
     results: set[str] = set()
-    uses: list[dict[str, Any]] = []
+    uses: list[tuple[dict[str, Any], Any]] = []
     for entry in after:
         message = entry.get("message")
         blocks = _content_blocks(message)
@@ -1439,10 +1507,10 @@ def inflight_foreground_tool(transcript_path: str | None, max_lines: int = TRANS
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     tid = block.get("id")
                     if isinstance(tid, str) and tid:
-                        uses.append(block)
+                        uses.append((block, entry.get("timestamp")))
         results |= _collect_tool_result_ids(blocks)
 
-    for block in reversed(uses):
+    for block, timestamp in reversed(uses):
         tid = block.get("id")
         if tid in results:
             continue
@@ -1454,6 +1522,7 @@ def inflight_foreground_tool(transcript_path: str | None, max_lines: int = TRANS
             "tool": str(block.get("name", "")) or "tool",
             "command": str(command) if command is not None else None,
             "tool_use_id": tid,
+            "timestamp": timestamp if isinstance(timestamp, str) else None,
         }
     return None
 
