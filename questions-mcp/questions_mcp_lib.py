@@ -819,6 +819,8 @@ def notify(
     text: str,
     role: Optional[str] = None,
     ack: bool = True,
+    *,
+    workspace_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Send an async notification to a human role.
 
@@ -838,6 +840,14 @@ def notify(
         When ``False``, sends as ``kind=notification`` (fire-and-forget) and
         records nothing.  Idle-session notifications are byte-identical to the
         pre-epic behaviour (invariant 9).
+    workspace_dir:
+        Keyword-only.  The workspace whose ``roles.toml`` and ``[questions]``
+        section to use.  ``None`` (the default, and the MCP tool's only form)
+        resolves it per call as today: ``CLAUDE_PROJECT_DIR`` → ``PWD`` →
+        cwd.  The epic driver's tick passes the epic workspace (epic 50,
+        architecture §16.4); note that ``roles_config.find_roles_file`` still
+        prefers ``CLAUDE_PROJECT_DIR`` when it is set, so a caller naming a
+        workspace runs without it.
 
     Returns
     -------
@@ -846,7 +856,8 @@ def notify(
         message_id  — relay message id (``None`` when ``dispatched=False``)
         error       — present only when something went wrong
     """
-    workspace_dir = _resolve_workspace_dir()
+    if workspace_dir is None:
+        workspace_dir = _resolve_workspace_dir()
     wc = _load_workspace(workspace_dir)
 
     # For notify we only need a token — [questions] section is not required.

@@ -869,8 +869,8 @@ cleared. State: `state.alarms["<id>:<subject>"]`.
 
 - **Raise** ⇒ `notify(text, ack=True, workspace_dir=<workspace>)`. Text: `[epic-driver <epic>] ALARM <id> <subject>:
   <detail> — epic-driver status`.
-- **Repeat**: none while the alarm's nudge ladder is live; after that every 4 h while active, each repeat a new
-  `ack=True` notify. *Ladder live* = the notify's `message_id` is still in the listener's index
+- **Repeat**: none while the alarm's nudge ladder is live; after that every 4 h while active — the first repeat 4 h
+  after the ladder ends (or after the last attempt, whichever is later), each repeat a new `ack=True` notify. *Ladder live* = the notify's `message_id` is still in the listener's index
   (`questions_listen_lib.read_index().messages`) and `now < sent_at + span(the workspace's [questions] nudge
   schedule)`. (50-08 confirms against the listener code whether an acknowledged message leaves the index; if it does
   not, the span alone decides.)

@@ -24,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import timedelta
@@ -1768,11 +1769,24 @@ class TestModuleContract(unittest.TestCase):
         src = (_REPO / ".claude" / "hooks" / "epic_driver_lib.py").read_text()
         code = re.sub(r"#[^\n]*", "", re.sub(r'""".*?"""', "", src, flags=re.S))
         self.assertIn("def run_check", code)   # the stripping kept the code
-        for needle in ("new-session", "kill-session", "questions_mcp_lib", ".notify(", "systemctl"):
+        for needle in ("kill-session", "start-server"):
             self.assertNotIn(needle, code, needle)
-        # 50-05: tmux reads (display-message, capture-pane) only through RealWorld._tmux_read.
+        # "tmux kill-server" only as advice in enable's refusal text, never run
+        self.assertEqual(code.count("kill-server"), 1)
+        self.assertIn("kill-server", code[code.index("def tmux_move_instructions("):code.index("def move_tmux_server(")])
+        # 50-05: tmux reads (display-message, capture-pane) only through RealWorld._tmux_read;
+        # 50-08 adds list-sessions (the server's pid).
         verbs = set(re.findall(r'_tmux_read\(\["([a-z-]+)"', code))
-        self.assertEqual(verbs, {"display-message", "capture-pane"})
+        self.assertEqual(verbs, {"display-message", "capture-pane", "list-sessions"})
+        # 50-08: the one server start is the systemd-run argv of tmux_start_args (§21.1), run only by
+        # ensure_tmux_server through World.systemd_run; systemd, busctl and the notify module are named
+        # only in RealWorld; World.notify is called only by the Notifier and enable's test notify.
+        self.assertEqual(code.count("new-session"), 1)
+        start_args = code[code.index("def tmux_start_args("):code.index("_SYSTEMD_BUS =")]
+        self.assertIn('"new-session"', start_args)
+        self.assertEqual(code.count("world.systemd_run("), 1)
+        ensure = code[code.index("def ensure_tmux_server("):code.index("def tmux_conditions(")]
+        self.assertIn("world.systemd_run(tmux_start_args()", ensure)
         # 50-06: amux, amux-spawn and the one tmux write (send-keys) are each named once and run only
         # inside RealWorld; the pure dispatcher calls the World effects only from run_effect.
         start = code.index("class RealWorld(World):")
@@ -1780,9 +1794,25 @@ class TestModuleContract(unittest.TestCase):
         for literal in ('"amux-spawn"', '"amux"', '"send-keys"'):
             self.assertEqual(code.count(literal), 1, literal)
         self.assertEqual(real.count('"send-keys"'), 1)
-        for const, uses in (("TMUX_BIN", 2), ("AMUX_BIN", 1), ("AMUX_SPAWN_BIN", 2)):
+        for const, uses in (("AMUX_BIN", 1), ("AMUX_SPAWN_BIN", 2), ("SYSTEMCTL_BIN", 1), ("SYSTEMD_RUN_BIN", 1),
+                            ("SYSTEMD_INHIBIT_BIN", 1), ("CLAUDE_QUESTIONS_BIN", 2)):
             self.assertEqual(real.count(const), uses, const)
             self.assertEqual(code.count(const), uses + 1, f"{const}: defined once, used only in RealWorld")
+        # TMUX_BIN: twice in RealWorld, once in the argv of tmux_start_args (run through systemd-run).
+        self.assertEqual(real.count("TMUX_BIN"), 2)
+        self.assertEqual(code.count("TMUX_BIN"), 4)
+        self.assertIn("TMUX_BIN", start_args)
+        # BUSCTL_BIN: run in RealWorld; also printed in enable's refusal instructions (text only).
+        self.assertEqual(real.count("BUSCTL_BIN"), 1)
+        self.assertEqual(code.count('"questions_mcp_lib"'), 1)
+        self.assertIn('"questions_mcp_lib"', real)
+        notify_calls = re.findall(r"[\w.]*\.notify\(", code)
+        self.assertEqual(sorted(notify_calls), ["qml.notify(", "self.world.notify(", "world.notify("])
+        self.assertIn("qml.notify(", real)
+        sender = code[code.index("class Notifier:"):code.index("def record_notify_failure(")]
+        self.assertIn("self.world.notify(", sender)
+        enable = code[code.index("def cmd_enable("):code.index("def cmd_disable(")]
+        self.assertIn("world.notify(", enable)
         run_effect = code[code.index("def run_effect("):code.index("def execute_dispatch(")]
         for call in ("world.spawn(", "world.resume(", "world.reap(", "world.amux_send(", "world.send_keys("):
             self.assertEqual(code.count(call), 1, call)
@@ -5292,7 +5322,8 @@ class TestWorktreeDiscipline(unittest.TestCase):
 
     def test_no_git_argv_can_reset_clean_stash_force_remove_delete_or_push(self):
         whole = self.code()
-        code = whole[whole.index("ALARM_WORKTREE_REFUSED ="):]
+        # the 50-07 section (50-08's, after it, runs no git and has its own contract test)
+        code = whole[whole.index("ALARM_WORKTREE_REFUSED ="):whole.index("EXIT_OK = 0")]
         self.assertIn("def ensure_integration", code)
         for verb in ("reset", "clean", "stash", "push", "checkout", "restore", "rebase", "switch", "remove",
                      "prune", "gc", "-D", "-d", "-f", "-F", "-B", "-M", "-m", "-c", "--force", "--force-with-lease", "--hard",
@@ -5474,3 +5505,2461 @@ class TestShaAndRefHardening(_GitRepos):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# =============================================================================
+# 50-08 — the tick, the CLI, alarms and notify, the tmux server (§12.10, §16–§18, §20–§23)
+# =============================================================================
+#
+# Everything runs against TickWorld (DispatchWorld plus fake systemd, tmux server, notify and
+# questions tooling): no real systemctl, systemd-run, systemd-inhibit, busctl, tmux, relay or
+# Telegram. The CLI is loaded from .claude/bin/epic-driver and called in process with that world;
+# the state root is the test's temp dir; EPIC_DRIVER_ALLOW_UNSTAMPED=1 except in the stamp tests.
+
+import hashlib  # noqa: E402
+import importlib.util  # noqa: E402
+import io  # noqa: E402
+import threading  # noqa: E402
+from importlib.machinery import SourceFileLoader  # noqa: E402
+
+CLI_PATH = _REPO / ".claude" / "bin" / "epic-driver"
+
+
+def _load_cli():
+    loader = SourceFileLoader("epic_driver_cli", str(CLI_PATH))
+    spec = importlib.util.spec_from_loader("epic_driver_cli", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+CLI = _load_cli()
+
+OWN_CG = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/epic-driver-tmux.scope\n"
+TERM_CG = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ptyxis-spawn-5916.scope\n"
+SERVICE_CG = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/claude-epic-driver.service\n"
+INHIBIT_HEAD = ("WHO                UID  USER  PID  COMM            WHAT        WHY                MODE\n"
+                "GNOME Shell        1000 anton 9014 gnome-shell     sleep       GNOME needs to save delay\n")
+INHIBIT_LINE = "claude-epic-driver 1000 anton 4343 systemd-inhibit sleep:idle  epic driver is on  block\n"
+
+
+class TickWorld(DispatchWorld):
+    """DispatchWorld plus systemd, the tmux server, notify and the questions tooling, all faked."""
+
+    def __init__(self, tdir, **kw):
+        super().__init__(tdir, **kw)
+        self.units = {edl.LISTENER_UNIT: "active", edl.INHIBIT_UNIT: "active", edl.TIMER_UNIT: "inactive"}
+        self.start_fails = set()           # units whose `start` fails
+        self.enable_fails = False
+        self.inhibit_takes_lock = True     # the inhibitor's lock shows once the unit is active
+        self.systemctl_calls = []
+        self.server_pid = 16651
+        self.cgroups = {16651: OWN_CG}
+        self.runs = []                     # (args, env) of systemd-run
+        self.run_lands_in = OWN_CG         # where a started server lands; None: starting fails
+        self.busctl_calls = []
+        self.busctl_moves = True
+        self.notifies = []                 # dicts: text, role, ack, workspace_dir, at
+        self.notify_ok = True
+        self.next_mid = 9000
+        self.index = set()
+        self.settings = {"nudge": "1h", "sync": "commit"}
+        self.qcheck = edl.CommandResult(rc=0, stdout="bound\n")
+        self.slept = []
+        self.cost = {}                     # World method name -> seconds the fake clock advances
+
+    def _cost(self, what):
+        if self.cost.get(what):
+            self.advance(self.cost[what])
+
+    def systemctl(self, args):
+        args = list(args)
+        self.systemctl_calls.append(args)
+        self._cost("systemctl")
+        verb = args[0]
+        if verb == "is-active":
+            on = self.units.get(args[1]) == "active"
+            return edl.CommandResult(rc=0 if on else 3, stdout="active\n" if on else "inactive\n")
+        if verb == "start":
+            if args[1] in self.start_fails:
+                return edl.CommandResult(rc=1, stderr=f"Job for {args[1]} failed.\n")
+            self.units[args[1]] = "active"
+            return edl.CommandResult(rc=0)
+        if verb == "enable":
+            if self.enable_fails:
+                return edl.CommandResult(rc=1, stderr="Unit claude-epic-driver.timer not found.\n")
+            for u in args[2:]:
+                self.units[u] = "active"
+            return edl.CommandResult(rc=0)
+        if verb == "disable":
+            for u in args[2:]:
+                self.units[u] = "inactive"
+            return edl.CommandResult(rc=0)
+        if verb == "show":
+            on = self.units.get(args[1]) == "active"
+            return edl.CommandResult(rc=0, stdout=f"ActiveState={'active' if on else 'inactive'}\n"
+                                                  f"NextElapseUSecRealtime={'Tue 2026-11-24 09:40:00 UTC' if on else ''}\n")
+        raise AssertionError(f"unexpected systemctl {args}")
+
+    def systemd_run(self, args, env):
+        self.runs.append((list(args), dict(env)))
+        self._cost("systemd_run")
+        if self.run_lands_in is None:
+            return edl.CommandResult(rc=1, stderr="Failed to start transient scope unit: Access denied\n")
+        self.server_pid = 20001
+        self.cgroups[20001] = self.run_lands_in
+        return edl.CommandResult(rc=0)
+
+    def inhibit_list(self):
+        self._cost("inhibit_list")
+        held = self.units.get(edl.INHIBIT_UNIT) == "active" and self.inhibit_takes_lock
+        return edl.CommandResult(rc=0, stdout=INHIBIT_HEAD + (INHIBIT_LINE if held else ""))
+
+    def busctl(self, args):
+        args = list(args)
+        self.busctl_calls.append(args)
+        if not self.busctl_moves:
+            return edl.CommandResult(rc=1, stderr="Call failed: Access denied\n")
+        self.cgroups[int(args[-2] if args[4] == "StartTransientUnit" else args[-1])] = OWN_CG
+        self.units[edl.TMUX_SCOPE_UNIT] = "active"
+        return edl.CommandResult(rc=0, stdout='o "/org/freedesktop/systemd1/job/77"\n')
+
+    def tmux_server_pid(self):
+        self._cost("tmux_server_pid")
+        return self.server_pid
+
+    def read_cgroup(self, pid):
+        return self.cgroups.get(pid)
+
+    def notify(self, text, *, role, ack, workspace_dir):
+        self._cost("notify")
+        self.notifies.append({"text": text, "role": role, "ack": ack, "workspace_dir": workspace_dir,
+                              "at": self.clock})
+        if not self.notify_ok:
+            return {"dispatched": False, "message_id": None, "error": "Relay send failed: relay down"}
+        self.next_mid += 1
+        if ack:
+            self.index.add(str(self.next_mid))
+        return {"dispatched": True, "message_id": self.next_mid}
+
+    def notify_index_ids(self):
+        return set(self.index)
+
+    def questions_settings(self, workspace):
+        return None if self.settings is None else dict(self.settings)
+
+    def questions_check(self, workspace):
+        return self.qcheck
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.advance(seconds)
+
+    def alarm_notifies(self):
+        return [n for n in self.notifies if n["ack"]]
+
+
+class _Tick(_Disp):
+    NOW = "2026-11-24T10:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.world = TickWorld(self.tdir, now=T(self.NOW), profiles={
+            "claude": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-opus-5-5"}})
+        self.env = {edl.STATE_ROOT_ENV: os.environ[edl.STATE_ROOT_ENV], CLI.ALLOW_UNSTAMPED_ENV: "1",
+                    "HOME": str(self.tmp), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+    # -- the run, set up as `enable` leaves it (without the gates) --
+    def enable(self, steps=None, **top):
+        d = self.ledger_dict(steps if steps is not None else [self.driver("A")], **top)
+        path = self.write(d)
+        L = edl.load_ledger(path, self.world)
+        paths = edl.run_paths(L.run_id)
+        paths.dir.mkdir(parents=True, exist_ok=True)
+        edl.save_state(paths.state, edl.new_state(L, self.world.now()))
+        edl.atomic_write_text(paths.last_valid_ledger, Path(path).read_text())
+        edl.write_active({"run_id": L.run_id, "ledger": L.path, "state_dir": str(paths.dir),
+                          "enabled_at": edl.iso(self.world.now()), "workspace": L.workspace, "epic": L.epic,
+                          "notify_role": L.notify_role})
+        self.lpath, self.L, self.rp = path, L, paths
+        return L
+
+    def state(self):
+        return edl.load_state(self.rp.state)
+
+    def save(self, st):
+        edl.save_state(self.rp.state, st)
+
+    def run_pass(self, advance=None):
+        if advance:
+            self.world.advance(advance)
+        out, err = io.StringIO(), io.StringIO()
+        rc = edl.run_tick(self.world, environ=self.env, out=out, err=err)
+        self.last_out, self.last_err = out.getvalue(), err.getvalue()
+        return rc
+
+    def cli(self, *argv, environ=None):
+        out, err = io.StringIO(), io.StringIO()
+        rc = CLI.main(list(argv), world=self.world, environ=environ if environ is not None else dict(self.env),
+                      out=out, err=err)
+        return rc, out.getvalue(), err.getvalue()
+
+    def active_alarms(self, st=None):
+        st = st or self.state()
+        return sorted(k for k, r in (st.get("alarms") or {}).items() if not r.get("cleared_at"))
+
+
+# -- the full pass on a toy ledger (§23) -------------------------------------------
+
+class TestTickFullPass(_Tick):
+    def test_a_toy_ledger_runs_end_to_end_across_ticks(self):
+        self.enable([self.driver("A", phase="P1"), self.driver("B", needs=["A"], phase="P2")])
+        name = "ws-t-driver-g1"
+        self.world.check_script.update({"A": (0, 2), "B": (0, 2)})
+        # tick 1: A is due → the driver session is spawned, seeded with E-1 (its turn ends ADVANCED: A)
+        self.world.reply[name] = "Rolled.\nADVANCED: A"
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        st = self.state()
+        self.assertEqual(st["steps"]["A"]["status"], "inflight")
+        self.assertEqual(len(self.world.spawns), 1)
+        self.assertEqual(self.world.spawns[0][-1], f"EVENT E-1: read {self.rp.events / 'E-1.md'}")
+        self.assertEqual((st["tick_seq"], st["last_tick_error"]), (1, None))
+        self.assertEqual(st["last_tick_at"], st["last_tick_ok_at"])
+        # tick 2: E-1 confirmed, the verdict moves A to verifying, its check passes (done), B is due → E-2
+        self.world.reply[name] = "Done.\nADVANCED: B"
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertEqual((st["steps"]["A"]["status"], st["steps"]["A"]["by"]), ("done", "check"))
+        self.assertEqual(st["steps"]["B"]["status"], "inflight")
+        self.assertEqual([s[1] for s in self.world.sends], [f"EVENT E-2: read {self.rp.events / 'E-2.md'}"])
+        self.assertEqual([c[0] for c in self.world.check_calls], ["A"])
+        # tick 3: B verifying → its check → done; then a quiet tick
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertEqual(st["steps"]["B"]["status"], "done")
+        self.assertEqual([c[0] for c in self.world.check_calls], ["A", "B"])
+        self.assertEqual(self.active_alarms(st), [])
+        self.assertEqual(st["tick_seq"], 4)
+        # the heartbeats: one per phase transition, ack=False, to the ledger's workspace
+        beats = [n for n in self.world.notifies if not n["ack"]]
+        self.assertEqual([n["text"] for n in beats],
+                         ["[epic-driver t] phase P1 done; next: P2 (1 step)",
+                          "[epic-driver t] phase P2 done; every phase is done"])
+        self.assertTrue(all(n["workspace_dir"] == str(self.ws) for n in beats))
+        self.assertEqual(self.world.alarm_notifies(), [])
+        log = self.rp.tick_log.read_text()
+        self.assertEqual(log.count(" ok in "), 4)
+
+    def test_the_tick_unsets_a_dead_ssh_auth_sock(self):
+        self.enable()
+        self.env["SSH_AUTH_SOCK"] = str(self.tmp / "gone.sock")
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertNotIn("SSH_AUTH_SOCK", self.env)
+        self.assertIn("SSH_AUTH_SOCK", self.rp.tick_log.read_text())
+
+    def test_no_active_run_exits_0(self):
+        self.assertEqual(self.run_pass(), 0)
+        self.assertIn("no active run", self.last_out)
+
+
+# -- tick.lock (§18) ---------------------------------------------------------------
+
+class TestTickLock(_Tick):
+    def hold_in_subprocess(self):
+        code = ("import fcntl,sys,time; f=open(sys.argv[1],'a'); fcntl.flock(f, fcntl.LOCK_EX); "
+                "print('held', flush=True); time.sleep(60)")
+        p = subprocess.Popen([sys.executable, "-c", code, str(self.rp.lock)], stdout=subprocess.PIPE, text=True)
+        self.assertEqual(p.stdout.readline().strip(), "held")
+        return p
+
+    def test_a_second_tick_while_one_holds_the_lock_exits_0_quietly(self):
+        self.enable()
+        p = self.hold_in_subprocess()
+        try:
+            self.assertEqual(self.run_pass(), 0)
+            self.assertEqual(self.state()["tick_seq"], 0)              # nothing ran
+            self.assertEqual(self.world.spawns, [])
+            self.assertIn("already running", self.rp.tick_log.read_text())
+        finally:
+            p.kill()
+            p.wait()
+            p.stdout.close()
+
+    def test_a_lock_left_by_a_dead_process_is_acquired(self):
+        self.enable()
+        p = self.hold_in_subprocess()
+        p.kill()
+        p.wait()
+        p.stdout.close()
+        self.assertTrue(self.rp.lock.exists())
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.state()["tick_seq"], 1)
+
+    def test_mark_waits_for_the_lock(self):
+        self.enable([self.driver("A")])
+        fd = edl.acquire_lock(self.rp.lock, 0)
+        self.assertIsNotNone(fd)
+        threading.Timer(0.6, edl.release_lock, args=(fd,)).start()
+        t0 = time.monotonic()
+        rc, out, err = self.cli("mark", "A", "done")
+        self.assertEqual(rc, 0, err)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+        self.assertEqual(self.state()["steps"]["A"]["status"], "done")
+
+    def test_a_writing_verb_gives_up_after_its_wait(self):
+        self.enable()
+        fd = edl.acquire_lock(self.rp.lock, 0)
+        try:
+            with mock.patch.object(edl, "LOCK_WAIT_S", 0.2):
+                with mock.patch.object(edl._Locked.__init__, "__defaults__", (0.2,)):
+                    rc, out, err = self.cli("pause")
+            self.assertEqual(rc, 1)
+            self.assertIn("is held", err)
+        finally:
+            edl.release_lock(fd)
+
+
+# -- a crash mid-pass (§23) ---------------------------------------------------------
+
+class TestTickCrash(_Tick):
+    def test_an_exception_mid_pass_records_tick_error_and_the_next_pass_clears_it(self):
+        self.enable()
+        with mock.patch.object(edl, "reconcile", side_effect=RuntimeError("boom in reconcile")):
+            self.assertEqual(self.run_pass(), 1)
+        self.assertIn("RuntimeError: boom in reconcile", self.last_err)
+        st = self.state()
+        self.assertEqual(st["last_tick_error"]["error"], "RuntimeError: boom in reconcile")
+        self.assertEqual(st["last_tick_ok_at"], None)
+        self.assertEqual(self.active_alarms(st), ["tick_error:run"])
+        alarm = self.world.alarm_notifies()
+        self.assertEqual(len(alarm), 1)
+        self.assertEqual(alarm[0]["text"], "[epic-driver t] ALARM tick_error run: RuntimeError: boom in reconcile"
+                                           " — epic-driver status")
+        self.assertEqual(self.world.spawns, [])                 # the pass's effects never ran
+        self.assertIn("pass failed", self.rp.tick_log.read_text())
+        # the next pass completes: last_tick_error cleared, tick_error cleared (no notify on a clear)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertIsNone(st["last_tick_error"])
+        self.assertEqual(st["alarms"]["tick_error:run"]["cleared_at"], edl.iso(self.world.now()))
+        self.assertEqual(len(self.world.alarm_notifies()), 1)
+
+    def test_the_error_is_recorded_on_the_last_committed_state(self):
+        self.enable()
+        st = self.state()
+        st["steps"]["A"]["status"] = "verifying"
+        self.save(st)
+        with mock.patch.object(edl, "run_checks", side_effect=OSError("disk")):
+            self.assertEqual(self.run_pass(), 1)
+        self.assertEqual(self.state()["steps"]["A"]["status"], "verifying")
+        self.assertEqual(self.state()["clock"], None)          # the reconcile's result was not committed
+
+
+# -- stamps (§17, OQ-3) ---------------------------------------------------------------
+
+class TestStamps(_Tick):
+    def fake_install(self):
+        """An installed layout in the temp dir: every §17 file, and a manifest that matches."""
+        root = self.tmp / "home" / ".claude"
+        modules = {}
+        for name, rel in CLI.STAMPED_FILES.items():
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"# {name}\n")
+            modules[name] = {"path": str(p), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+        manifest = root / "epic-driver" / "stamps.json"
+        manifest.write_text(json.dumps({"revision": "v1.4-12-g2a2f966", "installed_at": "2026-11-23T08:00:00Z",
+                                        "modules": modules}))
+        return CLI.layout(root / "bin" / "epic-driver"), manifest, modules
+
+    def test_the_installed_layout(self):
+        lay, manifest, _ = self.fake_install()
+        root = self.tmp / "home" / ".claude"
+        self.assertTrue(lay["installed"])
+        self.assertEqual(lay["sys_path"], [str(root / "hooks"), str(root / "statusline"), str(root / "epic-driver" / "lib")])
+        self.assertEqual(lay["hooks_repo"], str(self.tmp / "home"))          # CLAUDE_HOOKS_REPO=$HOME
+        self.assertEqual(lay["manifest"], manifest)
+        repo = CLI.layout(CLI_PATH)
+        self.assertFalse(repo["installed"])
+        self.assertEqual(repo["hooks_repo"], str(_REPO))
+        self.assertIn(str(_REPO / "questions-mcp"), repo["sys_path"])
+
+    def test_agreeing_stamps(self):
+        lay, _, _ = self.fake_install()
+        self.assertEqual(CLI.check_stamps(lay, {}), {"checked": True, "ok": True, "problem": None,
+                                                    "revision": "v1.4-12-g2a2f966", "files": [],
+                                                    "override_env": False})
+
+    def test_missing_manifest_changed_file_missing_file_and_wrong_path(self):
+        lay, manifest, modules = self.fake_install()
+        with self.subTest("changed"):
+            (self.tmp / "home" / ".claude" / "hooks" / "amux_spawn_lib.py").write_text("# reinstalled by amux\n")
+            r = CLI.check_stamps(lay, {})
+            self.assertFalse(r["ok"])
+            self.assertIn("amux_spawn_lib.py", r["problem"])
+            self.assertIn("changed since it was installed", r["problem"])
+        with self.subTest("missing file"):
+            os.unlink(self.tmp / "home" / ".claude" / "hooks" / "amux_spawn_lib.py")
+            self.assertIn("is missing", CLI.check_stamps(lay, {})["problem"])
+        with self.subTest("not listed"):
+            data = json.loads(manifest.read_text())
+            del data["modules"]["questions_mcp_lib.py"]
+            manifest.write_text(json.dumps(data))
+            self.assertIn("questions_mcp_lib.py is not in", CLI.check_stamps(lay, {})["problem"])
+        with self.subTest("another path"):
+            data["modules"]["questions_mcp_lib.py"] = {"path": str(_REPO / "questions-mcp" / "questions_mcp_lib.py"),
+                                                       "sha256": "0"}
+            manifest.write_text(json.dumps(data))
+            self.assertIn("this CLI uses", CLI.check_stamps(lay, {})["problem"])
+        with self.subTest("missing manifest"):
+            os.unlink(manifest)
+            r = CLI.check_stamps(lay, {})
+            self.assertEqual((r["checked"], r["ok"]), (True, False))
+            self.assertIn("no stamps manifest", r["problem"])
+
+    def test_an_unstamped_repo_run_is_refused_unless_the_test_env_var_is_set(self):
+        path = self.write(self.ledger_dict([self.driver("A")]))
+        env = {k: v for k, v in self.env.items() if k != CLI.ALLOW_UNSTAMPED_ENV}
+        rc, out, err = self.cli("validate", path, environ=env)
+        self.assertEqual(rc, 3)
+        self.assertIn("stamp_mismatch: no stamps manifest", err)
+        env[CLI.ALLOW_UNSTAMPED_ENV] = "yes"                     # only exactly "1" counts
+        self.assertEqual(self.cli("validate", path, environ=env)[0], 3)
+        rc, out, err = self.cli("validate", path)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("valid", out)
+
+    def test_the_cli_drops_claude_hooks_repo_and_claude_project_dir(self):
+        path = self.write(self.ledger_dict([self.driver("A")]))
+        env = dict(self.env, CLAUDE_PROJECT_DIR="/elsewhere", CLAUDE_HOOKS_REPO="/wrong")
+        self.assertEqual(self.cli("validate", path, environ=env)[0], 0)
+        self.assertNotIn("CLAUDE_HOOKS_REPO", env)        # not left in the process for children
+        self.assertNotIn("CLAUDE_PROJECT_DIR", env)
+
+    def test_verbs_that_stop_or_observe_still_run_on_a_mismatch(self):
+        self.enable()
+        env = {k: v for k, v in self.env.items() if k != CLI.ALLOW_UNSTAMPED_ENV}
+        rc, out, err = self.cli("status", environ=env)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("stamps MISMATCH: no stamps manifest", out)
+        self.assertEqual(self.cli("mark", "A", "done", environ=env)[0], 3)
+        self.assertEqual(self.cli("pause", environ=env)[0], 0)
+        with mock.patch.object(CLI, "tick_stamp_mismatch", return_value=1) as tsm:
+            self.assertEqual(self.cli("tick", environ=env)[0], 1)
+        tsm.assert_called_once()
+
+    def test_a_mismatched_tick_records_notifies_once_and_exits_1_then_a_good_tick_clears_it(self):
+        self.enable()
+        sent = []
+
+        def fake_notify(text, role=None, ack=True, *, workspace_dir=None):
+            sent.append((text, ack, workspace_dir))
+            return {"dispatched": True, "message_id": 4242}
+        problem = "amux_spawn_lib.py: /x changed since it was installed"
+        self.assertEqual(CLI.tick_stamp_mismatch(problem, self.env, notify=fake_notify, err=io.StringIO()), 1)
+        st = self.state()
+        self.assertEqual(st["last_tick_error"]["error"], f"stamp_mismatch: {problem}")
+        self.assertEqual(st["alarms"]["stamp_mismatch:run"]["message_id"], 4242)
+        self.assertEqual(sent, [(f"[epic-driver t] ALARM stamp_mismatch run: {problem} — epic-driver status",
+                                 True, str(self.ws))])
+        self.assertEqual((self.world.spawns, self.world.systemctl_calls, self.world.calls), ([], [], []))
+        # the next mismatched tick records again, without a second notify
+        self.assertEqual(CLI.tick_stamp_mismatch(problem, self.env, notify=fake_notify, err=io.StringIO()), 1)
+        self.assertEqual(len(sent), 1)
+        # stamps agree again: the tick runs and the alarm clears
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertIsNotNone(st["alarms"]["stamp_mismatch:run"]["cleared_at"])
+        self.assertIsNone(st["last_tick_error"])
+
+    def test_a_mismatched_tick_whose_notify_fails_records_the_failure(self):
+        self.enable()
+
+        def failing(text, role=None, ack=True, *, workspace_dir=None):
+            raise RuntimeError("relay down")
+        self.assertEqual(CLI.tick_stamp_mismatch("x", self.env, notify=failing, err=io.StringIO()), 1)
+        st = self.state()
+        self.assertIn("relay down", st["notify_failures"][-1]["error"])
+        self.assertIn("dispatched=no", self.rp.notify_log.read_text())
+
+    # -- EPIC_DRIVER_ALLOW_UNSTAMPED: repo runs only --------------------------------------------------
+
+    def test_an_installed_copy_ignores_the_override_and_always_checks_stamps(self):
+        lay, manifest, _ = self.fake_install()
+        env = {CLI.ALLOW_UNSTAMPED_ENV: "1"}
+        r = CLI.check_stamps(lay, env)
+        self.assertEqual((r["checked"], r["ok"], r["override_env"]), (True, True, True))   # checked, and agrees
+        (self.tmp / "home" / ".claude" / "hooks" / "amux_spawn_lib.py").write_text("# reinstalled\n")
+        r = CLI.check_stamps(lay, env)
+        self.assertEqual((r["checked"], r["ok"]), (True, False))                           # the override did not help
+        self.assertIn("changed since it was installed", r["problem"])
+        self.assertEqual(r["files"], ["amux_spawn_lib.py"])
+        # a repo checkout honours it (the tests rely on that)
+        repo = CLI.check_stamps(CLI.layout(CLI_PATH), env)
+        self.assertEqual((repo["checked"], repo["ok"]), (False, True))
+
+    def test_how_a_repo_run_and_an_installed_run_are_told_apart(self):
+        home = self.tmp / "h2"
+        (home / ".claude" / "bin").mkdir(parents=True)
+        # the installer's bin dir, even before epic-driver/lib exists
+        self.assertTrue(CLI.layout(home / ".claude" / "bin" / "epic-driver", home=str(home))["installed"])
+        self.assertTrue(CLI.layout(home / ".claude" / "bin" / "epic-driver", home=str(home))["installed"])
+        # <root>/epic-driver/lib exists: installed, wherever it is
+        other = self.tmp / "h3" / ".claude"
+        (other / "bin").mkdir(parents=True)
+        (other / "epic-driver" / "lib").mkdir(parents=True)
+        self.assertTrue(CLI.layout(other / "bin" / "epic-driver", home=str(home))["installed"])
+        # a checkout is neither
+        self.assertFalse(CLI.layout(CLI_PATH, home=str(home))["installed"])
+        self.assertFalse(CLI.layout(CLI_PATH)["installed"])
+
+    def test_an_installed_run_through_main_ignores_the_variable(self):
+        self.enable()
+        lay, manifest, _ = self.fake_install()
+        (self.tmp / "home" / ".claude" / "hooks" / "amux_spawn_lib.py").write_text("# reinstalled\n")
+        with mock.patch.object(CLI, "layout", lambda *a, **kw: lay):
+            rc, out, err = self.cli("status")                        # self.env has ALLOW_UNSTAMPED=1
+            self.assertEqual(rc, 0, err)
+            self.assertIn("stamps MISMATCH", out)
+            self.assertEqual(self.cli("mark", "A", "done")[0], 3)
+
+    def test_the_variables_are_stripped_from_the_process_environment(self):
+        path = self.write(self.ledger_dict([self.driver("A")]))
+        env = dict(self.env, CLAUDE_HOOKS_REPO="/wrong")
+        self.assertEqual(self.cli("validate", path, environ=env)[0], 0)
+        self.assertNotIn(CLI.ALLOW_UNSTAMPED_ENV, env)
+        self.assertNotIn("CLAUDE_HOOKS_REPO", env)
+
+    def test_a_check_and_the_tmux_server_never_see_either_variable(self):
+        self.enable([self.driver("A", check="true")])
+        st = self.state()
+        st["steps"]["A"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.server_pid = None                                  # the tick starts the server
+        env = dict(self.env, CLAUDE_HOOKS_REPO="/repo", KEEP_ME="1")
+        self.env.clear()
+        self.env.update(env)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertTrue(self.world.check_calls)
+        for call in self.world.check_calls:
+            self.assertNotIn(CLI.ALLOW_UNSTAMPED_ENV, call[3])
+            self.assertNotIn("CLAUDE_HOOKS_REPO", call[3])
+        self.assertTrue(self.world.runs)
+        for _args, run_env in self.world.runs:
+            self.assertNotIn(CLI.ALLOW_UNSTAMPED_ENV, run_env)
+            self.assertNotIn("CLAUDE_HOOKS_REPO", run_env)
+            self.assertEqual(run_env.get("KEEP_ME"), "1")             # everything else still goes through
+        for name in (CLI.ALLOW_UNSTAMPED_ENV, "CLAUDE_HOOKS_REPO"):
+            self.assertNotIn(name, edl.tmux_start_env({name: "1", "X": "y"}, {name: "2"}))
+
+    # -- stamp_mismatch: repeat, and no import of a mismatched questions_mcp_lib -----------------------
+
+    def poison(self, calls, seen_env=None):
+        mod = mock.Mock()
+
+        def notify(text, **kw):
+            calls.append((text, kw))
+            if seen_env is not None:
+                seen_env.append(os.environ.get("CLAUDE_HOOKS_REPO"))
+            return {"dispatched": True, "message_id": 77}
+        mod.notify = notify
+        return mod
+
+    def mismatch_at(self, hours, mismatched, hooks_repo=None):
+        t0 = T("2026-11-24T10:00:00Z")
+        stamp = edl.iso(t0 + timedelta(hours=hours))
+        with mock.patch.object(CLI, "_now_iso", lambda: stamp):
+            return CLI.tick_stamp_mismatch("x changed", self.env, err=io.StringIO(), mismatched=mismatched,
+                                           hooks_repo=hooks_repo)
+
+    def test_stamp_mismatch_repeats_like_any_alarm_every_4h_not_once_per_episode(self):
+        self.enable()
+        calls, seen = [], []
+        with mock.patch.dict(sys.modules, {"questions_mcp_lib": self.poison(calls, seen)}):
+            os.environ.pop("CLAUDE_HOOKS_REPO", None)
+            self.assertEqual(self.mismatch_at(0, ["amux_spawn_lib.py"], hooks_repo="/hooks"), 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(seen, ["/hooks"])                       # set around the call only
+            self.assertNotIn("CLAUDE_HOOKS_REPO", os.environ)
+            self.mismatch_at(3, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 1)                          # not yet: 4 h after the last attempt
+            self.mismatch_at(4.1, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 2)                          # the first repeat
+            self.mismatch_at(6, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 2)
+            self.mismatch_at(8.2, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 3)
+            self.assertTrue(all(c[1]["ack"] for c in calls))
+        self.assertEqual(self.state()["alarms"]["stamp_mismatch:run"]["sends"], 3)
+
+    def test_stamp_mismatch_waits_for_a_live_ladder(self):
+        self.enable()
+        calls = []
+        with mock.patch.dict(sys.modules, {"questions_mcp_lib": self.poison(calls)}):
+            self.mismatch_at(0, ["amux_spawn_lib.py"])
+            st = self.state()
+            st["alarms"]["stamp_mismatch:run"]["ladder_until"] = edl.iso(T("2026-11-24T10:00:00Z") + timedelta(hours=10))
+            self.save(st)
+            self.mismatch_at(5, ["amux_spawn_lib.py"])
+            self.mismatch_at(13, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 1)                          # 4 h after the ladder ends = hour 14
+            self.mismatch_at(14.1, ["amux_spawn_lib.py"])
+            self.assertEqual(len(calls), 2)
+
+    def test_the_notify_import_closure_covers_what_questions_mcp_lib_really_imports(self):
+        """Derive the project modules ``questions_mcp_lib`` imports, transitively, from its source (every
+        import statement, nested ones too) and assert ``NOTIFY_IMPORT_CLOSURE`` lists them all."""
+        import ast
+        roots = [_REPO / ".claude" / "hooks", _REPO / "questions-mcp", _REPO / ".claude" / "statusline"]
+
+        def source(mod):
+            for d in roots:
+                if (d / f"{mod}.py").is_file():
+                    return d / f"{mod}.py"
+            return None
+        seen, todo = set(), ["questions_mcp_lib"]
+        while todo:
+            mod = todo.pop()
+            if mod in seen:
+                continue
+            seen.add(mod)
+            tree = ast.parse(source(mod).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    names = [node.module]
+                else:
+                    continue
+                for name in names:
+                    top = name.split(".")[0]
+                    if source(top) is not None and top not in seen:
+                        todo.append(top)
+        derived = {f"{m}.py" for m in seen}
+        self.assertGreaterEqual(len(derived), 6)                       # questions_mcp_lib and its five direct ones
+        self.assertLessEqual(derived, set(CLI.NOTIFY_IMPORT_CLOSURE), "NOTIFY_IMPORT_CLOSURE went stale")
+        self.assertLessEqual(set(CLI.NOTIFY_IMPORT_CLOSURE), set(CLI.STAMPED_FILES))   # and each is stamped
+
+    def test_any_mismatched_module_of_the_import_closure_blocks_the_notify_import(self):
+        self.enable()
+        calls = []
+        with mock.patch.dict(sys.modules, {"questions_mcp_lib": self.poison(calls)}):
+            for name in CLI.NOTIFY_IMPORT_CLOSURE:
+                with self.subTest(mismatched=name):
+                    st = self.state()
+                    st["alarms"], st["notify_failures"] = {}, []
+                    self.save(st)
+                    self.assertEqual(self.mismatch_at(0, ["amux_spawn_lib.py", name]), 1)
+                    self.assertEqual(calls, [])                          # the notify path was not imported or called
+                    st = self.state()
+                    self.assertIn("not sent", st["alarms"]["stamp_mismatch:run"]["last_error"])
+                    self.assertIn("not sent", st["notify_failures"][-1]["error"])
+
+    def test_only_modules_outside_the_closure_mismatched_still_notifies(self):
+        self.enable()
+        calls = []
+        outside = [n for n in CLI.STAMPED_FILES if n not in CLI.NOTIFY_IMPORT_CLOSURE]
+        self.assertIn("amux_spawn_lib.py", outside)
+        with mock.patch.dict(sys.modules, {"questions_mcp_lib": self.poison(calls)}):
+            self.assertEqual(self.mismatch_at(0, outside), 1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][1]["ack"])
+
+    def test_a_mismatched_questions_mcp_lib_is_never_imported(self):
+        self.enable()
+        calls = []
+        with mock.patch.dict(sys.modules, {"questions_mcp_lib": self.poison(calls)}):
+            for mismatched in (["questions_mcp_lib.py"], ["amux_spawn_lib.py", "questions_mcp_lib.py"], None):
+                with self.subTest(mismatched=mismatched):
+                    st = self.state()
+                    st["alarms"], st["notify_failures"] = {}, []        # a fresh episode
+                    self.save(st)
+                    self.assertEqual(self.mismatch_at(0, mismatched), 1)
+                    self.assertEqual(calls, [])
+                    st = self.state()
+                    self.assertIn("questions_mcp_lib.py", st["notify_failures"][-1]["error"])
+                    self.assertIn("not sent", st["alarms"]["stamp_mismatch:run"]["last_error"])
+                    log = self.rp.notify_log.read_text()
+                    self.assertIn("alarm stamp_mismatch:run", log)
+                    self.assertIn("dispatched=no", log)
+                    rc, out, err = self.cli("status")
+                    self.assertIn("not sent", out)                   # `status` shows it
+
+
+# -- the tmux server (§21.1, P0-5) -------------------------------------------------------
+
+class TestTmuxServer(_Tick):
+    def test_no_server_starts_one_in_its_own_scope_with_the_snapshot_environment(self):
+        self.enable()
+        self.world.server_pid = None
+        edl.write_env_snapshot(self.rp, {"PATH": "/usr/local/go/bin:/home/x/.cargo/bin:/usr/bin", "GOPATH": "/g"})
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(len(self.world.runs), 1)
+        args, env = self.world.runs[0]
+        self.assertEqual(args, ["--user", "--scope", "--unit=epic-driver-tmux", "tmux", "new-session", "-d", "-s",
+                                "epic-driver-keepalive"])
+        self.assertEqual(env["PATH"], "/usr/local/go/bin:/home/x/.cargo/bin:/usr/bin")   # over the service's
+        self.assertEqual((env["GOPATH"], env["HOME"]), ("/g", str(self.tmp)))
+        self.assertEqual(self.active_alarms(), [])
+        self.assertEqual(len(self.world.spawns), 1)               # then the spawn went into that server
+        self.assertIn("started the tmux server (pid 20001) in epic-driver-tmux.scope", self.rp.tick_log.read_text())
+
+    def test_a_failed_start_raises_tmux_server_and_nothing_is_launched(self):
+        self.enable()
+        self.world.server_pid = None
+        self.world.run_lands_in = None
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), ["tmux_server:run"])
+        self.assertIn("no tmux server, and starting it failed: Failed to start transient scope",
+                      self.state()["alarms"]["tmux_server:run"]["detail"])
+        self.assertEqual((self.world.spawns, self.world.sends), ([], []))
+        self.assertEqual(self.state()["steps"]["A"]["status"], "due")
+        # the start works on a later pass: the alarm clears and the step goes
+        self.world.run_lands_in = OWN_CG
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+        self.assertEqual(len(self.world.spawns), 1)
+
+    def test_a_started_server_outside_its_scope_raises_tmux_server(self):
+        self.enable()
+        self.world.server_pid = None
+        self.world.run_lands_in = SERVICE_CG
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), ["tmux_server:run"])
+        self.assertIn("started, but it runs in claude-epic-driver.service",
+                      self.state()["alarms"]["tmux_server:run"]["detail"])
+
+    def test_the_tick_raises_tmux_server_for_a_server_in_a_terminal_scope_and_never_moves_it(self):
+        self.enable()
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        self.world.cgroups[16651] = TERM_CG
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), ["tmux_server:run"])
+        self.assertIn("ptyxis-spawn-5916.scope (pid 16651)", self.state()["alarms"]["tmux_server:run"]["detail"])
+        self.assertEqual((self.world.busctl_calls, self.world.runs), ([], []))
+        self.assertEqual(len(self.world.spawns), 1)               # a server exists: amux starts none
+        # enable moved it: the alarm clears
+        self.world.cgroups[16651] = OWN_CG
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+
+    def test_paused_no_server_is_not_started_and_not_an_alarm(self):
+        self.enable()
+        self.world.server_pid = None
+        self.assertEqual(self.cli("pause", "--reason", "lunch")[0], 0)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual((self.world.runs, self.world.spawns), ([], []))
+        self.assertEqual(self.active_alarms(), [])
+
+    def test_cgroup_scope(self):
+        self.assertEqual(edl.cgroup_scope(OWN_CG), "epic-driver-tmux.scope")
+        self.assertEqual(edl.cgroup_scope("12:pids:/x\n1:name=systemd:/a/b/ptyxis.scope\n"), "ptyxis.scope")
+        self.assertIsNone(edl.cgroup_scope(None))
+        self.assertIsNone(edl.cgroup_scope("0::/\n"))
+
+    def test_the_move_commands(self):
+        self.assertEqual(edl.start_scope_args(16651),
+                         ["call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+                          "org.freedesktop.systemd1.Manager", "StartTransientUnit", "ssa(sv)a(sa(sv))",
+                          "epic-driver-tmux.scope", "fail", "1", "PIDs", "au", "1", "16651", "0"])
+        self.assertEqual(edl.attach_scope_args(16651)[4:], ["AttachProcessesToUnit", "ssau", "epic-driver-tmux.scope",
+                                                            "/", "1", "16651"])
+        w = self.world
+        w.cgroups[16651] = TERM_CG
+        self.assertEqual(edl.move_tmux_server(w, 16651)[0], True)
+        self.assertEqual(w.busctl_calls[-1][4], "StartTransientUnit")    # the scope did not exist yet
+        w.cgroups[16651] = TERM_CG
+        self.assertTrue(edl.move_tmux_server(w, 16651)[0])
+        self.assertEqual(w.busctl_calls[-1][4], "AttachProcessesToUnit")  # now it does
+
+    def test_no_amux_effect_without_a_server(self):
+        """Never let an amux call start a server in the service's cgroup (§21.1): with no server,
+        the plan is paused, so not one spawn, resume, send, key or reap runs."""
+        self.enable([self.driver("A")])
+        self.world.server_pid = None
+        self.world.run_lands_in = None
+        st = self.state()
+        self.live(st)
+        st["sessions"]["driver"]["parked"] = [{"name": "ws-t-driver-g0", "since": self.NOW}]
+        self.save(st)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        w = self.world
+        self.assertEqual((w.spawns, w.resumes, w.sends, w.keys, w.reaps), ([], [], [], [], []))
+
+
+# -- the listener and the inhibitor (§12.10) ----------------------------------------------
+
+class TestInfrastructure(_Tick):
+    def test_one_start_attempt_each_then_the_alarm(self):
+        self.enable([])
+        w = self.world
+        w.units[edl.LISTENER_UNIT] = "inactive"
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertIn(["start", edl.LISTENER_UNIT], w.systemctl_calls)
+        self.assertEqual(self.active_alarms(), [])                 # the start worked
+        w.units[edl.LISTENER_UNIT] = "inactive"
+        w.units[edl.INHIBIT_UNIT] = "inactive"
+        w.start_fails = {edl.LISTENER_UNIT, edl.INHIBIT_UNIT}
+        w.systemctl_calls.clear()
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual([c for c in w.systemctl_calls if c[0] == "start"],
+                         [["start", edl.LISTENER_UNIT], ["start", edl.INHIBIT_UNIT]])
+        self.assertEqual(self.active_alarms(), ["inhibitor_down:run", "listener_down:run"])
+        st = self.state()
+        self.assertIn("after one start attempt (Job for", st["alarms"]["listener_down:run"]["detail"])
+        self.assertEqual([n["ack"] for n in w.alarm_notifies()], [True, True])
+        w.start_fails = set()
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+
+    def test_the_inhibitor_lock_is_verified_in_systemd_inhibit_list(self):
+        self.enable([])
+        self.world.inhibit_takes_lock = False
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), ["inhibitor_down:run"])
+        self.assertIn("not in systemd-inhibit --list", self.state()["alarms"]["inhibitor_down:run"]["detail"])
+        self.world.inhibit_takes_lock = True
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+
+    def test_inhibitor_lock_parser(self):
+        self.assertTrue(edl.inhibitor_lock_held(INHIBIT_HEAD + INHIBIT_LINE))
+        self.assertFalse(edl.inhibitor_lock_held(INHIBIT_HEAD))
+        self.assertFalse(edl.inhibitor_lock_held(INHIBIT_LINE.replace("block", "delay")))
+        self.assertFalse(edl.inhibitor_lock_held(INHIBIT_LINE.replace("sleep:idle", "sleep")))
+        self.assertFalse(edl.inhibitor_lock_held(None))
+
+
+# -- the alarm engine (§16.1, P0-8) ---------------------------------------------------------
+
+class _Engine(_Tick):
+    """run_alarms over a state, with a Notifier on TickWorld and a commit that records each state."""
+
+    def setUp(self):
+        super().setUp()
+        self.enable([self.driver("A"), self.driver("B", needs=["A"])])
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        self.st = self.state()
+        self.commits = []
+
+    def notifier(self, can_send=None):
+        return edl.Notifier(self.world, self.rp, self.st, workspace=str(self.ws), role=None, epic="t",
+                            can_send=can_send)
+
+    def commit(self, st):
+        self.commits.append(copy.deepcopy(st))
+
+    def alarms(self, conds, span_s=3600, notifier="default", ledger=None):
+        n = self.notifier() if notifier == "default" else notifier
+        return edl.run_alarms(self.st, conds, n, self.world.now(), commit=self.commit, ledger=ledger or self.L,
+                              span_s=span_s, index_ids=self.world.notify_index_ids)
+
+
+class TestAlarmEngine(_Engine):
+    C = edl.AlarmCondition("check_error", "A", "3 consecutive errors: exit 7")
+
+    def test_a_raise_is_one_ack_notify_with_the_text_of_16_1(self):
+        res = self.alarms([self.C])
+        self.assertEqual(res.raised, ["check_error:A"])
+        n = self.world.notifies
+        self.assertEqual(len(n), 1)
+        self.assertEqual(n[0]["text"], "[epic-driver t] ALARM check_error A: 3 consecutive errors: exit 7 — epic-driver status")
+        self.assertEqual((n[0]["ack"], n[0]["workspace_dir"]), (True, str(self.ws)))
+        rec = self.st["alarms"]["check_error:A"]
+        self.assertEqual((rec["sends"], rec["message_id"], rec["raised_at"]), (1, 9001, self.NOW))
+        self.assertEqual(rec["ladder_until"], "2026-11-24T11:00:00Z")
+        # invariant 5: the attempt is committed before the notify, the result after
+        self.assertEqual(self.commits[0]["alarms"]["check_error:A"]["last_attempt_at"], self.NOW)
+        self.assertIsNone(self.commits[0]["alarms"]["check_error:A"]["message_id"])
+        self.assertEqual(self.commits[1]["alarms"]["check_error:A"]["message_id"], 9001)
+        self.assertIn("alarm check_error:A ack=yes dispatched=yes message_id=9001", self.rp.notify_log.read_text())
+
+    def test_no_repeat_while_the_ladder_is_live_then_every_4h(self):
+        self.alarms([self.C], span_s=3600)
+        for minutes in (10, 59, 60, 4 * 60 + 59):           # the ladder (1 h), then 4 h after it ends
+            self.world.clock = T(self.NOW) + timedelta(minutes=minutes)
+            self.assertEqual(self.alarms([self.C]).repeated, [], minutes)
+        self.world.clock = T(self.NOW) + timedelta(hours=5)
+        res = self.alarms([self.C])
+        self.assertEqual(res.repeated, ["check_error:A"])
+        self.assertEqual(len(self.world.notifies), 2)
+        self.assertTrue(self.world.notifies[1]["ack"])         # each repeat a new ack=True notify
+        self.assertEqual(self.st["alarms"]["check_error:A"]["sends"], 2)
+        self.world.clock = T(self.NOW) + timedelta(hours=9, minutes=59)
+        self.assertEqual(self.alarms([self.C]).repeated, [])
+        self.world.clock = T(self.NOW) + timedelta(hours=10)
+        self.assertEqual(self.alarms([self.C]).repeated, ["check_error:A"])
+
+    def test_a_long_ladder_holds_the_repeat_until_it_ends(self):
+        span = edl.nudge_span_s("4h,1d,3d,7d*")
+        self.assertEqual(span, (4 + 24 + 72 + 168) * 3600)
+        self.alarms([self.C], span_s=span)
+        self.world.clock = T(self.NOW) + timedelta(seconds=span + 4 * 3600 - 1)
+        self.assertEqual(self.alarms([self.C], span_s=span).repeated, [])
+        self.world.clock = T(self.NOW) + timedelta(seconds=span + 4 * 3600)
+        self.assertEqual(self.alarms([self.C], span_s=span).repeated, ["check_error:A"])
+
+    def test_a_message_gone_from_the_index_lets_the_4h_rule_alone_decide(self):
+        self.alarms([self.C], span_s=24 * 3600)
+        self.world.index.clear()
+        self.world.clock = T(self.NOW) + timedelta(hours=4)
+        self.assertEqual(self.alarms([self.C]).repeated, ["check_error:A"])
+
+    def test_ladder_live(self):
+        rec = {"message_id": 5, "ladder_until": "2026-11-24T11:00:00Z"}
+        self.assertTrue(edl.ladder_live(rec, {"5"}, T("2026-11-24T10:59:59Z")))
+        self.assertFalse(edl.ladder_live(rec, {"5"}, T("2026-11-24T11:00:00Z")))
+        self.assertFalse(edl.ladder_live(rec, {"6"}, T("2026-11-24T10:00:00Z")))
+        self.assertTrue(edl.ladder_live(rec, None, T("2026-11-24T10:00:00Z")))      # unreadable index: span
+        self.assertFalse(edl.ladder_live({"message_id": None}, {"5"}, T("2026-11-24T10:00:00Z")))
+
+    def test_a_failed_notify_lands_in_the_log_and_status_and_is_not_retried_in_a_loop(self):
+        self.world.notify_ok = False
+        res = self.alarms([self.C])
+        self.assertEqual(res.failed, ["check_error:A"])
+        rec = self.st["alarms"]["check_error:A"]
+        self.assertEqual(rec["last_error"], "Relay send failed: relay down")
+        self.assertEqual(self.st["notify_failures"][-1]["what"], "alarm check_error:A")
+        self.assertIn("dispatched=no message_id=None error=Relay send failed: relay down",
+                      self.rp.notify_log.read_text())
+        for minutes in (10, 20, 239):
+            self.world.clock = T(self.NOW) + timedelta(minutes=minutes)
+            self.alarms([self.C])
+        self.assertEqual(len(self.world.notifies), 1)          # the next repeat time retries, not the next pass
+        self.world.clock = T(self.NOW) + timedelta(hours=4)
+        self.world.notify_ok = True
+        self.assertEqual(self.alarms([self.C]).repeated, ["check_error:A"])
+        # status shows the failure and the alarm's notify error
+        self.save(self.st)
+        rc, out, err = self.cli("status")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("NOTIFY FAILURES (last 3)\n  2026-11-24T10:00:00Z alarm check_error:A: Relay send failed: relay down",
+                      out)
+
+    def test_notify_failures_keep_the_last_20(self):
+        self.world.notify_ok = False
+        for i in range(25):
+            self.alarms([edl.AlarmCondition("orphan_session", f"n{i}")])
+        self.assertEqual(len(self.st["notify_failures"]), 20)
+        self.assertEqual(self.st["notify_failures"][0]["what"], "alarm orphan_session:n5")
+
+    def test_a_clear_sends_nothing_and_keeps_the_record(self):
+        self.alarms([self.C])
+        self.world.clock = T(self.NOW) + timedelta(minutes=10)
+        res = self.alarms([])
+        self.assertEqual(res.cleared, ["check_error:A"])
+        rec = self.st["alarms"]["check_error:A"]
+        self.assertEqual((rec["cleared_at"], rec["cleared_by"]), ("2026-11-24T10:10:00Z", "condition"))
+        self.assertEqual(len(self.world.notifies), 1)
+        # raised again later: a fresh record and a fresh notify
+        self.world.clock = T(self.NOW) + timedelta(minutes=20)
+        self.assertEqual(self.alarms([self.C]).raised, ["check_error:A"])
+        self.assertEqual(self.st["alarms"]["check_error:A"]["raised_at"], "2026-11-24T10:20:00Z")
+
+    def test_no_time_left_defers_the_notify_to_the_next_pass(self):
+        res = self.alarms([self.C], notifier=self.notifier(can_send=lambda: False))
+        self.assertEqual((res.raised, res.deferred), (["check_error:A"], ["check_error:A"]))
+        self.assertIsNone(self.st["alarms"]["check_error:A"]["last_attempt_at"])
+        self.assertEqual(self.world.notifies, [])
+        res = self.alarms([self.C])
+        self.assertEqual(res.repeated, ["check_error:A"])      # never attempted: due at once
+        self.assertEqual(len(self.world.notifies), 1)
+
+    def test_a_pass_killed_between_the_attempt_and_its_result_never_sends_twice(self):
+        def boom(text, **kw):
+            raise Killed()
+        with mock.patch.object(self.world, "notify", side_effect=boom):
+            with self.assertRaises(Killed):
+                self.alarms([self.C])
+        self.st = copy.deepcopy(self.commits[-1])               # what the killed pass left on disk
+        self.world.clock = T(self.NOW) + timedelta(minutes=10)
+        self.assertEqual(self.alarms([self.C]).repeated, [])
+        self.assertEqual(self.world.notifies, [])
+
+    def test_alarm_cleared_items_for_a_driver_step_in_flight(self):
+        self.st["steps"]["A"]["status"] = "inflight"
+        self.alarms([self.C, edl.AlarmCondition("check_error", "B"), edl.AlarmCondition("halt", "A")])
+        self.world.clock = T(self.NOW) + timedelta(minutes=10)
+        self.alarms([])
+        self.assertEqual(self.st["alarm_cleared_pending"], [
+            {"alarm": "check_error", "subject": "A", "detail": "cleared: 3 consecutive errors: exit 7",
+             "cleared_at": "2026-11-24T10:10:00Z"}])               # B is pending; a halt clears on a verdict
+        items = edl.take_alarm_cleared_items(self.st)
+        self.assertEqual([(i.kind, i.to, i.step, i.data["alarm"]) for i in items],
+                         [("alarm_cleared", "driver", "A", "check_error")])
+
+    def test_the_alarm_cleared_item_reaches_the_driver_in_the_next_pass(self):
+        st = self.state()
+        self.live(st)
+        st["steps"]["A"].update(status="verifying", advanced_at=self.NOW)
+        st["alarm_cleared_pending"] = [{"alarm": "check_error", "subject": "A", "detail": "cleared", "cleared_at": self.NOW}]
+        self.save(st)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        st = self.state()
+        self.assertEqual(st["alarm_cleared_pending"], [])
+        entry = st["outbox"][-1]
+        self.assertEqual(entry["kinds"], ["alarm_cleared"])
+        self.assertIn("alarm_cleared — check_error A", (self.rp.events / f"{entry['event']}.md").read_text())
+
+    def test_mark_clears_a_still_true_condition_until_it_has_gone_once(self):
+        cond = edl.AlarmCondition("deadline_missed", "A", "deadline passed")
+        self.alarms([cond])
+        cleared = edl.clear_alarms_by_mark(self.st, ["A"], self.world.now())
+        self.assertEqual(cleared, ["deadline_missed:A"])
+        for minutes in (10, 20):
+            self.world.clock = T(self.NOW) + timedelta(minutes=minutes)
+            self.assertEqual(self.alarms([cond]).raised, [])
+        self.alarms([])                                         # the condition went (the step was done)
+        self.world.clock = T(self.NOW) + timedelta(minutes=30)
+        self.assertEqual(self.alarms([cond]).raised, ["deadline_missed:A"])   # a new occurrence missed it
+        self.assertEqual(len(self.world.notifies), 2)
+
+
+# -- the §16.2 catalogue: every id raised and cleared through the engine --------------------
+
+def _arch_catalogue_ids():
+    text = ARCHITECTURE.read_text(encoding="utf-8")
+    block = text[text.index("### 16.2 Catalogue"):text.index("### 16.3")]
+    return [m.group(1) for m in re.finditer(r"^\| `([a-z_]+)` \|", block, re.M)]
+
+
+class TestAlarmCatalogue(_Engine):
+    """Each row of §16.2: its producer's condition raised through the engine, then cleared."""
+
+    def test_the_catalogue_is_the_architectures(self):
+        self.assertEqual(list(edl.ALARM_IDS), _arch_catalogue_ids())
+        self.assertEqual(len(edl.ALARM_IDS), 29)
+
+    def cycle(self, key, produce, make_true, make_false):
+        """``produce(st, now)`` → conditions; ``make_true``/``make_false`` change the state."""
+        make_true(self.st)
+        res = self.alarms(produce(self.st, self.world.now()))
+        self.assertIn(key, res.raised, key)
+        self.world.advance(600)
+        make_false(self.st)
+        res = self.alarms(produce(self.st, self.world.now()))
+        rec = self.st["alarms"][key]
+        self.assertTrue(key in res.cleared or rec.get("cleared_by") == "mark", key)   # by its condition, or by mark
+        self.assertIsNotNone(rec["cleared_at"], key)
+        self.assertNotIn(key, res.raised, key)
+
+    def steps(self, st, now, sel=None):
+        return edl.step_alarm_conditions(self.L, st, now, sel)
+
+    def test_step_rows(self):
+        L = self.L
+
+        def rec(st, sid="A"):
+            return st["steps"][sid]
+        with self.subTest("step_timeout"):   # cleared by a verdict
+            self.cycle("step_timeout:A", self.steps,
+                       lambda st: rec(st).update(status="inflight", started_at="2026-11-24T03:00:00Z"),
+                       lambda st: rec(st).update(status="verifying", advanced_at=self.NOW))
+        with self.subTest("attempts_exhausted"):   # cleared by mark reset
+            def reset(st):
+                out = edl.mark_reset(L, st, "A", self.world.now())
+                edl.clear_alarms_by_mark(st, ["A"], self.world.now(), keys=out["cleared_alarms"])
+            self.cycle("attempts_exhausted:A", self.steps, lambda st: rec(st).update(status="failed", attempts=3), reset)
+        with self.subTest("check_error"):   # cleared by a run returning 0, 1 or 2
+            def errors(st):
+                rec(st).update(status="verifying", advanced_at=self.NOW)
+                rec(st)["check"].update(consecutive_errors=3, last_error="exit 7")
+            job = edl.CheckJob("A", edl.KIND_CHECK, "true", 60)
+            self.cycle("check_error:A", self.steps, errors, lambda st: edl.apply_check_result(
+                L, st, job, edl.CheckRun(rc=1, started_at=self.world.now(), duration_s=1), self.world.now()))
+        with self.subTest("halt"):   # cleared by a later verdict
+            self.cycle("halt:A", self.steps, lambda st: rec(st).update(status="halted", last_verdict={"line": "HALT: x"}),
+                       lambda st: rec(st).update(status="verifying"))
+        with self.subTest("due_not_started"):   # cleared on dispatch
+            def due(st):
+                rec(st).update(status="due", due_since=self.NOW, undispatched_ticks=2)
+            def prod(st, now):
+                return self.steps(st, now, edl.Selection(due=[edl.DueStep("A", T(self.NOW), 0, "due")],
+                                                         held={"A": [edl.Hold(edl.HOLD_RESOURCES, "busy")]}))
+            self.cycle("due_not_started:A", prod, due, lambda st: rec(st).update(status="inflight", undispatched_ticks=0))
+
+    def test_deadline_rows(self):
+        self.enable([self.driver("A", not_after="2026-11-25T00:00:00Z", warn_before="1d")])
+        self.st = self.state()
+        self.world.clock = T("2026-11-24T00:00:00Z")
+        res = self.alarms(self.steps(self.st, self.world.now()))
+        self.assertEqual(res.raised, ["deadline_near:A"])
+        self.world.clock = T("2026-11-25T00:00:00Z")
+        res = self.alarms(self.steps(self.st, self.world.now()))
+        self.assertEqual((res.raised, res.cleared), (["deadline_missed:A"], ["deadline_near:A"]))
+        edl.mark_done(self.L, self.st, "A", self.world.now())
+        res = self.alarms(self.steps(self.st, self.world.now()))
+        self.assertEqual(res.cleared, ["deadline_missed:A"])     # done
+        # deadline_near cleared by the step getting done before the deadline
+        self.st = self.state()
+        self.world.clock = T("2026-11-24T00:00:00Z")
+        self.assertEqual(self.alarms(self.steps(self.st, self.world.now())).raised, ["deadline_near:A"])
+        self.st["steps"]["A"].update(status="done", done_at="2026-11-24T06:00:00Z", by="check")
+        self.world.clock = T("2026-11-24T06:00:00Z")
+        self.assertEqual(self.alarms(self.steps(self.st, self.world.now())).cleared, ["deadline_near:A"])
+
+    def test_dispatch_rows(self):
+        def disp(st, now):
+            return edl.dispatch_conditions(self.L, st, now)
+        entry = {"event": "E-5", "to": "driver", "session": "ws-t-driver-g1", "kinds": ["step_due"], "steps": ["A"],
+                 "sends": [], "deferrals": 3, "confirmed_at": None, "verdict": None}
+        with self.subTest("delivery_deferred"):
+            self.cycle("delivery_deferred:E-5", disp, lambda st: st["outbox"].append(copy.deepcopy(entry)),
+                       lambda st: st["outbox"][0].update(sends=[self.NOW], confirmed_at=self.NOW))
+        self.st["outbox"] = []
+        with self.subTest("delivery_unconfirmed"):
+            self.cycle("delivery_unconfirmed:E-5", disp,
+                       lambda st: st["outbox"].append(dict(entry, deferrals=0, sends=["a", "b"], unconfirmed_at=self.NOW)),
+                       lambda st: st["outbox"][0].update(confirmed_at=self.NOW))
+        self.st["sessions"]["driver"] = {"name": "ws-t-driver-g1", "gen": 1, "status": "live", "parked": []}
+        with self.subTest("handoff_timeout"):
+            self.cycle("handoff_timeout:ws-t-driver-g1", disp,
+                       lambda st: st["sessions"]["driver"].update(handoff_timeout={"at": self.NOW, "event": "E-6"}),
+                       lambda st: st["sessions"]["driver"].update(name="ws-t-driver-g2", handoff_timeout=None))
+        self.st["sessions"]["driver"] = {"name": "ws-t-driver-g1", "gen": 1, "status": "live", "parked": []}
+        for alarm, via in (("spawn_failed", "spawn"), ("resume_failed", "resume")):
+            with self.subTest(alarm):
+                self.cycle(f"{alarm}:ws-t-driver-g1", disp,
+                           lambda st, v=via: st["sessions"]["driver"].update(
+                               launch_error={"kind": v, "at": self.NOW, "reason": "failed", "error": "rc 1"}),
+                           lambda st: st["sessions"]["driver"].update(launch_error=None))
+
+    def test_worktree_refused(self):
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        roles = {r: {"model": "claude-opus-5-5", "effort": "high"} for r in ("driver", "impl", "rev")}
+        self.enable([self.step("W", role={"worker": {"implementer": "impl", "reviewer": "rev", "repos": [
+            {"path": str(repo), "base_ref": "main"}]}}), self.driver("A")], roles=roles)
+        self.st = self.state()
+
+        def prod(st, now):
+            return edl.worktree_conditions(self.L, st)
+        self.cycle("worktree_refused:W", prod,
+                   lambda st: st.setdefault("worktrees", {}).setdefault("steps", {}).update(
+                       {"W": {"dir": None, "repos": {}, "branch": None, "refused": "base main does not resolve"}}),
+                   lambda st: st["worktrees"]["steps"]["W"].update(refused=None, dir=str(self.tmp / "wt")))
+
+    def test_run_rows_are_raised_and_cleared_by_real_passes(self):
+        # tick_error, stamp_mismatch, tmux_server, listener_down and inhibitor_down are cycled by
+        # TestTickCrash, TestStamps, TestTmuxServer and TestInfrastructure; ledger_invalid here.
+        self.st = None
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        good = Path(self.lpath).read_text()
+        Path(self.lpath).write_text(good.replace("version: 1", "version: 2"))
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertEqual(self.active_alarms(st), ["ledger_invalid:run"])
+        self.assertIn("version: must be 1, got 2; running on ledger.last_valid.yaml",
+                      st["alarms"]["ledger_invalid:run"]["detail"])
+        self.assertEqual(self.rp.last_valid_ledger.read_text(), good)       # the copy is the last valid one
+        Path(self.lpath).write_text(good)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+
+    def test_an_invalid_ledger_without_a_valid_copy_is_a_tick_error(self):
+        os.unlink(self.rp.last_valid_ledger)
+        Path(self.lpath).write_text("version: 2\n")
+        self.assertEqual(self.run_pass(), 1)
+        self.assertEqual(self.active_alarms(), ["tick_error:run"])
+        self.assertIn("no valid copy exists", self.state()["last_tick_error"]["error"])
+
+
+# -- enable (§18.1) ----------------------------------------------------------------------
+
+class TestEnable(_Tick):
+    def setUp(self):
+        super().setUp()
+        self.lpath = self.write(self.ledger_dict([self.driver("A")]))
+        self.paths = edl.run_paths("epic-t")
+        # `enable` refuses while EPIC_DRIVER_ALLOW_UNSTAMPED is set (gate 2), so these runs have stamps that
+        # agree (a fake manifest check) instead of the override.
+        self.env.pop(CLI.ALLOW_UNSTAMPED_ENV, None)
+        self.stamps_patch = mock.patch.object(
+            CLI, "check_stamps", side_effect=lambda lay, environ: {
+                "checked": True, "ok": True, "problem": None, "revision": "t", "files": [],
+                "override_env": bool(environ.get(CLI.ALLOW_UNSTAMPED_ENV))})
+        self.stamps_patch.start()
+        self.addCleanup(mock.patch.stopall)
+        self.env.update({"PATH": "/home/x/.cargo/bin:/usr/local/go/bin:/usr/bin", "GOPATH": "/home/x/go",
+                         "NVM_DIR": "/home/x/.nvm", "NVM_BIN": "/home/x/.nvm/v22/bin", "NVM_AUTH_TOKEN": "secret",
+                         "SSH_AUTH_SOCK": "/run/user/1000/ssh", "VIRTUAL_ENV": "/venv", "EDITOR": "vim",
+                         "ANTHROPIC_API_KEY": "sk-x"})
+
+    def enable_cli(self, stamps_env=None):
+        return self.cli("enable", self.lpath, environ=stamps_env)
+
+    def assertNothingEnabled(self):
+        self.assertNotIn("enable", [c[0] for c in self.world.systemctl_calls])
+        self.assertNotEqual(self.world.units.get(edl.TIMER_UNIT), "active")
+        self.assertIsNone(edl.read_active())
+
+    def test_all_gates_pass(self):
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 0, err)
+        w = self.world
+        self.assertIn(["enable", "--now", edl.TIMER_UNIT, edl.INHIBIT_UNIT], w.systemctl_calls)
+        self.assertEqual(w.units[edl.TIMER_UNIT], "active")
+        active = edl.read_active()
+        self.assertEqual({k: active[k] for k in ("run_id", "ledger", "state_dir", "workspace", "epic")},
+                         {"run_id": "epic-t", "ledger": self.lpath, "state_dir": str(self.paths.dir),
+                          "workspace": str(self.ws), "epic": "t"})
+        self.assertEqual(json.loads((self.plan / "epic-driver.run.json").read_text()),
+                         {"run_id": "epic-t", "state_dir": str(self.paths.dir)})
+        self.assertEqual(edl.load_state(self.paths.state)["run_id"], "epic-t")
+        self.assertEqual(self.paths.last_valid_ledger.read_text(), Path(self.lpath).read_text())
+        snap = json.loads(self.paths.env_snapshot.read_text())
+        self.assertEqual(snap, {"PATH": "/home/x/.cargo/bin:/usr/local/go/bin:/usr/bin", "GOPATH": "/home/x/go",
+                                "NVM_DIR": "/home/x/.nvm", "NVM_BIN": "/home/x/.nvm/v22/bin", "EDITOR": "vim",
+                                "LANG": "C.UTF-8"})
+        self.assertEqual([(n["text"], n["ack"]) for n in w.notifies],
+                         [("[epic-driver t] test notify from epic-driver enable (no action needed)", False),
+                          ("[epic-driver t] epic-driver on for t", False)])
+        self.assertIn("on for t", out)
+        # enabling again (the same ledger) keeps the state
+        st = edl.load_state(self.paths.state)
+        st["tick_seq"] = 7
+        edl.save_state(self.paths.state, st)
+        self.assertEqual(self.enable_cli()[0], 0)
+        self.assertEqual(edl.load_state(self.paths.state)["tick_seq"], 7)
+
+    def gate_fails(self, n, text, setup, env=None):
+        setup()
+        before = edl.read_active()
+        rc, out, err = self.enable_cli(env)
+        self.assertEqual(rc, 3, (out, err))
+        self.assertIn(f"refused: gate {n} ", err)
+        self.assertIn(text, err)
+        self.assertIn("fix:", err)
+        # the pointer file (the one write into the tracked tree) is not left behind by a refusal
+        self.assertFalse((self.plan / "epic-driver.run.json").exists(), f"gate {n}: pointer file left behind")
+        if n == 10:      # enabled, then rolled back
+            self.assertEqual(self.world.units[edl.TIMER_UNIT], "inactive")
+            self.assertIsNone(edl.read_active())
+        elif n == 1:     # the other run stays as it was
+            self.assertEqual(edl.read_active(), before)
+            self.assertNotIn("enable", [c[0] for c in self.world.systemctl_calls])
+        else:
+            self.assertNothingEnabled()
+
+    def test_each_gate_failing_in_turn_refuses_and_leaves_no_timer_enabled(self):
+        w = self.world
+        cases = [
+            (1, "run epic-other", lambda: edl.write_active({"run_id": "epic-other", "ledger": "/x/other.yaml"})),
+            (3, "version: must be 1", lambda: Path(self.lpath).write_text(Path(self.lpath).read_text().replace(
+                "version: 1", "version: 9"))),
+            (4, "claude-questions-listen.service is not active", lambda: w.units.update({edl.LISTENER_UNIT: "inactive"})),
+            (5, "no [questions] section", lambda: setattr(w, "settings", None)),
+            (5, "claude-questions --check", lambda: setattr(w, "qcheck", edl.CommandResult(rc=2, stdout="not bound"))),
+            (5, 'sync = "push"', lambda: setattr(w, "settings", {"nudge": "1h", "sync": "push"})),
+            (6, "Relay send failed: relay down", lambda: setattr(w, "notify_ok", False)),
+            (7, "could not be moved into epic-driver-tmux.scope (Call failed: Access denied)",
+             lambda: (w.cgroups.update({16651: TERM_CG}), setattr(w, "busctl_moves", False))),
+            (10, "systemctl --user enable --now failed", lambda: setattr(w, "enable_fails", True)),
+            (10, "no sleep:idle block lock", lambda: setattr(w, "inhibit_takes_lock", False)),
+        ]
+        good = Path(self.lpath).read_text()
+        for n, text, setup in cases:
+            with self.subTest(gate=n, text=text):
+                fresh = TickWorld(self.tdir, now=T(self.NOW))
+                self.world = w = fresh
+                Path(self.lpath).write_text(good)
+                edl.remove_active()
+                self.gate_fails(n, text, setup)
+                if n == 10:
+                    self.assertIn(["disable", "--now", edl.TIMER_UNIT, edl.INHIBIT_UNIT], w.systemctl_calls)
+                    self.assertEqual(w.units[edl.INHIBIT_UNIT], "inactive")     # rolled back
+        with self.subTest(gate=2):
+            self.world = TickWorld(self.tdir, now=T(self.NOW))
+            edl.remove_active()
+            env = {k: v for k, v in self.env.items() if k != CLI.ALLOW_UNSTAMPED_ENV}
+            self.stamps_patch.stop()                      # the real check: no manifest in a repo run
+            try:
+                rc, out, err = self.enable_cli(env)
+            finally:
+                self.stamps_patch.start()
+            self.assertEqual(rc, 3)
+            self.assertIn("stamp_mismatch", err)          # the CLI refuses before the lib is imported
+            self.assertNothingEnabled()
+            out2, err2 = io.StringIO(), io.StringIO()
+            ns = CLI.parse(["enable", self.lpath])
+            self.assertEqual(edl.cli(ns, self.world, {"checked": True, "ok": False, "problem": "x changed"},
+                                     environ=env, out=out2, err=err2), 3)
+            self.assertIn("refused: gate 2 (stamps): x changed", err2.getvalue())
+
+    def test_a_server_in_a_terminal_scope_is_moved(self):
+        self.world.cgroups[16651] = TERM_CG
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.world.busctl_calls[0][4], "StartTransientUnit")
+        self.assertEqual(self.world.cgroups[16651], OWN_CG)
+        self.assertIn("moved the tmux server (pid 16651) into epic-driver-tmux.scope", out)
+
+    def test_the_move_refusal_prints_instructions(self):
+        self.world.cgroups[16651] = TERM_CG
+        self.world.busctl_moves = False
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3)
+        self.assertIn("tmux kill-server", err)
+        self.assertIn("busctl --user call org.freedesktop.systemd1", err)
+
+    def pointer(self):
+        return self.plan / "epic-driver.run.json"
+
+    def test_gate_8_the_snapshot_cannot_be_written(self):
+        with mock.patch.object(edl, "write_env_snapshot", side_effect=OSError("No space left on device")):
+            rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("refused: gate 8 (environment snapshot): cannot write it: No space left on device", err)
+        self.assertNothingEnabled()
+        self.assertFalse(self.pointer().exists())
+
+    def test_gate_9_an_unreadable_state_refuses(self):
+        self.paths.dir.mkdir(parents=True, exist_ok=True)
+        self.paths.state.write_text("{ this is not json")
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("refused: gate 9 (state)", err)
+        self.assertNothingEnabled()
+        self.assertFalse(self.pointer().exists())
+
+    def test_gate_10_removes_the_pointer_file_this_run_created(self):
+        self.world.enable_fails = True
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3, err)
+        self.assertIn("refused: gate 10 ", err)
+        self.assertNotEqual(self.world.units.get(edl.TIMER_UNIT), "active")
+        self.assertIsNone(edl.read_active())
+        self.assertFalse(self.pointer().exists())               # created by this run: removed again
+        self.assertTrue(self.paths.state.exists())              # state-dir files may stay
+
+    def test_gate_10_inhibitor_rollback_also_removes_it(self):
+        self.world.inhibit_takes_lock = False
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(self.world.units[edl.TIMER_UNIT], "inactive")
+        self.assertFalse(self.pointer().exists())
+
+    def test_gate_10_leaves_a_pointer_file_that_was_already_there(self):
+        self.pointer().write_text('{"run_id": "older"}\n')
+        self.world.enable_fails = True
+        rc, out, err = self.enable_cli()
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(self.pointer().read_bytes(), b'{"run_id": "older"}\n')   # restored byte for byte
+
+    def test_a_refusal_restores_a_pre_existing_pointer_byte_for_byte_and_its_mode(self):
+        """Gate 9 overwrites the pointer with this run's body; a later refusal puts the old bytes back
+        (not valid JSON, no trailing newline, a non-default mode), for both gate 10 refusals."""
+        prior = b'not json \xff\xfe, no newline'
+        for fail in ("units", "inhibitor"):
+            with self.subTest(fail=fail):
+                self.pointer().write_bytes(prior)
+                os.chmod(self.pointer(), 0o640)
+                self.world.enable_fails = fail == "units"
+                self.world.inhibit_takes_lock = fail != "inhibitor"
+                rc, out, err = self.enable_cli()
+                self.assertEqual(rc, 3, err)
+                self.assertIn("refused: gate 10 ", err)
+                self.assertEqual(self.pointer().read_bytes(), prior)
+                self.assertEqual(self.pointer().stat().st_mode & 0o777, 0o640)
+                self.assertEqual([p.name for p in self.plan.iterdir() if p.name.endswith(".tmp")], [])
+        self.pointer().unlink()
+
+    def test_a_refusal_without_a_prior_pointer_removes_the_file_it_wrote(self):
+        self.assertFalse(self.pointer().exists())
+        self.world.enable_fails = True
+        self.assertEqual(self.enable_cli()[0], 3)
+        self.assertFalse(self.pointer().exists())
+
+    def test_gate_2_refuses_while_the_test_override_is_set(self):
+        for how in ("cli", "lib"):
+            with self.subTest(how=how):
+                env = dict(self.env, **{CLI.ALLOW_UNSTAMPED_ENV: "1"})
+                if how == "cli":
+                    rc, out, err = self.enable_cli(env)
+                else:
+                    err_io = io.StringIO()
+                    rc = edl.cli(CLI.parse(["enable", self.lpath]), self.world,
+                                 {"checked": False, "ok": True, "problem": None, "revision": None},
+                                 environ=env, out=io.StringIO(), err=err_io)
+                    err = err_io.getvalue()
+                self.assertEqual(rc, 3, err)
+                self.assertIn("refused: gate 2 (stamps): EPIC_DRIVER_ALLOW_UNSTAMPED is set", err)
+                self.assertIn("fix: unset EPIC_DRIVER_ALLOW_UNSTAMPED", err)
+                self.assertNothingEnabled()
+                self.assertFalse(self.pointer().exists())
+
+
+# -- disable, pause/resume, mark, grant, queue (§18) ----------------------------------------
+
+class TestVerbs(_Tick):
+    def test_disable_stops_both_units_keeps_sessions_and_state_and_notifies_once(self):
+        self.enable()
+        st = self.state()
+        self.live(st)
+        self.save(st)
+        self.world.units[edl.TIMER_UNIT] = "active"
+        rc, out, err = self.cli("disable")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.world.systemctl_calls, [["disable", "--now", edl.TIMER_UNIT, edl.INHIBIT_UNIT]])
+        self.assertIsNone(edl.read_active())
+        self.assertEqual(self.state()["sessions"]["driver"]["name"], "ws-t-driver-g1")
+        self.assertEqual((self.world.reaps, self.world.sends), ([], []))
+        self.assertEqual([(n["text"], n["ack"]) for n in self.world.notifies], [("[epic-driver t] epic-driver off for t", False)])
+        self.assertEqual(self.run_pass(), 0)                    # a stray tick after disable does nothing
+        self.assertIn("no active run", self.last_out)
+        self.assertEqual(self.cli("disable")[0], 0)
+
+    def test_pause_starts_nothing_but_the_tick_still_watches_and_alarms(self):
+        self.enable([self.driver("A", check="true")])
+        rc, out, err = self.cli("pause", "--reason", "deploy freeze")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(self.rp.paused.read_text())["reason"], "deploy freeze")
+        self.world.units[edl.LISTENER_UNIT] = "inactive"
+        self.world.start_fails = {edl.LISTENER_UNIT}
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.world.spawns, [])
+        self.assertEqual(self.active_alarms(), ["listener_down:run"])
+        self.assertEqual(self.state()["steps"]["A"]["status"], "due")
+        self.assertIn("PAUSED since", self.cli("status")[1])
+        self.assertEqual(self.cli("resume")[0], 0)
+        self.assertFalse(self.rp.paused.exists())
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(len(self.world.spawns), 1)
+
+    def test_mark_done_and_reset(self):
+        self.enable([self.driver("A", max_attempts=2)])
+        st = self.state()
+        st["steps"]["A"].update(status="failed", attempts=2)
+        st["alarms"]["attempts_exhausted:A"] = {"id": "attempts_exhausted", "subject": "A", "cleared_at": None}
+        self.save(st)
+        rc, out, err = self.cli("mark", "A", "reset")
+        self.assertEqual(rc, 0, err)
+        st = self.state()
+        self.assertEqual((st["steps"]["A"]["status"], st["steps"]["A"]["attempts"]), ("pending", 0))
+        self.assertEqual(st["alarms"]["attempts_exhausted:A"]["cleared_by"], "mark")
+        rc, out, err = self.cli("mark", "A", "done")
+        self.assertEqual(rc, 0, err)
+        st = self.state()
+        self.assertEqual((st["steps"]["A"]["status"], st["steps"]["A"]["by"]), ("done", "operator"))
+        self.assertEqual(self.cli("mark", "nope", "done")[0], 3)
+        self.assertEqual(self.cli("mark", "A")[0], 2)            # usage
+        self.assertEqual(self.cli("mark", "A", "done", "--note", "x")[0], 2)
+        self.assertEqual(self.cli("mark", "A", "done", "--grant", "SA1")[0], 2)
+
+    def test_mark_grant_is_the_only_writer_of_grants(self):
+        self.enable([self.driver("A", approval="SA4")], approvals={"SA4": {"conditions": []}})
+        rc, out, err = self.cli("mark", "--grant", "SA4", "--question", "Q-17", "--note", "yes from Telegram")
+        self.assertEqual(rc, 0, err)
+        g = self.state()["grants"]["SA4"]
+        self.assertEqual((g["question"], g["note"], g["by"], g["granted_at"]), ("Q-17", "yes from Telegram", "mark", self.NOW))
+        self.assertIn("SA4 granted", out)
+        rc, out, err = self.cli("mark", "--grant", "SA9")
+        self.assertEqual(rc, 3)
+        self.assertIn("unknown approval 'SA9'", err)
+        self.assertEqual(self.cli("mark", "--grant", "SA4")[0], 0)      # idempotent
+
+    def test_queue_stores_the_request_for_the_dispatcher(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        roles = {r: {"model": "claude-opus-5-5", "effort": "high"} for r in ("driver", "impl", "rev")}
+        self.enable([self.step("W", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                     "repos": [{"path": str(repo), "base_ref": "main"}]}})],
+                    roles=roles)
+        fb = self.tmp / "feedback.md"
+        rc, out, err = self.cli("queue", "W", "--to", "impl", "--file", str(fb))
+        self.assertEqual(rc, 0, err)
+        q = self.state()["queue"]
+        self.assertEqual([(r["id"], r["step"], r["to"], r["file"], r["event"]) for r in q],
+                         [("R-1", "W", "impl", str(fb), None)])
+        self.assertIn("queued R-1 for impl:W", out)
+        self.assertEqual(self.cli("queue", "W", "--to", "driver", "--file", str(fb))[0], 3)
+        self.assertEqual(self.cli("queue", "W", "--to", "impl")[0], 2)
+
+    def test_verbs_without_an_active_run_refuse(self):
+        for argv in (("pause",), ("resume",), ("mark", "A", "done"), ("mark", "--grant", "SA4"),
+                     ("queue", "W", "--to", "impl", "--file", "/x")):
+            with self.subTest(argv=argv):
+                rc, out, err = self.cli(*argv)
+                self.assertEqual(rc, 3)
+                self.assertIn("no active run", err)
+        self.assertEqual(self.cli("status")[1].strip(), "epic-driver: off (no active run)")
+        self.assertEqual(json.loads(self.cli("status", "--json")[1]), {"enabled": False})
+
+    def test_usage_errors_exit_2(self):
+        for argv in ((), ("frobnicate",), ("validate",), ("queue", "W")):
+            with self.subTest(argv=argv):
+                with mock.patch("sys.stderr", io.StringIO()):
+                    self.assertEqual(self.cli(*argv)[0], 2)
+
+    def test_validate(self):
+        good = self.write(self.ledger_dict([self.driver("A")]))
+        rc, out, err = self.cli("validate", good)
+        self.assertEqual(rc, 0, err)
+        bad = self.write(self.ledger_dict([self.driver("A", needs=["Z"])]), name="bad.yaml")
+        rc, out, err = self.cli("validate", bad)
+        self.assertEqual(rc, 1)
+        self.assertIn("error: [graph]", err)
+
+
+# -- heartbeats (§16.5, P0-11) ------------------------------------------------------------
+
+class TestHeartbeats(_Tick):
+    def test_none_on_a_quiet_day(self):
+        self.enable([self.driver("A", phase="P1", not_before="2026-12-01T00:00:00Z")])
+        for _ in range(144):                       # a day of ticks, nothing due, nothing wrong
+            self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.world.notifies, [])
+        self.assertEqual(self.state()["tick_seq"], 144)
+
+    def test_one_per_phase_transition_recorded_before_the_notify(self):
+        self.enable([self.driver("A", phase="E1"), self.driver("B", phase="E1"),
+                     self.driver("C", phase="S0"), self.driver("D", phase="S0"), self.driver("E", phase="S0")])
+        st = self.state()
+        edl.mark_done(self.L, st, "A", self.world.now())
+        commits = []
+        n = edl.Notifier(self.world, self.rp, st, workspace=str(self.ws), role=None, epic="t")
+        self.assertEqual(edl.run_heartbeats(self.L, st, n, commit=lambda s: commits.append(copy.deepcopy(s))), [])
+        edl.mark_done(self.L, st, "B", self.world.now())
+        self.assertEqual(edl.run_heartbeats(self.L, st, n, commit=lambda s: commits.append(copy.deepcopy(s))), ["E1"])
+        self.assertEqual(commits[0]["phases"]["announced"], ["E1"])
+        self.assertEqual([(x["text"], x["ack"]) for x in self.world.notifies],
+                         [("[epic-driver t] phase E1 done; next: S0 (3 steps)", False)])
+        self.assertEqual(edl.run_heartbeats(self.L, st, n, commit=lambda s: None), [])   # announced once
+
+
+# -- status (§20) ---------------------------------------------------------------------------
+
+class TestStatus(_Tick):
+    def fixture(self):
+        self.enable([self.driver("e1-roll", phase="E1", check="true"), self.step("e1-soak", phase="E1",
+                     check="true", needs=["e1-roll"]), self.driver("monterey", phase="R",
+                     not_after="2026-11-29T09:28:20Z")])
+        st = self.state()
+        st["steps"]["e1-roll"].update(status="done", done_at="2026-11-24T07:12:40Z", by="check",
+                                      check={"last_run_at": "2026-11-24T07:20:00Z", "last_rc": 0,
+                                             "consecutive_errors": 0, "output_tail": "", "last_error": None})
+        st["steps"]["e1-soak"].update(status="watching", due_since="2026-11-24T07:12:40Z",
+                                      check={"last_run_at": "2026-11-24T09:30:00Z", "last_rc": 1,
+                                             "consecutive_errors": 0, "output_tail": "", "last_error": None})
+        st["steps"]["monterey"].update(status="inflight", started_at="2026-11-24T09:30:05Z",
+                                       inflight={"step": "monterey", "event": "E-41", "started_at": "2026-11-24T09:30:05Z"})
+        st["outbox"].append({"event": "E-41", "to": "driver", "session": "ws-t-driver-g1", "kinds": ["step_due"],
+                             "steps": ["monterey"], "sends": ["2026-11-24T09:30:06Z"], "deferrals": 0,
+                             "confirmed_at": "2026-11-24T09:30:20Z", "verdict": None})
+        st["sessions"]["driver"] = {"name": "ws-t-driver-g1", "gen": 2, "status": "live", "model_verified": True,
+                                    "parked": []}
+        st["questions"]["Q-17"] = {"approval": "SA4", "status": "resolved"}
+        st["grants"]["SA4"] = {"granted_at": "2026-11-23T19:02:00Z", "question": "Q-17", "by": "mark"}
+        st["last_tick_at"] = st["last_tick_ok_at"] = "2026-11-24T09:58:00Z"
+        st["alarms"]["check_error:e1-soak"] = {"id": "check_error", "subject": "e1-soak", "detail": "3 errors",
+                                               "raised_at": "2026-11-24T09:00:00Z", "sends": 1, "cleared_at": None}
+        st["notify_failures"] = [{"at": "2026-11-24T09:00:01Z", "what": "alarm check_error:e1-soak",
+                                  "error": "Relay send failed: down"}]
+        self.save(st)
+        self.world.units[edl.TIMER_UNIT] = "active"
+
+    def test_text(self):
+        self.fixture()
+        rc, out, err = self.cli("status")
+        self.assertEqual(rc, 0, err)
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "epic-driver t · run epic-t · ON (timer active, next Tue 2026-11-24 09:40:00 UTC; "
+                                   "inhibitor held) · not paused")
+        self.assertEqual(lines[1], "last tick 2026-11-24T09:58:00Z (2m ago) ok · last error: none")
+        self.assertEqual(lines[2], "tmux server 16651 in epic-driver-tmux.scope · listener active · "
+                                   "stamps unchecked (EPIC_DRIVER_ALLOW_UNSTAMPED)")
+        self.assertEqual(lines[3], "phase E1: 1/2 done")
+        self.assertIn("  e1-roll              done        11-24 07:12  check rc 0 07:20", lines)
+        self.assertIn("  e1-soak              watching    11-24 07:12  check rc 1 09:30", lines)
+        self.assertIn("  monterey             inflight    11-24 09:30  E-41 confirmed; deadline 11-29 09:28Z", lines)
+        self.assertIn("  E-41 → driver     sent 09:30:06 · confirmed 09:30:20 · verdict pending", lines)
+        self.assertIn("  Q-17 SA4 resolved (granted 11-23 19:02)", lines)
+        self.assertIn("  check_error e1-soak  raised 11-24 09:00 · sends 1 · 3 errors", lines)
+        self.assertIn("  2026-11-24T09:00:01Z alarm check_error:e1-soak: Relay send failed: down", lines)
+        self.assertTrue(any(l.startswith("  driver           ws-t-driver-g1") and l.endswith("2    ok") for l in lines),
+                        out)
+
+    def test_json(self):
+        self.fixture()
+        rc, out, err = self.cli("status", "--json")
+        self.assertEqual(rc, 0, err)
+        data = json.loads(out)
+        self.assertEqual((data["epic"], data["run_id"], data["timer"]["active"], data["inhibitor"]["lock"]),
+                         ("t", "epic-t", True, True))
+        self.assertEqual(data["last_tick_at"], "2026-11-24T09:58:00Z")
+        self.assertEqual(data["last_tick_ago_s"], 120)
+        self.assertIsNone(data["last_tick_error"])
+        self.assertEqual(data["tmux"]["pid"], 16651)
+        self.assertTrue(data["tmux"]["own_scope"])
+        self.assertEqual(data["phase"], {"name": "E1", "done": 1, "total": 2})
+        self.assertEqual([s["id"] for s in data["steps"]], ["e1-roll", "e1-soak", "monterey"])
+        self.assertEqual([a["key"] for a in data["alarms"]], ["check_error:e1-soak"])
+        self.assertEqual(data["notify_failures"][0]["error"], "Relay send failed: down")
+
+    def test_a_stale_tick_and_the_last_error_show(self):
+        self.fixture()
+        st = self.state()
+        st["last_tick_error"] = {"at": "2026-11-24T09:58:00Z", "error": "RuntimeError: boom"}
+        self.save(st)
+        self.world.clock = T("2026-11-24T12:00:00Z")
+        out = self.cli("status")[1]
+        self.assertIn("last tick 2026-11-24T09:58:00Z (2h2m ago) ERROR · last error: 2026-11-24T09:58:00Z "
+                      "RuntimeError: boom", out)
+
+
+# -- the time bound (§22 TimeoutStartSec=5min, review m5) --------------------------------------
+
+class TestTickTiming(_Tick):
+    """``Done when``: one pass ends within 5 min on the toy ledger with the check budget saturated.
+
+    The fake clock advances by each call's worst case: a check by its full timeout (60 s), a spawn
+    by its full SPAWN_TIMEOUT_S, a notify by NOTIFY_TIMEOUT_S, every systemctl, systemd-inhibit and
+    tmux read by its timeout. ``World.now`` is the pass's only clock, so the elapsed time it measures
+    is the time the real pass would take in that worst case.
+    """
+
+    def worst_case(self):
+        self.world.cost = {"systemctl": edl.SYSTEMCTL_TIMEOUT_S, "inhibit_list": edl.INHIBIT_LIST_TIMEOUT_S,
+                           "tmux_server_pid": edl.TMUX_READ_TIMEOUT_S, "systemd_run": edl.SYSTEMD_RUN_TIMEOUT_S,
+                           "notify": edl.NOTIFY_TIMEOUT_S}
+        orig_spawn = self.world.spawn
+
+        def slow_spawn(args):
+            self.world.advance(edl.SPAWN_TIMEOUT_S)
+            return orig_spawn(args)
+        self.world.spawn = slow_spawn
+
+    def saturated(self, n=8):
+        self.enable([self.driver("A")] + [self.step(f"w{i}", check={"run": "true", "timeout": "60s"})
+                                          for i in range(n)])
+        st = self.state()
+        for i in range(n):
+            st["steps"][f"w{i}"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.check_script.update({f"w{i}": (1, 60) for i in range(n)})   # every check runs to its timeout
+        self.world.units[edl.LISTENER_UNIT] = "inactive"                        # one start attempt, then an alarm
+        self.world.start_fails = {edl.LISTENER_UNIT}
+
+    def test_a_saturated_check_budget_and_a_spawn_end_within_5_minutes(self):
+        self.saturated()
+        self.world.cost = {"systemctl": 1, "inhibit_list": 1, "tmux_server_pid": 1, "notify": 5}
+        start = self.world.now()
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        elapsed = (self.world.now() - start).total_seconds()
+        ran = [c[0] for c in self.world.check_calls]
+        self.assertEqual(ran, ["w0", "w1"])                            # 2 × 60 s; a third would end past 150 s
+        self.assertEqual(len(self.world.spawns), 1)                    # the spawn fitted after them
+        self.assertEqual(len(self.world.alarm_notifies()), 1)          # listener_down went out
+        self.assertEqual(self.state()["check_cursor"], "w2")           # round-robin: w2 first next pass
+        self.assertLessEqual(elapsed, 300)
+        self.assertLess(elapsed, 200)
+
+    # -- every World call at its timeout, several sessions, several alarms --------------------------------
+
+    #: the worst case of each World call the tick can make (``RealWorld``'s timeouts), seconds.
+    WORST = {"systemctl": edl.SYSTEMCTL_TIMEOUT_S, "systemd_run": edl.SYSTEMD_RUN_TIMEOUT_S,
+             "inhibit_list": edl.INHIBIT_LIST_TIMEOUT_S, "tmux_server_pid": edl.TMUX_READ_TIMEOUT_S,
+             "tmux_has_session": edl.TMUX_READ_TIMEOUT_S, "tmux_display": edl.TMUX_READ_TIMEOUT_S,
+             "capture_pane": edl.TMUX_READ_TIMEOUT_S, "amux_names": edl.AMUX_LS_TIMEOUT_S,
+             "spawn": edl.SPAWN_TIMEOUT_S, "resume": edl.RESUME_TIMEOUT_S, "reap": edl.REAP_TIMEOUT_S,
+             "amux_send": edl.SEND_TIMEOUT_S, "send_keys": edl.KEYS_TIMEOUT_S, "notify": edl.NOTIFY_TIMEOUT_S,
+             # calls with no subprocess: a nominal second each, so nothing is free
+             "list_handles": 1, "lifecycle_events": 1, "process_work": 1, "clock_sample": 1,
+             "local_timezone": 1, "question_entries": 1, "questions_settings": 1, "notify_index_ids": 1,
+             "profile_env": 1}
+
+    def everything_at_its_timeout(self):
+        """Wrap EVERY World call so it costs its worst case on the fake clock (git: its ``timeout_s``)."""
+        w = self.world
+        self.calls_at_timeout = []
+        self.call_ends = []                 # (name, seconds since this call began the pass, at the call's end)
+        self.t0 = w.now()
+
+        def wrap(name, cost):
+            orig = getattr(w, name)
+
+            def call(*args, **kw):
+                self.calls_at_timeout.append(name)
+                w.advance(cost(args, kw) if callable(cost) else cost)
+                self.call_ends.append((name, (w.now() - self.t0).total_seconds()))
+                return orig(*args, **kw)
+            setattr(w, name, call)
+        for name, cost in self.WORST.items():
+            wrap(name, cost)
+
+        def git_cost(args, kw):
+            return kw.get("timeout_s", args[2] if len(args) > 2 else edl.GIT_TIMEOUT_S)
+        orig_git = w.git
+
+        def git(args, cwd, timeout_s=edl.GIT_TIMEOUT_S):
+            self.calls_at_timeout.append(f"git {args[0]}")
+            w.advance(timeout_s)
+            self.call_ends.append((f"git {args[0]}", (w.now() - self.t0).total_seconds()))
+            return edl.CommandResult(rc=0, stdout="true\n") if args[:1] == ["merge-base"] else orig_git(args, cwd, timeout_s)
+        w.git = git
+
+    def reboot_ledger(self, n=3):
+        """n driven worker sessions that all resume at once after a reboot, plus a driver: n + 1 resumes,
+        and one ``attempts_exhausted`` alarm per step."""
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        steps = [self.step(f"W{i}", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                    "repos": [{"path": str(repo), "base_ref": "main"}]}})
+                 for i in range(n)] + [self.driver("A")]
+        roles = {"driver": {"model": "claude-opus-5-5", "effort": "high"},
+                 "impl": {"model": "claude-opus-5-5", "effort": "high"},
+                 "rev": {"model": "claude-opus-5-5", "effort": "high"}}
+        self.enable(steps, roles=roles)
+        st = self.state()
+        st["clock"] = {"boot_id": "boot-0", "wall": 1.0, "boottime": 1.0, "monotonic": 1.0}
+        self.live(st, alive=False, events=[edl and ev("turn_start", "2026-11-24T09:50:00Z")])
+        st["steps"]["A"]["status"] = "inflight"
+        for i in range(n):
+            sid = f"W{i}"
+            name = f"t-w{i}-t-impl-w{i}-g1"
+            self.live(st, key=f"impl:{sid}", name=name, alive=False)
+            self.inflight(st, sid, event=f"E-{i + 2}", name=name)
+            st["steps"][sid]["attempts"] = 99                      # attempts_exhausted: an alarm each
+        st["steps"]["A"]["attempts"] = 99
+        self.save(st)
+        return st
+
+    def phase_end(self, names):
+        return max([t for n, t in self.call_ends if n in names] or [0])
+
+    def test_after_a_reboot_with_every_call_at_its_timeout_the_pass_ends_before_300s(self):
+        self.reboot_ledger(6)                                       # 7 sessions: their reads alone are 100+ s
+        self.world.units[edl.LISTENER_UNIT] = "inactive"
+        self.world.units[edl.INHIBIT_UNIT] = "inactive"
+        self.world.start_fails = {edl.LISTENER_UNIT, edl.INHIBIT_UNIT}
+        self.world.server_pid = None
+        self.world.run_lands_in = None                              # the tmux server cannot be started either
+        self.everything_at_its_timeout()
+        start = self.world.now()
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        elapsed = (self.world.now() - start).total_seconds()
+        self.worst_case_elapsed = elapsed
+        self.assertLess(elapsed, 300, self.rp.tick_log.read_text())
+        self.assertLessEqual(elapsed, edl.TICK_HARD_LIMIT_S)
+        # every phase ended by its own limit, whatever the later phases could absorb
+        self.assertLessEqual(self.phase_end({"systemctl", "systemd_run", "inhibit_list", "tmux_server_pid"}),
+                             edl.INFRA_END_S)
+        self.assertLessEqual(self.phase_end({"tmux_has_session", "tmux_display", "capture_pane", "amux_names"}),
+                             edl.READINGS_END_S)
+        self.assertGreater(self.phase_end({"tmux_has_session"}), 0)  # and the readings did start
+        st = self.state()
+        self.assertEqual(st["tick_seq"], 1)                          # the pass completed and committed
+        self.assertIsNone(st["last_tick_error"])
+        self.assertEqual(self.world.resumes, [])                     # no server: nothing launched, and
+        # nothing it deferred counts as an error: no alarm for the calls it did not make
+        ids = {k.split(":")[0] for k in self.active_alarms(st)}
+        self.assertNotIn("tick_error", ids)
+        self.assertLessEqual(len(self.world.alarm_notifies()), 1 + edl.TICK_HARD_LIMIT_S // edl.NOTIFY_TIMEOUT_S)
+
+    def test_after_a_reboot_the_resumes_that_fit_run_and_the_rest_wait_for_the_next_pass(self):
+        self.reboot_ledger(3)
+        self.everything_at_its_timeout()
+        start = self.world.now()
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        elapsed = (self.world.now() - start).total_seconds()
+        self.assertLess(elapsed, 300, self.rp.tick_log.read_text())
+        resumed = len(self.world.resumes)
+        self.assertGreaterEqual(resumed, 1)                          # the pass did work
+        self.assertLess(resumed, 4)                                  # not all four fitted: 60 s each
+        st = self.state()
+        self.assertEqual(self.world.units[edl.LISTENER_UNIT], "active")
+        self.assertIn("left for the next pass", self.rp.tick_log.read_text())
+        # the deferral is consistent state, not an error: the next pass (fast calls) finishes the job
+        self.world.cost = {}
+        self.world.calls_at_timeout = []
+        for name in list(self.WORST):
+            setattr(self.world, name, getattr(type(self.world), name).__get__(self.world))
+        self.world.git = type(self.world).git.__get__(self.world)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(len(self.world.resumes), 4)
+        exhausted = {f"attempts_exhausted:{s}" for s in ("A", "W0", "W1", "W2")}
+        self.assertLessEqual(exhausted, set(self.active_alarms()))
+        sent = [n["text"] for n in self.world.alarm_notifies() if "attempts_exhausted" in n["text"]]
+        self.assertEqual(len(sent), 4)                              # every one went out, once
+        self.assertEqual(len(set(sent)), 4)
+
+    # -- a check or read the pass deadline skipped is unknown: no alarm raised, none cleared, nothing acted on --
+
+    def test_a_deferred_unit_check_is_unknown_not_down(self):
+        w = self.world
+        w.units[edl.LISTENER_UNIT] = w.units[edl.INHIBIT_UNIT] = "inactive"
+        w.start_fails = {edl.LISTENER_UNIT, edl.INHIBIT_UNIT}
+        calls = len(w.systemctl_calls)
+        for fits in (lambda cost: False, lambda cost: cost <= edl.SYSTEMCTL_TIMEOUT_S):
+            # nothing fits / the is-active fits but the start and the check after it do not
+            for unit in (edl.LISTENER_UNIT, edl.INHIBIT_UNIT):
+                self.assertEqual(edl.ensure_unit(w, unit, fits=fits)[0], None)
+        self.assertEqual([c for c in w.systemctl_calls[calls:] if c[0] == "start"], [])      # nothing was started
+        infra = edl.check_infrastructure(w, {}, {}, fits=lambda cost: False)
+        self.assertEqual((infra.listener_active, infra.inhibitor_active, infra.inhibitor_lock), (None, None, None))
+        self.assertTrue(infra.deferred)
+        ids = {c.id for c in infra.conditions}
+        self.assertFalse(ids & {"listener_down", "inhibitor_down"}, ids)
+        # asked for real, the same units are down
+        infra = edl.check_infrastructure(w, {}, {})
+        self.assertLessEqual({"listener_down", "inhibitor_down"}, {c.id for c in infra.conditions})
+
+    def test_a_pass_that_defers_the_infrastructure_raises_no_listener_or_inhibitor_alarm(self):
+        self.reboot_ledger(1)
+        w = self.world
+        w.units[edl.LISTENER_UNIT] = w.units[edl.INHIBIT_UNIT] = "inactive"
+        w.start_fails = {edl.LISTENER_UNIT, edl.INHIBIT_UNIT}
+        with mock.patch.object(edl, "INFRA_END_S", 0):
+            self.assertEqual(self.run_pass(), 0, self.last_err)
+        ids = {k.split(":")[0] for k in self.state()["alarms"]}
+        self.assertFalse(ids & {"listener_down", "inhibitor_down"}, ids)
+        self.assertFalse([n for n in w.alarm_notifies() if "listener_down" in n["text"] or "inhibitor_down" in n["text"]])
+        self.assertEqual([c for c in w.systemctl_calls if c[0] == "start"], [])
+        self.assertIn("infrastructure only partly looked at", self.rp.tick_log.read_text())
+
+    def test_a_pass_that_defers_the_infrastructure_leaves_an_active_alarm_as_it_was(self):
+        self.reboot_ledger(1)
+        w = self.world
+        w.units[edl.LISTENER_UNIT] = w.units[edl.INHIBIT_UNIT] = "inactive"
+        w.start_fails = {edl.LISTENER_UNIT, edl.INHIBIT_UNIT}
+        self.assertEqual(self.run_pass(), 0, self.last_err)                 # asked for real: both alarms
+        before = self.state()["alarms"]
+        self.assertLessEqual({"listener_down:run", "inhibitor_down:run"}, set(self.active_alarms()))
+        def infra_notifies():
+            return [n for n in w.alarm_notifies() if "listener_down" in n["text"] or "inhibitor_down" in n["text"]]
+        sent = len(infra_notifies())
+        self.assertEqual(sent, 2)
+        for _ in range(2):                                                  # even past the 4 h repeat time
+            with mock.patch.object(edl, "INFRA_END_S", 0):
+                self.assertEqual(self.run_pass(advance=5 * 3600), 0, self.last_err)
+            after = self.state()["alarms"]
+            for key in ("listener_down:run", "inhibitor_down:run"):
+                self.assertEqual(after[key], before[key], key)               # not cleared, not repeated, untouched
+            self.assertEqual(len(infra_notifies()), sent)                   # and no notify for them
+        # the units come back and are looked at: now they clear
+        w.units[edl.LISTENER_UNIT] = w.units[edl.INHIBIT_UNIT] = "active"
+        w.start_fails = set()
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertFalse({"listener_down:run", "inhibitor_down:run"} & set(self.active_alarms()))
+
+    def unread_ledger(self):
+        """One driver in flight on a dead session (a resume is due), a worker likewise, and two alarms that
+        a read pass would clear (``session_stuck`` / ``verdict_missing``): active records seeded by hand."""
+        self.reboot_ledger(1)
+        st = self.state()
+        for sid in ("A", "W0"):
+            st["steps"][sid]["attempts"] = 0
+        now = self.world.now()
+        for key, aid, sid in (("session_stuck:A", "session_stuck", "A"), ("verdict_missing:W0", "verdict_missing", "W0")):
+            st["alarms"][key] = edl._new_alarm(edl.AlarmCondition(aid, sid, "seeded"), now)
+        self.save(st)
+        return st
+
+    def test_a_session_the_deadline_left_unread_is_not_dead_resumed_or_alarmed_and_keeps_its_state(self):
+        st0 = self.unread_ledger()
+        w = self.world
+        # 12 s left for the readings: a session (15 s worst case) does not fit, the amux listing (10 s) does;
+        # 0: neither fits
+        for left in (12, 0):
+            with self.subTest(readings_left_s=left), mock.patch.object(edl, "READINGS_END_S", left):
+                self.assertEqual(self.run_pass(), 0, self.last_err)
+            self.assertEqual((w.resumes, w.spawns, w.sends), ([], [], []))         # not resumed, not spawned
+            st = self.state()
+            self.assertEqual(st["sessions"], st0["sessions"])                      # session records unchanged
+            for sid in ("A", "W0"):
+                self.assertEqual(st["steps"][sid], st0["steps"][sid], sid)         # status, attempts, inflight
+            for key in ("session_stuck:A", "verdict_missing:W0"):
+                self.assertEqual(st["alarms"][key], st0["alarms"][key], key)       # not cleared, not repeated
+            ids = {k.split(":")[0] for k in st["alarms"]}
+            self.assertFalse(ids - {"session_stuck", "verdict_missing"}, ids)      # nothing new, no 'dead' alarm
+            self.assertEqual(w.alarm_notifies(), [])
+            self.assertIn("sessions not read in time", self.rp.tick_log.read_text())
+        # the next pass reads them normally: the dead sessions are resumed and the seeded alarms clear
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(len(w.resumes), 2)
+
+    def test_take_readings_flags_each_kind_of_session_the_deadline_left_unread(self):
+        """Refuse exactly ONE session read (the amux listing still fits): the reading is incomplete whichever
+        kind of session it was (a record, a parked generation, a foreign handle of the run id)."""
+        st = self.unread_ledger()
+        L, w = self.L, self.world
+        st["sessions"]["driver"]["parked"] = [{"name": "ws-t-driver-g0"}]
+        self.session(st, key=None, name="foreign-1", run_id="epic-t")        # a handle of this run, no record
+        full = edl.take_readings(L, st, w, w.now())
+        self.assertFalse(full.incomplete)
+        n = len(full.sessions)
+        self.assertEqual(n, 4)
+        for refused in range(1, n + 1):
+            with self.subTest(refused_read=refused):
+                seen = []
+
+                def fits(cost):
+                    if cost == edl.SESSION_READ_WORST_S:
+                        seen.append(cost)
+                        return len(seen) != refused
+                    return True                                              # the amux listing fits
+                part = edl.take_readings(L, st, w, w.now(), fits=fits)
+                self.assertTrue(part.incomplete)
+                self.assertLess(len(part.sessions), n)                       # (a skipped record skips its parked ones too)
+        # only the amux listing refused: also incomplete
+        late = edl.take_readings(L, st, w, w.now(), fits=lambda cost: cost != edl.AMUX_LS_TIMEOUT_S)
+        self.assertTrue(late.incomplete)
+        self.assertEqual(len(late.sessions), n)
+        self.assertFalse(edl.take_readings(L, st, w, w.now(), fits=lambda cost: True).incomplete)
+
+    def test_a_normal_pass_with_fast_calls_does_all_its_work(self):
+        self.reboot_ledger(3)
+        self.world.cost = {k: 0.2 for k in self.WORST}
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(len(self.world.resumes), 4)
+        self.assertGreaterEqual(len([n for n in self.world.alarm_notifies() if "attempts_exhausted" in n["text"]]), 4)
+        self.assertNotIn("left for the next pass", self.rp.tick_log.read_text())
+
+    def test_the_sha_checks_are_charged_before_the_check_budget_is_computed(self):
+        n = 3
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        steps = [self.step(f"W{i}", check={"run": "true", "timeout": "60s"},
+                           role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                            "repos": [{"path": str(repo), "base_ref": "main"}]}})
+                 for i in range(n)] + [self.step(f"c{i}", check={"run": "true", "timeout": "60s"}) for i in range(6)]
+        self.enable(steps, roles={"driver": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "impl": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "rev": {"model": "claude-opus-5-5", "effort": "high"}})
+        st = self.state()
+        for i in range(n):
+            st["steps"][f"W{i}"].update(status="verifying", advanced_at=self.NOW, shas={edl.BARE_SHA: "a" * 40})
+        for i in range(6):
+            st["steps"][f"c{i}"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.check_script.update({f"c{i}": (1, 70) for i in range(6)})     # timeout 60 s + 10 s kill grace
+        self.everything_at_its_timeout()
+        start = self.world.now()
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        elapsed = (self.world.now() - start).total_seconds()
+        self.assertLess(elapsed, 300, self.rp.tick_log.read_text())
+        # ledger git 30 s + infrastructure + readings leave room for two sha checks (30 s each); the
+        # third would end past SHA_END_S, so it waits. The check budget is computed AFTER them: only
+        # 180 - elapsed is left, and a 60 s check + 10 s grace does not fit it (and the pass is not young).
+        self.assertEqual(self.calls_at_timeout.count("git merge-base"), 2)
+        self.assertLessEqual(self.phase_end({"git merge-base"}), edl.SHA_END_S)
+        self.assertEqual(len(self.world.check_calls), 0)
+        st = self.state()
+        self.assertEqual(sum(1 for i in range(n) if st["steps"][f"W{i}"].get("sha_check")), 2)
+        self.assertEqual(st["steps"]["W2"].get("sha_check"), None)              # deferred, not an error
+        self.assertFalse([k for k in self.active_alarms(st) if k.startswith("check_error")])
+        # next pass, fast calls: the deferred sha check runs, then the checks
+        for name in list(self.WORST):
+            setattr(self.world, name, getattr(type(self.world), name).__get__(self.world))
+        self.world.git = type(self.world).git.__get__(self.world)
+        orig_git = type(self.world).git
+
+        def git(args, cwd, timeout_s=30.0):
+            return edl.CommandResult(rc=0) if args[:1] == ["merge-base"] else orig_git(self.world, args, cwd, timeout_s)
+        self.world.git = git
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertTrue(all(st["steps"][f"W{i}"]["sha_check"]["passed"] for i in range(n)))
+        self.assertGreaterEqual(len(self.world.check_calls), 1)
+
+    def test_worktree_preparation_stops_at_its_deadline_and_defers_without_a_refusal(self):
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        steps = [self.step(f"W{i}", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                    "repos": [{"path": str(repo), "base_ref": "main"}]}})
+                 for i in range(3)]
+        L = self.enable(steps, roles={"driver": {"model": "claude-opus-5-5", "effort": "high"},
+                                      "impl": {"model": "claude-opus-5-5", "effort": "high"},
+                                      "rev": {"model": "claude-opus-5-5", "effort": "high"}})
+        state = self.state()
+        gits = []
+
+        def git(args, cwd, timeout_s=30.0):
+            gits.append(timeout_s)
+            self.world.advance(timeout_s)                    # every git call costs its timeout
+            return edl.CommandResult(rc=0) if timeout_s >= 30 else edl.CommandResult(rc=None, error="timed out")
+
+        def fake_ensure(ledger, st, world, step_id):         # two git calls per step, as the real one makes several
+            recs = st.setdefault("worktrees", {}).setdefault("steps", {})
+            for _ in range(2):
+                res = world.git(["status"], "/x")
+                if not res.ok:
+                    recs[step_id] = {"refused": res.error}   # what a clamped call would be recorded as
+                    return
+            recs[step_id] = {"dir": f"/d/{step_id}", "refused": None}
+        self.world.git = git
+        clock = edl.TickClock(self.world)
+        with mock.patch.object(edl, "ensure_step_worktrees", fake_ensure):
+            dirs = edl.prepare_worker_steps(L, state, self.world, ["W0", "W1", "W2"],
+                                            remaining=lambda: clock.remaining_to(100))
+        self.assertEqual(dirs, {"W0": "/d/W0"})                      # W1's second call was clamped: deferred
+        self.assertEqual(gits, [30, 30, 30, 10])                     # never past the 100 s deadline
+        self.assertEqual((self.world.now() - clock.start).total_seconds(), 100)
+        recs = state["worktrees"]["steps"]
+        self.assertNotIn("W1", recs)                                 # no "refused" left behind: not worktree_refused
+        self.assertNotIn("W2", recs)                                 # and W2 was not started
+        self.assertEqual(edl.worktree_conditions(L, state), [])
+        # the next pass, with time, prepares the rest
+        gits.clear()
+        with mock.patch.object(edl, "ensure_step_worktrees", fake_ensure):
+            dirs = edl.prepare_worker_steps(L, state, self.world, ["W0", "W1", "W2"],
+                                            remaining=lambda: 1000)
+        self.assertEqual(sorted(dirs), ["W0", "W1", "W2"])
+
+    def test_the_tick_bounds_worktree_preparation_by_its_deadline(self):
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        steps = [self.step(f"W{i}", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                    "repos": [{"path": str(repo), "base_ref": "main"}]}})
+                 for i in range(3)]
+        self.enable(steps, roles={"driver": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "impl": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "rev": {"model": "claude-opus-5-5", "effort": "high"}})
+        orig_git = self.world.git
+
+        def git(args, cwd, timeout_s=30.0):
+            if args[:1] == ["status"]:                       # the (faked) worktree work: each call at its timeout
+                self.world.advance(timeout_s)
+                return edl.CommandResult(rc=0) if timeout_s >= 30 else edl.CommandResult(rc=None, error="timed out")
+            return orig_git(args, cwd, timeout_s)
+        self.world.git = git
+
+        def fake_ensure(ledger, st, world, step_id):          # 4 git calls a step: 3 steps = 360 s unbounded
+            recs = st.setdefault("worktrees", {}).setdefault("steps", {})
+            for _ in range(4):
+                if not world.git(["status"], "/x").ok:
+                    recs[step_id] = {"refused": "git timed out"}
+                    return
+            recs[step_id] = {"dir": f"/d/{step_id}", "repos": {}, "branch": "b", "refused": None}
+        start = self.world.now()
+        with mock.patch.object(edl, "ensure_step_worktrees", fake_ensure):
+            self.assertEqual(self.run_pass(), 0, self.last_err)
+        elapsed = (self.world.now() - start).total_seconds()
+        self.assertLessEqual(elapsed, edl.PREPARE_END_S)             # stopped at the worktree deadline
+        st = self.state()
+        self.assertFalse([k for k in self.active_alarms(st) if k.startswith("worktree_refused")])
+        recs = st["worktrees"]["steps"]
+        self.assertFalse([k for k, r in recs.items() if r.get("refused")])    # a deferral is not a refusal
+        self.assertLess(len([r for r in recs.values() if r.get("dir")]), 3)   # not all three fitted
+
+    def test_the_first_check_is_exempt_from_the_budget_only_while_the_pass_is_young(self):
+        self.enable([self.step(f"w{i}", check={"run": "true", "timeout": "100s"}) for i in range(3)])
+        st = self.state()
+        for i in range(3):
+            st["steps"][f"w{i}"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.check_script.update({f"w{i}": (1, 100) for i in range(3)})
+        ledger = edl.load_ledger(self.lpath, self.world)
+        state = self.state()
+        young = edl.run_checks(ledger, state, self.world, budget_s=50, overhead_s=10, first_exempt=True,
+                               pass_left_s=270)
+        self.assertEqual([c[0] for c in self.world.check_calls], ["w0"])           # ran although 110 > 50
+        self.assertEqual(young.cursor, "w1")
+        self.world.check_calls.clear()
+        state = self.state()
+        old = edl.run_checks(ledger, state, self.world, budget_s=50, overhead_s=10, first_exempt=False,
+                             pass_left_s=270)
+        self.assertEqual(self.world.check_calls, [])                                # not young: nothing runs
+        self.assertEqual(old.cursor, "w0")                                          # w0 goes first next pass
+        self.world.check_calls.clear()
+        state = self.state()
+        long_ = edl.run_checks(ledger, state, self.world, budget_s=500, overhead_s=10, first_exempt=True,
+                               pass_left_s=105)                                     # 100 + 10 > 105: never started
+        self.assertEqual(len(long_.too_long), 3)
+        self.assertEqual(self.world.check_calls, [])
+
+    def test_the_tick_passes_first_exempt_false_late_in_the_pass(self):
+        self.enable([self.step("w0", check={"run": "true", "timeout": "100s"})])
+        st = self.state()
+        st["steps"]["w0"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.check_script["w0"] = (1, 100)
+        self.world.cost = {"systemctl": 25, "inhibit_list": 25, "tmux_server_pid": 25}    # 100 s before the checks
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertGreater(float(self.state()["tick_seq"]), 0)
+        self.assertEqual(self.world.check_calls, [])        # 100 s in: 100 + 10 > the 80 s budget left; not young
+        self.assertEqual(self.state()["check_cursor"], "w0")
+
+    def test_with_fast_infrastructure_the_checks_get_the_full_150s(self):
+        self.enable([self.step(f"w{i}", check={"run": "true", "timeout": "20s"}) for i in range(10)])
+        st = self.state()
+        for i in range(10):
+            st["steps"][f"w{i}"].update(status="watching", due_since=self.NOW)
+        self.save(st)
+        self.world.check_script.update({f"w{i}": (1, 20) for i in range(10)})
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(len(self.world.check_calls), 7)              # 7 × 20 s; the 8th would end at 160 s
+
+    def test_an_effect_that_would_end_past_the_deadline_is_left_to_the_next_pass(self):
+        self.enable([self.driver("A")])
+        clock = edl.TickClock(self.world)
+        plan_ops = []
+        orig = edl.execute_dispatch
+
+        def late(plan, state, world, commit, gate=None):
+            plan_ops.extend(op.label for op in plan.ops)
+            self.world.advance(edl.TICK_DEADLINE_S - 30)               # the pass is late by now
+            return orig(plan, state, world, commit, gate=gate)
+        with mock.patch.object(edl, "execute_dispatch", late):
+            self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.world.spawns, [])
+        st = self.state()
+        # committed, not run: the next pass launches it with the same event (a kill after the commit)
+        self.assertEqual(st["sessions"]["driver"]["status"], "spawning")
+        self.assertEqual(st["sessions"]["driver"]["launch_event"], "E-1")
+        self.assertIn("1 left for the next pass", self.rp.tick_log.read_text())
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(len(self.world.spawns), 1)
+        self.assertTrue(self.world.spawns[0][-1].startswith("EVENT E-1: "))
+        self.assertIsNotNone(clock)
+
+    def test_the_gate(self):
+        clock = edl.TickClock(self.world)
+        spawn, send = edl.Effect(edl.EFFECT_SPAWN), edl.Effect(edl.EFFECT_SEND)
+        self.world.advance(edl.TICK_DEADLINE_S - edl.SPAWN_TIMEOUT_S)
+        self.assertTrue(clock.gate(spawn))
+        self.world.advance(1)
+        self.assertFalse(clock.gate(spawn))
+        self.assertTrue(clock.gate(send))
+        self.assertEqual(clock.check_budget(), 0)
+        clock2 = edl.TickClock(self.world)
+        self.assertEqual(clock2.check_budget(), edl.CHECK_BUDGET_S)
+        self.world.advance(60)
+        self.assertEqual(clock2.check_budget(), edl.TICK_DEADLINE_S - edl.TICK_DISPATCH_RESERVE_S - 60)
+
+    def test_a_skipped_send_records_nothing(self):
+        self.enable([self.driver("A")])
+        st = self.state()
+        self.live(st)
+        self.save(st)
+        with mock.patch.object(edl.TickClock, "gate", lambda self, effect: effect.kind != edl.EFFECT_SEND):
+            self.assertEqual(self.run_pass(), 0, self.last_err)
+        st = self.state()
+        self.assertEqual(self.world.sends, [])
+        self.assertEqual(st["outbox"][-1]["sends"], [])          # unsent, no deferral, no send recorded
+        self.assertEqual(st["outbox"][-1]["deferrals"], 0)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(len(self.world.sends), 1)
+
+
+# -- --dry-run ---------------------------------------------------------------------------------
+
+class TestDryRun(_Tick):
+    def snapshot(self):
+        """(path, size, mtime_ns, sha256) of every file under the state root, plus the epic folder's pointer."""
+        root = Path(os.environ[edl.STATE_ROOT_ENV])
+        files = [p for p in root.rglob("*") if p.is_file()] + [self.plan / "epic-driver.run.json"]
+        out = {}
+        for p in sorted(files):
+            if p.exists():
+                st = p.stat()
+                out[str(p)] = (st.st_size, st.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+            else:
+                out[str(p)] = None
+        return out
+
+    def test_computes_and_prints_and_writes_nothing(self):
+        self.enable([self.driver("A")])
+        self.world.server_pid = None
+        self.world.units[edl.LISTENER_UNIT] = "inactive"
+        (self.plan / "epic-driver.run.json").write_text('{"run_id": "epic-t"}\n')
+        # the ledger changed since the last valid copy: a pass that kept its copy would rewrite it
+        Path(self.lpath).write_text(Path(self.lpath).read_text() + "\n# edited\n")
+        self.assertNotEqual(self.rp.last_valid_ledger.read_text(), Path(self.lpath).read_text())
+        (self.rp.dir / "tick.lock").write_text("")
+        before = self.snapshot()
+        self.assertIn(str(self.rp.last_valid_ledger), before)
+        self.assertIn(str(self.rp.state), before)
+        time.sleep(0.05)                                    # an mtime touch must be visible
+        rc, out, err = self.cli("tick", "--dry-run")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("ops (", out)
+        self.assertIn("spawn ws-t-driver-g1 seeded with E-1 [spawn]", out)
+        self.assertIn("listener_down:run", out)
+        self.assertEqual(self.snapshot(), before)           # no write at all: not even an mtime
+        self.assertEqual(self.world.spawns, [])
+        self.assertEqual(self.world.notifies, [])
+
+    def test_a_dry_run_that_keeps_the_last_valid_copy_fails_the_snapshot(self):
+        """The reviewer's M5, as a unit: with ``keep_copy`` forced on, the snapshot differs."""
+        self.enable([self.driver("A")])
+        Path(self.lpath).write_text(Path(self.lpath).read_text() + "\n# edited\n")
+        before = self.snapshot()
+        orig = edl.load_run_ledger
+        with mock.patch.object(edl, "load_run_ledger",
+                               lambda *a, **kw: orig(*a, **dict(kw, keep_copy=True))):
+            self.assertEqual(self.cli("tick", "--dry-run")[0], 0)
+        self.assertNotEqual(self.snapshot(), before)
+
+
+# -- the environment (§21.2) -----------------------------------------------------------------
+
+class TestEnvironment(unittest.TestCase):
+    def test_the_snapshot_keeps_the_allowlist_and_never_a_secret(self):
+        env = {"PATH": "/p", "GOROOT": "/go", "NVM_DIR": "/n", "NVM_RC_VERSION": "22", "NVM_TOKEN": "s",
+               "SSH_AUTH_SOCK": "/s", "VIRTUAL_ENV": "/v", "HOME": "/h", "LC_ALL": "C", "AWS_SECRET": "x"}
+        self.assertEqual(edl.env_snapshot(env), {"PATH": "/p", "GOROOT": "/go", "NVM_DIR": "/n",
+                                                 "NVM_RC_VERSION": "22", "LC_ALL": "C"})
+
+    def test_is_secret_key_matches_amux_spawn(self):
+        loader = SourceFileLoader("amux_spawn_cli_for_test", str(_REPO / ".claude" / "bin" / "amux-spawn"))
+        spec = importlib.util.spec_from_loader("amux_spawn_cli_for_test", loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        for key in ("PATH", "GITHUB_TOKEN", "NVM_AUTH", "MONKEY", "API_KEY", "PASS", "PASSPHRASE", "GOPATH",
+                    "AWS_SECRET_ACCESS_KEY", "ANTHROPIC_API_KEY", "MY_PAT", "PATTERN", "KEYS_DIR"):
+            with self.subTest(key=key):
+                self.assertEqual(edl.is_secret_key(key), mod.is_secret_key(key))
+
+    def test_a_dead_ssh_auth_sock_is_unset_a_live_one_kept(self):
+        tmp = Path(tempfile.mkdtemp(prefix="edl-sock-"))
+        try:
+            live = tmp / "agent.sock"
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(str(live))
+            env = {"SSH_AUTH_SOCK": str(live)}
+            self.assertIsNone(edl.fix_ssh_auth_sock(env))
+            self.assertEqual(edl.tmux_start_env(env, {})["SSH_AUTH_SOCK"], str(live))
+            s.close()
+            env = {"SSH_AUTH_SOCK": str(tmp / "gone")}
+            self.assertIn("is gone", edl.fix_ssh_auth_sock(env))
+            self.assertNotIn("SSH_AUTH_SOCK", env)
+            self.assertNotIn("SSH_AUTH_SOCK", edl.tmux_start_env({"SSH_AUTH_SOCK": str(tmp / "gone")}, {}))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
+
+    def test_nudge_span(self):
+        self.assertEqual(edl.nudge_span_s("15m,45m,3h"), 15 * 60 + 45 * 60 + 3 * 3600)
+        self.assertEqual(edl.nudge_span_s("2h30m,1d"), 2 * 3600 + 1800 + 86400)
+        self.assertEqual(edl.nudge_span_s(None), 0)
+        self.assertEqual(edl.nudge_span_s("junk"), 0)
+
+
+
+# -- the World boundary of 50-08 -----------------------------------------------------------
+
+class TestRealWorld50_08(unittest.TestCase):
+    """RealWorld's new effects build the documented argv; subprocess is mocked, nothing runs."""
+
+    def run_with(self, call, stdout="", rc=0):
+        seen = []
+
+        def fake_run(argv, **kw):
+            seen.append((list(argv), kw))
+            return subprocess.CompletedProcess(argv, rc, stdout, "")
+        with mock.patch.object(edl.subprocess, "run", fake_run), \
+                mock.patch.object(edl.shutil, "which", lambda b: f"/usr/bin/{b}"):
+            res = call(edl.RealWorld())
+        return res, seen
+
+    def test_argv(self):
+        _, seen = self.run_with(lambda w: w.systemctl(["is-active", edl.LISTENER_UNIT]))
+        self.assertEqual(seen[0][0], ["systemctl", "--user", "is-active", "claude-questions-listen.service"])
+        _, seen = self.run_with(lambda w: w.systemd_run(edl.tmux_start_args(), {"PATH": "/p"}))
+        self.assertEqual(seen[0][0][:4], ["systemd-run", "--user", "--scope", "--unit=epic-driver-tmux"])
+        self.assertEqual(seen[0][1]["env"], {"PATH": "/p"})
+        _, seen = self.run_with(lambda w: w.inhibit_list())
+        self.assertEqual(seen[0][0], ["systemd-inhibit", "--list", "--no-pager"])
+        _, seen = self.run_with(lambda w: w.busctl(edl.attach_scope_args(7)))
+        self.assertEqual(seen[0][0][:3], ["busctl", "--user", "call"])
+        _, seen = self.run_with(lambda w: w.questions_check("/ws"))
+        self.assertEqual(seen[0][0], ["/usr/bin/claude-questions", "--check", "--workspace-dir", "/ws"])
+        pid, seen = self.run_with(lambda w: w.tmux_server_pid(), stdout="16651\n16651\n")
+        self.assertEqual((pid, seen[0][0]), (16651, ["tmux", "list-sessions", "-F", "#{pid}"]))
+        pid, _ = self.run_with(lambda w: w.tmux_server_pid(), rc=1)
+        self.assertIsNone(pid)
+
+    def test_notify_is_questions_mcp_lib_in_process_with_the_workspace(self):
+        calls = []
+        fake = mock.Mock()
+        fake.notify = lambda text, **kw: calls.append((text, kw)) or {"dispatched": True, "message_id": 3}
+        with mock.patch.object(edl.importlib, "import_module", lambda name: fake if name == "questions_mcp_lib" else None):
+            res = edl.RealWorld().notify("hi", role="hpl", ack=True, workspace_dir="/ws")
+        self.assertEqual(res, {"dispatched": True, "message_id": 3})
+        self.assertEqual(calls, [("hi", {"role": "hpl", "ack": True, "workspace_dir": "/ws"})])
+
+        def broken(name):
+            raise ImportError("httpx missing")
+        with mock.patch.object(edl.importlib, "import_module", broken):
+            res = edl.RealWorld().notify("hi", role=None, ack=False, workspace_dir="/ws")
+        self.assertEqual((res["dispatched"], res["error"]), (False, "ImportError: httpx missing"))
+
+    def test_no_child_gets_the_override_or_the_hooks_repo(self):
+        """A spawn (and every other RealWorld child) is started with an explicit environment without
+        EPIC_DRIVER_ALLOW_UNSTAMPED and CLAUDE_HOOKS_REPO, whatever the process has."""
+        extra = {"EPIC_DRIVER_ALLOW_UNSTAMPED": "1", "CLAUDE_HOOKS_REPO": "/some/repo", "CLAUDE_KEEP": "yes"}
+        calls = {
+            "spawn": lambda w: w.spawn(["amux-spawn", "x"]),
+            "resume": lambda w: w.resume(["amux-spawn", "resume", "x"]),
+            "reap": lambda w: w.reap(["amux-spawn", "rm", "x"]),
+            "amux_send": lambda w: w.amux_send("x", "line"),
+            "send_keys": lambda w: w.send_keys("x", "Enter"),
+            "systemctl": lambda w: w.systemctl(["is-active", "u"]),
+            "inhibit_list": lambda w: w.inhibit_list(),
+            "busctl": lambda w: w.busctl(["call"]),
+            "tmux_server_pid": lambda w: w.tmux_server_pid(),
+            "systemd_run": lambda w: w.systemd_run(["--scope"], dict(extra, PATH="/p")),
+            "git": lambda w: w.git(["rev-parse", "HEAD"], "/tmp"),
+        }
+        for name, call in calls.items():
+            with self.subTest(call=name), mock.patch.dict(os.environ, extra):
+                _, seen = self.run_with(call)
+                self.assertTrue(seen, name)
+                env = seen[0][1]["env"]
+                self.assertNotIn("EPIC_DRIVER_ALLOW_UNSTAMPED", env)
+                self.assertNotIn("CLAUDE_HOOKS_REPO", env)
+                if name != "systemd_run":
+                    self.assertEqual(env.get("CLAUDE_KEEP"), "yes")      # the rest of the environment still goes
+
+    def test_claude_hooks_repo_is_set_around_the_import_alone_in_the_calling_thread(self):
+        """questions_mcp_lib reads it at import time only: it is set around the import (main thread, once)
+        and put back at once; the notify call, and the notify thread, never touch os.environ."""
+        seen = []
+        fake = mock.Mock()
+        fake.notify = lambda text, **kw: seen.append(os.environ.get("CLAUDE_HOOKS_REPO")) or {"dispatched": True}
+        imported = []
+
+        def import_module(name):
+            imported.append((os.environ.get("CLAUDE_HOOKS_REPO"), threading.current_thread().name))
+            return fake
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(edl.importlib, "import_module", import_module):
+            os.environ.pop("CLAUDE_HOOKS_REPO", None)
+            w = edl.RealWorld(hooks_repo="/hooks")
+            w.prepare_notify()
+            self.assertEqual(imported, [("/hooks", threading.current_thread().name)])
+            self.assertNotIn("CLAUDE_HOOKS_REPO", os.environ)              # put back right after the import
+            w.notify("hi", role=None, ack=True, workspace_dir="/ws")
+            w.prepare_notify()
+            self.assertEqual(len(imported), 1)                             # imported once
+            self.assertEqual(seen, [None])                                 # the call does not set it
+            os.environ["CLAUDE_HOOKS_REPO"] = "/operator"
+            edl.RealWorld(hooks_repo="/hooks").prepare_notify()
+            self.assertEqual(os.environ["CLAUDE_HOOKS_REPO"], "/operator")  # a prior value comes back
+            edl.RealWorld().prepare_notify()                               # no hooks_repo: untouched
+            self.assertEqual(imported[-1][0], "/operator")
+
+    def test_a_notifier_prepares_in_the_main_thread_and_its_thread_leaves_os_environ_alone(self):
+        env_in_thread = []
+        fake = mock.Mock()
+
+        def fake_notify(text, **kw):
+            env_in_thread.append((threading.current_thread().name, dict(os.environ)))
+            return {"dispatched": True, "message_id": 1}
+        fake.notify = fake_notify
+        imported = []
+
+        def import_module(name):
+            imported.append(threading.current_thread() is threading.main_thread())
+            return fake
+        world = edl.RealWorld(hooks_repo="/hooks")
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(edl.importlib, "import_module", import_module):
+            os.environ.pop("CLAUDE_HOOKS_REPO", None)
+            before = dict(os.environ)
+            n = edl.Notifier(world, None, {}, workspace="/ws", role=None, epic="t")
+            self.assertEqual(imported, [True])                      # imported by the constructor, in the main thread
+            res = n._call("hi", True)
+            self.assertTrue(res["dispatched"])
+            self.assertEqual(env_in_thread[0][0], "epic-driver-notify")
+            self.assertNotIn("CLAUDE_HOOKS_REPO", env_in_thread[0][1])   # the thread ran with no variable set
+            self.assertEqual(dict(os.environ), before)                    # and changed nothing
+
+    def test_no_child_environment_contains_the_hooks_repo_after_a_notify(self):
+        fake = mock.Mock()
+        fake.notify = lambda text, **kw: {"dispatched": True}
+        with mock.patch.dict(os.environ, {"CLAUDE_HOOKS_REPO": "/leaked"}), \
+                mock.patch.object(edl.importlib, "import_module", lambda n: fake):
+            w = edl.RealWorld(hooks_repo="/hooks")
+            w.notify("hi", role=None, ack=True, workspace_dir="/ws")
+            for call in (lambda x: x.spawn(["amux-spawn", "x"]), lambda x: x.systemctl(["is-active", "u"]),
+                         lambda x: x.git(["rev-parse", "HEAD"], "/tmp")):
+                _, seen = self.run_with(call)
+                self.assertNotIn("CLAUDE_HOOKS_REPO", seen[0][1]["env"])
+
+    def test_the_new_world_methods_fail_loudly_on_the_base_class(self):
+        w = edl.World()
+        for call in (lambda: w.systemctl([]), lambda: w.systemd_run([], {}), lambda: w.inhibit_list(),
+                     lambda: w.busctl([]), lambda: w.tmux_server_pid(), lambda: w.read_cgroup(1),
+                     lambda: w.notify("x", role=None, ack=True, workspace_dir="/"), lambda: w.notify_index_ids(),
+                     lambda: w.questions_settings("/"), lambda: w.questions_check("/"), lambda: w.sleep(0)):
+            with self.assertRaises(NotImplementedError):
+                call()
+
+
+class TestNotifyTimeout(_Tick):
+    """The in-process notify runs in a daemon thread joined with NOTIFY_TIMEOUT_S."""
+
+    def blocking(self):
+        gate, entered = threading.Event(), threading.Event()
+        orig = self.world.notify
+
+        def notify(text, **kw):
+            entered.set()
+            gate.wait(10)
+            return orig(text, **kw)
+        self.world.notify = notify
+        return gate, entered
+
+    def test_a_notify_that_blocks_is_a_recorded_failure_and_the_pass_goes_on(self):
+        self.enable([self.driver("A")])
+        st = self.state()
+        st["steps"]["A"]["attempts"] = 99                          # attempts_exhausted: one alarm
+        self.save(st)
+        gate, entered = self.blocking()
+        t0 = time.monotonic()
+        with mock.patch.object(edl, "NOTIFY_TIMEOUT_S", 0.2):
+            rc = self.run_pass()
+        took = time.monotonic() - t0
+        self.assertEqual(rc, 0, self.last_err)
+        self.assertTrue(entered.is_set())
+        self.assertLess(took, 5)                                   # did not wait for the blocked notify
+        st = self.state()
+        self.assertEqual(st["tick_seq"], 1)                        # the pass completed
+        self.assertIn("timed out after 0.2s", st["notify_failures"][-1]["error"])
+        self.assertIn("(it may still complete)", st["notify_failures"][-1]["error"])
+        rec = st["alarms"]["attempts_exhausted:A"]
+        self.assertIn("timed out", rec["last_error"])
+        self.assertIsNone(rec["message_id"])
+        self.assertIn("dispatched=no", self.rp.notify_log.read_text())
+        self.assertIn("timed out", self.cli("status")[1])          # `status` shows it
+        gate.set()                                                 # the late completion: nothing breaks
+        for t in threading.enumerate():
+            if t.name == "epic-driver-notify":
+                t.join(5)
+        self.assertEqual(len(self.world.alarm_notifies()), 1)      # it did go out in the end (the documented duplicate risk)
+
+    def test_a_notify_that_returns_in_time_is_unchanged(self):
+        self.enable([self.driver("A")])
+        st = self.state()
+        st["steps"]["A"]["attempts"] = 99
+        self.save(st)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.state()["notify_failures"], [])
+        self.assertEqual(len(self.world.alarm_notifies()), 1)
+
+
+class TestReconcileAlarmsThroughTheTick(_Tick):
+    """A 50-05 condition through real passes: raised with one ack=True notify, cleared with none."""
+
+    def test_session_stuck(self):
+        self.enable([])
+        st = self.state()
+        old = T("2026-11-24T09:00:00Z").timestamp()
+        self.session(st, events=[ev("turn_start", "2026-11-24T09:00:01Z")], state="running", mtime=old,
+                     entries=[u("2026-11-24T09:00:01Z", "fix it"), a("2026-11-24T09:00:30Z", "working")])
+        self.save(st)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), ["session_stuck:ws-t-driver-g1"])
+        self.assertEqual([n["text"].split(":")[0] for n in self.world.alarm_notifies()],
+                         ["[epic-driver t] ALARM session_stuck ws-t-driver-g1"])
+        self.world.events["ws-t-driver-g1"].append(ev("stop", "2026-11-24T10:05:00Z", state="idle"))
+        self.world.handles[0].update(state="idle", stopped_at="2026-11-24T10:05:00Z")
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual(self.active_alarms(), [])
+        self.assertEqual(len(self.world.alarm_notifies()), 1)

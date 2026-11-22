@@ -42,7 +42,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | done | 50-01, 50-02, 50-03, 50-04 | |
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | done | 50-05 | D4, D5, M6, m2 |
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | done | 50-04 | P0-7 |
-| 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | todo | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
+| 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | done | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
 | 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | todo | 50-06, 50-08 | |
 | 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | todo | 50-08, 50-09 | P0-12 (stamps); units |
 | 50-11 | Workstation root setup (sleep lock with no login) | dropped (P0-6) | — | No file. The id is kept so 50-12 keeps its number. |
@@ -164,3 +164,13 @@ Phase 0 decisions. They stay listed here for the reasoning.
   step-id collisions are rejected at validation. Accepted without change (review 2, optional): `_git_env` does not
   scrub `GIT_CONFIG_*`/`GIT_EXEC_PATH` (matters only with a hostile driver environment), and the `rev-parse`/`status`
   allowlist is a flag allowlist, not an argv-shape check (read-only forms).
+- **2026-11-23 — 50-08 done** (2 reviews, 2 fixes; suite 3030 OK, 2 skipped). `.claude/bin/epic-driver` (all §18
+  verbs), the tick pass, tmux-server ownership, the environment snapshot, infrastructure checks, the alarm engine with
+  the full §16.2 catalogue, the notify path (`questions_mcp_lib.notify(..., workspace_dir=)`, None unchanged),
+  heartbeats. From review: one pass deadline (~270 s) governs every phase — work that does not fit is deferred,
+  raises nothing and clears nothing; `EPIC_DRIVER_ALLOW_UNSTAMPED` is honoured only from a repo checkout, refused by
+  `enable`, stripped from children; `CLAUDE_HOOKS_REPO` never reaches children; a stamp mismatch anywhere in
+  `questions_mcp_lib`'s import closure blocks the notify import; `enable` rollback restores a pre-existing pointer
+  file byte for byte; notifies have a wall-clock limit. Architecture §16.1 clarified: the first repeat comes 4 h after
+  the ladder ends. Nothing on the workstation was enabled or started. The stamps manifest format and the repo-vs-
+  installed detection 50-10 must honour are in `agents_output/50-08_implementation_report.md` and `_fix_report.md`.

@@ -29,11 +29,17 @@ Dispatch plan         ``plan_dispatch``: (mutation, effect) ops   50-06
 Dispatch execution    ``execute_dispatch``: COMMIT → effect → COMMIT 50-06
 Dispatch conditions   delivery/handoff/spawn/resume alarm rows    50-06
 Worker worktrees      §14 integration/step worktrees, sha check   50-07
+Environment           §21.2 snapshot, the dead SSH_AUTH_SOCK      50-08
+tmux server           §21.1 start in its own scope, verify, move  50-08
+Infrastructure        §12.10 listener and inhibitor               50-08
+Notify and alarms     §16.1 engine, §16.4 notify, §16.5 beats     50-08
+The tick              §23 one pass, tick.lock, its time bound     50-08
+Status and verbs      §20 screen, §18 verbs (``cli``)             50-08
 ====================  ==========================================  ======
 
-Later tasks append their own sections (reconcile §12, dispatch §9/§11,
-worktrees §14, alarms/notify §16, the tick §23) and extend ``World`` with one
-method per new effect.
+Each task appended its own section and extended ``World`` with one method per
+new effect. ``.claude/bin/epic-driver`` (argparse, path setup, the §17 stamp
+check) calls :func:`cli`.
 
 Rules every section follows:
 
@@ -45,12 +51,13 @@ Rules every section follows:
   evaluated at import (``from __future__ import annotations`` below), no
   ``tomllib``. PyYAML is imported lazily-guarded: the module imports without
   it, and only :func:`load_ledger` needs it (``SafeLoader`` only).
-- Nothing in this module starts a session, sends to a pane or notifies by
-  itself; the tick (50-08) runs the effects a pass decides on.
+- The pure sections decide; only the tick (:func:`tick_pass`) and the verbs
+  run the effects a pass decides on, each through ``World``.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib
 import json
@@ -209,8 +216,11 @@ PROMPT_GLYPHS = ("❯", ">")           # the TUI's prompt glyph (input box and m
 # -- 50-06: dispatch — session policy (§11) and delivery (§9) --
 AMUX_BIN = "amux"                    # `amux send` only (RealWorld.amux_send)
 AMUX_SPAWN_BIN = "amux-spawn"        # spawn / resume / rm (RealWorld._amux_spawn)
-SPAWN_TIMEOUT_S = 180                # *default*: amux-spawn spawn confirms the launch before it returns
-RESUME_TIMEOUT_S = 120               # *default*: the resume waits up to 30 s for transcript growth
+#: *default*: ``amux-spawn spawn --detach`` creates the session and the handle and returns (no wait on the
+#: session). 60 s (50-08, from 180) so that a launch fits the pass deadline after a saturated check budget
+#: (``TICK_DEADLINE_S``); a launch that does not fit is left to the next pass (``execute_dispatch``'s gate).
+SPAWN_TIMEOUT_S = 60
+RESUME_TIMEOUT_S = 60                # *default*: the resume waits up to 30 s for transcript growth
 REAP_TIMEOUT_S = 60
 SEND_TIMEOUT_S = 30
 KEYS_TIMEOUT_S = 10
@@ -240,6 +250,94 @@ ROLE_PROMPTS_DIR = Path.home() / ".claude" / "epic-driver" / "prompts"
 DRIVER_PROMPT_FILE = "epic-driver-driver.md"
 WORKER_PROMPT_FILE = "epic-driver-worker.md"
 PING_LINE = 'PING: no action needed; reply exactly "WAITING: ping"'
+
+# -- 50-08: the tick, the CLI, alarms and notify, the tmux server (§16–§18, §20–§23) --
+SYSTEMCTL_BIN = "systemctl"          # always `systemctl --user` (RealWorld.systemctl)
+SYSTEMD_RUN_BIN = "systemd-run"      # `systemd-run --user --scope …` (the tmux server, §21.1)
+SYSTEMD_INHIBIT_BIN = "systemd-inhibit"   # `systemd-inhibit --list` (the inhibitor's lock, §22)
+BUSCTL_BIN = "busctl"                # `busctl --user call … AttachProcessesToUnit|StartTransientUnit`
+CLAUDE_QUESTIONS_BIN = "claude-questions"   # `claude-questions --check --workspace-dir <ws>` (§18.1 gate 5)
+SYSTEMCTL_TIMEOUT_S = 30
+SYSTEMD_RUN_TIMEOUT_S = 30
+INHIBIT_LIST_TIMEOUT_S = 10
+BUSCTL_TIMEOUT_S = 15
+QUESTIONS_CHECK_TIMEOUT_S = 60       # it probes every token against the relay (10 s each)
+#: §22 unit names.
+LISTENER_UNIT = "claude-questions-listen.service"
+SERVICE_UNIT = "claude-epic-driver.service"
+TIMER_UNIT = "claude-epic-driver.timer"
+INHIBIT_UNIT = "claude-epic-driver-inhibit.service"
+#: §21.1: the tmux server's own scope and its keepalive session.
+TMUX_SCOPE_NAME = "epic-driver-tmux"
+TMUX_SCOPE_UNIT = TMUX_SCOPE_NAME + ".scope"
+TMUX_KEEPALIVE_SESSION = "epic-driver-keepalive"
+#: §22: the inhibitor's lock as `systemd-inhibit --list` shows it.
+INHIBIT_WHO = "claude-epic-driver"
+INHIBIT_WHAT = "sleep:idle"
+INHIBIT_MODE = "block"
+INHIBIT_VERIFY_TRIES = 5             # `enable` polls the list this many times, 1 s apart
+#: §16.1: an active alarm repeats every 4 h once its nudge ladder is no longer live.
+ALARM_REPEAT_S = 4 * 3600
+NOTIFY_FAILURES_KEEP = 20            # §8: the last 20
+RUN_SUBJECT = "run"                  # the subject of the run-level alarms (§16.2)
+#: §16.2 in catalogue order: every alarm id the engine knows.
+ALARM_IDS = (
+    "tick_error", "ledger_invalid", "stamp_mismatch", "tmux_server", "listener_down", "inhibitor_down",
+    "due_not_started", "step_timeout", "attempts_exhausted", "check_error", "deadline_near", "deadline_missed",
+    "halt", "delivery_deferred", "delivery_unconfirmed", "verdict_missing", "handoff_timeout", "session_stuck",
+    "permission_open", "ask_user_question_open", "usage_limit", "spawn_failed", "resume_failed",
+    "model_mismatch", "compaction", "startup_dialog", "foreign_handle", "orphan_session", "worktree_refused",
+)
+#: The pass's time bound (§22 `TimeoutStartSec=5min`, review m5). The dispatch starts no effect whose
+#: timeout would end past ``TICK_DEADLINE_S`` from the pass start; the check budget is capped so that
+#: ``TICK_DISPATCH_RESERVE_S`` stays for the dispatch; a notify starts only when it can end before
+#: ``TICK_HARD_LIMIT_S``. All *defaults*, measured on ``World.now``.
+#:
+#: ``TICK_DEADLINE_S`` = 270: 30 s under the unit's 300 s ``TimeoutStartSec``. It is the latest any call but
+#: a notify may *end*: every call starts only when ``elapsed + its worst case <=`` its phase's end below,
+#: and the phase ends are all at or before it. The last 30 s are the notify (45 s, started only when it
+#: ends by ``TICK_HARD_LIMIT_S`` = 290) plus the final commits and log writes. Phase ends (seconds from the
+#: pass start): ledger git 30, infrastructure 100, readings 150, sha checks 190, the check budget 180 (it
+#: is computed after the sha checks), worktrees 200, effects 270 (``EFFECT_MAX_S``), notifies 290.
+#: Deferred work runs next pass and is never an error.
+TICK_DEADLINE_S = 270
+TICK_DISPATCH_RESERVE_S = 90
+TICK_HARD_LIMIT_S = 290
+LEDGER_END_S = 30
+INFRA_END_S = 100
+READINGS_END_S = 150
+SHA_END_S = 190
+PREPARE_END_S = 200
+#: The first check of a pass runs even when it does not fit the budget, but only while the pass is young.
+FIRST_CHECK_UNTIL_S = TICK_DEADLINE_S / 3
+#: SIGTERM grace + SIGKILL reap (``RealWorld.run_check``) on top of a check's own timeout.
+CHECK_OVERHEAD_S = 2 * CHECK_KILL_GRACE_S
+GIT_TIMEOUT_S = 30.0                 # ``World.git``'s default per call
+AMUX_LS_TIMEOUT_S = 10               # ``amux_spawn_lib.list_amux_names``
+NOTIFY_TIMEOUT_S = 45                # the relay client's connect 5 s + read 35 s, and the index write
+#: §18: every writing verb but `tick` waits this long for tick.lock.
+LOCK_WAIT_S = 300
+#: §17: the stamps manifest the installer writes; the env var only tests set.
+STAMPS_FILE = "stamps.json"
+ALLOW_UNSTAMPED_ENV = "EPIC_DRIVER_ALLOW_UNSTAMPED"
+HOOKS_REPO_ENV = "CLAUDE_HOOKS_REPO"
+#: Never in a child's environment: the stamp override must not reach a session or a check, and the hooks
+#: repo is only for ``questions_mcp_lib`` (set around its import and call, see ``RealWorld.notify``).
+CHILD_ENV_STRIPPED = (ALLOW_UNSTAMPED_ENV, HOOKS_REPO_ENV)
+
+
+def child_env(environ: Any = None) -> Dict[str, str]:
+    """``environ`` (default the process's) without :data:`CHILD_ENV_STRIPPED`: what every child gets."""
+    src = os.environ if environ is None else environ
+    return {k: v for k, v in src.items() if isinstance(v, str) and k not in CHILD_ENV_STRIPPED}
+
+
+#: amux-spawn's credential rule (``is_secret_key``): a key with one of these ``_``-segments is never
+#: written to the environment snapshot (§21.2). A test pins it against amux-spawn's own function.
+SECRET_KEY_SEGMENTS = frozenset({
+    "TOKEN", "TOKENS", "SECRET", "SECRETS", "KEY", "KEYS", "APIKEY",
+    "PASSWORD", "PASSWD", "PASS", "PAT", "CREDENTIAL", "CREDENTIALS", "AUTH",
+})
 
 
 # =============================================================================
@@ -457,10 +555,63 @@ class World:
         """``tmux send-keys -t =amux-<name>: <key>``, one key of ``STARTUP_DIALOG_KEYS`` (§12.11)."""
         raise NotImplementedError("World.send_keys")
 
+    # -- 50-08: systemd, the tmux server, notify and the questions tooling (§12.10, §16, §18, §21) --
+
+    def systemctl(self, args: Sequence[str]) -> CommandResult:
+        """``systemctl --user <args>`` (is-active, start, enable --now, disable --now, show)."""
+        raise NotImplementedError("World.systemctl")
+
+    def systemd_run(self, args: Sequence[str], env: Dict[str, str]) -> CommandResult:
+        """``systemd-run <args>`` with ``env`` as its whole environment (:func:`tmux_start_args`)."""
+        raise NotImplementedError("World.systemd_run")
+
+    def inhibit_list(self) -> CommandResult:
+        """``systemd-inhibit --list --no-pager``."""
+        raise NotImplementedError("World.inhibit_list")
+
+    def busctl(self, args: Sequence[str]) -> CommandResult:
+        """``busctl --user <args>`` (:func:`attach_scope_args`, :func:`start_scope_args`)."""
+        raise NotImplementedError("World.busctl")
+
+    def tmux_server_pid(self) -> Optional[int]:
+        """The default tmux server's pid (``tmux list-sessions -F '#{pid}'``); None when none runs."""
+        raise NotImplementedError("World.tmux_server_pid")
+
+    def read_cgroup(self, pid: int) -> Optional[str]:
+        """``/proc/<pid>/cgroup``; None when unreadable."""
+        raise NotImplementedError("World.read_cgroup")
+
+    def notify(self, text: str, *, role: Optional[str], ack: bool, workspace_dir: str) -> Dict[str, Any]:
+        """``questions_mcp_lib.notify(text, role=…, ack=…, workspace_dir=…)`` in process (§16.4); never raises."""
+        raise NotImplementedError("World.notify")
+
+    def notify_index_ids(self) -> Optional[set]:
+        """The message ids in the listener's index (``questions_listen_lib.read_index().messages``)."""
+        raise NotImplementedError("World.notify_index_ids")
+
+    def questions_settings(self, workspace: str) -> Optional[Dict[str, str]]:
+        """``{"nudge", "sync"}`` of the workspace's ``[questions]`` section; None when it has none."""
+        raise NotImplementedError("World.questions_settings")
+
+    def questions_check(self, workspace: str) -> CommandResult:
+        """``claude-questions --check --workspace-dir <workspace>`` (§18.1 gate 5)."""
+        raise NotImplementedError("World.questions_check")
+
+    def sleep(self, seconds: float) -> None:
+        raise NotImplementedError("World.sleep")
+
+
+def _workspace_roles_path(workspace: str) -> Optional[Path]:
+    """The workspace's own ``.claude/roles.toml``, found by walking up from it (never ``CLAUDE_PROJECT_DIR``)."""
+    for d in (Path(workspace).resolve(), *Path(workspace).resolve().parents):
+        if (d / ".claude" / "roles.toml").is_file():
+            return d / ".claude" / "roles.toml"
+    return None
+
 
 def _git_env() -> Dict[str, str]:
     """``questions_git``'s discipline: no stray GIT_* redirection, never prompt."""
-    env = dict(os.environ)
+    env = child_env()
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX"):
         env.pop(key, None)
@@ -600,7 +751,7 @@ class RealWorld(World):
         argv = [TMUX_BIN, *args]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=TMUX_READ_TIMEOUT_S,
-                                  stdin=subprocess.DEVNULL)
+                                  stdin=subprocess.DEVNULL, env=child_env())
         except (OSError, subprocess.SubprocessError):
             return None
         return proc.stdout if proc.returncode == 0 else None
@@ -669,11 +820,7 @@ class RealWorld(World):
         # The workspace's own .claude/roles.toml, found by walking up from it. Passed
         # explicitly so a CLAUDE_PROJECT_DIR in the caller's environment (a tick run
         # by hand from a Claude session) cannot point the reader at another queue.
-        roles_path = None
-        for d in (Path(workspace).resolve(), *Path(workspace).resolve().parents):
-            if (d / ".claude" / "roles.toml").is_file():
-                roles_path = d / ".claude" / "roles.toml"
-                break
+        roles_path = _workspace_roles_path(workspace)
         if roles_path is None:
             return None
         store = qs.open_store(workspace, roles_path=roles_path)
@@ -706,7 +853,7 @@ class RealWorld(World):
     def _run_tool(self, argv: Sequence[str], timeout_s: float) -> CommandResult:
         try:
             proc = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout_s,
-                                  stdin=subprocess.DEVNULL)
+                                  stdin=subprocess.DEVNULL, env=child_env())
         except subprocess.TimeoutExpired:
             return CommandResult(rc=None, error=f"{os.path.basename(argv[0])} timed out after {timeout_s:g}s")
         except OSError as exc:
@@ -735,6 +882,109 @@ class RealWorld(World):
             return CommandResult(rc=None, error=f"refusing key {key!r}: not one of {STARTUP_DIALOG_KEYS}")
         return self._run_tool([TMUX_BIN, "send-keys", "-t", f"={asl.tmux_session_name(name)}:", key],
                               KEYS_TIMEOUT_S)
+
+    # -- 50-08: systemd, the tmux server, notify, the questions tooling --
+
+    def systemctl(self, args: Sequence[str]) -> CommandResult:
+        return self._run_tool([SYSTEMCTL_BIN, "--user", *args], SYSTEMCTL_TIMEOUT_S)
+
+    def systemd_run(self, args: Sequence[str], env: Dict[str, str]) -> CommandResult:
+        try:
+            proc = subprocess.run([SYSTEMD_RUN_BIN, *args], capture_output=True, text=True, env=child_env(env),
+                                  timeout=SYSTEMD_RUN_TIMEOUT_S, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return CommandResult(rc=None, error=f"systemd-run timed out after {SYSTEMD_RUN_TIMEOUT_S}s")
+        except OSError as exc:
+            return CommandResult(rc=None, error=f"systemd-run could not run: {exc}")
+        return CommandResult(rc=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    def inhibit_list(self) -> CommandResult:
+        return self._run_tool([SYSTEMD_INHIBIT_BIN, "--list", "--no-pager"], INHIBIT_LIST_TIMEOUT_S)
+
+    def busctl(self, args: Sequence[str]) -> CommandResult:
+        return self._run_tool([BUSCTL_BIN, "--user", *args], BUSCTL_TIMEOUT_S)
+
+    def tmux_server_pid(self) -> Optional[int]:
+        out = self._tmux_read(["list-sessions", "-F", "#{pid}"])
+        first = (out or "").strip().split("\n")[0].strip()
+        return int(first) if first.isdigit() else None
+
+    def read_cgroup(self, pid: int) -> Optional[str]:
+        try:
+            with open(f"/proc/{int(pid)}/cgroup", encoding="utf-8") as f:
+                return f.read()
+        except (OSError, ValueError):
+            return None
+
+    #: What ``CLAUDE_HOOKS_REPO`` must be for ``questions_mcp_lib`` to import the hooks this CLI imports
+    #: (``$HOME`` when installed; the checkout for a repo run). None: leave the process's value alone.
+    hooks_repo: Optional[str] = None
+
+    def __init__(self, hooks_repo: Optional[str] = None) -> None:
+        self.hooks_repo = hooks_repo
+
+    _qml: Any = None
+    _qml_error: Optional[str] = None
+
+    def prepare_notify(self) -> None:
+        """Import ``questions_mcp_lib`` ONCE, in the calling (main) thread, before any notify thread exists.
+
+        ``questions_mcp_lib`` reads CLAUDE_HOOKS_REPO at import time (its ``HOOKS_DIR``), and only there, so
+        the variable is set around the import alone and put back right after: no notify thread is running
+        yet, and none ever touches ``os.environ`` (an abandoned one may outlive its join timeout). Every
+        child gets an explicit ``child_env()`` without the variable. ``Notifier`` calls this from the main
+        thread; ``notify`` calls it itself only when nobody did (the main-thread ``enable`` test notify).
+        """
+        if self._qml is not None:
+            return
+        prev = os.environ.get(HOOKS_REPO_ENV)
+        try:
+            if self.hooks_repo:
+                os.environ[HOOKS_REPO_ENV] = self.hooks_repo
+            self._qml = importlib.import_module("questions_mcp_lib")
+            self._qml_error = None
+        except Exception as exc:  # noqa: BLE001 - a notify failure is a recorded fact, never a crash
+            self._qml_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            if self.hooks_repo:
+                if prev is None:
+                    os.environ.pop(HOOKS_REPO_ENV, None)
+                else:
+                    os.environ[HOOKS_REPO_ENV] = prev
+
+    def notify(self, text: str, *, role: Optional[str], ack: bool, workspace_dir: str) -> Dict[str, Any]:
+        self.prepare_notify()
+        qml = self._qml
+        if qml is None:
+            return {"dispatched": False, "message_id": None, "error": self._qml_error}
+        try:
+            return dict(qml.notify(text, role=role, ack=ack, workspace_dir=workspace_dir))
+        except Exception as exc:  # noqa: BLE001 - a notify failure is a recorded fact, never a crash
+            return {"dispatched": False, "message_id": None, "error": f"{type(exc).__name__}: {exc}"}
+
+    def notify_index_ids(self) -> Optional[set]:
+        try:
+            qll = importlib.import_module("questions_listen_lib")
+            return set(qll.read_index().messages)
+        except Exception:  # noqa: BLE001 - an unreadable index: the ladder span alone decides
+            return None
+
+    def questions_settings(self, workspace: str) -> Optional[Dict[str, str]]:
+        qs = importlib.import_module("questions_store")
+        roles_path = _workspace_roles_path(workspace)
+        if roles_path is None:
+            return None
+        cfg = qs.load_questions_config(workspace, roles_path=roles_path)
+        if cfg is None:
+            return None
+        return {"nudge": str(cfg.nudge), "sync": str(cfg.sync)}
+
+    def questions_check(self, workspace: str) -> CommandResult:
+        binary = shutil.which(CLAUDE_QUESTIONS_BIN) or str(Path.home() / ".local" / "bin" / CLAUDE_QUESTIONS_BIN)
+        return self._run_tool([binary, "--check", "--workspace-dir", workspace], QUESTIONS_CHECK_TIMEOUT_S)
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(max(0.0, seconds))
 
 
 # =============================================================================
@@ -2300,6 +2550,27 @@ def atomic_write_text(path: Path, text: str, mode: int = 0o600) -> None:
     _fsync_dir(path.parent)
 
 
+def atomic_write_bytes(path: Path, data: bytes, mode: int = 0o600) -> None:
+    """:func:`atomic_write_text` for raw bytes (a byte-for-byte restore)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(path.parent)
+
+
 def save_state(path: Path, state: RunState) -> None:
     """Commit the state (§23 commit point): atomic, fsynced file and directory."""
     if state.get("schema") != STATE_SCHEMA:
@@ -2981,6 +3252,7 @@ class CheckPass:
     ran: List[Tuple[CheckJob, CheckRun, CheckOutcome]] = field(default_factory=list)
     not_reached: List[CheckJob] = field(default_factory=list)
     cursor: Optional[str] = None
+    too_long: List[CheckJob] = field(default_factory=list)    # cannot end within the pass: never started
 
 
 def check_anchor(step: Step, rec: Optional[StepState]) -> Optional[datetime]:
@@ -3182,15 +3454,21 @@ def log_check_run(paths: RunPaths, job: CheckJob, run: CheckRun) -> None:
 
 def run_checks(ledger: Ledger, state: RunState, world: World, *,
                snapshot: Optional[Dict[str, str]] = None, budget_s: float = CHECK_BUDGET_S,
-               base_env: Optional[Dict[str, str]] = None, log: bool = True) -> CheckPass:
+               base_env: Optional[Dict[str, str]] = None, log: bool = True,
+               overhead_s: float = 0.0, first_exempt: bool = True,
+               pass_left_s: Optional[float] = None) -> CheckPass:
     """Tick step 4: run eligible checks and triggers round-robin within the budget.
 
     Starts at ``state.check_cursor``; stops starting new runs once ``budget_s``
     has elapsed (by ``world.now()``) and leaves the cursor on the first job not
     reached, so it goes first next tick. A job is not started when its own
     timeout would end past the budget (elapsed + timeout > ``budget_s``); the
-    first job of a pass always runs, so a check whose timeout alone exceeds
-    the budget still gets its turn. Timeouts are never clamped: a clamped
+    first job of a pass runs even when it does not fit (``first_exempt``), so a
+    check whose timeout alone exceeds the budget still gets its turn. The tick
+    passes ``first_exempt=False`` once the pass is no longer young, ``overhead_s``
+    (the kill grace on top of a timeout) and ``pass_left_s`` (what the pass
+    deadline leaves): a job that cannot end within it is skipped, never started
+    (``CheckPass.too_long``), and the jobs after it still get their turn. Timeouts are never clamped: a clamped
     timeout would count as a check error. Results are applied to the state as
     each run ends, and the daily-window coverage (``window_covered_s``) is
     refreshed first. Never runs an action (invariant 1).
@@ -3204,7 +3482,11 @@ def run_checks(ledger: Ledger, state: RunState, world: World, *,
     result = CheckPass()
     for i, job in enumerate(jobs):
         elapsed = (require_aware(world.now()) - start).total_seconds()
-        if result.ran and elapsed + job.timeout_s > budget_s:
+        need = job.timeout_s + overhead_s
+        if pass_left_s is not None and need > pass_left_s - elapsed:
+            result.too_long.append(job)
+            continue
+        if elapsed + need > budget_s and (result.ran or not first_exempt):
             result.not_reached = jobs[i:]
             result.cursor = job.step_id
             break
@@ -3453,6 +3735,7 @@ class Readings:
     tz: Any = None
     questions: Optional[QuestionsSnapshot] = None
     questions_error: Optional[str] = None
+    incomplete: bool = False             # the pass deadline left sessions unread: nothing may be reconciled
 
     def by_name(self) -> Dict[str, SessionReading]:
         return {r.name: r for r in self.sessions}
@@ -3665,13 +3948,23 @@ def _read_session(world: World, name: str, kind: str, key: Optional[str],
     return reading
 
 
-def take_readings(ledger: Ledger, state: RunState, world: World, now: datetime) -> Readings:
+#: The longest one session's reads take: ``tmux has-session``, ``display-message`` and ``capture-pane``.
+SESSION_READ_WORST_S = 3 * TMUX_READ_TIMEOUT_S
+
+
+def take_readings(ledger: Ledger, state: RunState, world: World, now: datetime, *,
+                  fits: Optional[Callable[[float], bool]] = None) -> Readings:
     """Measure every session record, its parked generations and every handle of the run id.
 
     One ``SessionReading`` per name. Also the amux names (orphans, §12.8), the
     clock (§12.7), the system timezone (§12.4) and, when a question recorded
     in the state is still open, the workspace's queue (§15.2). Reads only:
     nothing is sent, spawned or written.
+
+    ``fits(cost_s)`` is the pass deadline: a session whose reads (``SESSION_READ_WORST_S``) or the
+    ``amux ls`` do not fit is not read, and ``incomplete`` is set. A partial reading must never be
+    reconciled (an unread session would look dead), so the tick then reconciles and dispatches nothing
+    this pass.
     """
     now = require_aware(now)
     handles = [asl.upgrade_handle(h) for h in world.list_handles() if isinstance(h, dict)]
@@ -3682,18 +3975,30 @@ def take_readings(ledger: Ledger, state: RunState, world: World, now: datetime) 
         name = rec.get("name")
         if isinstance(name, str) and name and name not in known:
             known.add(name)
+            if fits is not None and not fits(SESSION_READ_WORST_S):
+                out.incomplete = True
+                continue
             out.sessions.append(_read_session(world, name, SESSION_RECORD, key, by_name.get(name), rec, state, now))
         for p in rec.get("parked") or []:
             pname = (p or {}).get("name")
             if isinstance(pname, str) and pname and pname not in known:
                 known.add(pname)
+                if fits is not None and not fits(SESSION_READ_WORST_S):
+                    out.incomplete = True
+                    continue
                 out.sessions.append(_read_session(world, pname, SESSION_PARKED, key, by_name.get(pname),
                                                   None, state, now))
     for h in handles:
         name = h.get("name")
         if h.get("run_id") == ledger.run_id and isinstance(name, str) and name not in known:
             known.add(name)
+            if fits is not None and not fits(SESSION_READ_WORST_S):
+                out.incomplete = True
+                continue
             out.sessions.append(_read_session(world, name, SESSION_FOREIGN, None, h, None, state, now))
+    if fits is not None and not fits(AMUX_LS_TIMEOUT_S):
+        out.incomplete = True
+        return out
     out.amux_names = sorted(set(world.amux_names()))
     out.clock = world.clock_sample()
     out.tz = world.local_timezone()
@@ -6794,16 +7099,42 @@ def run_effect(world: World, effect: Effect) -> EffectOutcome:
     raise ValueError(f"unknown effect {effect.kind!r}")
 
 
+#: The longest an effect of each kind may take (its subprocess timeouts; a send or a key also reads the
+#: pane twice first). 50-08's deadline gate starts an effect only when this much time is left.
+EFFECT_MAX_S: Dict[str, float] = {
+    EFFECT_SPAWN: SPAWN_TIMEOUT_S, EFFECT_RESUME: RESUME_TIMEOUT_S, EFFECT_REAP: REAP_TIMEOUT_S,
+    EFFECT_SEND: SEND_TIMEOUT_S + 2 * TMUX_READ_TIMEOUT_S, EFFECT_KEYS: KEYS_TIMEOUT_S + 2 * TMUX_READ_TIMEOUT_S,
+}
+
+
 def execute_dispatch(plan: DispatchPlan, state: RunState, world: World,
-                     commit: Callable[[RunState], None]) -> List[EffectOutcome]:
+                     commit: Callable[[RunState], None], *,
+                     gate: Optional[Callable[[Effect], bool]] = None) -> List[EffectOutcome]:
     """Run the plan on ``state`` (in place): per op, write its files, mutate, COMMIT, run the effect,
     apply its result, COMMIT. ``commit`` is the tick's ``save_state`` (§23 step 6, invariant 5).
 
     An event file whose number a crashed pass wrote but never committed is
     overwritten: no state ever named it, so nothing was sent for it.
+
+    ``gate`` (the tick's deadline, 50-08) is asked before every op with an effect; False leaves the
+    effect to the next pass. A spawn or resume is then committed and not run, which is exactly a pass
+    killed between that commit and its effect (the next pass launches it again with the same event,
+    the crash matrix's case). Any other op (a send, a retry, a reminder, a key, a ping, a reap) is
+    skipped whole, its mutation included: nothing records an attempt that never happened, and the next
+    pass plans it again.
     """
     outcomes: List[EffectOutcome] = []
     for op in plan.ops:
+        if op.effect.kind != EFFECT_NONE and gate is not None and not gate(op.effect):
+            if op.effect.kind not in (EFFECT_SPAWN, EFFECT_RESUME):
+                outcomes.append(EffectOutcome(op.effect, ran=False, deferred="pass deadline"))
+                continue
+            for path, text in op.files.items():
+                atomic_write_text(Path(path), text)
+            op.mutate(state)
+            commit(state)
+            outcomes.append(EffectOutcome(op.effect, ran=False, deferred="pass deadline"))
+            continue
         for path, text in op.files.items():
             atomic_write_text(Path(path), text)
         op.mutate(state)
@@ -7146,12 +7477,69 @@ def ensure_step_worktrees(ledger: Ledger, state: RunState, world: World, step_id
     return result
 
 
+class BoundedWorld:
+    """``World`` whose ``git`` stops at a deadline: for code that makes an unknown number of git calls.
+
+    ``remaining()`` is the seconds to the deadline. A call gets ``min(its timeout, remaining)``; with
+    less than a second left it is not made (``rc=None``). ``expired`` records that a call was refused
+    or clamped, so the caller can defer whatever it was doing instead of recording the git error.
+    Everything else is the wrapped world's.
+    """
+
+    def __init__(self, world: World, remaining: Callable[[], float], *, assume_git: bool = False) -> None:
+        self._world = world
+        self._remaining = remaining
+        self.expired = False
+        self.assume_git = assume_git      # every git call "succeeds" without running (the ledger's structure only)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._world, name)
+
+    def now(self) -> datetime:
+        return self._world.now()
+
+    def git(self, args: Sequence[str], cwd: str, timeout_s: float = GIT_TIMEOUT_S) -> CommandResult:
+        if self.assume_git:
+            return CommandResult(rc=0, stdout="true\n")
+        left = self._remaining()
+        if left < 1.0:
+            self.expired = True
+            return CommandResult(rc=None, error="pass deadline: git not run")
+        if left < timeout_s:
+            self.expired = True
+            timeout_s = left
+        return self._world.git(args, cwd, timeout_s)
+
+
 def prepare_worker_steps(ledger: Ledger, state: RunState, world: World,
-                         step_ids: Iterable[str]) -> Dict[str, str]:
-    """Run :func:`ensure_step_worktrees` for each worker step in ``step_ids``; return :func:`worker_dirs`."""
+                         step_ids: Iterable[str], *,
+                         remaining: Optional[Callable[[], float]] = None) -> Dict[str, str]:
+    """Run :func:`ensure_step_worktrees` for each worker step in ``step_ids``; return :func:`worker_dirs`.
+
+    ``remaining()`` is the pass deadline for this phase (``PREPARE_END_S``). Its git calls are bounded
+    by it (:class:`BoundedWorld`); a step that ran out of time is deferred: its record is put back as it
+    was (a clamped git error must not become ``worktree_refused``; what was created stays and is reused,
+    the call being idempotent) and so are all the steps after it. The next pass prepares them.
+    """
+    bounded = BoundedWorld(world, remaining) if remaining is not None else None
     for step_id in step_ids:
-        if ledger.has_step(step_id) and ledger.step(step_id).worker is not None:
+        if not (ledger.has_step(step_id) and ledger.step(step_id).worker is not None):
+            continue
+        if bounded is None:
             ensure_step_worktrees(ledger, state, world, step_id)
+            continue
+        if bounded.expired or remaining() < 1.0:       # type: ignore[misc]
+            bounded.expired = True
+            break
+        records = ((state.setdefault("worktrees", {})).setdefault("steps", {}))
+        before = json.loads(json.dumps(records.get(step_id))) if step_id in records else None
+        ensure_step_worktrees(ledger, state, bounded, step_id)
+        if bounded.expired:
+            if before is None:
+                records.pop(step_id, None)
+            else:
+                records[step_id] = before
+            break
     return worker_dirs(state)
 
 
@@ -7214,18 +7602,24 @@ def sha_gate_open(step: Step, rec: Optional[StepState]) -> bool:
     return bool(done.get("passed")) and done.get("shas") == (rec or {}).get("shas")
 
 
-def run_sha_checks(ledger: Ledger, state: RunState, world: World, now: datetime) -> List[ShaCheck]:
+def run_sha_checks(ledger: Ledger, state: RunState, world: World, now: datetime, *,
+                   fits: Optional[Callable[[float], bool]] = None) -> List[ShaCheck]:
     """Tick step 4, in front of :func:`run_checks`: the sha check of every worker step in a checked status.
 
     Records ``steps[*].sha_check = {passed, status, shas, detail, at}``. All repos pass ⇒ the gate opens
     (the step's own check runs next), and a step with no own check is done (``by="check"``). Local
     git only, re-run each tick until it passes. Never raises an alarm itself.
+
+    ``fits(cost_s)`` is the pass deadline: a step whose worst case (``GIT_TIMEOUT_S`` per repo) does not
+    fit is left as it is, unchecked, for the next pass (not an error).
     """
     now = require_aware(now)
     out: List[ShaCheck] = []
     for step in ledger.steps:
         rec = _step_state(state, step.id)
         if step.worker is None or rec.get("status") not in (VERIFYING, WAITING) or sha_gate_open(step, rec):
+            continue
+        if fits is not None and not fits(GIT_TIMEOUT_S * max(1, len(step.worker.repos))):
             continue
         shas = dict(rec.get("shas") or {})
         res = sha_check(ledger, world, step.id, shas)
@@ -7238,3 +7632,1641 @@ def run_sha_checks(ledger: Ledger, state: RunState, world: World, now: datetime)
             rec["inflight"] = None
         out.append(res)
     return out
+
+
+# =============================================================================
+# The tick, alarms and notify, infrastructure, the tmux server, the CLI verbs
+# (§12.10, §16–§18, §20–§23) — 50-08
+# =============================================================================
+#
+# This section assembles the earlier ones into the one-pass tick of §23 and the
+# verbs of §18. Every effect still goes through ``World``: systemctl, systemd-run,
+# systemd-inhibit, busctl and the tmux server reads are World methods, and the
+# notify is ``World.notify`` (``questions_mcp_lib.notify`` in process, §16.4).
+# The CLI (``.claude/bin/epic-driver``) is argparse, path setup and the stamp
+# check of §17; it calls :func:`cli`.
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_REFUSED = 3
+
+
+# -- the environment (§21.2, §7.2) ------------------------------------------------
+
+def is_secret_key(key: str) -> bool:
+    """amux-spawn's rule: a key naming a credential (``_``-segment match on :data:`SECRET_KEY_SEGMENTS`)."""
+    return any(seg in SECRET_KEY_SEGMENTS for seg in key.upper().split("_"))
+
+
+def env_snapshot(environ: Dict[str, str]) -> Dict[str, str]:
+    """The allowlisted keys of the operator's interactive environment (§21.2), never a credential.
+
+    ``ENV_SNAPSHOT_KEYS`` plus every ``NVM_*`` key that is set. ``SSH_AUTH_SOCK`` and
+    ``VIRTUAL_ENV`` are not in the list on purpose.
+    """
+    out: Dict[str, str] = {}
+    for key in sorted(environ):
+        if key in ENV_SNAPSHOT_KEYS or any(key.startswith(p) for p in ENV_SNAPSHOT_PREFIXES):
+            if not is_secret_key(key) and isinstance(environ[key], str):
+                out[key] = environ[key]
+    return out
+
+
+def write_env_snapshot(paths: RunPaths, snapshot: Dict[str, str]) -> None:
+    atomic_write_text(paths.env_snapshot, json.dumps(snapshot, indent=1, sort_keys=True) + "\n")
+
+
+def _is_socket(path: str) -> bool:
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def fix_ssh_auth_sock(environ: Any) -> Optional[str]:
+    """§21.2: unset ``SSH_AUTH_SOCK`` when its socket is gone (the keys have no passphrase). Returns a note."""
+    sock = environ.get("SSH_AUTH_SOCK")
+    if sock and not _is_socket(sock):
+        environ.pop("SSH_AUTH_SOCK", None)
+        return f"SSH_AUTH_SOCK {sock} is gone: unset"
+    return None
+
+
+def tmux_start_env(environ: Dict[str, str], snapshot: Dict[str, str]) -> Dict[str, str]:
+    """The environment the tmux server starts with: the snapshot applied over the service environment.
+
+    A scope runs the command from ``systemd-run`` itself, so the server inherits this and takes its
+    global environment from it (§21.1). ``SSH_AUTH_SOCK`` only when its socket exists.
+    """
+    env = child_env(environ)
+    env.update({k: v for k, v in snapshot.items() if k not in CHILD_ENV_STRIPPED})
+    if env.get("SSH_AUTH_SOCK") and not _is_socket(env["SSH_AUTH_SOCK"]):
+        env.pop("SSH_AUTH_SOCK", None)
+    return env
+
+
+# -- the tmux server (§21.1, P0-5) -------------------------------------------------
+
+@dataclass
+class TmuxServer:
+    """The default tmux server as one pass found it."""
+
+    pid: Optional[int] = None
+    scope: Optional[str] = None          # the last component of its cgroup path
+    started: bool = False                # this pass started it
+    deferred: bool = False               # the pass deadline left no time to look or to start: unknown, no alarm
+    error: Optional[str] = None          # why starting one failed
+
+    @property
+    def own_scope(self) -> bool:
+        return self.pid is not None and self.scope == TMUX_SCOPE_UNIT
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"pid": self.pid, "scope": self.scope, "own_scope": self.own_scope, "started": self.started,
+                "error": self.error}
+
+
+def cgroup_scope(text: Optional[str]) -> Optional[str]:
+    """The unit a process runs in, from ``/proc/<pid>/cgroup`` (the unified ``0::`` line, else systemd's)."""
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    chosen = next((ln for ln in lines if ln.startswith("0::")), None) \
+        or next((ln for ln in lines if ":name=systemd:" in ln), None)
+    if chosen is None:
+        return None
+    path = chosen.split(":", 2)[2]
+    parts = [p for p in path.split("/") if p]
+    return parts[-1] if parts else None
+
+
+def tmux_start_args() -> List[str]:
+    """§21.1: ``systemd-run --user --scope --unit=epic-driver-tmux tmux new-session -d -s epic-driver-keepalive``."""
+    return ["--user", "--scope", f"--unit={TMUX_SCOPE_NAME}", TMUX_BIN, "new-session", "-d", "-s",
+            TMUX_KEEPALIVE_SESSION]
+
+
+_SYSTEMD_BUS = ("org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager")
+
+
+def attach_scope_args(pid: int) -> List[str]:
+    """``AttachProcessesToUnit(epic-driver-tmux.scope, "/", [pid])`` on the user manager."""
+    return ["call", *_SYSTEMD_BUS, "AttachProcessesToUnit", "ssau", TMUX_SCOPE_UNIT, "/", "1", str(int(pid))]
+
+
+def start_scope_args(pid: int) -> List[str]:
+    """``StartTransientUnit(epic-driver-tmux.scope, "fail", [PIDs=[pid]], [])``: the scope is created
+    around the pid (a scope cannot exist empty, so creating it is the move)."""
+    return ["call", *_SYSTEMD_BUS, "StartTransientUnit", "ssa(sv)a(sa(sv))", TMUX_SCOPE_UNIT, "fail",
+            "1", "PIDs", "au", "1", str(int(pid)), "0"]
+
+
+def _cmd_text(res: CommandResult) -> str:
+    text = ((res.stderr or "").strip() or (res.error or "").strip() or (res.stdout or "").strip())
+    return text[-300:] or f"exit {res.rc}"
+
+
+def probe_tmux_server(world: World) -> TmuxServer:
+    """Read-only: is a default server running, and in which scope."""
+    pid = world.tmux_server_pid()
+    if pid is None:
+        return TmuxServer()
+    return TmuxServer(pid=pid, scope=cgroup_scope(world.read_cgroup(pid)))
+
+
+#: ``fits(cost_s)``: whether a call of that worst case may start now (the pass deadline, per phase).
+Fits = Callable[[float], bool]
+
+
+def ensure_tmux_server(world: World, environ: Dict[str, str], snapshot: Dict[str, str], *,
+                       start: bool = True, fits: Optional[Fits] = None) -> TmuxServer:
+    """§21.1 each tick before any spawn: none running ⇒ start one in its own scope with the snapshot
+    environment and verify it through ``/proc/<pid>/cgroup``. The tick never moves a server (``enable`` does)."""
+    if fits is not None and not fits(TMUX_READ_TIMEOUT_S):
+        return TmuxServer(deferred=True)
+    found = probe_tmux_server(world)
+    if found.pid is not None or not start:
+        return found
+    if fits is not None and not fits(SYSTEMD_RUN_TIMEOUT_S + TMUX_READ_TIMEOUT_S):
+        found.deferred = True
+        return found
+    res = world.systemd_run(tmux_start_args(), tmux_start_env(environ, snapshot))
+    after = probe_tmux_server(world)
+    if after.pid is None:
+        after.error = f"starting it failed: {_cmd_text(res)}"
+        return after
+    after.started = True
+    return after
+
+
+def tmux_conditions(server: TmuxServer) -> List[AlarmCondition]:
+    """``tmux_server``: no server and starting one failed, or the server outside its own scope."""
+    if server.pid is None:
+        if server.error:
+            return [AlarmCondition("tmux_server", RUN_SUBJECT, f"no tmux server, and {server.error}")]
+        return []
+    if not server.own_scope:
+        how = "started, but it runs" if server.started else "the server runs"
+        return [AlarmCondition("tmux_server", RUN_SUBJECT,
+                               f"{how} in {server.scope or 'an unknown cgroup'} (pid {server.pid}), not "
+                               f"{TMUX_SCOPE_UNIT}: closing that terminal takes every driven session with it; "
+                               f"run `epic-driver enable <ledger>` again to move it")]
+    return []
+
+
+def tmux_move_instructions(pid: int, scope: Optional[str], why: str) -> str:
+    return (f"the tmux server (pid {pid}) runs in {scope or 'an unknown cgroup'}, a terminal's scope, and "
+            f"could not be moved into {TMUX_SCOPE_UNIT} ({why}). Either save your sessions, stop that server "
+            f"(`tmux kill-server`) and let the first tick start its own, or move it yourself with "
+            f"`{BUSCTL_BIN} --user {shlex.join(start_scope_args(pid))}` and run enable again")
+
+
+def move_tmux_server(world: World, pid: int) -> Tuple[bool, str]:
+    """``enable``'s move (§21.1): into ``epic-driver-tmux.scope``, created around the pid when it does not
+    exist (``StartTransientUnit``) or joined with ``AttachProcessesToUnit``; verified in the cgroup."""
+    exists = unit_active(world, TMUX_SCOPE_UNIT)
+    res = world.busctl(attach_scope_args(pid) if exists else start_scope_args(pid))
+    scope = None
+    for i in range(INHIBIT_VERIFY_TRIES):
+        scope = cgroup_scope(world.read_cgroup(pid))
+        if scope == TMUX_SCOPE_UNIT:
+            return True, f"moved the tmux server (pid {pid}) into {TMUX_SCOPE_UNIT}"
+        if i + 1 < INHIBIT_VERIFY_TRIES:
+            world.sleep(0.5)
+    why = _cmd_text(res) if not res.ok else f"it is still in {scope or 'an unknown cgroup'}"
+    return False, why
+
+
+# -- listener and inhibitor (§12.10, §22) --------------------------------------------
+
+def unit_active(world: World, unit: str) -> bool:
+    res = world.systemctl(["is-active", unit])
+    return res.rc == 0 and res.stdout.strip() == "active"
+
+
+def ensure_unit(world: World, unit: str, *, start: bool = True,
+                fits: Optional[Fits] = None) -> Tuple[Optional[bool], bool, Optional[str]]:
+    """``(active, start_attempted, start_error)``: one ``systemctl --user start`` when inactive.
+
+    ``active`` is None when ``fits`` (the pass deadline) left no time to ask: unknown, not an alarm.
+    A start is attempted only when it and the check after it still fit; else the unit reads inactive
+    now and the next pass tries."""
+    if fits is not None and not fits(SYSTEMCTL_TIMEOUT_S):
+        return None, False, None
+    if unit_active(world, unit):
+        return True, False, None
+    if not start:
+        return False, False, None
+    if fits is not None and not fits(2 * SYSTEMCTL_TIMEOUT_S):
+        return None, False, None
+    res = world.systemctl(["start", unit])
+    if fits is not None and not fits(SYSTEMCTL_TIMEOUT_S):
+        return None, True, None
+    if unit_active(world, unit):
+        return True, True, None
+    return False, True, _cmd_text(res) if not res.ok else "still inactive"
+
+
+def inhibitor_lock_held(text: Optional[str]) -> bool:
+    """The driver's ``sleep:idle`` block lock in ``systemd-inhibit --list`` (WHO … WHAT WHY MODE)."""
+    for line in (text or "").splitlines():
+        tokens = line.split()
+        if tokens and tokens[0] == INHIBIT_WHO and INHIBIT_WHAT in tokens and tokens[-1] == INHIBIT_MODE:
+            return True
+    return False
+
+
+@dataclass
+class Infrastructure:
+    """§12.10 for one pass: the tmux server, the listener and the inhibitor, and their conditions."""
+
+    tmux: TmuxServer
+    listener_active: Optional[bool]      # None: not asked (the pass deadline)
+    listener_started: bool
+    inhibitor_active: Optional[bool]
+    inhibitor_lock: Optional[bool]
+    conditions: List[AlarmCondition] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def dispatch_ok(self) -> bool:
+        """amux may run: a server exists, so no amux call can start one in the service's cgroup."""
+        return self.tmux.pid is not None
+
+    @property
+    def deferred(self) -> bool:
+        """Something was not looked at for want of time (it is looked at next pass; no alarm)."""
+        return (self.tmux.deferred or self.listener_active is None or self.inhibitor_active is None
+                or self.inhibitor_lock is None)
+
+
+def check_infrastructure(world: World, environ: Dict[str, str], snapshot: Dict[str, str], *,
+                         start_tmux: bool = True, start_units: bool = True,
+                         fits: Optional[Fits] = None) -> Infrastructure:
+    """Tick step 1: ensure the tmux server, the listener and the inhibitor (one start attempt each).
+
+    With ``fits`` (the tick's infrastructure phase, ends at ``INFRA_END_S``) a call whose worst case
+    does not fit is not made: what it would have shown is unknown this pass (None), raises no alarm and
+    is looked at next pass."""
+    server = ensure_tmux_server(world, environ, snapshot, start=start_tmux, fits=fits)
+    l_ok, l_tried, l_err = ensure_unit(world, LISTENER_UNIT, start=start_units, fits=fits)
+    i_ok, i_tried, i_err = ensure_unit(world, INHIBIT_UNIT, start=start_units, fits=fits)
+    if i_ok:
+        lock: Optional[bool] = (inhibitor_lock_held(world.inhibit_list().stdout)
+                                if fits is None or fits(INHIBIT_LIST_TIMEOUT_S) else None)
+    else:
+        lock = False if i_ok is False else None
+    infra = Infrastructure(tmux=server, listener_active=l_ok, listener_started=bool(l_tried and l_ok),
+                           inhibitor_active=i_ok, inhibitor_lock=lock)
+    infra.conditions += tmux_conditions(server)
+    if server.started:
+        infra.notes.append(f"started the tmux server (pid {server.pid}) in {server.scope}")
+    if l_ok is False:
+        infra.conditions.append(AlarmCondition(
+            "listener_down", RUN_SUBJECT,
+            f"{LISTENER_UNIT} is inactive" + (f" after one start attempt ({l_err})" if l_tried else "")))
+    if i_ok is False:
+        infra.conditions.append(AlarmCondition(
+            "inhibitor_down", RUN_SUBJECT,
+            f"{INHIBIT_UNIT} is inactive" + (f" after one start attempt ({i_err})" if i_tried else "")))
+    elif i_ok and lock is False:
+        infra.conditions.append(AlarmCondition(
+            "inhibitor_down", RUN_SUBJECT, f"the {INHIBIT_WHAT} block lock of {INHIBIT_WHO} is not in "
+                                           "systemd-inhibit --list"))
+    return infra
+
+
+# -- notify (§16.4) ------------------------------------------------------------------
+
+def nudge_span_s(schedule: Optional[str]) -> int:
+    """The length of a ``[questions] nudge`` ladder: the sum of its rungs (each measured from the one
+    before). A repeating last rung (``7d*``) is counted once; an unparseable ladder counts 0."""
+    total = 0
+    for part in (schedule or "").split(","):
+        rung = part.strip().rstrip("*").strip()
+        if not rung:
+            continue
+        try:
+            total += parse_duration(rung)
+        except ValueError:
+            return 0
+    return total
+
+
+class Notifier:
+    """One pass's notify path: ``World.notify`` with the ledger's workspace, the log and the failures.
+
+    ``can_send`` is the pass deadline (a notify that cannot end before ``TICK_HARD_LIMIT_S`` waits
+    for the next pass). Every notify and every failure goes to ``logs/notify.log``; a failure also to
+    ``state.notify_failures`` (the last 20), which ``status`` shows. Never retried in a loop.
+    """
+
+    def __init__(self, world: World, paths: RunPaths, state: RunState, *, workspace: str,
+                 role: Optional[str], epic: str, can_send: Optional[Callable[[], bool]] = None) -> None:
+        self.world = world
+        self.paths = paths
+        self.state = state
+        self.workspace = workspace
+        self.role = role
+        self.epic = epic
+        self._can_send = can_send
+        prepare = getattr(world, "prepare_notify", None)
+        if callable(prepare):
+            prepare()       # main thread, before any notify thread: see RealWorld.prepare_notify
+
+    def can_send(self) -> bool:
+        return self._can_send is None or bool(self._can_send())
+
+    def prefix(self, text: str) -> str:
+        return f"[epic-driver {self.epic}] {text}"
+
+    def _call(self, text: str, ack: bool) -> Dict[str, Any]:
+        """``World.notify`` in a daemon thread joined with ``NOTIFY_TIMEOUT_S`` (the relay client has no
+        wall-clock limit of its own). On timeout the notify counts as failed and the pass goes on.
+
+        The abandoned thread can still finish later: the message may then be sent although it is recorded
+        as failed (a repeat then follows at the next repeat time: at worst one duplicate). It is a daemon
+        thread, so it never holds the process open."""
+        box: Dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                box["res"] = self.world.notify(text, role=self.role, ack=ack, workspace_dir=self.workspace)
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller below
+                box["exc"] = exc
+
+        t = threading.Thread(target=run, name="epic-driver-notify", daemon=True)
+        t.start()
+        t.join(NOTIFY_TIMEOUT_S)
+        if t.is_alive():
+            return {"dispatched": False, "message_id": None,
+                    "error": f"notify timed out after {NOTIFY_TIMEOUT_S:g}s (it may still complete)"}
+        exc = box.get("exc")
+        if exc is not None:
+            raise exc        # as before the thread: ``RealWorld.notify`` never raises, so this is a bug or a kill
+        return dict(box.get("res") or {})
+
+    def send(self, what: str, text: str, *, ack: bool) -> Dict[str, Any]:
+        res = self._call(text, ack)
+        now = require_aware(self.world.now())
+        ok = bool(res.get("dispatched"))
+        line = (f"{iso(now)} {what} ack={'yes' if ack else 'no'} dispatched={'yes' if ok else 'no'}"
+                f" message_id={res.get('message_id')}" + (f" error={res.get('error')}" if res.get("error") else "")
+                + "\n")
+        try:
+            _append_rotating(self.paths.notify_log, line)
+        except OSError:
+            pass
+        if not ok:
+            record_notify_failure(self.state, now, what, str(res.get("error") or "not dispatched"))
+        return res
+
+
+def record_notify_failure(state: RunState, now: datetime, what: str, error: str) -> None:
+    fails = state.setdefault("notify_failures", [])
+    fails.append({"at": iso(now), "what": what, "error": error[-500:]})
+    del fails[:-NOTIFY_FAILURES_KEEP]
+
+
+# -- the alarm engine (§16.1) ----------------------------------------------------------
+
+@dataclass
+class AlarmPass:
+    raised: List[str] = field(default_factory=list)
+    repeated: List[str] = field(default_factory=list)
+    cleared: List[str] = field(default_factory=list)
+    deferred: List[str] = field(default_factory=list)     # due, but the pass deadline left no time
+    failed: List[str] = field(default_factory=list)       # the notify did not go out
+
+
+def alarm_text(epic: str, rec: Dict[str, Any]) -> str:
+    """§16.1: ``[epic-driver <epic>] ALARM <id> <subject>: <detail> — epic-driver status``."""
+    detail = str(rec.get("detail") or "").strip()
+    return (f"[epic-driver {epic}] ALARM {rec.get('id')} {rec.get('subject')}"
+            + (f": {detail}" if detail else "") + " — epic-driver status")
+
+
+def _ladder_base(rec: Dict[str, Any], index_ids: Optional[set]) -> Optional[datetime]:
+    """When the alarm's ladder stops counting: ``ladder_until`` while its message is in the index."""
+    mid = rec.get("message_id")
+    if mid is None or not rec.get("ladder_until"):
+        return None
+    if index_ids is not None and str(mid) not in index_ids:
+        return None
+    return from_iso(rec.get("ladder_until"))
+
+
+def ladder_live(rec: Dict[str, Any], index_ids: Optional[set], now: datetime) -> bool:
+    """§16.1 *ladder live*: the notify's message id is in the listener's index and now < sent + span.
+
+    An acknowledged message stays in the index (``questions_listen_lib`` never removes a ``messages``
+    entry; ``process_answer`` only finalises it and moves the watermark), so in practice the span
+    decides. An unreadable index (``index_ids`` None) leaves the span alone to decide.
+    """
+    until = _ladder_base(rec, index_ids)
+    return until is not None and require_aware(now) < until
+
+
+def repeat_due_at(rec: Dict[str, Any], index_ids: Optional[set]) -> Optional[datetime]:
+    """The next repeat: 4 h after the later of the last attempt and the end of a live ladder
+    (none while the ladder is live, then every 4 h). None: due now (never sent)."""
+    last = from_iso(rec.get("last_attempt_at"))
+    if last is None:
+        return None
+    base = last
+    until = _ladder_base(rec, index_ids)
+    if until is not None and until > base:
+        base = until
+    return base + timedelta(seconds=ALARM_REPEAT_S)
+
+
+def _new_alarm(cond: AlarmCondition, now: datetime) -> Dict[str, Any]:
+    return {"id": cond.id, "subject": cond.subject, "detail": cond.detail, "raised_at": iso(now),
+            "last_attempt_at": None, "last_sent_at": None, "message_id": None, "ladder_until": None,
+            "cleared_at": None, "cleared_by": None, "suppressed": False, "sends": 0, "last_error": None}
+
+
+#: Steps whose cleared alarm becomes an ``alarm_cleared`` item for the driver (§9.1: "a driver step in
+#: flight or halted").
+ALARM_CLEARED_STATUSES = (INFLIGHT, VERIFYING, WAITING, ASKED, HALTED)
+
+
+def _alarm_cleared_item(ledger: Optional[Ledger], state: RunState, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if ledger is None or rec.get("id") == "halt" or not ledger.has_step(str(rec.get("subject"))):
+        return None          # a halt clears on the driver's own verdict: nothing to tell it
+    step = ledger.step(str(rec.get("subject")))
+    status = ((state.get("steps") or {}).get(step.id) or {}).get("status")
+    if step.role_kind != ROLE_KIND_DRIVER or status not in ALARM_CLEARED_STATUSES:
+        return None
+    return {"alarm": rec.get("id"), "subject": step.id, "detail": f"cleared: {rec.get('detail') or ''}".strip(),
+            "cleared_at": rec.get("cleared_at")}
+
+
+def run_alarms(state: RunState, conditions: Iterable[AlarmCondition], notifier: Optional[Notifier],
+               now: datetime, *, commit: Callable[[RunState], None], ledger: Optional[Ledger] = None,
+               span_s: int = 0, index_ids: Optional[Callable[[], Optional[set]]] = None,
+               clear: bool = True) -> AlarmPass:
+    """Tick step 8 (§16.1): raise new conditions, repeat active ones, clear vanished ones.
+
+    A raise or a repeat is ``ack=True`` (P0-8). Each notify sits between two commits: the attempt
+    (``last_attempt_at``) is committed first, the result after (invariant 5), so a pass killed in
+    between never sends it twice. A cleared record keeps ``cleared_at``; a cleared alarm whose
+    subject is a driver step in flight or halted queues an ``alarm_cleared`` item for the next
+    dispatch (``state.alarm_cleared_pending``). An alarm ``mark`` cleared while its condition still
+    holds (``suppressed``) is not raised again until the condition has gone once. ``notifier`` None:
+    compute only (``--dry-run``). ``clear`` False: raise only (the crash path of the tick).
+    """
+    now = require_aware(now)
+    alarms = state.setdefault("alarms", {})
+    active: Dict[str, AlarmCondition] = {}
+    for c in conditions:
+        active.setdefault(c.key, c)
+    out = AlarmPass()
+    if clear:
+        for key, rec in list(alarms.items()):
+            if key in active:
+                continue
+            rec["suppressed"] = False
+            if rec.get("cleared_at"):
+                continue
+            rec["cleared_at"] = iso(now)
+            rec["cleared_by"] = "condition"
+            out.cleared.append(key)
+            item = _alarm_cleared_item(ledger, state, rec)
+            if item is not None:
+                state.setdefault("alarm_cleared_pending", []).append(item)   # type: ignore[typeddict-unknown-key]
+    ids_cache: List[Optional[set]] = []
+
+    def ids() -> Optional[set]:
+        if not ids_cache:
+            ids_cache.append(index_ids() if index_ids is not None else None)
+        return ids_cache[0]
+
+    for key, cond in active.items():
+        rec = alarms.get(key)
+        first = rec is None or bool(rec.get("cleared_at"))
+        if first:
+            if rec is not None and rec.get("suppressed"):
+                continue
+            rec = _new_alarm(cond, now)
+            alarms[key] = rec
+            out.raised.append(key)
+        else:
+            rec["detail"] = cond.detail
+            due = repeat_due_at(rec, ids())
+            if due is not None and now < due:
+                continue
+        if notifier is None:
+            continue
+        if not notifier.can_send():
+            out.deferred.append(key)
+            continue
+        rec["last_attempt_at"] = iso(now)
+        commit(state)
+        res = notifier.send(f"alarm {key}", alarm_text(notifier.epic, rec), ack=True)
+        rec["sends"] = int(rec.get("sends") or 0) + 1
+        if res.get("dispatched"):
+            sent = require_aware(notifier.world.now())
+            rec.update(last_sent_at=iso(sent), message_id=res.get("message_id"), last_error=None,
+                       ladder_until=iso(sent + timedelta(seconds=span_s)) if res.get("message_id") is not None
+                       else None)
+        else:
+            rec["last_error"] = str(res.get("error") or "not dispatched")[-300:]
+            out.failed.append(key)
+        if not first:
+            out.repeated.append(key)
+        commit(state)
+    return out
+
+
+def clear_alarms_by_mark(state: RunState, subjects: Iterable[str], now: datetime,
+                         keys: Iterable[str] = ()) -> List[str]:
+    """``mark`` clears the step's alarms (§16.2 "or mark"): ``cleared_at``, ``cleared_by: mark`` and
+    ``suppressed`` so a condition that still holds (a deadline long past) is not raised again until it
+    has gone once."""
+    subj = set(subjects)
+    want = set(keys)
+    out: List[str] = []
+    for key, rec in (state.get("alarms") or {}).items():
+        if rec.get("subject") in subj or key in want:
+            if not rec.get("cleared_at"):
+                rec["cleared_at"] = iso(now)
+            if key in want or rec.get("cleared_by") != "condition":
+                rec["cleared_by"] = "mark"
+                rec["suppressed"] = True
+                out.append(key)
+    return out
+
+
+def take_alarm_cleared_items(state: RunState) -> List[EventItem]:
+    """The ``alarm_cleared`` items queued by earlier passes, for this pass's dispatch."""
+    return [EventItem(ITEM_ALARM_CLEARED, "driver", p.get("subject"),
+                      {"alarm": p.get("alarm"), "subject": p.get("subject"), "detail": p.get("detail")})
+            for p in state.get("alarm_cleared_pending") or []]   # type: ignore[typeddict-item]
+
+
+# -- heartbeats (§16.5) ---------------------------------------------------------------
+
+def phase_order(ledger: Ledger) -> List[str]:
+    return list(dict.fromkeys(s.phase for s in ledger.steps if s.phase))
+
+
+def phase_done(ledger: Ledger, state: RunState, phase: str) -> bool:
+    steps = state.get("steps") or {}
+    members = [s for s in ledger.steps if s.phase == phase]
+    return bool(members) and all(step_is_done(s, steps.get(s.id)) for s in members)
+
+
+def phase_transitions(ledger: Ledger, state: RunState) -> List[Tuple[str, str]]:
+    """Phases newly done (every step of the phase done) and not yet announced: ``(phase, text)``."""
+    announced = set((state.get("phases") or {}).get("announced") or [])
+    order = phase_order(ledger)
+    out: List[Tuple[str, str]] = []
+    for i, ph in enumerate(order):
+        if ph in announced or not phase_done(ledger, state, ph):
+            continue
+        nxt = next((p for p in order[i + 1:] if not phase_done(ledger, state, p)), None)
+        if nxt is None:
+            nxt = next((p for p in order if p != ph and not phase_done(ledger, state, p)), None)
+        if nxt is None:
+            text = f"phase {ph} done; every phase is done"
+        else:
+            n = sum(1 for s in ledger.steps if s.phase == nxt)
+            text = f"phase {ph} done; next: {nxt} ({n} step{'s' if n != 1 else ''})"
+        out.append((ph, text))
+    return out
+
+
+def run_heartbeats(ledger: Ledger, state: RunState, notifier: Optional[Notifier], *,
+                   commit: Callable[[RunState], None]) -> List[str]:
+    """One ``ack=False`` heartbeat per phase transition (§16.5); nothing else, no daily line (P0-11).
+
+    The phase is recorded as announced (committed) before its notify; a pass with no time left
+    leaves it for the next pass."""
+    sent: List[str] = []
+    if notifier is None:
+        return sent
+    for phase, text in phase_transitions(ledger, state):
+        if not notifier.can_send():
+            break
+        state.setdefault("phases", {}).setdefault("announced", []).append(phase)
+        commit(state)
+        notifier.send(f"heartbeat phase {phase}", notifier.prefix(text), ack=False)
+        commit(state)
+        sent.append(phase)
+    return sent
+
+
+# -- tick.lock (§18) and the active run (§4) ------------------------------------------
+
+def acquire_lock(path: Path, wait_s: float, *, poll_s: float = 0.1) -> Optional[int]:
+    """``flock`` on ``tick.lock``: an fd, or None when another holder kept it for ``wait_s`` (0 = no wait).
+
+    A lock file left by a crashed process is free: flock dies with its holder."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except (BlockingIOError, PermissionError):
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(poll_s)
+
+
+def release_lock(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def active_path() -> Path:
+    return state_root() / ACTIVE_FILE
+
+
+def read_active() -> Optional[Dict[str, Any]]:
+    """``active.json`` (§4): the one active run, or None."""
+    try:
+        with open(active_path(), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("run_id"), str) or not data.get("ledger"):
+        return None
+    return data
+
+
+def write_active(rec: Dict[str, Any]) -> None:
+    atomic_write_text(active_path(), json.dumps(rec, indent=1) + "\n")
+
+
+def remove_active() -> None:
+    try:
+        os.unlink(active_path())
+    except FileNotFoundError:
+        pass
+    _fsync_dir(active_path().parent)
+
+
+# -- the tick (§23) --------------------------------------------------------------------
+
+class TickError(Exception):
+    """A pass that cannot run (no usable ledger, an unreadable state): recorded as ``tick_error``."""
+
+
+class TickClock:
+    """The pass's time bound on ``World.now`` (§22 ``TimeoutStartSec=5min``)."""
+
+    def __init__(self, world: World) -> None:
+        self.world = world
+        self.start = require_aware(world.now())
+
+    def elapsed(self) -> float:
+        return (require_aware(self.world.now()) - self.start).total_seconds()
+
+    def remaining_to(self, end_s: float) -> float:
+        """Seconds until ``end_s`` after the pass start (negative: past it)."""
+        return end_s - self.elapsed()
+
+    def fits_by(self, end_s: float) -> Callable[[float], bool]:
+        """``fits(cost)``: a call of worst case ``cost`` started now ends by ``end_s`` after the pass start."""
+        return lambda cost: self.elapsed() + cost <= end_s
+
+    def check_budget(self) -> float:
+        """At most ``CHECK_BUDGET_S``, and never into the dispatch's reserve. Ask it AFTER every phase
+        that runs before the checks (the sha checks): it is measured from what is left."""
+        return max(0.0, min(float(CHECK_BUDGET_S), TICK_DEADLINE_S - TICK_DISPATCH_RESERVE_S - self.elapsed()))
+
+    def gate(self, effect: Effect) -> bool:
+        """An effect starts only when its longest run ends before ``TICK_DEADLINE_S``."""
+        return self.elapsed() + EFFECT_MAX_S.get(effect.kind, 0.0) <= TICK_DEADLINE_S
+
+    def notify_ok(self) -> bool:
+        return self.elapsed() + NOTIFY_TIMEOUT_S <= TICK_HARD_LIMIT_S
+
+
+def _issues_text(issues: Sequence[LedgerIssue], limit: int = 3) -> str:
+    text = "; ".join(str(i) for i in issues[:limit])
+    return text + (f" (+{len(issues) - limit} more)" if len(issues) > limit else "")
+
+
+def load_run_ledger(active: Dict[str, Any], paths: RunPaths, world: World, *,
+                    verify_base_refs: bool = True, keep_copy: bool = True) -> Tuple[Ledger, List[AlarmCondition]]:
+    """Tick step 1: the ledger, re-read and validated; invalid ⇒ the last valid copy + ``ledger_invalid``.
+
+    A valid ledger is copied to ``ledger.last_valid.yaml`` when it changed (``keep_copy``). A ledger
+    whose ``run_id`` is no longer the active run's counts as invalid.
+    """
+    ledger, errors, _ = validate_ledger(str(active["ledger"]), world, verify_base_refs=verify_base_refs)
+    if ledger is not None and ledger.run_id != active["run_id"]:
+        errors = [LedgerIssue(E_SCHEMA, "run_id", f"is {ledger.run_id!r}, the active run is {active['run_id']!r}")]
+        ledger = None
+    if ledger is not None:
+        if keep_copy:
+            try:
+                data = Path(ledger.path).read_text(encoding="utf-8")
+                old = paths.last_valid_ledger.read_text(encoding="utf-8") if paths.last_valid_ledger.exists() else None
+                if old != data:
+                    atomic_write_text(paths.last_valid_ledger, data)
+            except OSError:
+                pass
+        return ledger, []
+    detail = _issues_text(errors) or "it does not validate"
+    fallback, ferrors, _ = validate_ledger(str(paths.last_valid_ledger), world, verify_base_refs=False)
+    if fallback is None:
+        raise TickError(f"the ledger is invalid ({detail}) and no valid copy exists ({_issues_text(ferrors)})")
+    return fallback, [AlarmCondition("ledger_invalid", RUN_SUBJECT,
+                                     f"{detail}; running on {paths.last_valid_ledger.name}")]
+
+
+def _tick_log(paths: RunPaths, now: datetime, text: str) -> None:
+    try:
+        _append_rotating(paths.tick_log, f"{iso(now)} {text}\n")
+    except OSError:
+        pass
+
+
+def _paused(paths: RunPaths) -> Optional[Dict[str, Any]]:
+    try:
+        with open(paths.paused, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {"at": None, "reason": None}
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {"at": None, "reason": None}
+
+
+@dataclass
+class TickResult:
+    """What one pass did (for the log, ``--dry-run`` and tests)."""
+
+    rc: int = EXIT_OK
+    ops: List[str] = field(default_factory=list)
+    skipped_ops: List[str] = field(default_factory=list)
+    alarms: Optional[AlarmPass] = None
+    heartbeats: List[str] = field(default_factory=list)
+    conditions: List[AlarmCondition] = field(default_factory=list)
+    checks: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+    elapsed_s: float = 0.0
+    check_budget_s: float = 0.0
+
+
+def _notifier_for(world: World, paths: RunPaths, state: RunState, ledger: Optional[Ledger],
+                  active: Dict[str, Any], clock: Optional[TickClock]) -> Notifier:
+    return Notifier(world, paths, state,
+                    workspace=ledger.workspace if ledger is not None else str(active.get("workspace") or ""),
+                    role=ledger.notify_role if ledger is not None else active.get("notify_role"),
+                    epic=ledger.epic if ledger is not None else str(active.get("epic") or state.get("epic") or ""),
+                    can_send=clock.notify_ok if clock is not None else None)
+
+
+def tick_pass(world: World, active: Dict[str, Any], paths: RunPaths, *, environ: Any,
+              dry_run: bool = False) -> TickResult:
+    """One pass of §23, steps 1–8, under ``tick.lock`` (the caller holds it unless ``dry_run``).
+
+    ``dry_run``: the same computation on a copy, with no effect at all (no start, no check, no
+    worktree, no send, no notify) and nothing written.
+    """
+    clock = TickClock(world)
+    now = clock.start
+    result = TickResult()
+
+    def commit(st: RunState) -> None:
+        if not dry_run:
+            save_state(paths.state, st)
+
+    # 1. read: the pause file, the ledger, the state; the environment; the infrastructure.
+    paused_rec = _paused(paths)
+    paused = paused_rec is not None
+    bounded = BoundedWorld(world, lambda: clock.remaining_to(LEDGER_END_S))
+    try:
+        ledger, run_conds = load_run_ledger(active, paths, bounded, keep_copy=not dry_run)
+    except TickError:
+        if not bounded.expired:
+            raise
+    if bounded.expired:
+        # the validator's git calls ran out of time (a clamped call reads as an invalid ledger): look again
+        # with the git facts assumed (the structure is still validated) rather than alarm; the next pass
+        # asks git again.
+        ledger, run_conds = load_run_ledger(active, paths, BoundedWorld(world, lambda: 0.0, assume_git=True),
+                                            verify_base_refs=False, keep_copy=not dry_run)
+        result.notes.append("repos and base refs not checked with git this pass (pass deadline)")
+    try:
+        state = load_state(paths.state, active["run_id"])
+    except StateError as exc:
+        raise TickError(str(exc)) from None
+    ensure_step_states(ledger, state)
+    state["ledger_sha256"] = ledger.sha256
+    if not dry_run:
+        note = fix_ssh_auth_sock(environ)
+        if note:
+            result.notes.append(note)
+    snapshot = load_env_snapshot(paths)
+    infra = check_infrastructure(world, environ, snapshot, start_tmux=not (paused or dry_run),
+                                 start_units=not dry_run, fits=clock.fits_by(INFRA_END_S))
+    run_conds += infra.conditions
+    result.notes += infra.notes
+    # No server (and starting one failed): plan nothing that runs amux, which would start a server in
+    # this service's cgroup (§21.1). A dry run starts nothing anyway, and plans as if the start worked.
+    dispatch_paused = paused or (not infra.dispatch_ok and not dry_run)
+    if infra.tmux.deferred and not dry_run:
+        result.notes.append("tmux server not looked at (pass deadline): nothing is launched or sent this pass")
+    elif not infra.dispatch_ok and not paused and not dry_run:
+        result.notes.append("no tmux server: nothing is launched or sent this pass")
+    if infra.deferred:
+        result.notes.append("infrastructure only partly looked at (pass deadline): the rest next pass")
+
+    # 2–3. reconcile sessions and questions (pure over the readings).
+    readings = take_readings(ledger, state, world, now, fits=clock.fits_by(READINGS_END_S))
+    # Sessions the deadline left unread are never reconciled (an unread session would look dead): the
+    # pass then reconciles, checks and dispatches nothing, and clears no alarm (their conditions are
+    # unknown). The next pass does all of it.
+    partial = readings.incomplete
+    if partial:
+        recon = ReconcileResult(state=json.loads(json.dumps(state)))
+        result.notes.append("sessions not read in time (pass deadline): no reconcile, checks or dispatch this pass")
+    else:
+        recon = reconcile(ledger, state, readings, now)
+    s = recon.state
+
+    # 4. the built-in sha checks, then the checks and triggers within the budget (computed after them).
+    outcomes: List[CheckOutcome] = []
+    if dry_run:
+        result.check_budget_s = clock.check_budget()
+        result.checks = [f"{j.kind} {j.step_id}" for j in
+                         order_by_cursor(eligible_checks(ledger, s, now), ledger, s.get("check_cursor"))]
+    else:
+        run_sha_checks(ledger, s, world, now, fits=clock.fits_by(SHA_END_S))
+        result.check_budget_s = clock.check_budget()
+        if result.check_budget_s > 0 and not partial:
+            elapsed = clock.elapsed()
+            cp = run_checks(ledger, s, world, snapshot=snapshot, budget_s=result.check_budget_s,
+                            base_env=child_env(environ), overhead_s=CHECK_OVERHEAD_S,
+                            first_exempt=elapsed <= FIRST_CHECK_UNTIL_S, pass_left_s=TICK_DEADLINE_S - elapsed)
+            outcomes = [o for _, _, o in cp.ran]
+            result.checks = [f"{o.kind} {o.step_id}: {o.outcome}" for o in outcomes]
+            result.notes += [f"{j.kind} {j.step_id}: timeout {j.timeout_s}s cannot end within a pass: not run"
+                             for j in cp.too_long]
+    now_d = require_aware(world.now())
+    advance_schedule(ledger, s, now_d)
+
+    # 5. due and dispatchable steps; the worktrees of the worker steps about to go.
+    dispatch_paused = dispatch_paused or partial
+    sel = select(ledger, s, now_d, paused=dispatch_paused)
+    if dry_run or dispatch_paused:
+        wdirs = worker_dirs(s)
+    else:
+        wave = [sid for unit in sel.units for sid in unit if ledger.step(sid).worker is not None]
+        wdirs = prepare_worker_steps(ledger, s, world, wave,
+                                     remaining=lambda: clock.remaining_to(PREPARE_END_S))
+
+    # 6–7. dispatch and keep-warm: (mutation, effect) pairs, COMMIT → effect → COMMIT.
+    pending_items = [] if partial else take_alarm_cleared_items(s)
+    if partial:
+        plan = DispatchPlan()
+    else:
+        plan = plan_dispatch(ledger, s, recon, readings, now_d, paths=paths, selection=sel,
+                             check_outcomes=outcomes, items=pending_items, worker_dirs=wdirs,
+                             paused=dispatch_paused)
+    if dry_run:
+        result.ops = [op.label + (f" [{op.effect.kind}]" if op.effect.kind != EFFECT_NONE else "")
+                      for op in plan.ops]
+        s = plan.preview if plan.preview is not None else s
+    else:
+        outs = execute_dispatch(plan, s, world, commit, gate=clock.gate)
+        result.ops = [op.label for op in plan.ops]
+        result.skipped_ops = [o.effect.kind + " " + str(o.effect.name) for o in outs if o.deferred == "pass deadline"]
+        for e in plan.completed:
+            _tick_log(paths, now_d, f"outbox {e.get('event')} left ({e.get('left', 'completed')})"
+                                    + (f" by {e['by']}" if e.get("by") else ""))
+    if pending_items:
+        s["alarm_cleared_pending"] = []          # type: ignore[typeddict-unknown-key]
+    if not partial:
+        note_undispatched(ledger, s, sel, plan.dispatched_steps)
+
+    # 8. alarms: raise / repeat / clear; phase heartbeats; the pass's record. COMMIT.
+    now_e = require_aware(world.now())
+    conds = (run_conds + step_alarm_conditions(ledger, s, now_e, sel) + list(recon.conditions)
+             + dispatch_conditions(ledger, s, now_e) + worktree_conditions(ledger, s))
+    result.conditions = conds
+    notifier = None if dry_run else _notifier_for(world, paths, s, ledger, active, clock)
+    span = 0
+    if notifier is not None:
+        try:
+            settings = world.questions_settings(ledger.workspace)
+        except Exception:  # noqa: BLE001 - no ladder known: repeats every 4 h
+            settings = None
+        span = nudge_span_s((settings or {}).get("nudge"))
+    result.alarms = run_alarms(s, conds, notifier, now_e, commit=commit, ledger=ledger, span_s=span,
+                               index_ids=world.notify_index_ids, clear=not (partial or infra.deferred))
+    result.heartbeats = run_heartbeats(ledger, s, notifier, commit=commit)
+    s["last_tick_at"] = iso(now)
+    s["last_tick_ok_at"] = iso(now)
+    s["last_tick_error"] = None
+    s["tick_seq"] = int(s.get("tick_seq") or 0) + 1
+    commit(s)
+    result.elapsed_s = clock.elapsed()
+    if not dry_run:
+        a = result.alarms
+        _tick_log(paths, now, f"pass {s['tick_seq']} ok in {result.elapsed_s:.0f}s: {len(result.ops)} op(s)"
+                              + (f", {len(result.skipped_ops)} left for the next pass" if result.skipped_ops else "")
+                              + f", {len(result.checks)} check(s); alarms +{len(a.raised)} ~{len(a.repeated)} "
+                                f"-{len(a.cleared)}" + (f"; paused" if paused else "")
+                              + "".join(f"; {n}" for n in result.notes))
+    return result
+
+
+def record_tick_error(world: World, active: Dict[str, Any], paths: RunPaths, error: str,
+                      clock: Optional[TickClock]) -> None:
+    """§23: an unhandled exception ⇒ ``last_tick_error`` + ``tick_error`` (best effort), COMMIT.
+
+    Recorded on the last committed state, never on a half-applied pass. The ledger is the last
+    valid copy (no git) when it loads; the alarm notify is tried within the pass deadline."""
+    now = clock.start if clock is not None else require_aware(world.now())
+    _tick_log(paths, now, f"pass failed: {error}")
+    try:
+        state = load_state(paths.state, active["run_id"])
+    except StateError:
+        return
+    ledger = None
+    try:
+        ledger = load_ledger(str(paths.last_valid_ledger), world, verify_base_refs=False)
+    except Exception:  # noqa: BLE001 - the alarm still goes, to the workspace active.json names
+        ledger = None
+    state["last_tick_at"] = iso(now)
+    state["last_tick_error"] = {"at": iso(now), "error": error[-2000:]}   # type: ignore[typeddict-item]
+
+    def commit(st: RunState) -> None:
+        save_state(paths.state, st)
+
+    notifier = _notifier_for(world, paths, state, ledger, active, clock)
+    if not notifier.workspace:
+        notifier = None
+    run_alarms(state, [AlarmCondition("tick_error", RUN_SUBJECT, error[-300:])], notifier, now,
+               commit=commit, ledger=ledger, clear=False)
+    commit(state)
+
+
+def run_tick(world: World, *, dry_run: bool = False, environ: Any = None, out: Any = None,
+             err: Any = None) -> int:
+    """``epic-driver tick [--dry-run]`` (§23 step 0 after the CLI's stamp check and imports)."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    environ = os.environ if environ is None else environ
+    active = read_active()
+    if active is None:
+        print("epic-driver tick: no active run", file=out)
+        return EXIT_OK
+    paths = run_paths(active["run_id"])
+    if dry_run:
+        try:
+            res = tick_pass(world, active, paths, environ=dict(environ), dry_run=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"epic-driver tick --dry-run: {type(exc).__name__}: {exc}", file=err)
+            return EXIT_ERROR
+        print(render_dry_run(res), file=out)
+        return EXIT_OK
+    fd = acquire_lock(paths.lock, 0)
+    if fd is None:
+        _tick_log(paths, require_aware(world.now()), "a pass is already running (tick.lock held): skipped")
+        return EXIT_OK
+    clock: Optional[TickClock] = None
+    try:
+        clock = TickClock(world)
+        try:
+            tick_pass(world, active, paths, environ=environ)
+            return EXIT_OK
+        except Exception as exc:  # noqa: BLE001 - §23: any unhandled exception ⇒ tick_error, exit 1
+            text = f"{type(exc).__name__}: {exc}"
+            try:
+                record_tick_error(world, active, paths, text, clock)
+            except Exception as exc2:  # noqa: BLE001
+                print(f"epic-driver tick: could not record the error: {exc2}", file=err)
+            print(f"epic-driver tick: {text}", file=err)
+            return EXIT_ERROR
+    finally:
+        release_lock(fd)
+
+
+def render_dry_run(res: TickResult) -> str:
+    lines = ["epic-driver tick --dry-run (nothing written, nothing started or sent)"]
+    lines.append(f"checks that would run ({len(res.checks)}): " + (", ".join(res.checks) or "none"))
+    lines.append(f"ops ({len(res.ops)}):")
+    lines += [f"  {op}" for op in res.ops] or ["  (none)"]
+    lines.append("alarm conditions:")
+    lines += [f"  {c.key}: {c.detail}" for c in res.conditions] or ["  (none)"]
+    if res.alarms is not None:
+        lines.append(f"would raise: {', '.join(res.alarms.raised) or 'none'}; "
+                     f"would clear: {', '.join(res.alarms.cleared) or 'none'}")
+    lines += [f"note: {n}" for n in res.notes]
+    return "\n".join(lines)
+
+
+# -- status (§20) ------------------------------------------------------------------------
+
+def _short(value: Any, fmt: str = "%m-%d %H:%M") -> str:
+    dt = from_iso(value)
+    return dt.strftime(fmt) if dt is not None else "-"
+
+
+def _ago(now: datetime, value: Any) -> Optional[int]:
+    dt = from_iso(value)
+    return None if dt is None else int((require_aware(now) - dt).total_seconds())
+
+
+def _ago_text(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "never"
+    if seconds < 0:
+        return "in the future"
+    return f"{format_duration(seconds - seconds % 60) if seconds >= 60 else str(seconds) + 's'} ago"
+
+
+def _systemd_show(world: World, unit: str, props: Sequence[str]) -> Dict[str, str]:
+    res = world.systemctl(["show", unit, "--property=" + ",".join(props)])
+    out: Dict[str, str] = {}
+    for line in (res.stdout or "").splitlines():
+        k, sep, v = line.partition("=")
+        if sep:
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _step_detail(ledger: Ledger, state: RunState, step: Step, sel: Selection) -> Tuple[str, str]:
+    """``(since, detail)`` for one row of the STEPS table."""
+    rec = (state.get("steps") or {}).get(step.id) or {}
+    status = rec.get("status", PENDING)
+    check = rec.get("check") or {}
+    since_key = {DONE: "done_at", INFLIGHT: "started_at", VERIFYING: "advanced_at", WAITING: "advanced_at",
+                 ASKED: "advanced_at", DUE: "due_since", WATCHING: "due_since"}.get(status)
+    since = _short(rec.get(since_key)) if since_key else "-"
+    parts: List[str] = []
+    if status == DONE:
+        by = rec.get("by")
+        if by == "check":
+            parts.append(f"check rc 0 {_short(check.get('last_run_at'), '%H:%M')}")
+        elif by == "operator":
+            parts.append("marked done")
+        elif by == "verdict":
+            parts.append("done (unchecked)")
+    elif status == INFLIGHT:
+        ev = (rec.get("inflight") or {}).get("event")
+        entry = next((e for e in state.get("outbox") or [] if e.get("event") == ev), None)
+        word = ("confirmed" if (entry or {}).get("confirmed_at") else "sent" if (entry or {}).get("sends")
+                else "queued") if entry else "no outbox entry"
+        parts.append(f"{ev} {word}")
+    elif status == DUE:
+        holds = sel.held.get(step.id) or []
+        parts.append(", ".join(h.reason + (f" ({h.detail})" if h.detail else "") for h in holds) or "dispatchable")
+    elif status == PENDING:
+        at = step_due_at(ledger, state, step.id)
+        parts.append(f"due {_short(iso(at))}" if at is not None else
+                     ("needs " + ", ".join(step.needs) if step.needs else "pending"))
+    elif status == FAILED:
+        parts.append(f"check rc 2; attempt {rec.get('attempts', 0)}/{step.max_attempts}")
+    elif status == HALTED:
+        parts.append(str((rec.get("last_verdict") or {}).get("line") or "HALT"))
+    elif status == ASKED:
+        parts.append("asked " + ", ".join(rec.get("questions") or []))
+    if status == WAITING and rec.get("wait"):
+        parts.append(f"waiting: {rec.get('wait')}")
+    if status in CHECKED_STATUSES and step.check is not None:
+        parts.append(f"check rc {check.get('last_rc')} {_short(check.get('last_run_at'), '%H:%M')}"
+                     if check.get("last_run_at") else "check not run yet")
+        if check.get("last_error"):
+            parts.append(f"last error: {check.get('last_error')}")
+    if status != DONE:
+        dl = occurrence_deadline(step, rec, state)
+        if dl is not None:
+            parts.append(f"deadline {_short(iso(dl[1]))}Z")
+    return since, "; ".join(p for p in parts if p)
+
+
+def status_data(world: World, active: Dict[str, Any], paths: RunPaths, ledger: Optional[Ledger],
+                state: RunState, stamps: Optional[Dict[str, Any]], now: datetime) -> Dict[str, Any]:
+    """Everything the status screen shows (§20); ``status --json`` prints this dict."""
+    now = require_aware(now)
+    timer = _systemd_show(world, TIMER_UNIT, ("ActiveState", "NextElapseUSecRealtime"))
+    inhibitor_active = unit_active(world, INHIBIT_UNIT)
+    lock = inhibitor_lock_held(world.inhibit_list().stdout) if inhibitor_active else False
+    server = probe_tmux_server(world)
+    data: Dict[str, Any] = {
+        "epic": state.get("epic"), "run_id": state.get("run_id"), "ledger": active.get("ledger"),
+        "enabled": True,
+        "timer": {"active": timer.get("ActiveState") == "active", "next": timer.get("NextElapseUSecRealtime") or None},
+        "inhibitor": {"active": inhibitor_active, "lock": lock},
+        "paused": _paused(paths),
+        "last_tick_at": state.get("last_tick_at"), "last_tick_ago_s": _ago(now, state.get("last_tick_at")),
+        "last_tick_ok_at": state.get("last_tick_ok_at"), "last_tick_error": state.get("last_tick_error"),
+        "tick_seq": state.get("tick_seq"),
+        "tmux": server.as_dict(), "listener": "active" if unit_active(world, LISTENER_UNIT) else "inactive",
+        "stamps": dict(stamps or {"checked": False, "ok": True, "problem": None, "revision": None}),
+        "phase": None, "steps": [], "sessions": [], "outbox": [], "questions": [], "grants": [],
+        "alarms": [], "notify_failures": list(state.get("notify_failures") or []),
+        "ledger_problem": None if ledger is not None else "no usable ledger",
+    }
+    if ledger is not None:
+        order = phase_order(ledger)
+        current = next((p for p in order if not phase_done(ledger, state, p)), order[-1] if order else None)
+        if current is not None:
+            members = [s for s in ledger.steps if s.phase == current]
+            done = sum(1 for s in members if step_is_done(s, (state.get("steps") or {}).get(s.id)))
+            data["phase"] = {"name": current, "done": done, "total": len(members)}
+        sel = select(ledger, state, now, paused=data["paused"] is not None)
+        for step in ledger.steps:
+            since, detail = _step_detail(ledger, state, step, sel)
+            data["steps"].append({"id": step.id, "status": ((state.get("steps") or {}).get(step.id) or {}).get(
+                "status", PENDING), "since": since, "detail": detail})
+        try:
+            by_name = take_readings(ledger, state, world, now).by_name()
+        except Exception:  # noqa: BLE001 - the screen still shows the records
+            by_name = {}
+        for key, rec in (state.get("sessions") or {}).items():
+            reading = by_name.get(rec.get("name"))
+            role = ledger.roles.get(_role_of(key)[0])
+            cache = "-"
+            if reading is not None and reading.cache_left_s is not None:
+                cache = (f"warm {int(reading.cache_left_s // 60)}m" if reading.cache_left_s > 0 else "cold")
+            ctx = reading.context_tokens if reading is not None else None
+            mv = rec.get("model_verified")
+            data["sessions"].append({
+                "key": key, "name": rec.get("name"),
+                "state": session_status(reading) if reading is not None else str(rec.get("status")),
+                "cache": cache, "ctx": ctx, "cap": role.cap if role is not None else None, "gen": rec.get("gen"),
+                "model": "ok" if mv is True else "mismatch" if mv is False else "?"})
+    for e in state.get("outbox") or []:
+        sends = e.get("sends") or []
+        data["outbox"].append({
+            "event": e.get("event"), "to": e.get("to"), "sent": max(sends) if sends else None,
+            "confirmed": e.get("confirmed_at"), "deferrals": int(e.get("deferrals") or 0),
+            "verdict": "complete" if (e.get("verdict") or {}).get("complete") else "pending"})
+    for qid, q in (state.get("questions") or {}).items():
+        data["questions"].append({"id": qid, "for": q.get("approval") or q.get("step"), "status": q.get("status")})
+    for aid, g in (state.get("grants") or {}).items():
+        data["grants"].append({"approval": aid, "granted_at": g.get("granted_at"), "question": g.get("question")})
+    for key, rec in sorted((state.get("alarms") or {}).items(), key=lambda kv: str(kv[1].get("raised_at"))):
+        if not rec.get("cleared_at"):
+            data["alarms"].append({"key": key, "id": rec.get("id"), "subject": rec.get("subject"),
+                                   "detail": rec.get("detail"), "raised_at": rec.get("raised_at"),
+                                   "last_sent_at": rec.get("last_sent_at"), "sends": rec.get("sends"),
+                                   "last_error": rec.get("last_error")})
+    return data
+
+
+def render_status(data: Dict[str, Any]) -> str:
+    """The one-screen layout of §20."""
+    if not data.get("enabled"):
+        return "epic-driver: off (no active run)"
+    t, inh, p = data["timer"], data["inhibitor"], data.get("paused")
+    on = (f"ON (timer active, next {t['next']}" if t["active"] else "OFF (timer inactive") + \
+        f"; inhibitor {'held' if inh['lock'] else 'NOT held'})"
+    pause = "not paused" if not p else f"PAUSED since {p.get('at') or '?'}" + (f": {p['reason']}" if p.get("reason") else "")
+    lines = [f"epic-driver {data['epic']} · run {data['run_id']} · {on} · {pause}"]
+    err = data.get("last_tick_error")
+    err_text = "none" if not err else (f"{err.get('at')} {err.get('error')}" if isinstance(err, dict) else str(err))
+    state_word = "never" if not data.get("last_tick_at") else ("ok" if not err else "ERROR")
+    lines.append(f"last tick {data.get('last_tick_at') or '-'} ({_ago_text(data.get('last_tick_ago_s'))}) "
+                 f"{state_word} · last error: {err_text}")
+    tm = data["tmux"]
+    tmux = (f"tmux server {tm['pid']} in {tm['scope'] or '?'}" if tm.get("pid") is not None else "no tmux server")
+    st = data["stamps"]
+    stamps = ("stamps unchecked (EPIC_DRIVER_ALLOW_UNSTAMPED)" if not st.get("checked") else
+              f"stamps ok ({st.get('revision') or '?'})" if st.get("ok") else f"stamps MISMATCH: {st.get('problem')}")
+    lines.append(f"{tmux} · listener {data['listener']} · {stamps}")
+    ph = data.get("phase")
+    if ph:
+        lines.append(f"phase {ph['name']}: {ph['done']}/{ph['total']} done")
+    if data.get("ledger_problem"):
+        lines.append(f"ledger: {data['ledger_problem']}")
+    lines += ["", "STEPS", f"  {'id':<20} {'status':<11} {'since':<12} detail"]
+    lines += [f"  {r['id']:<20} {r['status']:<11} {r['since']:<12} {r['detail']}" for r in data["steps"]] or ["  (none)"]
+    lines += ["SESSIONS", f"  {'key':<16} {'name':<34} {'state':<9} {'cache':<10} {'ctx':<12} gen  model"]
+    for r in data["sessions"]:
+        ctx = "-" if r["ctx"] is None else f"{round(r['ctx'] / 1000)}K/{round((r['cap'] or 0) / 1000)}K"
+        lines.append(f"  {r['key']:<16} {str(r['name']):<34} {r['state']:<9} {r['cache']:<10} {ctx:<12} "
+                     f"{str(r['gen']):<4} {r['model']}")
+    if not data["sessions"]:
+        lines.append("  (none)")
+    lines.append("OUTBOX")
+    for r in data["outbox"]:
+        sent = f"sent {_short(r['sent'], '%H:%M:%S')}" if r["sent"] else f"queued ({r['deferrals']} deferrals)"
+        conf = f" · confirmed {_short(r['confirmed'], '%H:%M:%S')}" if r["confirmed"] else ""
+        lines.append(f"  {r['event']} → {r['to']:<10} {sent}{conf} · verdict {r['verdict']}")
+    if not data["outbox"]:
+        lines.append("  (none)")
+    lines.append("QUESTIONS / APPROVALS")
+    grants = {g["approval"]: g for g in data["grants"]}
+    for q in data["questions"]:
+        g = grants.get(q["for"]) if q["for"] else None
+        lines.append(f"  {q['id']} {q['for'] or ''} {q['status']}"
+                     + (f" (granted {_short(g['granted_at'])})" if g else ""))
+    asked = {q["for"] for q in data["questions"]}
+    for aid, g in grants.items():
+        if aid not in asked:
+            lines.append(f"  {aid} granted {_short(g['granted_at'])}")
+    if not data["questions"] and not grants:
+        lines.append("  (none)")
+    lines.append("ALARMS")
+    for a in data["alarms"]:
+        lines.append(f"  {a['id']} {a['subject']}  raised {_short(a['raised_at'])} · sends {a['sends']}"
+                     + (f" · notify failed: {a['last_error']}" if a.get("last_error") else "")
+                     + (f" · {a['detail']}" if a.get("detail") else ""))
+    if not data["alarms"]:
+        lines.append("  (none)")
+    lines.append("NOTIFY FAILURES (last 3)")
+    for f in data["notify_failures"][-3:]:
+        lines.append(f"  {f.get('at')} {f.get('what')}: {f.get('error')}")
+    if not data["notify_failures"]:
+        lines.append("  (none)")
+    return "\n".join(lines)
+
+
+# -- the verbs (§18) -----------------------------------------------------------------------
+
+class Refused(Exception):
+    """A verb refuses (exit 3) with a reason and the fix."""
+
+    def __init__(self, reason: str, fix: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.fix = fix
+
+
+def _print_refusal(err: Any, verb: str, exc: Refused) -> int:
+    print(f"epic-driver {verb}: refused: {exc.reason}", file=err)
+    if exc.fix:
+        print(f"  fix: {exc.fix}", file=err)
+    return EXIT_REFUSED
+
+
+def _require_active() -> Dict[str, Any]:
+    active = read_active()
+    if active is None:
+        raise Refused("no active run", "epic-driver enable <ledger>")
+    return active
+
+
+class _Locked:
+    """``with _Locked(paths, wait):`` — tick.lock for a writing verb (waits up to 300 s)."""
+
+    def __init__(self, paths: RunPaths, wait_s: float = LOCK_WAIT_S) -> None:
+        self.paths = paths
+        self.wait_s = wait_s
+        self.fd: Optional[int] = None
+
+    def __enter__(self) -> "_Locked":
+        self.fd = acquire_lock(self.paths.lock, self.wait_s)
+        if self.fd is None:
+            raise TickError(f"{self.paths.lock} is held: a pass or another verb kept it for {self.wait_s:g}s")
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        release_lock(self.fd)
+
+
+def cmd_validate(world: World, ledger_path: str, out: Any, err: Any) -> int:
+    """``validate <ledger>``: lint only; exit 0 (valid) / 1."""
+    ledger, errors, warnings = validate_ledger(ledger_path, world)
+    for w in warnings:
+        print(f"warning: [{w.category}] {w}", file=out)
+    for e in errors:
+        print(f"error: [{e.category}] {e}", file=err)
+    if ledger is None:
+        print(f"{os.path.abspath(ledger_path)}: invalid ({len(errors)} error(s))", file=err)
+        return EXIT_ERROR
+    print(f"{ledger.path}: valid (run {ledger.run_id}, {len(ledger.steps)} steps, {len(warnings)} warning(s))",
+          file=out)
+    return EXIT_OK
+
+
+def _rollback_units(world: World) -> CommandResult:
+    return world.systemctl(["disable", "--now", TIMER_UNIT, INHIBIT_UNIT])
+
+
+def cmd_enable(world: World, ledger_path: str, stamps: Optional[Dict[str, Any]], *, environ: Dict[str, str],
+               out: Any, err: Any) -> int:
+    """``enable <ledger>`` (§18.1): the gates in order; the first failure refuses (exit 3) with its fix."""
+    def gate(n: int, name: str, reason: str, fix: str) -> Refused:
+        return Refused(f"gate {n} ({name}): {reason}", fix)
+
+    try:
+        # 1. no other run is active, unless it names the same ledger.
+        target = os.path.realpath(ledger_path)
+        active = read_active()
+        if active is not None and os.path.realpath(str(active.get("ledger"))) != target:
+            raise gate(1, "one active run", f"run {active.get('run_id')} ({active.get('ledger')}) is active",
+                       "epic-driver disable, then enable this ledger")
+        # 2. stamps agree (§17), and the test override is not in use: a driver switched on while
+        # EPIC_DRIVER_ALLOW_UNSTAMPED is set would tick unstamped for as long as the variable survives
+        # somewhere (a shell export, the user manager's environment).
+        if environ.get(ALLOW_UNSTAMPED_ENV) or (stamps or {}).get("override_env"):
+            raise gate(2, "stamps", f"{ALLOW_UNSTAMPED_ENV} is set (a test-only override of the stamp check)",
+                       f"unset {ALLOW_UNSTAMPED_ENV} (and `systemctl --user unset-environment "
+                       f"{ALLOW_UNSTAMPED_ENV}`), then enable again")
+        if stamps is not None and not stamps.get("ok", True):
+            raise gate(2, "stamps", str(stamps.get("problem")),
+                       "re-run ./install.sh --yes with the epic-driver feature on")
+        # 3. the ledger validates, every base_ref included.
+        ledger, errors, warnings = validate_ledger(target, world)
+        if ledger is None:
+            raise gate(3, "ledger", _issues_text(errors, 10), f"epic-driver validate {target}")
+        for w in warnings:
+            print(f"warning: [{w.category}] {w}", file=out)
+        ws = ledger.workspace
+        # 4. the listener is active.
+        if not unit_active(world, LISTENER_UNIT):
+            raise gate(4, "listener", f"{LISTENER_UNIT} is not active",
+                       f"systemctl --user start {LISTENER_UNIT}")
+        # 5. claude-questions --check passes and sync is not "push" (review m8).
+        settings = world.questions_settings(ws)
+        if settings is None:
+            raise gate(5, "questions", f"{ws} has no [questions] section in its .claude/roles.toml",
+                       "add [questions] (sync = \"commit\" or off) and a queue for the notify role")
+        res = world.questions_check(ws)
+        if not res.ok:
+            raise gate(5, "questions", f"claude-questions --check --workspace-dir {ws} failed: {_cmd_text(res)}",
+                       f"run claude-questions --check --workspace-dir {ws} and fix what it reports")
+        if str(settings.get("sync", "")).lower() == "push":
+            raise gate(5, "questions", '[questions] sync = "push"',
+                       'set [questions] sync = "commit" (or off) in the workspace\'s .claude/roles.toml')
+        # 6. a test notify (ack=False).
+        res6 = dict(world.notify(f"[epic-driver {ledger.epic}] test notify from epic-driver enable "
+                                 "(no action needed)", role=ledger.notify_role, ack=False, workspace_dir=ws) or {})
+        if not res6.get("dispatched"):
+            raise gate(6, "test notify", str(res6.get("error") or "not dispatched"),
+                       f"claude-questions --check --workspace-dir {ws}; check the relay binding")
+        # 7. the tmux server: none, or in its own scope; inside a terminal's scope ⇒ move it.
+        server = probe_tmux_server(world)
+        if server.pid is not None and not server.own_scope:
+            moved, why = move_tmux_server(world, server.pid)
+            if not moved:
+                raise gate(7, "tmux server", tmux_move_instructions(server.pid, server.scope, why),
+                           "see above; then epic-driver enable again")
+            print(f"epic-driver enable: {why}", file=out)
+        paths = run_paths(ledger.run_id)
+        pointer = pointer_path(ledger)
+        try:
+            pointer_prior: Optional[bytes] = pointer.read_bytes() if pointer.exists() else None
+            pointer_mode = (pointer.stat().st_mode & 0o777) if pointer_prior is not None else 0o644
+        except OSError:
+            pointer_prior, pointer_mode = None, 0o644
+        with _Locked(paths):
+            try:
+                _enable_write_and_start(world, ledger, paths, pointer, environ, out)
+            except Refused:
+                # Rollback of a refusal after gate 9: the units and active.json are undone where they were
+                # done (gate 10). The pointer file is the one write into the tracked tree: its prior bytes
+                # are put back byte for byte, or the file is removed when it did not exist before.
+                # state.json, the env snapshot and the last-valid ledger copy stay: they live in the state
+                # dir, outside the repo, and a later enable reuses them.
+                try:
+                    if pointer_prior is None:
+                        os.unlink(pointer)
+                    else:
+                        atomic_write_bytes(pointer, pointer_prior, mode=pointer_mode)
+                except OSError:
+                    pass
+                raise
+        print(f"epic-driver: on for {ledger.epic} (run {ledger.run_id}, state {paths.dir})", file=out)
+        return EXIT_OK
+    except Refused as exc:
+        return _print_refusal(err, "enable", exc)
+
+
+def _enable_write_and_start(world: World, ledger: Ledger, paths: RunPaths, pointer: Path,
+                            environ: Dict[str, str], out: Any) -> None:
+    """``enable`` gates 8 to 11, under the run's lock (:func:`cmd_enable` rolls the pointer file back on a refusal)."""
+    ws = ledger.workspace
+
+    def gate(n: int, name: str, reason: str, fix: str) -> Refused:
+        return Refused(f"gate {n} ({name}): {reason}", fix)
+
+    # 8. the environment snapshot (§21.2).
+    try:
+        write_env_snapshot(paths, env_snapshot(environ))
+    except OSError as exc:
+        raise gate(8, "environment snapshot", f"cannot write it: {exc}",
+                   f"check that {paths.dir} is writable") from None
+    # 9. state.json (fresh, or the existing one of this run), active.json, the pointer file.
+    now = require_aware(world.now())
+    if paths.state.exists():
+        try:
+            state = load_state(paths.state, ledger.run_id)
+        except StateError as exc:
+            raise gate(9, "state", str(exc), f"move {paths.state} aside to start the run afresh") from None
+        state["ledger"] = ledger.path
+        ensure_step_states(ledger, state)
+    else:
+        state = new_state(ledger, now)
+    save_state(paths.state, state)
+    atomic_write_text(paths.last_valid_ledger, Path(ledger.path).read_text(encoding="utf-8"))
+    write_active({"run_id": ledger.run_id, "ledger": ledger.path, "state_dir": str(paths.dir),
+                  "enabled_at": iso(now), "workspace": ws, "epic": ledger.epic,
+                  "notify_role": ledger.notify_role})
+    body = json.dumps({"run_id": ledger.run_id, "state_dir": str(paths.dir)}, indent=1) + "\n"
+    try:
+        current = pointer.read_text(encoding="utf-8") if pointer.exists() else None
+    except (OSError, ValueError):       # unreadable or not UTF-8: it is replaced (the prior bytes are kept for a rollback)
+        current = None
+    if current != body:
+        atomic_write_text(pointer, body, mode=0o644)
+    # 10. the timer and the inhibitor, then the inhibitor's lock (else roll back).
+    res10 = world.systemctl(["enable", "--now", TIMER_UNIT, INHIBIT_UNIT])
+    if not res10.ok:
+        _rollback_units(world)
+        remove_active()
+        raise gate(10, "units", f"systemctl --user enable --now failed: {_cmd_text(res10)}",
+                   "install the units (./install.sh --yes with epic-driver on), then enable again")
+    held = False
+    for i in range(INHIBIT_VERIFY_TRIES):
+        held = inhibitor_lock_held(world.inhibit_list().stdout)
+        if held:
+            break
+        if i + 1 < INHIBIT_VERIFY_TRIES:
+            world.sleep(1.0)
+    if not held:
+        _rollback_units(world)
+        remove_active()
+        raise gate(10, "inhibitor", f"no {INHIBIT_WHAT} block lock of {INHIBIT_WHO} in systemd-inhibit "
+                                    "--list; the timer was rolled back",
+                   f"journalctl --user -u {INHIBIT_UNIT}")
+    # 11. one notify.
+    notifier = Notifier(world, paths, state, workspace=ws, role=ledger.notify_role, epic=ledger.epic)
+    notifier.send("heartbeat enable", notifier.prefix(f"epic-driver on for {ledger.epic}"), ack=False)
+    save_state(paths.state, state)
+
+
+def cmd_disable(world: World, *, out: Any, err: Any) -> int:
+    """``disable``: stop and disable the timer and the inhibitor; sessions and state untouched; one notify."""
+    active = read_active()
+    if active is None:
+        print("epic-driver: not enabled", file=out)
+        return EXIT_OK
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        res = _rollback_units(world)
+        remove_active()
+        try:
+            state = load_state(paths.state, active["run_id"])
+        except StateError:
+            state = None
+        if state is not None:
+            epic = str(active.get("epic") or state.get("epic") or "")
+            notifier = Notifier(world, paths, state, workspace=str(active.get("workspace") or ""),
+                                role=active.get("notify_role"), epic=epic)
+            if notifier.workspace:
+                notifier.send("heartbeat disable", notifier.prefix(f"epic-driver off for {epic}"), ack=False)
+            save_state(paths.state, state)
+    if not res.ok:
+        print(f"epic-driver disable: systemctl --user disable --now failed: {_cmd_text(res)}", file=err)
+        return EXIT_ERROR
+    print(f"epic-driver: off for run {active['run_id']} (sessions and state kept in {paths.dir})", file=out)
+    return EXIT_OK
+
+
+def cmd_pause(world: World, reason: Optional[str], *, out: Any) -> int:
+    active = _require_active()
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        atomic_write_text(paths.paused, json.dumps({"at": iso(world.now()), "reason": reason}) + "\n")
+    print(f"epic-driver: paused (the tick still watches and alarms; it starts nothing)", file=out)
+    return EXIT_OK
+
+
+def cmd_resume(world: World, *, out: Any) -> int:
+    active = _require_active()
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        try:
+            os.unlink(paths.paused)
+        except FileNotFoundError:
+            pass
+    print("epic-driver: resumed", file=out)
+    return EXIT_OK
+
+
+def cmd_status(world: World, stamps: Optional[Dict[str, Any]], *, json_out: bool, out: Any, err: Any) -> int:
+    active = read_active()
+    if active is None:
+        print(json.dumps({"enabled": False}) if json_out else render_status({"enabled": False}), file=out)
+        return EXIT_OK
+    paths = run_paths(active["run_id"])
+    try:
+        state = load_state(paths.state, active["run_id"])
+    except StateError as exc:
+        print(f"epic-driver status: {exc}", file=err)
+        return EXIT_ERROR
+    try:
+        ledger: Optional[Ledger] = load_run_ledger(active, paths, world, verify_base_refs=False, keep_copy=False)[0]
+    except TickError:
+        ledger = None
+    data = status_data(world, active, paths, ledger, state, stamps, require_aware(world.now()))
+    print(json.dumps(data, indent=1, default=str) if json_out else render_status(data), file=out)
+    return EXIT_OK
+
+
+def _run_ledger_and_state(world: World, active: Dict[str, Any], paths: RunPaths) -> Tuple[Ledger, RunState]:
+    ledger = load_run_ledger(active, paths, world, verify_base_refs=False, keep_copy=False)[0]
+    state = load_state(paths.state, active["run_id"])
+    ensure_step_states(ledger, state)
+    return ledger, state
+
+
+def cmd_mark(world: World, step_id: str, action: str, *, out: Any) -> int:
+    """``mark <step> done|reset`` (§8 rules); the step's alarms clear (§16.2 "or mark")."""
+    active = _require_active()
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        ledger, state = _run_ledger_and_state(world, active, paths)
+        if not ledger.has_step(step_id):
+            raise Refused(f"unknown step {step_id!r}", "epic-driver status lists the steps")
+        now = require_aware(world.now())
+        if action == "done":
+            mark_done(ledger, state, step_id, now)
+            cleared = clear_alarms_by_mark(state, [step_id], now)
+        else:
+            res = mark_reset(ledger, state, step_id, now)
+            cleared = clear_alarms_by_mark(state, [step_id], now, keys=res["cleared_alarms"])
+        save_state(paths.state, state)
+    print(f"epic-driver: {step_id} marked {action}" + (f"; cleared {', '.join(cleared)}" if cleared else ""), file=out)
+    return EXIT_OK
+
+
+def cmd_grant(world: World, approval_id: str, question: Optional[str], note: Optional[str], *, out: Any) -> int:
+    """``mark --grant <approval> [--question Q-n] [--note TEXT]``: the only writer of ``state.grants`` (P0-13)."""
+    active = _require_active()
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        ledger, state = _run_ledger_and_state(world, active, paths)
+        try:
+            g = grant(ledger, state, approval_id, question, note, require_aware(world.now()))
+        except KeyError as exc:
+            raise Refused(str(exc.args[0] if exc.args else exc), "use an approval id of the ledger") from None
+        save_state(paths.state, state)
+    print(f"epic-driver: {approval_id} granted at {g.get('granted_at')}"
+          + (f" (question {g.get('question')})" if g.get("question") else ""), file=out)
+    return EXIT_OK
+
+
+def cmd_queue(world: World, step_id: str, to_role: str, file: str, *, out: Any) -> int:
+    """``queue <step> --to <role> --file <path>`` (OQ-4): stored for the next dispatch as a ``feedback`` event."""
+    active = _require_active()
+    paths = run_paths(active["run_id"])
+    with _Locked(paths):
+        ledger, state = _run_ledger_and_state(world, active, paths)
+        try:
+            req = queue_request(ledger, state, step_id, to_role, os.path.abspath(file) if file else file,
+                                require_aware(world.now()))
+        except ValueError as exc:
+            raise Refused(str(exc)) from None
+        save_state(paths.state, state)
+    print(f"epic-driver: queued {req['id']} for {to_role}:{step_id}: {req['file']}", file=out)
+    return EXIT_OK
+
+
+def cli(ns: Any, world: World, stamps: Optional[Dict[str, Any]] = None, *, environ: Any = None,
+        out: Any = None, err: Any = None) -> int:
+    """Run one parsed verb (the CLI calls this after its stamp check). Exit 0 ok, 1 error, 3 refused."""
+    out = out or sys.stdout
+    err = err or sys.stderr
+    environ = os.environ if environ is None else environ
+    verb = ns.verb
+    try:
+        if verb == "validate":
+            return cmd_validate(world, ns.ledger, out, err)
+        if verb == "enable":
+            return cmd_enable(world, ns.ledger, stamps, environ=dict(environ), out=out, err=err)
+        if verb == "disable":
+            return cmd_disable(world, out=out, err=err)
+        if verb == "pause":
+            return cmd_pause(world, ns.reason, out=out)
+        if verb == "resume":
+            return cmd_resume(world, out=out)
+        if verb == "status":
+            return cmd_status(world, stamps, json_out=ns.json, out=out, err=err)
+        if verb == "tick":
+            return run_tick(world, dry_run=ns.dry_run, environ=environ, out=out, err=err)
+        if verb == "mark":
+            if ns.grant:
+                return cmd_grant(world, ns.grant, ns.question, ns.note, out=out)
+            return cmd_mark(world, ns.step, ns.action, out=out)
+        if verb == "queue":
+            return cmd_queue(world, ns.step, ns.to, ns.file, out=out)
+    except Refused as exc:
+        return _print_refusal(err, verb, exc)
+    except Exception as exc:  # noqa: BLE001 - a verb's failure is reported, exit 1
+        print(f"epic-driver {verb}: error: {type(exc).__name__}: {exc}", file=err)
+        return EXIT_ERROR
+    print(f"epic-driver: unknown verb {verb!r}", file=err)
+    return EXIT_USAGE

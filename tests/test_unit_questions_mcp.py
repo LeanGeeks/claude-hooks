@@ -650,6 +650,106 @@ class TestNotify(QuestionsLibTestCase):
         self.assertIn("error", result)
 
 
+
+# ── Test: notify(workspace_dir=…) for the epic driver (epic 50, task 50-08) ──
+
+
+class TestNotifyWorkspaceDir(QuestionsLibTestCase):
+    """The keyword-only ``workspace_dir``: honoured when given; ``None`` is today's resolution."""
+
+    def _notify_capturing(self, *, env, **kwargs):
+        captured = []
+
+        def fake_send(*args, **kw):
+            captured.append(kw)
+            return _make_fake_handle(7001)
+
+        client = MagicMock()
+        client.send_message.side_effect = fake_send
+        resolved = []
+        real_resolve = lib._resolve_workspace_dir
+
+        def spy():
+            resolved.append(True)
+            return real_resolve()
+
+        with patch.dict(os.environ, env), \
+             patch.object(roles_config, "load_bindings", return_value=_make_fake_bindings()), \
+             patch.object(lib, "_client", return_value=client), \
+             patch.object(lib, "_resolve_workspace_dir", side_effect=spy), \
+             patch.object(qll, "INDEX_PATH", self.index_path), \
+             patch.object(qll, "_LOCK_PATH", self.index_lock):
+            if "CLAUDE_PROJECT_DIR" not in env:
+                os.environ.pop("CLAUDE_PROJECT_DIR", None)     # as the epic driver's CLI runs it
+            with lib._ws_lock:
+                lib._ws_cache.clear()
+            result = lib.notify(**kwargs)
+        return result, captured, resolved
+
+    def test_the_signature(self):
+        import inspect
+        params = inspect.signature(lib.notify).parameters
+        self.assertEqual(list(params), ["text", "role", "ack", "workspace_dir"])
+        self.assertEqual(params["workspace_dir"].kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(params["workspace_dir"].default)
+        with self.assertRaises(TypeError):
+            lib.notify("x", None, True, self.ws.workspace_dir)   # not positional
+
+    def test_workspace_dir_is_honoured(self):
+        """No CLAUDE_PROJECT_DIR (the epic driver drops it) and PWD elsewhere: the named workspace wins."""
+        elsewhere = tempfile.mkdtemp(prefix="qs-elsewhere-")
+        try:
+            result, captured, resolved = self._notify_capturing(
+                env={"PWD": elsewhere}, text="ALARM x", ack=True, workspace_dir=self.ws.workspace_dir)
+        finally:
+            shutil.rmtree(elsewhere, ignore_errors=True)
+        self.assertTrue(result["dispatched"], result)
+        self.assertEqual(resolved, [])                       # the per-call resolution was not consulted
+        self.assertIn("test-ws", captured[0]["text"])
+        self.assertEqual(captured[0]["nudge_schedule"], "4h,1d,3d,7d*")   # that workspace's ladder
+        entry = qll.read_index(self.index_path).messages["7001"]
+        self.assertEqual(entry.workspace_id, "test-ws")
+        self.assertEqual(entry.root, str(Path(self.ws.workspace_dir).resolve()))
+
+    def test_without_it_a_workspace_named_nowhere_is_refused_as_today(self):
+        elsewhere = tempfile.mkdtemp(prefix="qs-elsewhere-")
+        try:
+            result, captured, resolved = self._notify_capturing(env={"PWD": elsewhere}, text="x", ack=False)
+        finally:
+            shutil.rmtree(elsewhere, ignore_errors=True)
+        self.assertFalse(result["dispatched"])
+        self.assertIn("no role catalog", result["error"])
+        self.assertEqual(resolved, [True])
+        self.assertEqual(captured, [])
+
+    def test_the_mcp_tool_path_is_unchanged(self):
+        """server.py's tool passes no workspace_dir, and a call without it resolves exactly as before:
+        the same message, kind, ladder and index entry as naming the resolved workspace explicitly."""
+        import ast
+        tree = ast.parse((_REPO_ROOT / "questions-mcp" / "server.py").read_text(encoding="utf-8"))
+        tool = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "notify")
+        self.assertEqual([a.arg for a in tool.args.args], ["text", "role", "ack"])
+        self.assertEqual(tool.args.kwonlyargs, [])
+        call = next(n for n in ast.walk(tool) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute) and n.func.attr == "notify")
+        self.assertEqual(sorted(k.arg for k in call.keywords), ["ack", "role", "text"])
+
+        env = {"CLAUDE_PROJECT_DIR": self.ws.workspace_dir}
+        r1, c1, resolved = self._notify_capturing(env=env, text="Build done", ack=True)
+        self.assertEqual(resolved, [True])
+        e1 = qll.read_index(self.index_path).messages["7001"]
+        os.unlink(self.index_path)
+        r2, c2, _ = self._notify_capturing(env=env, text="Build done", ack=True, workspace_dir=self.ws.workspace_dir)
+        e2 = qll.read_index(self.index_path).messages["7001"]
+        self.assertEqual(r1, r2)
+        for a, b in zip(c1, c2):
+            a, b = dict(a), dict(b)
+            self.assertTrue(a.pop("idempotency_key").startswith("notify:test-ws:"))
+            b.pop("idempotency_key")
+            self.assertEqual(a, b)
+        self.assertEqual((e1.workspace_id, e1.root, e1.qid, e1.role), (e2.workspace_id, e2.root, e2.qid, e2.role))
+
+
 # ── Test: caps (brd D12) ──────────────────────────────────────────────────────
 
 

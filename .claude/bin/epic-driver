@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""``epic-driver`` — run one epic's step ledger unattended (epic 50; architecture §17, §18).
+
+    epic-driver validate <ledger>                      lint only; exit 0/1
+    epic-driver enable <ledger>                        the gates of §18.1; exit 0, or 3 with the failed gate
+    epic-driver disable                                stop timer + inhibitor; sessions and state untouched
+    epic-driver pause [--reason TEXT] | resume         the pause file; the tick still watches and alarms
+    epic-driver status [--json]                        the status screen (§20)
+    epic-driver tick [--dry-run]                       one pass (the unit runs this)
+    epic-driver mark <step> done|reset                 the §8 rules
+    epic-driver mark --grant <approval> [--question Q-n] [--note TEXT]
+    epic-driver queue <step> --to <role> --file <path> a feedback event for a worker (OQ-4)
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 refused.
+
+This file is argparse, path setup and the stamp check of §17; every verb is
+``epic_driver_lib.cli``. The stamp check runs before anything but the standard
+library is imported: the installer's ``~/.claude/epic-driver/stamps.json``
+lists every installed file the driver imports or reads, with its sha256, and a
+missing manifest, a missing file or a changed hash is ``stamp_mismatch``. The
+tick then only records the error (state.json, written here with the standard
+library), notifies once and exits 1; ``status``, ``disable``, ``pause`` and
+``resume`` still run; every other verb refuses (exit 3). Only tests set
+``EPIC_DRIVER_ALLOW_UNSTAMPED=1`` (they run the repo copies); the unit never does, and an *installed*
+copy ignores it: it is honoured only for a run from a repo checkout (``layout()["installed"]`` is
+False). ``enable`` refuses while it is set, and it is stripped from the environment of every child.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+ALLOW_UNSTAMPED_ENV = "EPIC_DRIVER_ALLOW_UNSTAMPED"
+STATE_ROOT_ENV = "EPIC_DRIVER_STATE_ROOT"
+HOOKS_REPO_ENV = "CLAUDE_HOOKS_REPO"
+QUESTIONS_MCP_FILE = "questions_mcp_lib.py"        # the stamped file the notify path imports
+#: The notify path's import closure: ``questions_mcp_lib`` and every project module it imports, transitively
+#: (by name in ``STAMPED_FILES``). Importing it executes all of them, so if ANY is mismatched the notify path
+#: is not imported. A test derives the closure from the source with ``ast`` and asserts this list covers it.
+NOTIFY_IMPORT_CLOSURE = (
+    "questions_mcp_lib.py",
+    "questions_store.py",
+    "questions_git.py",
+    "questions_listen_lib.py",
+    "questions_ops.py",
+    "roles_config.py",
+)
+ALARM_REPEAT_S = 4 * 3600                           # §16.1; the lib's ALARM_REPEAT_S (not importable here)
+
+#: §17's stamp set: manifest name → path under the installed ``~/.claude``. The installer (50-10) writes
+#: one ``modules`` entry per name, with exactly this path.
+STAMPED_FILES: Dict[str, str] = {
+    "epic-driver": "bin/epic-driver",
+    "epic_driver_lib.py": "hooks/epic_driver_lib.py",
+    "amux_spawn_lib.py": "hooks/amux_spawn_lib.py",
+    "claude_event_reducer.py": "hooks/claude_event_reducer.py",
+    "keep_awake_hook.py": "hooks/keep_awake_hook.py",
+    "questions_store.py": "hooks/questions_store.py",
+    "questions_listen_lib.py": "hooks/questions_listen_lib.py",
+    "questions_git.py": "hooks/questions_git.py",
+    "questions_ops.py": "hooks/questions_ops.py",
+    "roles_config.py": "hooks/roles_config.py",
+    "statusline.py": "statusline/statusline.py",
+    "context_mcp_lib.py": "epic-driver/lib/context_mcp_lib.py",
+    "models.json": "epic-driver/lib/models.json",
+    "questions_mcp_lib.py": "epic-driver/lib/questions_mcp_lib.py",
+    "epic-driver-driver.md": "epic-driver/prompts/epic-driver-driver.md",
+    "epic-driver-worker.md": "epic-driver/prompts/epic-driver-worker.md",
+}
+
+#: Verbs that only stop or observe: they still run when the stamps disagree.
+RUN_DESPITE_MISMATCH = ("status", "disable", "pause", "resume")
+
+
+def layout(cli_path: Optional[Path] = None, home: Optional[str] = None) -> Dict[str, Any]:
+    """Where everything is, from this file's own path (§17).
+
+    Installed: ``~/.claude/bin/epic-driver`` (``~/.local/bin/epic-driver`` is a symlink to it), the
+    modules in ``~/.claude/{hooks,statusline,epic-driver/lib}``. The repo: ``.claude/bin/epic-driver``,
+    the modules in ``.claude/{hooks,statusline}``, ``context-mcp/`` and ``questions-mcp/``.
+    ``hooks_repo`` is what ``CLAUDE_HOOKS_REPO`` must be for ``questions_mcp_lib._resolve_hooks_dir``
+    to land on the same hooks directory: ``$HOME`` when installed.
+
+    **Installed vs repo run** (50-10 relies on this; ``EPIC_DRIVER_ALLOW_UNSTAMPED`` is honoured only
+    for the repo run): the resolved script sits in ``<home>/.claude/bin`` (the installer's bin dir), or
+    ``<root>/epic-driver/lib/`` exists (what the installer creates and a checkout never has). Either
+    makes it an installed copy.
+    """
+    here = Path(cli_path or __file__).resolve()
+    root = here.parent.parent                       # ~/.claude, or <repo>/.claude
+    home_dir = Path(home) if home else Path.home()
+    installed = ((root / "epic-driver" / "lib").is_dir()
+                 or here.parent == (home_dir / ".claude" / "bin").resolve())
+    paths = [root / "hooks", root / "statusline"]
+    if installed:
+        paths.append(root / "epic-driver" / "lib")
+    else:
+        paths += [root.parent / "context-mcp", root.parent / "questions-mcp"]
+    return {"root": root, "installed": installed, "sys_path": [str(p) for p in paths],
+            "manifest": root / "epic-driver" / "stamps.json", "hooks_repo": str(root.parent)}
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_stamps(lay: Dict[str, Any], environ: Any) -> Dict[str, Any]:
+    """§17 / OQ-3: every file the manifest lists hashes as recorded, and the manifest lists §17's set at
+    the paths this CLI imports. ``{"checked", "ok", "problem", "revision", "files", "override_env"}``;
+    standard library only.
+
+    ``EPIC_DRIVER_ALLOW_UNSTAMPED=1`` skips the check only when ``lay["installed"]`` is False (a repo
+    checkout, i.e. the tests); an installed copy ignores it and checks. ``override_env`` reports that
+    the variable was set at all (``enable`` refuses on it). ``files`` is the names that disagree, None
+    when that cannot be told (no usable manifest).
+    """
+    override = bool(environ.get(ALLOW_UNSTAMPED_ENV))
+    if environ.get(ALLOW_UNSTAMPED_ENV) == "1" and not lay["installed"]:
+        return {"checked": False, "ok": True, "problem": None, "revision": None, "files": [],
+                "override_env": True}
+    manifest: Path = lay["manifest"]
+
+    def bad(problem: str, revision: Optional[str] = None, files: Optional[List[str]] = None) -> Dict[str, Any]:
+        return {"checked": True, "ok": False, "problem": problem, "revision": revision, "files": files,
+                "override_env": override}
+
+    try:
+        with open(manifest, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return bad(f"no stamps manifest at {manifest} (an uninstalled copy, or the epic-driver feature is off)")
+    except (OSError, ValueError) as exc:
+        return bad(f"the stamps manifest {manifest} is unreadable: {exc}")
+    modules = data.get("modules") if isinstance(data, dict) else None
+    revision = data.get("revision") if isinstance(data, dict) else None
+    if not isinstance(modules, dict):
+        return bad(f"{manifest} has no modules map", revision)
+    root: Path = lay["root"]
+    for name, rel in STAMPED_FILES.items():
+        entry = modules.get(name)
+        if not isinstance(entry, dict):
+            return bad(f"{name} is not in {manifest}", revision)
+        if os.path.realpath(str(entry.get("path"))) != os.path.realpath(str(root / rel)):
+            return bad(f"{manifest} lists {entry.get('path')} for {name}; this CLI uses {root / rel}", revision)
+    problems: List[str] = []
+    files: List[str] = []
+    for name, entry in sorted(modules.items()):
+        path = Path(str((entry or {}).get("path")))
+        try:
+            digest = _sha256(path)
+        except OSError:
+            problems.append(f"{name}: {path} is missing")
+            files.append(name)
+            continue
+        if digest != (entry or {}).get("sha256"):
+            problems.append(f"{name}: {path} changed since it was installed (sha256 {digest[:12]}, "
+                            f"stamped {str((entry or {}).get('sha256'))[:12]})")
+            files.append(name)
+    if problems:
+        return bad(problems[0], revision, files)
+    return {"checked": True, "ok": True, "problem": None, "revision": revision, "files": [],
+            "override_env": override}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _append(path: Path, line: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _parse_iso(text: Any) -> Optional[datetime]:
+    try:
+        return datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def tick_stamp_mismatch(problem: str, environ: Any, *, notify: Any = None, err: Any = None,
+                        mismatched: Optional[List[str]] = None, hooks_repo: Optional[str] = None) -> int:
+    """§17: a tick whose stamps disagree records ``stamp_mismatch``, notifies, exits 1, touches nothing else.
+
+    Standard library only: the lib that would do it is what disagrees. The notify (``ack=True``) goes
+    when the alarm is raised and repeats like any other alarm (§16.1): 4 h after the later of the last
+    attempt and the end of the ladder the record holds (``ladder_until``; the listener's index, which
+    the engine also consults, is stamped code and is not read here). A tick whose stamps agree again
+    clears the alarm. ``notify`` is the notify function (tests); by default ``questions_mcp_lib.notify``,
+    imported at that moment with ``CLAUDE_HOOKS_REPO`` set to ``hooks_repo`` only around the import and
+    the call. When any file of ``NOTIFY_IMPORT_CLOSURE`` is among ``mismatched`` (None: cannot tell, which
+    counts) it is NOT imported: nothing is sent, and the alarm goes to ``logs/notify.log`` and the notify failures
+    ``status`` shows.
+
+    Nothing but ``state.json`` and the logs is written here, and only with the run lock held.
+    """
+    err = err or sys.stderr
+    print(f"epic-driver tick: stamp_mismatch: {problem}", file=err)
+    root = Path(environ.get(STATE_ROOT_ENV) or (Path.home() / ".local" / "state" / "epic-driver"))
+    try:
+        active = json.loads((root / "active.json").read_text(encoding="utf-8"))
+        state_dir = Path(active["state_dir"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1
+    try:
+        lock_fd = os.open(str(state_dir / "tick.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        print(f"epic-driver tick: cannot record the mismatch: {exc}", file=err)
+        return 1
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, PermissionError):
+            return 0
+        state_path = state_dir / "state.json"
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"epic-driver tick: cannot record the mismatch: {exc}", file=err)
+            return 1
+        now = _now_iso()
+        now_dt = _parse_iso(now)
+        state["last_tick_at"] = now
+        state["last_tick_error"] = {"at": now, "error": f"stamp_mismatch: {problem}"}
+        alarms = state.setdefault("alarms", {})
+        key = "stamp_mismatch:run"
+        rec = alarms.get(key)
+        raise_now = not isinstance(rec, dict) or bool(rec.get("cleared_at"))
+        if raise_now:
+            rec = {"id": "stamp_mismatch", "subject": "run", "detail": problem, "raised_at": now,
+                   "last_attempt_at": None, "last_sent_at": None, "message_id": None, "ladder_until": None,
+                   "cleared_at": None, "cleared_by": None, "suppressed": False, "sends": 0, "last_error": None}
+            alarms[key] = rec
+            due = True
+        else:
+            rec["detail"] = problem
+            base = _parse_iso(rec.get("last_attempt_at"))
+            until = _parse_iso(rec.get("ladder_until"))
+            if base is not None and until is not None and until > base:
+                base = until
+            due = base is None or (now_dt is not None and now_dt.timestamp() >= base.timestamp() + ALARM_REPEAT_S)
+        _atomic_write(state_path, json.dumps(state, indent=1) + "\n")
+        if due and active.get("workspace"):
+            text = (f"[epic-driver {active.get('epic') or state.get('epic')}] ALARM stamp_mismatch run: {problem}"
+                    " — epic-driver status")
+            rec["last_attempt_at"] = now
+            rec["sends"] = int(rec.get("sends") or 0) + 1
+            unsafe = notify is None and (mismatched is None
+                                         or any(name in mismatched for name in NOTIFY_IMPORT_CLOSURE))
+            if unsafe:
+                res = {"dispatched": False, "message_id": None,
+                       "error": f"not sent: a file of the notify path ({QUESTIONS_MCP_FILE} and what it imports) is among "
+                                "the files whose stamp disagrees (or the manifest cannot say), so it is not imported"}
+            else:
+                prev = os.environ.get(HOOKS_REPO_ENV)
+                try:
+                    fn = notify
+                    if fn is None:
+                        if hooks_repo:
+                            os.environ[HOOKS_REPO_ENV] = hooks_repo
+                        import questions_mcp_lib  # noqa: PLC0415 - the notify path, best effort
+                        fn = questions_mcp_lib.notify
+                    res = dict(fn(text, role=active.get("notify_role"), ack=True,
+                                  workspace_dir=str(active["workspace"])) or {})
+                except Exception as exc:  # noqa: BLE001
+                    res = {"dispatched": False, "message_id": None, "error": f"{type(exc).__name__}: {exc}"}
+                finally:
+                    if notify is None and hooks_repo:
+                        if prev is None:
+                            os.environ.pop(HOOKS_REPO_ENV, None)
+                        else:
+                            os.environ[HOOKS_REPO_ENV] = prev
+            if res.get("dispatched"):
+                rec.update(last_sent_at=_now_iso(), message_id=res.get("message_id"), last_error=None)
+            else:
+                rec["last_error"] = str(res.get("error") or "not dispatched")[-300:]
+                fails = state.setdefault("notify_failures", [])
+                fails.append({"at": _now_iso(), "what": f"alarm {key}", "error": rec["last_error"]})
+                del fails[:-20]
+            _append(state_dir / "logs" / "notify.log",
+                    f"{_now_iso()} alarm {key} ack=yes dispatched={'yes' if res.get('dispatched') else 'no'}"
+                    f" message_id={res.get('message_id')}"
+                    + (f" error={res.get('error')}" if res.get("error") else "") + "\n")
+            _atomic_write(state_path, json.dumps(state, indent=1) + "\n")
+        _append(state_dir / "logs" / "tick.log", f"{now} pass refused: stamp_mismatch: {problem}\n")
+        return 1
+    finally:
+        os.close(lock_fd)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="epic-driver", description="Run one epic's step ledger unattended.",
+                                epilog="exit 0 ok, 1 error, 2 usage, 3 refused")
+    sub = p.add_subparsers(dest="verb", metavar="VERB")
+    sub.required = True
+    v = sub.add_parser("validate", help="lint a ledger (exit 0/1)")
+    v.add_argument("ledger")
+    e = sub.add_parser("enable", help="turn the driver on for a ledger (§18.1 gates)")
+    e.add_argument("ledger")
+    sub.add_parser("disable", help="stop the timer and the inhibitor; sessions and state untouched")
+    pa = sub.add_parser("pause", help="start nothing; the tick still watches and alarms")
+    pa.add_argument("--reason", default=None)
+    sub.add_parser("resume", help="remove the pause")
+    st = sub.add_parser("status", help="the status screen")
+    st.add_argument("--json", action="store_true")
+    t = sub.add_parser("tick", help="one pass (the unit runs this)")
+    t.add_argument("--dry-run", action="store_true", help="compute and print; write, start and send nothing")
+    m = sub.add_parser("mark", help="mark <step> done|reset, or --grant <approval>")
+    m.add_argument("step", nargs="?")
+    m.add_argument("action", nargs="?")
+    m.add_argument("--grant", metavar="APPROVAL", default=None)
+    m.add_argument("--question", metavar="Q-n", default=None)
+    m.add_argument("--note", metavar="TEXT", default=None)
+    q = sub.add_parser("queue", help="a feedback event for a worker of a step (OQ-4)")
+    q.add_argument("step")
+    q.add_argument("--to", required=True, metavar="ROLE")
+    q.add_argument("--file", required=True, metavar="PATH")
+    return p
+
+
+def parse(argv: Optional[List[str]]) -> argparse.Namespace:
+    parser = build_parser()
+    ns = parser.parse_args(argv)
+    if ns.verb == "mark":
+        if ns.grant:
+            if ns.step or ns.action:
+                parser.error("mark --grant takes no step or action")
+        else:
+            if not ns.step or ns.action not in ("done", "reset"):
+                parser.error("mark needs <step> done|reset, or --grant <approval>")
+            if ns.question or ns.note:
+                parser.error("--question and --note go with --grant")
+    return ns
+
+
+def main(argv: Optional[List[str]] = None, *, world: Any = None, environ: Any = None,
+         out: Any = None, err: Any = None) -> int:
+    environ = os.environ if environ is None else environ
+    out = out or sys.stdout
+    err = err or sys.stderr
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            ns = parse(argv)
+    except SystemExit as exc:          # argparse: usage errors exit 2, --help exits 0
+        return int(exc.code or 0)
+    lay = layout(home=environ.get("HOME"))
+    for p in reversed(lay["sys_path"]):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    stamps = check_stamps(lay, environ)
+    # Neither variable stays in the process: a child of this CLI (a check, the tmux server, an amux-spawn
+    # session) must not see the stamp override, nor a hooks repo meant for questions_mcp_lib alone.
+    # ``RealWorld.notify`` sets CLAUDE_HOOKS_REPO (``hooks_repo``) around the import and call only.
+    environ.pop(ALLOW_UNSTAMPED_ENV, None)
+    environ.pop(HOOKS_REPO_ENV, None)
+    # The workspace is always the ledger's: an inherited CLAUDE_PROJECT_DIR (a tick run by hand from a
+    # Claude session) would make roles_config read another workspace's roles.toml.
+    environ.pop("CLAUDE_PROJECT_DIR", None)
+    if not stamps["ok"]:
+        if ns.verb == "tick" and not ns.dry_run:
+            return tick_stamp_mismatch(stamps["problem"], environ, err=err, mismatched=stamps.get("files"),
+                                       hooks_repo=lay["hooks_repo"])
+        if ns.verb not in RUN_DESPITE_MISMATCH:
+            print(f"epic-driver {ns.verb}: refused: stamp_mismatch: {stamps['problem']}", file=err)
+            print("  fix: re-run ./install.sh --yes with the epic-driver feature on", file=err)
+            return 3
+    import epic_driver_lib as edl  # noqa: E402 - after the path setup and the stamp check
+
+    return edl.cli(ns, world if world is not None else edl.RealWorld(hooks_repo=lay["hooks_repo"]), stamps,
+                   environ=environ, out=out, err=err)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
