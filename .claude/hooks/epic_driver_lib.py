@@ -28,6 +28,7 @@ Session policy        §11.2 decision table, §11.5 keep-warm       50-06
 Dispatch plan         ``plan_dispatch``: (mutation, effect) ops   50-06
 Dispatch execution    ``execute_dispatch``: COMMIT → effect → COMMIT 50-06
 Dispatch conditions   delivery/handoff/spawn/resume alarm rows    50-06
+Worker worktrees      §14 integration/step worktrees, sha check   50-07
 ====================  ==========================================  ======
 
 Later tasks append their own sections (reconcile §12, dispatch §9/§11,
@@ -314,6 +315,53 @@ class CheckRun:
     error: Optional[str] = None
 
 
+# The git this module may run (invariants 3, 4, 6), enforced at runtime by ``RealWorld.git`` and by the test
+# fake through :func:`git_refusal`. Exact ``(verb, subverb)`` pairs and, per pair, the only flags allowed;
+# anything else is refused without running git. No ``-c`` / ``-C`` / ``--git-dir`` (the runner adds its own
+# ``-c core.hooksPath=/dev/null``); no reset, clean, stash, push, update-ref, branch, checkout, switch,
+# restore, rebase, worktree remove/prune/move; ``worktree add`` takes ``-b`` only (no ``-B``, ``-f``,
+# ``--force``, ``--detach``, ``--orphan``). Tokens after ``--end-of-options`` are operands, as in git.
+GIT_ALLOWED: Dict[Tuple[str, Optional[str]], frozenset] = {
+    ("rev-parse", None): frozenset({"--is-inside-work-tree", "--verify", "--quiet", "--end-of-options"}),
+    ("check-ref-format", None): frozenset({"--branch"}),
+    ("worktree", "list"): frozenset({"--porcelain"}),
+    ("worktree", "add"): frozenset({"-b", "--end-of-options"}),
+    ("status", None): frozenset({"--porcelain"}),
+    ("merge-base", None): frozenset({"--is-ancestor", "--end-of-options"}),
+}
+GIT_WORKTREE_SUBVERBS = frozenset(sub for (verb, sub) in GIT_ALLOWED if verb == "worktree")
+
+
+def git_refusal(args: Sequence[str]) -> Optional[str]:
+    """Why ``args`` (the argv after ``git -C <cwd>``) may not run, or None when it is on the allow list."""
+    if isinstance(args, (str, bytes)) or not args or not all(isinstance(a, str) for a in args):
+        return "git refused: arguments must be a non-empty list of strings"
+    verb = args[0]
+    if verb.startswith("-"):
+        return f"git refused: global option {verb!r} is not allowed"
+    sub: Optional[str] = None
+    rest = list(args[1:])
+    if verb == "worktree":
+        sub = rest[0] if rest else None
+        if sub not in GIT_WORKTREE_SUBVERBS:
+            return f"git refused: 'worktree {sub or ''}' is not allowed"
+        rest = rest[1:]
+    flags = GIT_ALLOWED.get((verb, sub))
+    if flags is None:
+        return f"git refused: {verb!r} is not allowed"
+    name = " ".join(filter(None, (verb, sub)))
+    operands = False
+    for tok in rest:
+        if operands:     # after --end-of-options git reads operands; ours (paths, shas, refs) never start with '-'
+            if tok.startswith("-"):
+                return f"git refused: operand {tok!r} starts with '-' for 'git {name}'"
+        elif tok == "--end-of-options":
+            operands = True
+        elif tok.startswith("-") and tok not in flags:
+            return f"git refused: flag {tok!r} is not allowed for 'git {name}'"
+    return None
+
+
 class World:
     """Every effect the driver has, one method each.
 
@@ -487,6 +535,9 @@ class RealWorld(World):
         return datetime.now(UTC)
 
     def git(self, args: Sequence[str], cwd: str, timeout_s: float = 30.0) -> CommandResult:
+        refused = git_refusal(args)
+        if refused:
+            return CommandResult(rc=None, error=refused)
         argv = ["git", "-c", "core.hooksPath=/dev/null", "-C", cwd, *args]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s,
@@ -1422,6 +1473,9 @@ def _parse_worker(v: _Validator, raw: Any, where: str) -> Optional[Worker]:
             name = v.string(r, "name", rw)
             if path is None or base is None:
                 continue
+            if base.startswith("-"):
+                v.err(E_SCHEMA, f"{rw}.base_ref", f"must not start with '-': {base!r}")
+                continue
             repos.append(WorkerRepo(path=path, base_ref=base,
                                     name=name if name is not None else os.path.basename(path.rstrip("/"))))
     if impl is None or rev is None:
@@ -1679,41 +1733,53 @@ def _git_cached(world: World, cache: Dict[Tuple[str, Tuple[str, ...]], CommandRe
     return cache[key]
 
 
-def _validate_repos(v: _Validator, step: Step, world: World, verify_base_refs: bool,
-                    cache: Dict[Tuple[str, Tuple[str, ...]], CommandResult]) -> None:
-    if step.worker is None:
-        return
+def repo_problems(repos: Sequence[WorkerRepo], git: Callable[[Tuple[str, ...], str], CommandResult],
+                  verify_base_refs: bool = True) -> List[Tuple[int, str, str]]:
+    """§5.4/§14.1 repo checks: ``[(index, field, message)]``, empty when the repos are usable.
+
+    Absolute, unique by ``realpath``, unique ``name``, a git work tree, and ``base_ref`` resolving to a
+    commit. Only ``git rev-parse`` is run, in the repo's own path: the primary checkout's branch and
+    status are never read. ``git(args, path)`` is the runner (the validator passes a cached one).
+    """
+    out: List[Tuple[int, str, str]] = []
     seen_paths: Dict[str, int] = {}
     seen_names: Dict[str, int] = {}
-    for i, repo in enumerate(step.worker.repos):
-        where = f"steps.{step.id}.role.worker.repos[{i}]"
+    for i, repo in enumerate(repos):
         if not os.path.isabs(repo.path):
-            v.err(E_REPOS, f"{where}.path", f"must be absolute: {repo.path!r}")
+            out.append((i, "path", f"must be absolute: {repo.path!r}"))
             continue
         real = os.path.realpath(repo.path)
         if real in seen_paths:
-            v.err(E_REPOS, f"{where}.path", f"duplicate of repos[{seen_paths[real]}] ({real})")
+            out.append((i, "path", f"duplicate of repos[{seen_paths[real]}] ({real})"))
         seen_paths.setdefault(real, i)
         if repo.name in seen_names:
-            v.err(E_REPOS, f"{where}.name", f"duplicate name {repo.name!r}")
+            out.append((i, "name", f"duplicate name {repo.name!r}"))
         seen_names.setdefault(repo.name, i)
         try:
             sanitise(repo.name)
         except ValueError:
-            v.err(E_REPOS, f"{where}.name", f"unusable name {repo.name!r}")
+            out.append((i, "name", f"unusable name {repo.name!r}"))
         if not os.path.isdir(real):
-            v.err(E_REPOS, f"{where}.path", f"not a git work tree (no such directory): {repo.path}")
+            out.append((i, "path", f"not a git work tree (no such directory): {repo.path}"))
             continue
-        inside = _git_cached(world, cache, real, ("rev-parse", "--is-inside-work-tree"))
+        inside = git(("rev-parse", "--is-inside-work-tree"), real)
         if not inside.ok or inside.stdout.strip() != "true":
-            v.err(E_REPOS, f"{where}.path", f"not a git work tree: {repo.path}")
+            out.append((i, "path", f"not a git work tree: {repo.path}"))
             continue
         if verify_base_refs:
-            res = _git_cached(world, cache, real,
-                              ("rev-parse", "--verify", "--quiet", f"{repo.base_ref}^{{commit}}"))
+            res = git(("rev-parse", "--verify", "--quiet", "--end-of-options", f"{repo.base_ref}^{{commit}}"), real)
             if not res.ok:
-                v.err(E_REPOS, f"{where}.base_ref",
-                      f"{repo.base_ref!r} does not resolve to a commit in {repo.path}")
+                out.append((i, "base_ref", f"{repo.base_ref!r} does not resolve to a commit in {repo.path}"))
+    return out
+
+
+def _validate_repos(v: _Validator, step: Step, world: World, verify_base_refs: bool,
+                    cache: Dict[Tuple[str, Tuple[str, ...]], CommandResult]) -> None:
+    if step.worker is None:
+        return
+    for i, field_name, message in repo_problems(
+            step.worker.repos, lambda args, path: _git_cached(world, cache, path, args), verify_base_refs):
+        v.err(E_REPOS, f"steps.{step.id}.role.worker.repos[{i}].{field_name}", message)
 
 
 def _parse_startup_dialogs(v: _Validator, raw: Any) -> List[StartupDialog]:
@@ -1901,7 +1967,7 @@ def validate_ledger(path: str, world: Optional[World] = None, *,
             continue
         if step.key in keys:
             v.err(E_NAMES, f"steps.{step.id}.id",
-                  f"collides with step {keys[step.key]!r} after sanitising ({step.key})")
+                  f"step {step.id!r} collides with step {keys[step.key]!r} after sanitising ({step.key})")
         ids[step.id] = i
         keys.setdefault(step.key, step.id)
         steps.append(step)
@@ -2035,6 +2101,8 @@ class StepState(TypedDict, total=False):
     window_covered_s: int
     undispatched_ticks: int
     questions: List[str]
+    shas: Dict[str, str]                 # 50-05: the ADVANCED shas of a worker step ({name or "": sha})
+    sha_check: Dict[str, Any]            # 50-07: {passed, status, shas, detail, at}
 
 
 class Grant(TypedDict, total=False):
@@ -2979,7 +3047,8 @@ def eligible_checks(ledger: Ledger, state: RunState, now: datetime) -> List[Chec
     Checks: status verifying / waiting / watching, the ``check_window``
     eligible, ``check_every`` elapsed. Triggers: status pending, every other
     due condition met, not yet fired for the occurrence, the trigger's
-    ``every`` elapsed. (The worker sha check of §14.4 is 50-07's, in front.)
+    ``every`` elapsed. A worker step's own check waits for
+    its built-in sha check (:func:`sha_gate_open`, §14.4).
     """
     now = require_aware(now)
     steps = state.get("steps", {})
@@ -2988,6 +3057,8 @@ def eligible_checks(ledger: Ledger, state: RunState, now: datetime) -> List[Chec
         rec = steps.get(step.id) or {}
         status = rec.get("status", PENDING)
         if step.check is not None and status in CHECKED_STATUSES:
+            if not sha_gate_open(step, rec):     # §14.4: the built-in sha check comes first
+                continue
             eligible, _, _ = check_window_status(step, rec, now)
             if eligible and _rate_ok((rec.get("check") or {}).get("last_run_at"), step.check.every_s, now):
                 jobs.append(CheckJob(step.id, KIND_CHECK, step.check.run, step.check.timeout_s))
@@ -3729,7 +3800,7 @@ V_HALT = "HALT"
 V_HANDOFF = "HANDOFF"
 VERDICT_VERBS = (V_ADVANCED, V_WAITING, V_ASKED, V_DONE, V_HALT, V_HANDOFF)
 
-_SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}")      # always ``fullmatch``: ``$`` would accept a trailing newline
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _QID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*-\d+(?:-[A-Za-z]{1,4})?$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
@@ -3766,10 +3837,10 @@ def _parse_one(part: str) -> Optional[Verdict]:
                 if "=" in tokens[1]:
                     for pair in tokens[1].split(","):
                         name, eq, sha = pair.partition("=")
-                        if not eq or not _REPO_NAME_RE.match(name) or not _SHA_RE.match(sha):
+                        if not eq or not _REPO_NAME_RE.match(name) or not _SHA_RE.fullmatch(sha):
                             return None
                         shas.append((name, sha))
-                elif _SHA_RE.match(tokens[1]):
+                elif _SHA_RE.fullmatch(tokens[1]):
                     shas.append((BARE_SHA, tokens[1]))
                 else:
                     return None
@@ -6775,4 +6846,395 @@ def dispatch_conditions(ledger: Ledger, state: RunState, now: datetime) -> List[
         if isinstance(le, dict):
             alarm = "resume_failed" if le.get("kind") == VIA_RESUME else "spawn_failed"
             out.append(AlarmCondition(alarm, name, f"{le.get('reason')}: {le.get('error')}"))
+    return out
+
+
+# =============================================================================
+# Worker worktrees and the built-in sha check (§14, P0-7) — 50-07
+# =============================================================================
+#
+# Everything here is git through ``World.git`` (``git -c core.hooksPath=/dev/null -C <path> …`` with a
+# timeout and ``GIT_TERMINAL_PROMPT=0``). The verbs used: rev-parse, check-ref-format, worktree list,
+# worktree add, status, merge-base. Nothing resets, cleans, stashes, force-checks-out, removes a worktree,
+# deletes a branch or pushes (invariants 3, 4, 6; enforced by ``git_refusal`` in ``RealWorld.git``). A
+# refusal is a result, never a repair: it becomes a ``worktree_refused`` condition and the operator
+# or the driver deals with it.
+
+ALARM_WORKTREE_REFUSED = "worktree_refused"
+INTEGRATION_DIRNAME = "integration"
+SHA_PASS = "pass"
+SHA_NOT_ANCESTOR = "not_ancestor"
+SHA_INVALID = "invalid"                # a sha missing from the verdict, or malformed
+SHA_ERROR = "error"                    # git could not answer
+
+
+@dataclass
+class WorktreeResult:
+    """One worktree of §14: its path, or why it was refused."""
+
+    path: Optional[str] = None
+    refused: Optional[str] = None
+    created: bool = False
+
+
+@dataclass
+class StepWorktrees:
+    """The worktrees of one worker step. ``dir`` is the session ``--dir`` (§14.2); None when refused."""
+
+    step_id: str
+    dir: Optional[str] = None
+    repos: Dict[str, str] = field(default_factory=dict)      # repo name → step worktree path
+    refused: Optional[str] = None
+    created: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.refused is None and self.dir is not None
+
+
+@dataclass
+class RepoSha:
+    repo: str
+    status: str
+    sha: Optional[str] = None
+    detail: str = ""
+
+
+@dataclass
+class ShaCheck:
+    """§14.4 for one step: per repo, and ``passed`` when every repo's sha is on ``epic/<epic>``."""
+
+    step_id: str
+    repos: List[RepoSha] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.repos) and all(r.status == SHA_PASS for r in self.repos)
+
+    @property
+    def status(self) -> str:
+        """``pass``, else the most serious of ``invalid`` > ``error`` > ``not_ancestor``."""
+        if self.passed:
+            return SHA_PASS
+        for status in (SHA_INVALID, SHA_ERROR, SHA_NOT_ANCESTOR):
+            if any(r.status == status for r in self.repos):
+                return status
+        return SHA_INVALID
+
+    @property
+    def detail(self) -> str:
+        return "; ".join(f"{r.repo}: {r.status}" + (f" ({r.detail})" if r.detail else "")
+                         for r in self.repos if r.status != SHA_PASS)
+
+
+def integration_branch(epic: str) -> str:
+    return f"epic/{epic}"
+
+
+def step_branch(epic: str, step_id: str) -> str:
+    """``epic-step/<epic>/<step>``: not ``epic/<epic>/<step>``, which git cannot hold beside ``epic/<epic>``."""
+    return f"epic-step/{epic}/{step_id}"
+
+
+def integration_dir(ledger: Ledger, repo: WorkerRepo) -> str:
+    return os.path.join(ledger.worktree_root, INTEGRATION_DIRNAME, repo.name)
+
+
+def step_worktree_paths(ledger: Ledger, step: Step) -> Tuple[str, Dict[str, str]]:
+    """``(session --dir, {repo name: worktree path})`` for a worker step (§14.2).
+
+    One repo: the worktree is the directory, ``<root>/<epic>-<step>``. Several: the directory is the wave
+    directory ``<root>/<epic>-<step>/`` with a worktree per repo at ``<…>/<name>``.
+    """
+    assert step.worker is not None
+    base = os.path.join(ledger.worktree_root, worker_dir_name(ledger.epic, step.id))
+    repos = step.worker.repos
+    if len(repos) == 1:
+        return base, {repos[0].name: base}
+    return base, {r.name: os.path.join(base, r.name) for r in repos}
+
+
+def resolve_base_ref(world: World, repo: WorkerRepo) -> Tuple[Optional[str], Optional[str]]:
+    """``(sha, None)`` from ``rev-parse --verify <base_ref>^{commit}`` in the repo, or ``(None, why)``."""
+    res = world.git(["rev-parse", "--verify", "--quiet", "--end-of-options", f"{repo.base_ref}^{{commit}}"],
+                    os.path.realpath(repo.path))
+    sha = res.stdout.strip()
+    if not res.ok or not sha:
+        return None, f"base_ref {repo.base_ref!r} does not resolve to a commit in {repo.path}" + (
+            f" ({res.error})" if res.error else "")
+    return sha, None
+
+
+def _branch_sha(world: World, cwd: str, branch: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(sha, None)`` of ``refs/heads/<branch>``; ``(None, None)`` when it does not exist; ``(None, why)``."""
+    res = world.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], cwd)
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip(), None
+    if res.rc == 1:
+        return None, None
+    return None, f"git rev-parse failed in {cwd}: {res.error or res.stderr.strip() or res.rc}"
+
+
+def list_worktrees(world: World, repo_path: str) -> Tuple[Optional[Dict[str, Dict[str, Any]]], Optional[str]]:
+    """``git worktree list --porcelain`` → ``{realpath: {"branch": "refs/heads/x"|None, "head": sha}}``."""
+    res = world.git(["worktree", "list", "--porcelain"], repo_path)
+    if not res.ok:
+        return None, f"git worktree list failed in {repo_path}: {res.error or res.stderr.strip() or res.rc}"
+    out: Dict[str, Dict[str, Any]] = {}
+    cur: Optional[Dict[str, Any]] = None
+    for line in res.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur = {"branch": None, "head": None}
+            out[os.path.realpath(line[len("worktree "):])] = cur
+        elif cur is not None and line.startswith("branch "):
+            cur["branch"] = line[len("branch "):]
+        elif cur is not None and line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+    return out, None
+
+
+def _add_worktree(world: World, repo_path: str, path: str, branch: str, start: str,
+                  new_branch: bool) -> Optional[str]:
+    """``worktree add [-b <branch> <path> <start> | <path> <branch>]``; None on success, else why. Never ``-f``."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as exc:
+        return f"cannot create {os.path.dirname(path)}: {exc}"
+    args = (["worktree", "add", "-b", branch, "--end-of-options", path, start] if new_branch
+            else ["worktree", "add", "--end-of-options", path, branch])
+    res = world.git(args, repo_path)
+    if not res.ok:
+        return f"git worktree add {path} failed: {(res.error or res.stderr.strip() or res.rc)}"
+    return None
+
+
+def _repo_usable(repo: WorkerRepo) -> Optional[str]:
+    if not _REPO_NAME_RE.match(repo.name) or repo.name in (".", ".."):
+        return f"repo name {repo.name!r} cannot be a directory name"
+    return None
+
+
+def _branch_name_ok(world: World, repo_path: str, branch: str) -> Optional[str]:
+    res = world.git(["check-ref-format", "--branch", branch], repo_path)
+    return None if res.ok else f"{branch!r} is not a usable branch name"
+
+
+def ensure_integration(ledger: Ledger, world: World, repo: WorkerRepo) -> WorktreeResult:
+    """§14.1: the integration worktree of ``repo`` on ``epic/<epic>`` (create or reuse; refuse, never repair).
+
+    Created from ``base_ref``'s sha when the branch is new, attached to the existing branch otherwise.
+    Refused: a ``base_ref`` that does not resolve; ``epic/<epic>`` checked out in any other worktree
+    (the operator's included: a branch they have checked out is never moved); the integration worktree
+    on another branch, or dirty.
+    """
+    real = os.path.realpath(repo.path)
+    branch = integration_branch(ledger.epic)
+    bad = _repo_usable(repo) or _branch_name_ok(world, real, branch)
+    if bad:
+        return WorktreeResult(refused=bad)
+    base_sha, why = resolve_base_ref(world, repo)
+    if base_sha is None:
+        return WorktreeResult(refused=why)
+    path = integration_dir(ledger, repo)
+    trees, why = list_worktrees(world, real)
+    if trees is None:
+        return WorktreeResult(refused=why)
+    ours = os.path.realpath(path)
+    ref = f"refs/heads/{branch}"
+    for other, info in trees.items():
+        if info["branch"] == ref and other != ours:
+            return WorktreeResult(refused=f"{branch} is checked out in {other} (repo {repo.name}); "
+                                          "a branch checked out elsewhere is never moved")
+    here = trees.get(ours)
+    if here is not None:
+        if here["branch"] != ref:
+            return WorktreeResult(refused=f"integration worktree {path} is on "
+                                          f"{here['branch'] or 'a detached HEAD'}, not {branch}")
+        status = world.git(["status", "--porcelain"], ours)
+        if not status.ok:
+            return WorktreeResult(refused=f"git status failed in {path}: {status.error or status.stderr.strip()}")
+        if status.stdout.strip():
+            return WorktreeResult(refused=f"integration worktree {path} is dirty")
+        return WorktreeResult(path=path)
+    if os.path.lexists(path):
+        return WorktreeResult(refused=f"{path} exists and is not a worktree of {repo.path}")
+    tip, why = _branch_sha(world, real, branch)
+    if why:
+        return WorktreeResult(refused=why)
+    err = _add_worktree(world, real, path, branch, base_sha, new_branch=tip is None)
+    return WorktreeResult(refused=err) if err else WorktreeResult(path=path, created=True)
+
+
+def _ensure_step_worktree(ledger: Ledger, world: World, repo: WorkerRepo, step: Step,
+                          path: str) -> WorktreeResult:
+    real = os.path.realpath(repo.path)
+    branch = step_branch(ledger.epic, step.id)
+    bad = _branch_name_ok(world, real, branch)
+    if bad:
+        return WorktreeResult(refused=bad)
+    trees, why = list_worktrees(world, real)
+    if trees is None:
+        return WorktreeResult(refused=why)
+    ref = f"refs/heads/{branch}"
+    ours = os.path.realpath(path)
+    here = trees.get(ours)
+    if here is not None:     # reused as is, dirty or not (§14.2)
+        if here["branch"] != ref:
+            return WorktreeResult(refused=f"step worktree {path} is on "
+                                          f"{here['branch'] or 'a detached HEAD'}, not {branch}")
+        return WorktreeResult(path=path)
+    for other, info in trees.items():
+        if info["branch"] == ref:
+            return WorktreeResult(refused=f"{branch} is checked out in {other}")
+    if os.path.lexists(path):
+        return WorktreeResult(refused=f"{path} exists and is not a worktree of {repo.path}")
+    tip, why = _branch_sha(world, real, integration_branch(ledger.epic))
+    if tip is None:
+        return WorktreeResult(refused=why or f"{integration_branch(ledger.epic)} does not exist in {repo.path}")
+    existing, why = _branch_sha(world, real, branch)
+    if why:
+        return WorktreeResult(refused=why)
+    err = _add_worktree(world, real, path, branch, tip, new_branch=existing is None)
+    return WorktreeResult(refused=err) if err else WorktreeResult(path=path, created=True)
+
+
+def ensure_step_worktrees(ledger: Ledger, state: RunState, world: World, step_id: str) -> StepWorktrees:
+    """§14.1–§14.2: everything a worker step needs; recorded in ``state.worktrees``.
+
+    Idempotent: what exists on the right branch is reused untouched. A refusal leaves whatever was already
+    created in place (nothing is removed), is recorded on the step and read by :func:`worktree_conditions`;
+    the next call tries again. ``state.worktrees`` is ``{"integration": {name: path},
+    "steps": {step: {"dir", "repos", "branch", "refused"}}}``.
+    """
+    step = ledger.step(step_id)
+    result = StepWorktrees(step_id)
+    if step.worker is None:
+        result.refused = f"step {step_id} is not a worker step"
+        return result
+    wt = state.setdefault("worktrees", {})
+    records = wt.setdefault("steps", {})
+    session_dir, paths = step_worktree_paths(ledger, step)
+
+    def refuse(reason: str) -> StepWorktrees:
+        result.refused = reason
+        rec = records.setdefault(step_id, {})
+        rec["refused"] = reason
+        rec.pop("dir", None)
+        return result
+
+    repos = step.worker.repos
+    problems = repo_problems(repos, lambda args, path: world.git(list(args), path), True)
+    if problems:
+        i, field_name, message = problems[0]
+        return refuse(f"repos[{i}].{field_name}: {message}")
+    for repo in repos:
+        integ = ensure_integration(ledger, world, repo)
+        if integ.refused:
+            return refuse(f"{repo.name}: {integ.refused}")
+        wt.setdefault("integration", {})[repo.name] = integ.path
+        if integ.created:
+            result.created.append(integ.path or "")
+        made = _ensure_step_worktree(ledger, world, repo, step, paths[repo.name])
+        if made.refused:
+            return refuse(f"{repo.name}: {made.refused}")
+        if made.created:
+            result.created.append(paths[repo.name])
+    result.dir = session_dir
+    result.repos = dict(paths)
+    records[step_id] = {"dir": session_dir, "repos": dict(paths),
+                        "branch": step_branch(ledger.epic, step_id), "refused": None}
+    return result
+
+
+def prepare_worker_steps(ledger: Ledger, state: RunState, world: World,
+                         step_ids: Iterable[str]) -> Dict[str, str]:
+    """Run :func:`ensure_step_worktrees` for each worker step in ``step_ids``; return :func:`worker_dirs`."""
+    for step_id in step_ids:
+        if ledger.has_step(step_id) and ledger.step(step_id).worker is not None:
+            ensure_step_worktrees(ledger, state, world, step_id)
+    return worker_dirs(state)
+
+
+def worker_dirs(state: RunState) -> Dict[str, str]:
+    """``{step: session --dir}`` of every worker step whose worktrees are ready: 50-06's ``worker_dirs``."""
+    records = (state.get("worktrees") or {}).get("steps") or {}
+    return {sid: rec["dir"] for sid, rec in records.items() if rec.get("dir") and not rec.get("refused")}
+
+
+def worktree_conditions(ledger: Ledger, state: RunState) -> List[AlarmCondition]:
+    """``worktree_refused`` per step whose last attempt was refused and which is not done (§16.2)."""
+    out: List[AlarmCondition] = []
+    records = (state.get("worktrees") or {}).get("steps") or {}
+    for step in ledger.steps:
+        rec = records.get(step.id) or {}
+        if rec.get("refused") and (state.get("steps", {}).get(step.id) or {}).get("status") != DONE:
+            out.append(AlarmCondition(ALARM_WORKTREE_REFUSED, step.id, str(rec["refused"])))
+    return out
+
+
+def sha_check(ledger: Ledger, world: World, step_id: str, shas: Optional[Dict[str, str]]) -> ShaCheck:
+    """§14.4: per repo, ``merge-base --is-ancestor <sha> epic/<epic>`` in the integration worktree.
+
+    ``shas`` is the verdict's ``{name or BARE_SHA: sha}`` (``steps[*].shas``). A bare sha counts for a
+    single-repo step. A missing or malformed sha is ``invalid`` (no git call); exit 1 is ``not_ancestor``;
+    any other git outcome is ``error``.
+    """
+    step = ledger.step(step_id)
+    out = ShaCheck(step_id)
+    if step.worker is None:
+        return out
+    shas = shas or {}
+    single = len(step.worker.repos) == 1
+    for repo in step.worker.repos:
+        sha = shas.get(repo.name) or (shas.get(BARE_SHA) if single else None)
+        if sha is None:
+            out.repos.append(RepoSha(repo.name, SHA_INVALID, None, "no sha in the verdict"))
+            continue
+        if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
+            out.repos.append(RepoSha(repo.name, SHA_INVALID, str(sha), "malformed sha"))
+            continue
+        cwd = integration_dir(ledger, repo)
+        res = world.git(["merge-base", "--is-ancestor", "--end-of-options", sha,
+                         f"refs/heads/{integration_branch(ledger.epic)}"], cwd)
+        if res.rc == 0:
+            out.repos.append(RepoSha(repo.name, SHA_PASS, sha))
+        elif res.rc == 1:
+            out.repos.append(RepoSha(repo.name, SHA_NOT_ANCESTOR, sha, f"not on {integration_branch(ledger.epic)}"))
+        else:
+            out.repos.append(RepoSha(repo.name, SHA_ERROR, sha, res.error or res.stderr.strip() or f"exit {res.rc}"))
+    return out
+
+
+def sha_gate_open(step: Step, rec: Optional[StepState]) -> bool:
+    """Whether a step's own check may run: always for a non-worker step; for a worker step once the sha
+    check passed for the shas of its current ``ADVANCED`` (a newer verdict closes the gate again)."""
+    if step.worker is None:
+        return True
+    done = (rec or {}).get("sha_check") or {}
+    return bool(done.get("passed")) and done.get("shas") == (rec or {}).get("shas")
+
+
+def run_sha_checks(ledger: Ledger, state: RunState, world: World, now: datetime) -> List[ShaCheck]:
+    """Tick step 4, in front of :func:`run_checks`: the sha check of every worker step in a checked status.
+
+    Records ``steps[*].sha_check = {passed, status, shas, detail, at}``. All repos pass ⇒ the gate opens
+    (the step's own check runs next), and a step with no own check is done (``by="check"``). Local
+    git only, re-run each tick until it passes. Never raises an alarm itself.
+    """
+    now = require_aware(now)
+    out: List[ShaCheck] = []
+    for step in ledger.steps:
+        rec = _step_state(state, step.id)
+        if step.worker is None or rec.get("status") not in (VERIFYING, WAITING) or sha_gate_open(step, rec):
+            continue
+        shas = dict(rec.get("shas") or {})
+        res = sha_check(ledger, world, step.id, shas)
+        rec["sha_check"] = {"passed": res.passed, "status": res.status, "shas": shas,
+                            "detail": res.detail, "at": iso(now)}
+        if res.passed and step.check is None:
+            set_status(rec, DONE)
+            rec["done_at"] = iso(now)
+            rec["by"] = "check"
+            rec["inflight"] = None
+        out.append(res)
     return out

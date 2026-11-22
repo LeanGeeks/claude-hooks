@@ -54,6 +54,7 @@ class FakeWorld(edl.World):
         self.profiles = profiles or {}
         self.repos = repos or {}          # realpath -> {"refs": set of refs}
         self.git_calls = []
+        self.refused = []                 # git argvs the allow list refused: a correct run has none
         self.check_calls = []
         self.check_script = {}            # step id -> (rc, seconds)
 
@@ -66,6 +67,10 @@ class FakeWorld(edl.World):
     def git(self, args, cwd, timeout_s=30.0):
         args = list(args)
         self.git_calls.append((tuple(args), cwd))
+        refused = edl.git_refusal(args)          # the same runtime allow list as RealWorld.git
+        if refused:
+            self.refused.append(args)
+            return edl.CommandResult(rc=None, error=refused)
         repo = self.repos.get(cwd)
         if repo is None:
             return edl.CommandResult(rc=128, stderr="fatal: not a git repository")
@@ -91,6 +96,19 @@ class FakeWorld(edl.World):
         return dict(self.profiles[name])
 
 
+class RecordingRealWorld(edl.RealWorld):
+    """RealWorld that remembers every argv the runtime allow list refused."""
+
+    def __init__(self):
+        self.refused = []
+
+    def git(self, args, cwd, timeout_s=30.0):
+        res = super().git(args, cwd, timeout_s)
+        if res.rc is None and (res.error or "").startswith("git refused"):
+            self.refused.append(list(args))
+        return res
+
+
 class _Base(unittest.TestCase):
     """A temp workspace (``<tmp>/ws``, plan root ``plan``) and an isolated state root."""
 
@@ -106,8 +124,11 @@ class _Base(unittest.TestCase):
         self.world = FakeWorld()
 
     def tearDown(self):
-        self._env.stop()
-        shutil.rmtree(str(self.tmp), ignore_errors=True)
+        try:
+            self.assertEqual(self.world.refused, [], "the module attempted a git form the allow list refuses")
+        finally:
+            self._env.stop()
+            shutil.rmtree(str(self.tmp), ignore_errors=True)
 
     # -- ledger builders -------------------------------------------------
     def step(self, sid, **kw):
@@ -633,7 +654,7 @@ class TestLedgerValidation(_Base):
         world = FakeWorld(repos={str(repo): {"refs": {"main"}}})
         self.assertError(self._worker_ledger([{"path": str(repo), "base_ref": "nope"}]), edl.E_REPOS,
                          "repos[0].base_ref", "does not resolve", world=world)
-        self.assertIn((("rev-parse", "--verify", "--quiet", "nope^{commit}"), str(repo)), world.git_calls)
+        self.assertIn((("rev-parse", "--verify", "--quiet", "--end-of-options", "nope^{commit}"), str(repo)), world.git_calls)
         # lint without the base_ref check still runs the work-tree test
         world2 = FakeWorld(repos={str(repo): {"refs": {"main"}}})
         _, errors, _ = edl.validate_ledger(self.write(self._worker_ledger([{"path": str(repo), "base_ref": "nope"}])),
@@ -4816,6 +4837,639 @@ class TestDispatchContract(_Disp):
         self.assertEqual((ns.suffix, ns.dir, ns.yolo, ns.run_id, ns.detach, prompt),
                          ("t-driver-g1", str(self.ws), True, "epic-t", True, "EVENT E-1: read /p"))
         self.assertEqual(claude_flags, ["--model=claude-opus-5-5", "--effort=high"])
+
+
+# =============================================================================
+# 50-07 — worker waves: worktrees, integration branch, the sha check (§14)
+# =============================================================================
+#
+# Real git repositories in temp dirs, no network: a bare "remote", a primary clone that is left dirty and on
+# another branch, and a second clone with no remote. HOME and GIT_CONFIG_GLOBAL point into the temp dir so
+# the user's git config and hooks never leak in. Every test checks the primary checkouts are unchanged.
+
+class _GitRepos(_Base):
+    def setUp(self):
+        super().setUp()
+        home = self.tmp / "home"
+        home.mkdir()
+        cfg = home / "gitconfig"
+        cfg.write_text("[user]\n\tname = T\n\temail = t@example.invalid\n[init]\n\tdefaultBranch = main\n"
+                       "[commit]\n\tgpgsign = false\n")
+        self._genv = mock.patch.dict(os.environ, {"HOME": str(home), "GIT_CONFIG_GLOBAL": str(cfg),
+                                                  "GIT_CONFIG_NOSYSTEM": "1"})
+        self._genv.start()
+        self.gw = RecordingRealWorld()
+        self.remote = self.tmp / "remote.git"
+        self.primary = self.tmp / "primary"
+        self.solo = self.tmp / "solo"
+        self.g(self.tmp, "init", "--bare", "-b", "main", str(self.remote))
+        self.g(self.tmp, "clone", "-q", str(self.remote), str(self.primary))
+        self.commit(self.primary, "a.txt", "one\n", "first")
+        self.g(self.primary, "push", "-q", "origin", "main")
+        self.g(self.primary, "tag", "v1")
+        self.commit(self.primary, "a.txt", "two\n", "second")
+        self.second_sha = self.g(self.primary, "rev-parse", "HEAD")
+        self.g(self.primary, "checkout", "-q", "-b", "operator-work")
+        (self.primary / "a.txt").write_text("dirty\n")
+        (self.primary / "untracked.txt").write_text("u\n")
+        self.g(self.tmp, "init", "-q", str(self.solo))
+        self.commit(self.solo, "s.txt", "s\n", "solo first")
+        self.test_made_refs = set()
+        self.before = {r: self.snapshot(r) for r in (self.primary, self.solo)}
+
+    # the only things the driver may add to an operator's repo: its own branches and worktrees
+    expects_refusals = False
+    _ALLOWED_NEW_REF = re.compile(r"^refs/heads/(epic/[^/]+|epic-step/[^/]+/[^/]+)$")
+    _ALLOWED_NEW_BRANCH = re.compile(r"^refs/heads/(epic/[^/]+|epic-step/[^/]+/[^/]+)$")
+
+    def assert_unchanged(self, repo, snap):
+        now = self.snapshot(repo)
+        name = Path(repo).name
+        for i, what in enumerate(("status", "HEAD", "symbolic-ref", "working files")):
+            self.assertEqual(now[i], snap[i], f"{name}: {what} changed")
+        old_refs, new_refs = snap[4], now[4]
+        for ref, sha in old_refs.items():
+            self.assertEqual(new_refs.get(ref), sha, f"{name}: ref {ref} moved or was deleted")
+        for ref in set(new_refs) - set(old_refs) - self.test_made_refs:
+            self.assertRegex(ref, self._ALLOWED_NEW_REF, f"{name}: unexpected new ref {ref}")
+        old_wt, new_wt = snap[5], now[5]
+        for path, info in old_wt.items():
+            self.assertEqual(new_wt.get(path), info, f"{name}: worktree {path} changed or was removed")
+        for path in set(new_wt) - set(old_wt):
+            if new_wt[path][1] in self.test_made_refs:    # the driver's worktree, switched by the test itself
+                continue
+            self.assertRegex(new_wt[path][1] or "", self._ALLOWED_NEW_BRANCH,
+                             f"{name}: unexpected new worktree {path}")
+
+    def tearDown(self):
+        try:
+            if not self.expects_refusals:
+                self.assertEqual(self.gw.refused, [], "the module attempted a git form the allow list refuses")
+            for r, snap in self.before.items():
+                self.assert_unchanged(r, snap)
+        finally:
+            self._genv.stop()
+            super().tearDown()
+
+    def g(self, cwd, *args):
+        r = subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+        self.assertEqual(r.returncode, 0, f"git {args}: {r.stderr}")
+        return r.stdout.strip()
+
+    def commit(self, repo, name, text, msg):
+        Path(repo, name).write_text(text)
+        self.g(repo, "add", name)
+        self.g(repo, "commit", "-q", "-m", msg)
+
+    def snapshot(self, repo):
+        """Status, HEAD, branch, working files, every ref (name and sha) and the worktree list."""
+        files = {n: (Path(repo) / n).read_bytes() for n in sorted(os.listdir(repo)) if n != ".git"}
+        refs = {}
+        for line in self.g(repo, "for-each-ref", "--format=%(refname) %(objectname)").splitlines():
+            name, sha = line.split(" ")
+            refs[name] = sha
+        worktrees, cur = {}, None
+        for line in self.g(repo, "worktree", "list", "--porcelain").splitlines():
+            if line.startswith("worktree "):
+                cur = worktrees[os.path.realpath(line[9:])] = [None, None]
+            elif cur is not None and line.startswith("HEAD "):
+                cur[0] = line[5:]
+            elif cur is not None and line.startswith("branch "):
+                cur[1] = line[7:]
+        worktrees = {k: tuple(v) for k, v in worktrees.items()}
+        return (self.g(repo, "status", "--porcelain=v1", "--untracked-files=all"), self.g(repo, "rev-parse", "HEAD"),
+                self.g(repo, "symbolic-ref", "-q", "HEAD"), files, refs, worktrees)
+
+    def repos(self, *which, base="main"):
+        paths = {"primary": self.primary, "solo": self.solo}
+        return [{"path": str(paths[w]), "base_ref": base if w == "primary" else "main", "name": w} for w in which]
+
+    def wledger(self, *which, base="main", epic="e1", **top):
+        d = self.ledger_dict([self.step("W", role={"worker": {
+            "implementer": "impl", "reviewer": "rev", "repos": self.repos(*which, base=base)}})],
+            **{"epic": epic, **top})
+        d["roles"]["impl"] = {"model": "claude-opus-5-5", "effort": "high"}
+        d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+        L = self.load(d, self.gw)
+        return L, edl.new_state(L, T("2026-11-24T00:00:00Z"))
+
+
+class TestBaseRef(_GitRepos):
+    def test_resolves_by_branch_tag_and_sha_whatever_the_primary_checkout_looks_like(self):
+        repo = edl.WorkerRepo(str(self.primary), "main", "primary")
+        for ref, want in (("main", self.second_sha), ("v1", self.g(self.primary, "rev-parse", "v1^{commit}")),
+                          (self.second_sha, self.second_sha), (self.second_sha[:10], self.second_sha)):
+            repo.base_ref = ref
+            self.assertEqual(edl.resolve_base_ref(self.gw, repo), (want, None), ref)
+        self.assertEqual(self.g(self.primary, "symbolic-ref", "HEAD"), "refs/heads/operator-work")
+
+    def test_an_unknown_ref_is_refused(self):
+        sha, why = edl.resolve_base_ref(self.gw, edl.WorkerRepo(str(self.primary), "nope", "primary"))
+        self.assertIsNone(sha)
+        self.assertIn("'nope' does not resolve", why)
+        errors, _ = self.issues(self.ledger_dict([self.step("W", role={"worker": {
+            "implementer": "impl", "reviewer": "rev", "repos": self.repos("primary", base="nope")}})],
+            roles={"driver": {"model": "m", "effort": "high"}, "impl": {"model": "m", "effort": "high"},
+                   "rev": {"model": "m", "effort": "high"}}), self.gw)
+        self.assertIssue(errors, edl.E_REPOS, "repos[0].base_ref", "'nope'")
+
+    def test_repo_problems_checks_paths_names_and_work_trees(self):
+        repos = [edl.WorkerRepo(str(self.primary), "main", "a"),
+                 edl.WorkerRepo(str(self.primary) + "/../primary", "main", "a"),
+                 edl.WorkerRepo("rel", "main", "r"),
+                 edl.WorkerRepo(str(self.remote), "main", "bare")]
+        got = edl.repo_problems(repos, lambda args, path: self.gw.git(list(args), path))
+        self.assertEqual([(i, f) for i, f, _ in got], [(1, "path"), (1, "name"), (2, "path"), (3, "path")])
+        self.assertIn("not a git work tree", got[3][2])
+
+
+class TestIntegrationWorktree(_GitRepos):
+    def test_created_from_base_ref_then_reused(self):
+        L, st = self.wledger("primary")
+        repo = L.step("W").worker.repos[0]
+        first = edl.ensure_integration(L, self.gw, repo)
+        path = os.path.join(L.worktree_root, "integration", "primary")
+        self.assertEqual((first.path, first.created, first.refused), (path, True, None))
+        self.assertEqual(self.g(path, "symbolic-ref", "HEAD"), "refs/heads/epic/e1")
+        self.assertEqual(self.g(path, "rev-parse", "HEAD"), self.second_sha)
+        again = edl.ensure_integration(L, self.gw, repo)
+        self.assertEqual((again.path, again.created, again.refused), (path, False, None))
+
+    def test_the_branch_is_created_from_the_resolved_base_not_the_operators_branch(self):
+        L, st = self.wledger("primary", base="v1")
+        edl.ensure_integration(L, self.gw, L.step("W").worker.repos[0])
+        self.assertEqual(self.g(os.path.join(L.worktree_root, "integration", "primary"), "log", "-1", "--format=%s"),
+                         "first")
+
+    def test_an_existing_branch_is_attached(self):
+        self.g(self.primary, "branch", "epic/e1", "v1")
+        L, st = self.wledger("primary")
+        res = edl.ensure_integration(L, self.gw, L.step("W").worker.repos[0])
+        self.assertTrue(res.created and not res.refused)
+        self.assertEqual(self.g(res.path, "log", "-1", "--format=%s"), "first")
+
+    def test_refused_when_the_operator_has_the_branch_checked_out(self):
+        self.g(self.primary, "checkout", "-q", "-b", "epic/e1")
+        self.before[self.primary] = self.snapshot(self.primary)
+        L, st = self.wledger("primary")
+        res = edl.ensure_integration(L, self.gw, L.step("W").worker.repos[0])
+        self.assertIn("epic/e1 is checked out in", res.refused or "")
+        self.assertFalse(os.path.exists(os.path.join(L.worktree_root, "integration", "primary")))
+        self.assertEqual(self.g(self.primary, "symbolic-ref", "HEAD"), "refs/heads/epic/e1")
+
+    def test_refused_when_dirty_or_on_another_branch_and_changes_are_kept(self):
+        L, st = self.wledger("primary")
+        repo = L.step("W").worker.repos[0]
+        path = edl.ensure_integration(L, self.gw, repo).path
+        Path(path, "work.txt").write_text("mine\n")
+        dirty = edl.ensure_integration(L, self.gw, repo)
+        self.assertIn("is dirty", dirty.refused or "")
+        self.assertEqual(Path(path, "work.txt").read_text(), "mine\n")
+        os.unlink(os.path.join(path, "work.txt"))
+        self.g(path, "switch", "-q", "-c", "side")
+        self.test_made_refs.add("refs/heads/side")      # the test's own branch, made in the driver's worktree
+        other = edl.ensure_integration(L, self.gw, repo)
+        self.assertIn("not epic/e1", other.refused or "")
+
+    def test_an_unresolvable_base_is_refused_and_nothing_is_created(self):
+        L, st = self.wledger("primary")
+        repo = L.step("W").worker.repos[0]
+        repo.base_ref = "gone"
+        res = edl.ensure_integration(L, self.gw, repo)
+        self.assertIn("does not resolve", res.refused or "")
+        self.assertFalse(os.path.exists(L.worktree_root))
+
+    def test_a_path_that_is_not_a_worktree_is_refused(self):
+        L, st = self.wledger("primary")
+        path = os.path.join(L.worktree_root, "integration", "primary")
+        os.makedirs(path)
+        res = edl.ensure_integration(L, self.gw, L.step("W").worker.repos[0])
+        self.assertIn("is not a worktree", res.refused or "")
+
+
+class TestStepWorktrees(_GitRepos):
+    def test_one_repo_the_worktree_is_the_session_dir(self):
+        L, st = self.wledger("primary")
+        res = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        want = os.path.join(L.worktree_root, "e1-w")
+        self.assertTrue(res.ok, res.refused)
+        self.assertEqual((res.dir, res.repos), (want, {"primary": want}))
+        self.assertEqual(os.path.basename(res.dir), edl.worker_dir_name("e1", "W"))
+        self.assertEqual(self.g(want, "symbolic-ref", "HEAD"), "refs/heads/epic-step/e1/W")
+        self.assertEqual(self.g(want, "rev-parse", "HEAD"), self.second_sha)
+        self.assertEqual(edl.worker_dirs(st), {"W": want})
+        self.assertEqual(st["worktrees"]["integration"], {"primary": os.path.join(L.worktree_root, "integration", "primary")})
+        self.assertEqual(edl.worktree_conditions(L, st), [])
+
+    def test_two_repos_get_a_wave_directory(self):
+        L, st = self.wledger("primary", "solo")
+        res = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        wave = os.path.join(L.worktree_root, "e1-w")
+        self.assertTrue(res.ok, res.refused)
+        self.assertEqual(res.dir, wave)
+        self.assertEqual(res.repos, {"primary": os.path.join(wave, "primary"), "solo": os.path.join(wave, "solo")})
+        self.assertEqual(os.path.basename(wave), edl.worker_dir_name("e1", "W"))
+        for name, path in res.repos.items():
+            self.assertEqual(self.g(path, "symbolic-ref", "HEAD"), "refs/heads/epic-step/e1/W", name)
+        self.assertFalse(os.path.exists(os.path.join(wave, ".git")))
+
+    def test_the_step_branch_starts_at_the_integration_tip(self):
+        L, st = self.wledger("primary")
+        edl.ensure_step_worktrees(L, st, self.gw, "W")
+        integ = os.path.join(L.worktree_root, "integration", "primary")
+        self.commit(integ, "i.txt", "i\n", "integration moved")
+        tip = self.g(integ, "rev-parse", "HEAD")
+        L2, st2 = self.wledger("primary", epic="e1")
+        # a second step would start from the new tip
+        d = self.ledger_dict([self.step("W", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                              "repos": self.repos("primary")}}),
+                              self.step("X", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                              "repos": self.repos("primary")}})], epic="e1")
+        d["roles"]["impl"] = d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+        L3 = self.load(d, self.gw)
+        res = edl.ensure_step_worktrees(L3, st2, self.gw, "X")
+        self.assertEqual(self.g(res.dir, "rev-parse", "HEAD"), tip)
+
+    def test_recreation_reuses_a_dirty_worktree_without_losing_changes(self):
+        L, st = self.wledger("primary")
+        first = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        Path(first.dir, "a.txt").write_text("in progress\n")
+        Path(first.dir, "new.txt").write_text("new\n")
+        status = self.g(first.dir, "status", "--porcelain")
+        again = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        self.assertTrue(again.ok and not again.created, again.refused)
+        self.assertEqual(self.g(first.dir, "status", "--porcelain"), status)
+        self.assertEqual(Path(first.dir, "a.txt").read_text(), "in progress\n")
+        # a fresh state (the tick lost it) finds the same worktree
+        L2, st2 = self.wledger("primary")
+        self.assertTrue(edl.ensure_step_worktrees(L2, st2, self.gw, "W").ok)
+        self.assertEqual(Path(first.dir, "new.txt").read_text(), "new\n")
+
+    def test_a_step_worktree_on_another_branch_is_refused_and_left_alone(self):
+        L, st = self.wledger("primary")
+        res = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        self.g(res.dir, "switch", "-q", "-c", "elsewhere")
+        self.test_made_refs.add("refs/heads/elsewhere")
+        again = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        self.assertIn("not epic-step/e1/W", again.refused or "")
+        self.assertEqual(self.g(res.dir, "symbolic-ref", "HEAD"), "refs/heads/elsewhere")
+        self.assertEqual(edl.worker_dirs(st), {})
+        cond = edl.worktree_conditions(L, st)
+        self.assertEqual([(c.id, c.subject) for c in cond], [("worktree_refused", "W")])
+        self.assertIn("primary:", cond[0].detail)
+        self.g(res.dir, "switch", "-q", "epic-step/e1/W")
+        self.assertTrue(edl.ensure_step_worktrees(L, st, self.gw, "W").ok)
+        self.assertEqual(edl.worktree_conditions(L, st), [])
+
+    def test_the_dir_feeds_50_06s_spawn(self):
+        L, st = self.wledger("primary", "solo")
+        dirs = edl.prepare_worker_steps(L, st, self.gw, ["W"])
+        self.assertEqual(edl.session_dir_for(L, "impl:W", dirs), os.path.join(L.worktree_root, "e1-w"))
+        args = edl.spawn_args(L, "impl:W", 1, edl.session_dir_for(L, "impl:W", dirs), "EVENT E-1: read /p")
+        self.assertEqual(args[args.index("--dir") + 1], dirs["W"])
+        self.assertEqual(edl.session_name_for(L, "impl:W", 1, dirs), "e1-w-e1-impl-w-g1")
+
+    def test_a_refused_integration_leaves_the_step_undispatchable(self):
+        self.g(self.primary, "checkout", "-q", "-b", "epic/e1")
+        self.before[self.primary] = self.snapshot(self.primary)
+        L, st = self.wledger("primary")
+        dirs = edl.prepare_worker_steps(L, st, self.gw, ["W"])
+        self.assertEqual(dirs, {})
+        self.assertEqual([c.id for c in edl.worktree_conditions(L, st)], ["worktree_refused"])
+
+    def test_a_repo_without_a_remote_works_end_to_end(self):
+        L, st = self.wledger("solo")
+        res = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        self.assertTrue(res.ok, res.refused)
+        self.assertEqual(self.g(self.solo, "remote"), "")
+        self.commit(res.dir, "w.txt", "w\n", "work")
+        sha = self.g(res.dir, "rev-parse", "HEAD")
+        integ = st["worktrees"]["integration"]["solo"]
+        self.g(integ, "merge", "--no-ff", "-q", "-m", "merge W", "epic-step/e1/W")
+        merged = self.g(integ, "rev-parse", "HEAD")
+        self.assertTrue(edl.sha_check(L, self.gw, "W", {"": merged}).passed)
+
+    def test_a_worktree_root_defaults_under_the_state_dir(self):
+        L, st = self.wledger("primary")
+        self.assertEqual(L.worktree_root, str(edl.state_dir("epic-e1") / "worktrees"))
+
+    def test_the_driver_workspace_and_primary_status_are_not_touched_by_the_wave(self):
+        L, st = self.wledger("primary", "solo")
+        edl.prepare_worker_steps(L, st, self.gw, ["W"])
+        self.assertEqual(self.g(self.primary, "status", "--porcelain").splitlines(),
+                         ["M a.txt", "?? untracked.txt"])
+
+
+class TestShaCheck(_GitRepos):
+    def setUp(self):
+        super().setUp()
+        self.L, self.st = self.wledger("primary", "solo")
+        self.res = edl.ensure_step_worktrees(self.L, self.st, self.gw, "W")
+        self.assertTrue(self.res.ok, self.res.refused)
+        self.on, self.off = {}, {}
+        for name in ("primary", "solo"):
+            wt = self.res.repos[name]
+            self.commit(wt, f"{name}.txt", "x\n", f"work {name}")
+            self.off[name] = self.g(wt, "rev-parse", "HEAD")
+            integ = self.st["worktrees"]["integration"][name]
+            self.g(integ, "merge", "--no-ff", "-q", "-m", f"merge {name}", "epic-step/e1/W")
+            self.on[name] = self.g(integ, "rev-parse", "HEAD")
+        self.commit(self.res.repos["primary"], "late.txt", "x\n", "not merged")
+        self.stray = self.g(self.res.repos["primary"], "rev-parse", "HEAD")
+
+    def test_on_the_branch_passes(self):
+        res = edl.sha_check(self.L, self.gw, "W", self.on)
+        self.assertTrue(res.passed, res.detail)
+        self.assertEqual(res.status, edl.SHA_PASS)
+        # the step commit (an ancestor of the merge) passes too
+        self.assertTrue(edl.sha_check(self.L, self.gw, "W", self.off).passed)
+
+    def test_a_short_sha_passes(self):
+        self.assertTrue(edl.sha_check(self.L, self.gw, "W", {n: s[:9] for n, s in self.on.items()}).passed)
+
+    def test_a_sha_not_on_the_branch_fails_for_that_repo_only(self):
+        res = edl.sha_check(self.L, self.gw, "W", {"primary": self.stray, "solo": self.on["solo"]})
+        self.assertFalse(res.passed)
+        self.assertEqual([(r.repo, r.status) for r in res.repos],
+                         [("primary", edl.SHA_NOT_ANCESTOR), ("solo", edl.SHA_PASS)])
+        self.assertEqual(res.status, edl.SHA_NOT_ANCESTOR)
+
+    def test_a_missing_repo_sha_is_invalid(self):
+        res = edl.sha_check(self.L, self.gw, "W", {"primary": self.on["primary"]})
+        self.assertEqual([(r.repo, r.status) for r in res.repos],
+                         [("primary", edl.SHA_PASS), ("solo", edl.SHA_INVALID)])
+        self.assertEqual(res.status, edl.SHA_INVALID)
+        self.assertEqual(edl.sha_check(self.L, self.gw, "W", None).status, edl.SHA_INVALID)
+
+    def test_a_malformed_sha_is_invalid_and_never_reaches_git(self):
+        calls = []
+        real = self.gw.git
+        with mock.patch.object(self.gw, "git", side_effect=lambda a, c, t=30.0: calls.append(a) or real(a, c, t)):
+            res = edl.sha_check(self.L, self.gw, "W", {"primary": "--all", "solo": "XYZ"})
+        self.assertEqual([r.status for r in res.repos], [edl.SHA_INVALID, edl.SHA_INVALID])
+        self.assertEqual(calls, [])
+
+    def test_an_unknown_sha_is_a_git_error_not_a_pass(self):
+        res = edl.sha_check(self.L, self.gw, "W", {"primary": "0" * 40, "solo": self.on["solo"]})
+        self.assertEqual(res.repos[0].status, edl.SHA_ERROR)
+        self.assertFalse(res.passed)
+
+    def test_the_check_runs_in_the_integration_worktree_per_repo(self):
+        calls = []
+        real = self.gw.git
+        with mock.patch.object(self.gw, "git", side_effect=lambda a, c, t=30.0: calls.append((a, c)) or real(a, c, t)):
+            edl.sha_check(self.L, self.gw, "W", self.on)
+        root = self.L.worktree_root
+        self.assertEqual(calls, [
+            (["merge-base", "--is-ancestor", "--end-of-options", self.on["primary"], "refs/heads/epic/e1"],
+             f"{root}/integration/primary"),
+            (["merge-base", "--is-ancestor", "--end-of-options", self.on["solo"], "refs/heads/epic/e1"],
+             f"{root}/integration/solo")])
+
+    def test_a_single_repo_step_accepts_a_bare_sha(self):
+        L, st = self.wledger("solo", epic="e2")
+        res = edl.ensure_step_worktrees(L, st, self.gw, "W")
+        self.assertTrue(res.ok, res.refused)
+        integ = st["worktrees"]["integration"]["solo"]
+        self.assertTrue(edl.sha_check(L, self.gw, "W", {"": self.g(integ, "rev-parse", "HEAD")}).passed)
+
+
+class TestShaGate(_GitRepos):
+    def setUp(self):
+        super().setUp()
+        self.L, self.st = self.wledger("solo", epic="e3", )
+        self.assertTrue(edl.ensure_step_worktrees(self.L, self.st, self.gw, "W").ok)
+        self.integ = self.st["worktrees"]["integration"]["solo"]
+        self.tip = self.g(self.integ, "rev-parse", "HEAD")
+        self.now = T("2026-11-24T01:00:00Z")
+
+    def verifying(self, shas):
+        rec = self.st["steps"]["W"]
+        rec.update(status="verifying", shas=shas)
+        return rec
+
+    def test_a_worker_check_waits_for_the_sha_check_and_the_check_runs_after_it(self):
+        d = self.ledger_dict([self.step("W", role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                              "repos": self.repos("solo")}},
+                                        check="true")], epic="e3")
+        d["roles"]["impl"] = d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+        L = self.load(d, self.gw)
+        rec = self.verifying({"": self.tip})
+        self.assertEqual(edl.eligible_checks(L, self.st, self.now), [])
+        out = edl.run_sha_checks(L, self.st, self.gw, self.now)
+        self.assertTrue(out[0].passed)
+        self.assertEqual(rec["status"], "verifying")
+        self.assertEqual([j.step_id for j in edl.eligible_checks(L, self.st, self.now)], ["W"])
+        # a newer ADVANCED closes the gate again
+        rec["shas"] = {"": "0" * 40}
+        self.assertEqual(edl.eligible_checks(L, self.st, self.now), [])
+
+    def test_no_own_check_the_sha_check_finishes_the_step(self):
+        rec = self.verifying({"": self.tip})
+        edl.run_sha_checks(self.L, self.st, self.gw, self.now)
+        self.assertEqual((rec["status"], rec["by"]), ("done", "check"))
+        self.assertTrue(rec["sha_check"]["passed"])
+
+    def test_a_failing_sha_check_changes_nothing_but_the_record(self):
+        rec = self.verifying({"": self.g(self.primary, "rev-parse", "operator-work")})
+        out = edl.run_sha_checks(self.L, self.st, self.gw, self.now)
+        self.assertFalse(out[0].passed)
+        self.assertEqual(rec["status"], "verifying")
+        self.assertEqual(rec["sha_check"]["status"], edl.SHA_ERROR)   # not in solo at all
+        self.assertFalse(rec["sha_check"]["passed"])
+
+    def test_other_statuses_and_non_worker_steps_are_skipped(self):
+        self.st["steps"]["W"].update(status="inflight", shas={"": self.tip})
+        self.assertEqual(edl.run_sha_checks(self.L, self.st, self.gw, self.now), [])
+
+
+class TestWorktreeDiscipline(unittest.TestCase):
+    SRC = (_REPO / ".claude" / "hooks" / "epic_driver_lib.py").read_text()
+
+    def code(self):
+        return re.sub(r"#[^\n]*", "", re.sub(r'''"""(.*?)"""''', "", self.SRC, flags=re.S))
+
+    def test_no_git_argv_can_reset_clean_stash_force_remove_delete_or_push(self):
+        whole = self.code()
+        code = whole[whole.index("ALARM_WORKTREE_REFUSED ="):]
+        self.assertIn("def ensure_integration", code)
+        for verb in ("reset", "clean", "stash", "push", "checkout", "restore", "rebase", "switch", "remove",
+                     "prune", "gc", "-D", "-d", "-f", "-F", "-B", "-M", "-m", "-c", "--force", "--force-with-lease", "--hard",
+                     "--mirror", "--orphan", "--detach", "update-ref"):
+            self.assertNotRegex(code, rf'["\']{re.escape(verb)}["\']', verb)
+        # every literal verb handed to the git runner is on the allow list
+        verbs = set()
+        for m in re.finditer(r"(?:world\.git|git)\(\s*[\[(]\s*\"([a-z-]+)\"", whole):
+            verbs.add(m.group(1))
+        self.assertEqual(verbs, {"rev-parse", "check-ref-format", "worktree", "status", "merge-base"})
+        sub = set(re.findall(r'"worktree",\s*"([a-z-]+)"', whole))
+        self.assertEqual(sub, {"list", "add"})
+
+    def test_git_refusal_unit(self):
+        ok = [["rev-parse", "--is-inside-work-tree"], ["rev-parse", "--verify", "--quiet", "--end-of-options", "x^{commit}"],
+              ["check-ref-format", "--branch", "epic/e"], ["worktree", "list", "--porcelain"], ["status", "--porcelain"],
+              ["worktree", "add", "-b", "epic/e", "--end-of-options", "/p", "abc1234"],
+              ["worktree", "add", "--end-of-options", "/p", "epic/e"],
+              ["merge-base", "--is-ancestor", "--end-of-options", "abc1234", "refs/heads/epic/e"]]
+        for args in ok:
+            self.assertIsNone(edl.git_refusal(args), args)
+        for args in ([], "status", ["worktree"], ["worktree", "prune"], ["-c", "a=b", "status"], ["-C", "/", "status"],
+                     ["status", "-c", "a=b"], ["status", "--porcelain", "--end-of-options", "-x"],
+                     ["rev-parse", "--verify", "--end-of-options", "--abbrev-ref=3"], ["status", 1]):
+            self.assertTrue(edl.git_refusal(args), args)
+
+    def test_world_git_discipline(self):
+        w = edl.RealWorld()
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen.update(argv=argv, **kw)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(edl.subprocess, "run", fake_run), \
+                mock.patch.dict(os.environ, {"GIT_DIR": "/elsewhere"}):
+            w.git(["status"], "/x", timeout_s=7)
+        self.assertEqual(seen["argv"], ["git", "-c", "core.hooksPath=/dev/null", "-C", "/x", "status"])
+        self.assertEqual(seen["timeout"], 7)
+        self.assertEqual(seen["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertNotIn("GIT_DIR", seen["env"])
+        with mock.patch.object(edl.subprocess, "run", side_effect=subprocess.TimeoutExpired("git", 1)):
+            r = w.git(["status"], "/x", timeout_s=1)
+        self.assertIsNone(r.rc)
+        self.assertIn("timed out", r.error)
+
+
+class TestGitAllowList(_GitRepos):
+    """Behaviour: every forbidden git form is refused by RealWorld.git (and the fake) without running git."""
+
+    expects_refusals = True
+
+    def forbidden(self):
+        wt = str(self.tmp / "wt-x")
+        sha = self.second_sha
+        return [
+            ["reset", "--hard"], ["reset", "--hard", "HEAD~1"], ["reset", "--soft", "HEAD~1"], ["clean", "-fdx"],
+            ["clean", "-n"], ["stash"], ["stash", "-u"], ["push", "origin", "main"], ["push", "--force", "origin"],
+            ["update-ref", "-d", "refs/heads/main"], ["update-ref", "refs/heads/main", sha],
+            ["branch", "-D", "main"], ["branch", "-d", "main"], ["branch", "-f", "main", "HEAD~1"],
+            ["branch", "--force", "main", "HEAD~1"], ["branch", "-M", "main", "x"], ["branch", "-m", "main", "x"],
+            ["branch", "newbranch"], ["checkout", "main"], ["checkout", "--", "a.txt"], ["checkout", "-b", "x"],
+            ["checkout", "-f", "main"], ["switch", "main"], ["switch", "-c", "x"], ["restore", "a.txt"],
+            ["rebase", "main"],
+            ["worktree", "remove", wt], ["worktree", "remove", "--force", wt], ["worktree", "prune"],
+            ["worktree", "move", wt, wt + "2"],
+            ["worktree", "add", "-B", "main", wt, sha], ["worktree", "add", "--force", wt, "main"],
+            ["worktree", "add", "-f", wt, "main"], ["worktree", "add", "--detach", wt, sha],
+            ["worktree", "add", "--orphan", "-b", "o", wt], ["worktree", "add", "-b", "x", "-B", "main", wt, sha],
+            ["-c", "core.hooksPath=/tmp/h", "status"], ["status", "-c", "core.pager=x"],
+            ["-c", "alias.status=!touch /tmp/pwned", "status"], ["-C", str(self.tmp), "status"],
+            ["--git-dir=/x", "status"], ["status", "--porcelain", "-c", "a=b"],
+            ["worktree", "add", "-b", "x", "--end-of-options", wt, "-B"],
+        ]
+
+    def test_real_world_refuses_each_forbidden_form_and_changes_nothing(self):
+        for args in self.forbidden():
+            before = self.snapshot(self.primary)
+            res = self.gw.git(args, str(self.primary))
+            self.assertFalse(res.ok, args)
+            self.assertIsNone(res.rc, args)
+            self.assertIn("git refused", res.error or "", args)
+            self.assertEqual(self.snapshot(self.primary), before, f"{args} changed the repo")
+        self.assertFalse((self.tmp / "wt-x").exists())
+        self.assertFalse(os.path.exists("/tmp/pwned"))
+
+    def test_real_world_never_spawns_git_for_a_refused_form(self):
+        with mock.patch.object(edl.subprocess, "run") as run:
+            for args in self.forbidden():
+                self.gw.git(args, str(self.primary))
+        run.assert_not_called()
+
+    def test_the_fake_world_refuses_the_same_forms(self):
+        world = FakeWorld(repos={str(self.primary): {"refs": set()}})
+        for args in self.forbidden():
+            res = world.git(args, str(self.primary))
+            self.assertIsNone(res.rc, args)
+            self.assertIn("git refused", res.error or "", args)
+
+    def test_the_forms_the_module_needs_still_run(self):
+        p = str(self.primary)
+        self.assertTrue(self.gw.git(["status", "--porcelain"], p).ok)
+        self.assertTrue(self.gw.git(["rev-parse", "--verify", "--quiet", "--end-of-options", "main^{commit}"], p).ok)
+        self.assertTrue(self.gw.git(["worktree", "list", "--porcelain"], p).ok)
+
+    def test_a_dynamic_argv_is_refused_at_runtime(self):
+        verb, flag = "res" + "et", "--ha" + "rd"
+        res = self.gw.git([verb, flag], str(self.primary))
+        self.assertIn("git refused", res.error)
+
+    def test_dash_b_to_capital_b_in_add_worktree_would_be_refused(self):
+        # what the -b -> -B mutation of _add_worktree does: the runner refuses, so no worktree is made
+        path = str(self.tmp / "wt-b")
+        res = self.gw.git(["worktree", "add", "-B", "epic/zz", "--end-of-options", path, self.second_sha], str(self.solo))
+        self.assertIn("git refused", res.error)
+        self.assertFalse(os.path.exists(path))
+
+
+class TestShaAndRefHardening(_GitRepos):
+    def test_trailing_newline_sha_is_invalid_and_the_regex_uses_fullmatch(self):
+        L, st = self.wledger("solo", epic="e5")
+        self.assertTrue(edl.ensure_step_worktrees(L, st, self.gw, "W").ok)
+        integ = st["worktrees"]["integration"]["solo"]
+        tip = self.g(integ, "rev-parse", "HEAD")
+        calls = []
+        real = self.gw.git
+        with mock.patch.object(self.gw, "git", side_effect=lambda a, c, t=30.0: calls.append(a) or real(a, c, t)):
+            res = edl.sha_check(L, self.gw, "W", {"": tip + "\n"})
+        self.assertEqual(res.repos[0].status, edl.SHA_INVALID)
+        self.assertEqual(calls, [])
+        self.assertTrue(edl.sha_check(L, self.gw, "W", {"": tip}).passed)
+
+    def test_a_trailing_newline_sha_in_a_verdict_is_not_a_valid_sha(self):
+        self.assertIsNone(edl._SHA_RE.fullmatch("abc1234\n"))
+        self.assertTrue(edl._SHA_RE.fullmatch("abc1234"))
+
+    def test_a_tag_named_like_the_integration_branch_does_not_fool_the_sha_check(self):
+        solo = self.solo
+        self.g(solo, "checkout", "-q", "-b", "side")
+        self.commit(solo, "side.txt", "x\n", "side only")
+        side = self.g(solo, "rev-parse", "HEAD")
+        self.g(solo, "tag", "epic/e6")                 # a tag, not a branch, at a commit the branch lacks
+        self.g(solo, "checkout", "-q", "-")
+        self.g(solo, "branch", "-q", "-D", "side")
+        self.before[solo] = self.snapshot(solo)
+        L, st = self.wledger("solo", epic="e6")
+        self.assertTrue(edl.ensure_step_worktrees(L, st, self.gw, "W").ok)
+        res = edl.sha_check(L, self.gw, "W", {"": side})
+        self.assertEqual(res.repos[0].status, edl.SHA_NOT_ANCESTOR, res.detail)
+        self.assertFalse(res.passed)
+
+    def test_a_base_ref_starting_with_a_dash_is_refused_at_validation(self):
+        d = self.ledger_dict([self.step("W", role={"worker": {
+            "implementer": "impl", "reviewer": "rev", "repos": self.repos("primary", base="--abbrev-ref=3")}})])
+        d["roles"]["impl"] = {"model": "claude-opus-5-5", "effort": "high"}
+        d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+        errors, _ = self.issues(d, self.gw)
+        self.assertTrue([e for e in errors if "base_ref" in e.where and "'-'" in e.message], errors)
+
+    def test_base_ref_is_resolved_after_end_of_options(self):
+        calls = []
+        real = self.gw.git
+        repo = edl.WorkerRepo(str(self.primary), "main", "primary")
+        with mock.patch.object(self.gw, "git", side_effect=lambda a, c, t=30.0: calls.append(a) or real(a, c, t)):
+            edl.resolve_base_ref(self.gw, repo)
+        self.assertEqual(calls[0][:4], ["rev-parse", "--verify", "--quiet", "--end-of-options"])
+
+    def test_sanitised_step_id_collisions_are_rejected_with_both_ids(self):
+        for a, b in (("W", "w"), ("50-07", "50.07")):
+            w = {"worker": {"implementer": "impl", "reviewer": "rev", "repos": self.repos("primary")}}
+            d = self.ledger_dict([self.step(a, role=w), self.step(b, role=w)])
+            d["roles"]["impl"] = {"model": "claude-opus-5-5", "effort": "high"}
+            d["roles"]["rev"] = {"model": "claude-opus-5-5", "effort": "high"}
+            errors, _ = self.issues(d, self.gw)
+            hits = [e for e in errors if e.category == edl.E_NAMES and "collides" in e.message]
+            self.assertEqual(len(hits), 1, (a, b, errors))
+            self.assertIn(repr(a), hits[0].message)
+            self.assertIn(repr(b), hits[0].message)
 
 
 if __name__ == "__main__":

@@ -41,7 +41,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | done | Phase 0 | P0-10, P0-13 (selection side) |
 | 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | done | 50-01, 50-02, 50-03, 50-04 | |
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | done | 50-05 | D4, D5, M6, m2 |
-| 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | todo | 50-04 | P0-7 |
+| 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | done | 50-04 | P0-7 |
 | 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | todo | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
 | 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | todo | 50-06, 50-08 | |
 | 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | todo | 50-08, 50-09 | P0-12 (stamps); units |
@@ -155,3 +155,12 @@ Phase 0 decisions. They stay listed here for the reasoning.
   reset on success and on a reboot (alarm stays until a launch succeeds); a dialog key the guard refused (never ran)
   may be answered on a later pass, a key whose command ran is never re-sent; a retry falls back to `event_line`, never
   an empty send; after `handoff_timeout` the same generation is reused for `ROTATE_RETRY_AFTER = 1h`.
+- **2026-11-22 — 50-07 done** (2 reviews, 1 fix; suite 2908 OK, 2 skipped). Integration worktree on `epic/<epic>`,
+  step worktrees, the `merge-base --is-ancestor` sha check against `refs/heads/epic/<epic>`, worker `--dir` wired into
+  50-06's spawn. From review: invariants 3/4/6 are now enforced at runtime — `RealWorld.git` and the fake share an
+  argv allowlist that refuses reset/clean/stash/push/checkout/switch/update-ref, branch deletes or moves, `worktree
+  remove|prune|move`, `worktree add -B|--force|--detach|--orphan` and foreign `-c` before git runs; the operator-repo
+  snapshot covers every ref and worktree with explicit allowed deltas; a `base_ref` starting with `-` and sanitised
+  step-id collisions are rejected at validation. Accepted without change (review 2, optional): `_git_env` does not
+  scrub `GIT_CONFIG_*`/`GIT_EXEC_PATH` (matters only with a hostile driver environment), and the `rev-parse`/`status`
+  allowlist is a flag allowlist, not an argv-shape check (read-only forms).
