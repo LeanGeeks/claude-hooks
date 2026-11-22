@@ -115,7 +115,9 @@ leaves the tier to the harness default — which floats between sessions
 `ANTHROPIC_MODEL` (e.g. `claude-glm`) pins a model on its own.
 
 **A profile is spawn-time only.** `--profile` is refused on `resume` and
-refused with `--provider codex` — both with actionable errors. Profiles reach
+refused with `--provider codex` — both with actionable errors. A Claude
+`resume` re-exports the profile the session was spawned with, which is
+recorded in its handle (`profile`). Profiles reach
 the child through amux's env allowlist (prefix-based over
 `ANTHROPIC_*` / `CLAUDE_*`), never through argv, so nothing leaks to `ps`.
 
@@ -147,17 +149,21 @@ Codex worker.
 pass-through flags. With no explicit suffix, the space form's value is eaten
 as the suffix and the child receives a **bare, valueless flag**:
 
-| You type | suffix | forwarded to `claude` |
+| You type | suffix | forwarded to amux (Claude) |
 |---|---|---|
 | `spawn --model opus` | `opus` | `--model` ← broken |
-| `spawn --model=opus` | *(auto)* | `--model=opus` ← correct |
+| `spawn --model=opus` | *(auto)* | `--model opus` ← correct |
 | `spawn w1 --model opus` | `w1` | `--model opus` ← also fine |
 | `spawn --effort high` | `high` | `--effort` ← broken |
-| `spawn --effort=high` | *(auto)* | `--effort=high` ← correct |
+| `spawn --effort=high` | *(auto)* | `--effort high` ← correct |
 
 This is pre-existing argparse behaviour, identical for both providers. Use
-`=` and it never bites. (`resume` has no suffix positional, so both spellings
-work there.)
+`=` and it never bites. For Claude, amux-spawn then rewrites
+`--model=X`/`--effort=X` to the space form, because amux persists only that
+form in `CC_FLAGS`, and a restart (`resume`) re-passes only what `CC_FLAGS`
+holds. Codex flags are forwarded exactly as given. (A Codex `resume` has no
+suffix positional, so both spellings work there. A Claude `resume` takes no
+model flag at all: the handle decides.)
 
 ## `--effort` — thinking budget
 

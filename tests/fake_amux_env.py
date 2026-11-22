@@ -11,7 +11,17 @@ a subprocess. Everything behind its public process boundary is faked on PATH:
              ``<name>.meta.json``, bounded-run artifact preparation, provider
              argv construction (including the --yolo expansion), and rc-66
              thread-mismatch quarantine. It creates the "pane" through
-             whatever ``tmux`` resolves on PATH.
+             whatever ``tmux`` resolves on PATH. Epic 50 (task 50-01) adds the
+             interactive Claude path of amux 0.3.0: ``exec``/``start`` with
+             ``parse_amux_opts`` + ``parse_claude_flags`` (only the space form
+             of ``--model``/``--effort`` lands in ``CC_FLAGS``), ``--env``
+             exports, inline args after the session name, and the
+             ``meta.json`` ``claude_session_id``/``started`` pair that makes
+             amux append ``--session-id`` (first start) or ``--resume``.
+``claude``   the fake Claude executable (epic 50): records its argv, cwd and
+             ``ANTHROPIC_*``/``CLAUDE_*`` env, appends to the transcript Claude
+             would write (``$HOME/.claude/projects/<enc-dir>/<sid>.jsonl``),
+             then stays alive like a TUI. No model, no network.
 ``tmux``     either a state-file fake (hermetic suite — no tmux binary needed)
              or a shim that prefixes the real tmux with ``-L <private socket>``
              (private-tmux suite — real panes, private server).
@@ -267,14 +277,174 @@ def start_bounded(name, *, event_log, last_message, dir_, opts, flags, prompt,
     print(f"  result: {last_message}")
 
 
+# ── the interactive Claude path (amux 0.3.0; epic 50, task 50-01) ──────────
+#
+# Mirrors cmd_exec -> cmd_start -> build_claude_command of the real script:
+# amux-level options are stripped first (parse_amux_opts), the rest goes
+# through parse_claude_flags, and the claude argv is
+#   claude <CC_FLAGS> <inline args> [--model sonnet] [--session-id|--resume <id>]
+# On a Claude session the inline args keep a `--` token as given (only an
+# exec-mode start drops it).
+
+# parse_claude_flags' value-taking flags, verbatim from amux 0.3.0.
+CLAUDE_VALUE_FLAGS = {
+    "--model", "--permission-mode", "--system-prompt", "--append-system-prompt",
+    "--mcp-config", "--allowedTools", "--allowed-tools", "--disallowedTools",
+    "--disallowed-tools", "--add-dir", "--effort", "--settings",
+    "--setting-sources", "--tools", "--plugin-dir", "--agents", "--agent",
+    "--betas", "--debug-file", "--json-schema", "--fallback-model",
+    "--max-budget-usd", "--session-id", "--file", "--strict-mcp-config",
+}
+CLAUDE_BOOL_FLAGS = {
+    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+    "--yolo", "--verbose", "--chrome", "--no-chrome", "--debug",
+    "--disable-slash-commands", "--no-session-persistence", "--ide",
+    "--fork-session",
+}
+
+
+def parse_amux_opts(argv):
+    """amux 0.3.0 parse_amux_opts: order-independent amux-level options."""
+    o = {"no_default_model": False, "no_attach": False, "session_id": "",
+         "env": [], "provider": None, "agent_mode": None, "event_log": "",
+         "last_message": "", "rest": []}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        nxt = argv[i + 1] if i + 1 < len(argv) else ""
+        if tok == "--no-default-model":
+            o["no_default_model"] = True
+        elif tok == "--no-attach":
+            o["no_attach"] = True
+        elif tok in ("--provider", "--agent-mode", "--event-log",
+                     "--output-last-message", "--session-id", "--env"):
+            key = {"--provider": "provider", "--agent-mode": "agent_mode",
+                   "--event-log": "event_log",
+                   "--output-last-message": "last_message",
+                   "--session-id": "session_id"}.get(tok)
+            if tok == "--env":
+                o["env"].append(nxt)
+            else:
+                o[key] = nxt
+            i += 1
+        else:
+            o["rest"].append(tok)
+        i += 1
+    return o
+
+
+def parse_claude_flags(argv):
+    """amux 0.3.0 parse_claude_flags -> (cc_flags, cc_dir, extra_args)."""
+    flags, extra, cc_dir = [], [], ""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in CLAUDE_VALUE_FLAGS:
+            flags += [tok, argv[i + 1] if i + 1 < len(argv) else ""]
+            i += 2
+            continue
+        if tok in CLAUDE_BOOL_FLAGS:
+            flags.append(CLAUDE_YOLO_EXPANSION if tok == "--yolo" else tok)
+        elif tok == "--dir":
+            cc_dir = os.path.abspath(argv[i + 1])
+            os.makedirs(cc_dir, exist_ok=True)
+            i += 1
+        else:
+            extra.append(tok)  # `--model=x` lands HERE, never in CC_FLAGS
+        i += 1
+    return flags, cc_dir, extra
+
+
+def write_meta(name, **updates):
+    """meta_set: merge-safe read-modify-write of <name>.meta.json."""
+    data = read_meta(name)
+    data.update(updates)
+    SESSIONS.mkdir(parents=True, exist_ok=True)
+    with open(SESSIONS / f"{name}.meta.json", "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def claude_exec(name, rest):
+    """cmd_exec for a Claude session: register, then cmd_start with the
+    transient options (--no-attach, --env) and CC_EXTRA_ARGS."""
+    o = parse_amux_opts(rest)
+    if o["agent_mode"] not in (None, "interactive"):
+        die("fake amux: a claude session is interactive only")
+    flags, cc_dir, extra = parse_claude_flags(o["rest"])
+    dir_ = cc_dir or os.getcwd()
+    entries = {
+        "CC_NAME": name,
+        "CC_DIR": dir_,
+        "CC_FLAGS": " ".join(shlex.quote(f) for f in flags),
+        "CC_PROVIDER": "claude",
+        "CC_AGENT_MODE": "interactive",
+    }
+    if o["no_default_model"]:
+        entries["CC_NO_DEFAULT_MODEL"] = "1"
+    write_env_file(name, entries)
+    if o["session_id"]:
+        write_meta(name, claude_session_id=o["session_id"], started=False)
+    start_opts = ["--no-attach"] if o["no_attach"] else []
+    for pair in o["env"]:
+        start_opts += ["--env", pair]
+    claude_start(name, start_opts + extra)
+
+
+def claude_start(name, rest):
+    """cmd_start for a Claude session (interactive mode)."""
+    env = read_env_file(name)
+    o = parse_amux_opts(rest)
+    if o["provider"] is not None:
+        die(f"--provider cannot be set on start; re-register the session")
+    if o["agent_mode"] is not None:
+        die(f"--agent-mode cannot be set on start; re-register the session")
+    if o["event_log"] or o["last_message"]:
+        die("--event-log/--output-last-message cannot be set on start")
+    if tmux_has(name):
+        print(f"already running: {name} (--no-attach)")
+        return
+    dir_ = env.get("CC_DIR") or os.environ.get("HOME", "/")
+    if not os.path.isabs(dir_):
+        die(f"CC_DIR is not absolute ('{dir_}')")
+    if not os.path.isdir(dir_):
+        die(f"directory not found: {dir_}")
+    argv = ["claude", *shlex.split(env.get("CC_FLAGS", "")), *o["rest"]]
+    if env.get("CC_NO_DEFAULT_MODEL") != "1" and not o["no_default_model"]:
+        if not any(t == "--model" or t.startswith("--model=") for t in argv):
+            argv += ["--model", "sonnet"]
+    meta = read_meta(name)
+    sid = meta.get("claude_session_id") or ""
+    started = meta.get("started") is True
+    if sid:
+        argv += ["--resume", sid] if started else ["--session-id", sid]
+    setup = "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID; "
+    for pair in o["env"]:
+        key, _, value = pair.partition("=")
+        setup += f"export {key}={shlex.quote(value)}; "
+    pane_cmd = (setup + f"cd {shlex.quote(dir_)}; exec "
+                + " ".join(shlex.quote(a) for a in argv))
+    result = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", f"amux-{name}", "-c", dir_, pane_cmd],
+        capture_output=True, text=True, env=os.environ.copy())
+    if result.returncode != 0:
+        die(f"tmux new-session failed: {(result.stderr or '').strip()}")
+    if sid and not started:
+        write_meta(name, started=True)
+    print(f"started {name} in {dir_}")
+    print("  " + " ".join(shlex.quote(a) for a in argv))
+
+
 def cmd_exec(name, rest):
     opts, flags, prompt = parse(rest)
     provider = opts.get("--provider", "claude")
     mode = opts.get("--agent-mode", "interactive")
+    if provider == "claude":
+        claude_exec(name, rest)
+        return
     if provider != "codex" or mode != "exec":
-        die("fake amux: only the bounded codex path is implemented "
-            "(--provider codex --agent-mode exec); the Claude path is "
-            "covered by the epic-10 suites")
+        die("fake amux: only the bounded codex path and the interactive "
+            "claude path are implemented")
     dir_ = opts.get("--dir") or os.getcwd()
     if not os.path.isabs(dir_):
         die(f"CC_DIR must be absolute, got: {dir_}")
@@ -293,12 +463,17 @@ def cmd_exec(name, rest):
 
 
 def cmd_start(name, rest):
+    env = read_env_file(name)
+    if env.get("CC_PROVIDER") == "claude":
+        # --resume is a legitimate inline claude flag here; only an exec-mode
+        # (bounded) start treats it as amux's leading option.
+        claude_start(name, rest)
+        return
     if "--resume" in rest and rest.index("--resume") != 0:
         die("--resume must be the first option after the session name")
-    opts, flags, prompt = parse(rest)
-    env = read_env_file(name)
     if not env:
         die(f"session '{name}' not found")
+    opts, flags, prompt = parse(rest)
     if env.get("CC_PROVIDER") != "codex" or env.get("CC_AGENT_MODE") != "exec":
         die("fake amux: only bounded codex sessions are implemented")
     start_bounded(name, event_log=env.get("CC_EVENT_LOG"),
@@ -337,6 +512,10 @@ def cmd_ls():
 def main():
     if len(sys.argv) < 2:
         die("usage: amux <exec|start|rm|ls> ...")
+    log = os.environ.get("AMUX_ARGV_LOG")
+    if log:
+        with open(log, "a") as f:
+            f.write(json.dumps(sys.argv[1:]) + "\n")
     cmd, name, *rest = sys.argv[1:]
     if cmd in ("exec", "run"):
         cmd_exec(name, rest)
@@ -582,6 +761,54 @@ sys.exit(2)
 '''
 
 
+# ── the fake `claude` executable (epic 50, task 50-01) ───────────────────────
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+"""Fake `claude` (task 50-01) — records argv/env, writes the transcript.
+
+The argv amux built reaches this script verbatim; it is appended (with the cwd
+and every ANTHROPIC_*/CLAUDE_* variable of the pane) to $CLAUDE_ARGV_LOG. The
+session id comes from --session-id (first start) or --resume (restart), and
+the transcript is the path Claude Code would write:
+$HOME/.claude/projects/<cwd with / and . as ->/<sid>.jsonl.
+
+$FAKE_CLAUDE_MODE: "grow" (default) appends one entry and stays alive like a
+TUI; "nogrow" stays alive without writing; "exit" appends and exits 0.
+"""
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+argv = sys.argv[1:]
+mode = os.environ.get("FAKE_CLAUDE_MODE", "grow")
+cwd = os.environ.get("PWD") or os.getcwd()
+
+log = os.environ.get("CLAUDE_ARGV_LOG")
+if log:
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith(("ANTHROPIC_", "CLAUDE_"))}
+    with open(log, "a") as f:
+        f.write(json.dumps({"argv": argv, "cwd": cwd, "env": env}) + "\n")
+
+sid = None
+for i, tok in enumerate(argv[:-1]):
+    if tok in ("--session-id", "--resume"):
+        sid = argv[i + 1]
+if sid and mode in ("grow", "exit"):
+    project = Path.home() / ".claude" / "projects" / re.sub(r"[/.]", "-", cwd)
+    project.mkdir(parents=True, exist_ok=True)
+    with open(project / f"{sid}.jsonl", "a") as f:
+        f.write(json.dumps({"type": "user", "sessionId": sid,
+                            "fake_claude_argv": argv}) + "\n")
+if mode == "exit":
+    sys.exit(0)
+time.sleep(float(os.environ.get("FAKE_CLAUDE_HANG_S", "120")))
+'''
+
+
 # ── the state-file fake `tmux` (hermetic suite) ──────────────────────────────
 
 FAKE_TMUX_STATE = r'''#!/usr/bin/env python3
@@ -593,6 +820,9 @@ way to stop a bounded run), and new-session -d (spawn the pane command in its
 own session/process group, like a detached tmux pane). Session death when the
 pane exits is modelled by the pane wrapper dropping its own entry; entries
 whose pid died self-heal in has-session.
+
+Epic 50: an entry "dead" is a session kept by remain-on-exit with a dead pane
+— has-session succeeds, ``list-panes -s -t T -F '#{pane_dead}'`` prints 1.
 """
 import fcntl
 import json
@@ -657,10 +887,32 @@ if cmd == "has-session":
         entry = data.get(norm_target(target))
         # "starting" = reserved, pane process not yet recorded -> alive.
         # int = pane pid -> alive only while the process exists.
-        ok = entry == "starting" or (isinstance(entry, int) and alive(entry))
+        # "dead" = session kept with a dead pane (remain-on-exit) -> exists.
+        ok = entry in ("starting", "dead") or (isinstance(entry, int) and alive(entry))
         sys.exit(0 if ok else 1)
     finally:
         lock.close()
+
+if cmd == "list-panes":
+    target = None
+    i = 1
+    while i < len(argv):
+        if argv[i] == "-t" and i + 1 < len(argv):
+            target = argv[i + 1]
+        i += 1
+    lock = _locked()
+    try:
+        entry = load().get(norm_target(target))
+    finally:
+        lock.close()
+    if entry == "dead":
+        print("1")
+    elif entry == "starting" or (isinstance(entry, int) and alive(entry)):
+        print("0")
+    else:
+        print(f"can't find window: {norm_target(target)}", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
 
 if cmd == "kill-session":
     target = None
@@ -784,8 +1036,11 @@ class FakeAmuxEnv:
         self.wrapper.write_text(PANE_WRAPPER)
         self._install("amux", FAKE_AMUX)
         self._install("codex", FAKE_CODEX)
+        self._install("claude", FAKE_CLAUDE)
 
         self.argv_log = tmp / "codex-argv.jsonl"
+        self.claude_argv_log = tmp / "claude-argv.jsonl"
+        self.amux_argv_log = tmp / "amux-argv.jsonl"
         self.pid_log = tmp / "pids.log"
         self.tmux_state = tmp / "fake-tmux-state.json"
         self.socket = f"cc2050-{os.getpid()}-{os.urandom(3).hex()}"
@@ -817,6 +1072,8 @@ class FakeAmuxEnv:
             env.pop(key, None)
         env["CODEX_FIXTURES"] = str(FIXTURES)
         env["CODEX_ARGV_LOG"] = str(self.argv_log)
+        env["CLAUDE_ARGV_LOG"] = str(self.claude_argv_log)
+        env["AMUX_ARGV_LOG"] = str(self.amux_argv_log)
         env["PANE_WRAPPER"] = str(self.wrapper)
         env["FAKE_PID_LOG"] = str(self.pid_log)
         env["FAKE_PANE_LOG"] = str(self.tmp / "pane.log")
@@ -886,6 +1143,83 @@ class FakeAmuxEnv:
             except ValueError:
                 continue
         return out
+
+    @staticmethod
+    def _jsonl(path: Path) -> list[Any]:
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            return []
+        out = []
+        for line in lines:
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+        return out
+
+    def claude_calls(self) -> list[dict[str, Any]]:
+        """Every fake-claude launch: ``{"argv", "cwd", "env"}``, oldest first."""
+        return self._jsonl(self.claude_argv_log)
+
+    def amux_calls(self) -> list[list[str]]:
+        """Every fake-amux invocation's argv (without ``amux``), oldest first."""
+        return self._jsonl(self.amux_argv_log)
+
+    def session_env(self, name: str) -> dict[str, str]:
+        """The fake amux's persisted ``<name>.env`` (quotes stripped)."""
+        env: dict[str, str] = {}
+        try:
+            text = (self.cc_home / "sessions" / f"{name}.env").read_text()
+        except OSError:
+            return env
+        for line in text.splitlines():
+            key, eq, value = line.partition("=")
+            if not eq:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                value = value[1:-1]
+            env[key.strip()] = value
+        return env
+
+    def set_session_env(self, name: str, **entries: str) -> None:
+        """Overwrite keys of ``<name>.env`` (e.g. a pre-normalisation CC_FLAGS)."""
+        env = self.session_env(name)
+        env.update(entries)
+        (self.cc_home / "sessions" / f"{name}.env").write_text(
+            "".join(f'{k}="{v}"\n' for k, v in env.items()))
+
+    def kill_session(self, name: str) -> None:
+        """Stop a pane the way a crash or reboot does: its tmux session goes."""
+        subprocess.run([str(self.bin / "tmux"), "kill-session", "-t",
+                        f"=amux-{name}"], capture_output=True, env=self.base_env)
+
+    def kill_pane_keep_session(self, name: str) -> None:
+        """State-file tmux only: the pane dies, the session stays (remain-on-exit)."""
+        assert self.real_tmux is None, "state-file tmux only"
+        lock = open(f"{self.tmux_state}.lock", "a+")
+        try:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = json.loads(self.tmux_state.read_text())
+            pid = data.get(f"amux-{name}")
+            if isinstance(pid, int):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except OSError:
+                    pass
+            data[f"amux-{name}"] = "dead"
+            self.tmux_state.write_text(json.dumps(data))
+        finally:
+            lock.close()
+
+    def tmux_entry(self, name: str) -> Any:
+        """State-file tmux only: the raw entry for ``amux-<name>`` (or None)."""
+        try:
+            return json.loads(self.tmux_state.read_text()).get(f"amux-{name}")
+        except (OSError, ValueError):
+            return None
 
     def status(self, name: str) -> dict[str, Any]:
         proc = self.run_cli("status", name, "--json")

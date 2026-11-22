@@ -35,7 +35,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | in_progress | Phase 0 | P0-3, P0-9 (spawn side) |
+| 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | done | Phase 0 | P0-3, P0-9 (spawn side) |
 | 50-02 | [Lifecycle: clear the `terminated` latch](./50-02-lifecycle-terminated-latch_sonnet.md) | todo | Phase 0 | P0-4 |
 | 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | todo | Phase 0 | context, cache TTL, compaction, last assistant entry |
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | todo | Phase 0 | P0-10, P0-13 (selection side) |
@@ -115,3 +115,9 @@ Phase 0 decisions. They stay listed here for the reasoning.
   key `startup_dialogs` (§5.2, §5.5; empty by default, so nothing is auto-answered unless listed). Scope: 50-04
   (schema), 50-05 (classifier, condition), 50-06 (the one listed key, committed before the send), 50-12 check 13
   (and check 9 now expects `startup_dialog`). The implementation manager started 50-01.
+- **2026-11-22 — 50-01 done** (2 review passes, 2 fix passes; suite 2482 OK, 2 skipped). Architecture §13.3 amended
+  from what 50-01 found: the resume prompt goes without `--` (amux 0.3.0 would put `--resume` after it and start a fresh
+  conversation); only a missing model refuses a resume, an effort is passed when known; the growth check runs only with
+  a prompt, and a resume whose transcript does not grow still records `attempt` + 1, `state = "spawning"` before its
+  exit 1. Installed copies not refreshed yet (`./install.sh --yes` is needed before amux-spawn's change is live).
+  Reports: `agents_output/50-01_*`.

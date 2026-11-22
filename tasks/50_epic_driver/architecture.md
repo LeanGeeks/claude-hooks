@@ -753,13 +753,17 @@ All from ground truth, each pass, for every session record and every handle of t
    then the dead tmux session is removed first); the transcript file exists (**refuse when missing**).
 3. Environment: export `resolve_profile(handle.profile)` if set; `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`; remove
    `CLAUDE_CODE_CHILD_SESSION`.
-4. Command: `amux start <name> --no-attach [--env K=V …] [--model M] [--effort E] [-- <prompt>]`. `--model`/`--effort`
-   are added **only when the persisted `CC_FLAGS` (`parent_cc_flags(name)`) lack them** and the handle has them;
-   neither in `CC_FLAGS` nor the handle ⇒ refuse ("would resume on the harness default"). amux adds `--resume
+4. Command: `amux start <name> --no-attach [--env K=V …] [--model M] [--effort E] [<prompt>]` — the prompt as one
+   trailing argv element, **without `--`** (50-01 verified: amux 0.3.0's `cmd_start` keeps a `--` in the inline args of
+   an interactive Claude session and appends `--resume` after it, which would start a fresh conversation).
+   `--model`/`--effort` are added **only when the persisted `CC_FLAGS` (`parent_cc_flags(name)`) lack them** and the
+   handle has them; a model in neither `CC_FLAGS` nor the handle ⇒ refuse ("would resume on the harness default").
+   A missing effort is not a refusal: the effort is passed when known (every driven role has one, §5.3). amux adds `--resume
    <claude_session_id>` itself because `meta.json` has `started=true`. The exact argv is verified against amux
    0.3.0's `cmd_start` and modelled in `tests/fake_amux_env.py`.
-5. Confirm: `_launch_confirmed`, then the transcript grows within 30 s (*default*); not growing ⇒ exit 1 with
-   "resumed but the transcript is not growing" (the session is left running for inspection).
+5. Confirm: `_launch_confirmed`, then, when a prompt is given (the tick always gives one), the transcript grows within
+   30 s (*default*); not growing ⇒ the handle write of step 6 still happens (the session was launched), then exit 1
+   with "resumed but the transcript is not growing" (the session is left running for inspection).
 6. Handle write: `attempt` + 1, `state = "spawning"`, `updated_at`. `--json` prints `{name, provider, state, attempt,
    session_id, transcript_path, model, effort, profile}`.
 

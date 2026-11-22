@@ -409,19 +409,14 @@ class TestThreadIdAuthority(unittest.TestCase):
             tmp = Path(d)
             with _redirect_amux_home(tmp):
                 lib.ensure_dirs()
-                # A Claude handle (legacy shape) plus an amux meta with a
-                # thread id: resume must still refuse — it is a Codex op.
-                lib.write_handle("cl-1", lib.new_handle(
-                    name="cl-1", session_id="11111111-2222-3333-4444-555555555555",
-                    run_id="r", abs_dir="/ws/p", transcript_path="/t.jsonl",
-                    stuck_after_s=600,
-                ))
-                _write_meta(tmp, "cl-1", THREAD_ID)
+                # An unknown provider plus an amux meta with a thread id:
+                # neither the Claude nor the Codex branch may launch it.
+                _stage_worker(tmp, provider="gemini")
                 rc, calls, _out, err, _live = _drive_resume(
-                    ["resume", "cl-1", "--", "continue"])
+                    ["resume", "p-2", "--", "continue"])
                 self.assertEqual(rc, 1)
                 self.assertEqual(calls, [])
-                self.assertIn("Codex-thread operation", err)
+                self.assertIn("provider='gemini'", err)
 
     def test_missing_prompt_refused(self):
         with tempfile.TemporaryDirectory() as d:
@@ -925,9 +920,11 @@ class TestClaudePathUnchanged(unittest.TestCase):
             self.assertIn("--model", call)
             self.assertNotIn("gpt-5.5", call)
 
-    def test_claude_handle_resume_refusal_mentions_attach_not_profiles(self):
-        """The Claude refusal is about the provider, not about profiles.toml —
-        Claude profile behavior on spawn is governed by its own suites."""
+    def test_claude_handle_takes_the_claude_branch(self):
+        """Epic 50 replaced the "resume is a Codex-thread operation" refusal:
+        a Claude handle goes down the Claude branch, which refuses a missing
+        transcript before anything is launched (the Codex thread-id checks
+        never run for it)."""
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
             with _redirect_amux_home(tmp):
@@ -937,11 +934,308 @@ class TestClaudePathUnchanged(unittest.TestCase):
                     run_id="r", abs_dir="/ws/p", transcript_path="/t.jsonl",
                     stuck_after_s=600,
                 ))
+                _write_meta(tmp, "cl-1", THREAD_ID)
                 rc, calls, _out, err, _live = _drive_resume(
                     ["resume", "cl-1", "--", "go"])
                 self.assertEqual(rc, 1)
                 self.assertEqual(calls, [])
-                self.assertIn("a|attach", err)
+                self.assertIn("transcript", err)
+                self.assertNotIn("Codex", err)
+
+
+# ── Epic 50, task 50-01: the Claude resume branch, against the fake amux ─────
+#
+# The REAL CLI runs as a subprocess through fake_amux_env: the fake amux models
+# amux 0.3.0's Claude cmd_exec/cmd_start (CC_FLAGS persistence, --env exports,
+# inline args, --session-id/--resume from meta.json), the fake claude records
+# its argv/env and writes the transcript, and the state-file tmux holds the
+# panes. No real amux, tmux, claude, ~/.amux or ~/.claude is touched.
+
+# Variables the developer's own session may export; scrubbed so every
+# assertion about the pane's environment is about what amux-spawn set.
+_SCRUBBED_ENV = (
+    "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_MODEL", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS", "CLAUDE_CODE_EFFORT_LEVEL",
+    "AMUX_SPAWN_RESUME_GROWTH_TIMEOUT_S",
+)
+
+_PROFILES_TOML = """
+[all-profiles]
+CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS = "200000"
+
+[profile.claude]
+ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-opus-5-5"
+CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "65"
+"""
+
+
+class _ClaudeResumeBase(unittest.TestCase):
+    def setUp(self):
+        from fake_amux_env import new_env
+        self.env, self.tmp = new_env(tmux_mode="state")
+        self.addCleanup(self._tear_down)
+        for key in _SCRUBBED_ENV:
+            self.env.base_env.pop(key, None)
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+        claude_dir = self.env.home / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        (claude_dir / "profiles.toml").write_text(_PROFILES_TOML)
+
+    def _tear_down(self):
+        self.env.teardown()
+        self.assertEqual(self.env.live_sessions(), [])
+
+    def spawn_dead(self, suffix="drv", *flags, kill=True):
+        """Spawn a driven Claude session through the CLI, then crash it."""
+        if not flags:
+            flags = ("--model=opus", "--effort=high", "--yolo")
+        proc = self.env.run_cli("spawn", suffix, "--dir", str(self.ws), *flags,
+                                "--", "seed prompt")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        name = f"ws-{suffix}"
+        handle = self.env.handle(name)
+        self._await_file(handle["transcript_path"])
+        if kill:
+            self.env.kill_session(name)
+            self.assertNotIn(f"amux-{name}", self.env.live_sessions())
+        return name, handle
+
+    @staticmethod
+    def _await_file(path, timeout=10.0):
+        import time
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if Path(path).is_file() and Path(path).stat().st_size > 0:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"fake claude never wrote {path}")
+
+    def resume(self, name, *args, **env_extra):
+        return self.env.run_cli("resume", name, *args, **env_extra)
+
+    def amux_starts(self, name):
+        return [c for c in self.env.amux_calls() if c[:2] == ["start", name]]
+
+    def write_handle(self, name, **updates):
+        path = self.env.handle_path(name)
+        data = json.loads(path.read_text())
+        data.update(updates)
+        path.write_text(json.dumps(data))
+
+
+class TestClaudeResume(_ClaudeResumeBase):
+    def test_dead_session_resumes_with_profile_env_and_persistence(self):
+        name, handle = self.spawn_dead(
+            "drv", "--profile", "claude", "--model=fable", "--effort=xhigh",
+            "--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80")
+        proc = self.resume(name, "--", "RESUME E-1: read x",
+                           CLAUDE_CODE_CHILD_SESSION="1",
+                           CLAUDE_CODE_FORCE_SESSION_PERSISTENCE="0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        call = self.env.claude_calls()[-1]
+        env = call["env"]
+        self.assertEqual(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL"), "claude-opus-5-5")
+        self.assertEqual(env.get("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"), "1")
+        self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", env)
+        # --pin-env re-passed as --env: wins over the profile's 65.
+        self.assertEqual(env.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"), "80")
+        self.assertEqual(call["cwd"], str(self.ws))
+        self.assertEqual(call["argv"][-2:], ["--resume", handle["session_id"]])
+
+    def test_model_effort_from_cc_flags_are_not_repassed(self):
+        name, handle = self.spawn_dead(
+            "drv", "--model=opus", "--effort=high", "--yolo",
+            "--pin-env", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000")
+        proc = self.resume(name, "--", "RESUME E-1: read x")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.amux_starts(name)[-1], [
+            "start", name, "--no-attach",
+            "--env", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000",
+            "RESUME E-1: read x",
+        ])
+        self.assertEqual(self.env.claude_calls()[-1]["argv"], [
+            "--model", "opus", "--effort", "high",
+            "--dangerously-skip-permissions",
+            "RESUME E-1: read x", "--resume", handle["session_id"],
+        ])
+
+    def test_model_effort_passed_when_cc_flags_lack_them(self):
+        """A session spawned before the normalisation: amux persisted only
+        --dangerously-skip-permissions; the handle supplies model and effort."""
+        name, handle = self.spawn_dead()
+        self.env.set_session_env(name, CC_FLAGS="--dangerously-skip-permissions")
+        proc = self.resume(name, "--", "RESUME E-2: read y")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.amux_starts(name)[-1], [
+            "start", name, "--no-attach", "--model", "opus", "--effort", "high",
+            "RESUME E-2: read y",
+        ])
+        self.assertEqual(self.env.claude_calls()[-1]["argv"], [
+            "--dangerously-skip-permissions", "--model", "opus", "--effort", "high",
+            "RESUME E-2: read y", "--resume", handle["session_id"],
+        ])
+
+    def test_only_the_missing_one_is_added(self):
+        name, _handle = self.spawn_dead()
+        self.env.set_session_env(name, CC_FLAGS="--model opus")
+        proc = self.resume(name, "--", "go on")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.amux_starts(name)[-1],
+                         ["start", name, "--no-attach", "--effort", "high", "go on"])
+
+    def test_refused_when_neither_source_has_a_model(self):
+        name, _handle = self.spawn_dead()
+        self.env.set_session_env(name, CC_FLAGS="--effort high")
+        self.write_handle(name, model=None)
+        launches = len(self.env.claude_calls())
+        proc = self.resume(name, "--", "go on")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("harness default model", proc.stderr)
+        self.assertEqual(self.amux_starts(name), [])
+        self.assertEqual(len(self.env.claude_calls()), launches)
+
+    def test_resume_without_any_effort_source_proceeds_unpinned(self):
+        name, handle = self.spawn_dead()
+        self.env.set_session_env(name, CC_FLAGS="--model opus")
+        self.write_handle(name, effort=None)
+        proc = self.resume(name, "--", "go on")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.amux_starts(name)[-1],
+                         ["start", name, "--no-attach", "go on"])
+        self.assertNotIn("--effort", self.env.claude_calls()[-1]["argv"])
+
+    def test_prompt_reaches_the_pane_as_one_argv_element(self):
+        name, handle = self.spawn_dead()
+        proc = self.resume(name, "--", ADVERSARIAL_PROMPT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = self.env.claude_calls()[-1]["argv"]
+        self.assertEqual(argv[-3:], [ADVERSARIAL_PROMPT, "--resume", handle["session_id"]])
+        self.assertNotIn("--", argv)
+
+    def test_attempt_bumped_state_spawning_and_json_shape(self):
+        name, handle = self.spawn_dead("drv", "--profile", "claude",
+                                       "--model=fable", "--effort=high")
+        proc = self.resume(name, "--json", "--", "RESUME E-3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload, {
+            "name": name, "provider": "claude", "state": "spawning",
+            "attempt": 2, "session_id": handle["session_id"],
+            "transcript_path": handle["transcript_path"],
+            "model": "fable", "effort": "high", "profile": "claude",
+        })
+        after = self.env.handle(name)
+        self.assertEqual(after["attempt"], 2)
+        self.assertEqual(after["state"], "spawning")
+        self.assertNotEqual(after["updated_at"], handle["updated_at"])
+        # A second crash + resume keeps counting.
+        self.env.kill_session(name)
+        proc = self.resume(name, "--json", "--", "RESUME E-4")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["attempt"], 3)
+
+    def test_prompt_is_optional(self):
+        name, handle = self.spawn_dead()
+        proc = self.resume(name)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.amux_starts(name)[-1], ["start", name, "--no-attach"])
+        self.assertEqual(self.env.claude_calls()[-1]["argv"][-2:],
+                         ["--resume", handle["session_id"]])
+
+    def test_no_prompt_resume_skips_the_growth_check(self):
+        # Architecture 13.3 step 5: the growth check runs only when a prompt
+        # is given. Without one nothing is sent, so a static transcript is fine.
+        name, handle = self.spawn_dead()
+        proc = self.resume(name, FAKE_CLAUDE_MODE="nogrow",
+                           AMUX_SPAWN_RESUME_GROWTH_TIMEOUT_S="1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("not growing", proc.stderr)
+        self.assertNotIn("not growing", proc.stdout)
+        after = self.env.handle(name)
+        self.assertEqual(after["attempt"], handle["attempt"] + 1)
+        self.assertEqual(after["state"], "spawning")
+
+    def test_dead_pane_session_is_removed_then_resumed(self):
+        name, _handle = self.spawn_dead(kill=False)
+        self.env.kill_pane_keep_session(name)
+        self.assertEqual(self.env.tmux_entry(name), "dead")
+        proc = self.resume(name, "--", "RESUME E-5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsInstance(self.env.tmux_entry(name), int)
+        self.assertEqual(len(self.amux_starts(name)), 1)
+
+    def test_transcript_not_growing_exits_1_and_leaves_the_session(self):
+        name, handle = self.spawn_dead()
+        proc = self.resume(name, "--", "RESUME E-6",
+                           FAKE_CLAUDE_MODE="nogrow",
+                           AMUX_SPAWN_RESUME_GROWTH_TIMEOUT_S="1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("resumed but the transcript is not growing", proc.stderr)
+        self.assertIn(f"amux-{name}", self.env.live_sessions())
+        # The session was launched, so the handle moves on all the same.
+        after = self.env.handle(name)
+        self.assertEqual(after["attempt"], handle["attempt"] + 1)
+        self.assertEqual(after["state"], "spawning")
+
+    def test_wait_reuses_the_wait_contract(self):
+        name, _handle = self.spawn_dead()
+        proc = self.resume(name, "--json", "--wait", "--timeout", "1s", "--", "go")
+        # No producer hooks run in the fake pane, so the turn never idles:
+        # the shared _wait_and_report timeout contract applies (exit 3).
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), cli.WAIT_TIMEOUT_MARKER)
+        self.assertIn('"provider": "claude"', proc.stderr)
+
+
+class TestClaudeResumeRefusals(_ClaudeResumeBase):
+    def _refused(self, name, args, needle):
+        launches = len(self.env.claude_calls())
+        proc = self.resume(name, *args)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(needle, proc.stderr)
+        self.assertEqual(self.amux_starts(name), [], "a refusal must not launch")
+        self.assertEqual(len(self.env.claude_calls()), launches)
+
+    def test_live_session_refused(self):
+        name, _handle = self.spawn_dead(kill=False)
+        self._refused(name, ["--", "go"], "refusing to resume a live session")
+        self.assertIn(f"amux-{name}", self.env.live_sessions())
+
+    def test_missing_transcript_refused(self):
+        name, handle = self.spawn_dead()
+        Path(handle["transcript_path"]).unlink()
+        self._refused(name, ["--", "go"], "transcript")
+
+    def test_meta_without_a_started_session_refused(self):
+        name, _handle = self.spawn_dead()
+        meta = self.env.cc_home / "sessions" / f"{name}.meta.json"
+        meta.write_text(json.dumps({"claude_session_id": "other", "started": True}))
+        self._refused(name, ["--", "go"], "fresh conversation")
+
+    def test_yolo_refused(self):
+        name, _handle = self.spawn_dead()
+        self._refused(name, ["--yolo", "--", "go"], "--yolo cannot be set")
+
+    def test_profile_refused(self):
+        name, _handle = self.spawn_dead()
+        self._refused(name, ["--profile", "claude", "--", "go"],
+                      "--profile cannot be set")
+
+    def test_dir_refused(self):
+        name, _handle = self.spawn_dead()
+        self._refused(name, ["--dir", str(self.tmp), "--", "go"],
+                      "--dir cannot be changed")
+
+    def test_pass_through_flag_refused(self):
+        name, _handle = self.spawn_dead()
+        self._refused(name, ["--model=sonnet", "--", "go"],
+                      "pass-through flags cannot ride a Claude resume")
+
+    def test_dash_prompt_refused(self):
+        name, _handle = self.spawn_dead()
+        self._refused(name, ["--", "--print hi"], "must not start with '-'")
 
 
 # ── Hermeticity ───────────────────────────────────────────────────────────────

@@ -121,6 +121,42 @@ amux-spawn watch --run-id <uuid> --block --timeout 30m
 # Prints each handle as it settles. Exit 0 = all done, exit 3 = timeout.
 ```
 
+## Resuming a dead session
+
+A tracked Claude session that crashed, was killed, or did not survive a
+reboot is restarted **in place** — same name, same transcript, same model,
+effort and profile:
+
+```bash
+amux-spawn resume <name> [--json] [--wait] [--timeout T] [-- "prompt"]
+```
+
+- It resumes only a **terminated** session: tmux gone, or a session whose
+  pane is dead (that tmux session is removed first). A live session is
+  refused — talk to it with `amux send`.
+- The **handle decides** everything: amux-spawn re-exports the spawn's
+  `--profile`, forces `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, drops
+  `CLAUDE_CODE_CHILD_SESSION`, re-passes the `--pin-env` pairs, and adds
+  `--model`/`--effort` only when amux's persisted `CC_FLAGS` lack them.
+  `--yolo`, `--profile`, `--dir` and every pass-through flag are refused.
+- Refused too: a missing transcript (the resume would be an empty, unrelated
+  conversation) and a session with no model in either `CC_FLAGS`
+  or the handle (it would run on the harness default). A missing effort is
+  not refused: `--effort` is passed only when a source has one.
+- amux appends `--resume <session_id>` itself. The prompt, if given, must
+  not start with `-`.
+- With a prompt, success means the transcript grew within 30 s. If it does
+  not, the exit is 1 with "resumed but the transcript is not growing", the
+  session is left running for inspection, and the handle is still updated
+  (`attempt` + 1, `state` `spawning`) because the session was launched.
+- `--json` prints `{name, provider, state, attempt, session_id,
+  transcript_path, model, effort, profile}`; `attempt` goes up by one per
+  resume and `state` is `spawning`. `--wait` has the same exit-code contract
+  as `spawn --wait`.
+
+Codex workers keep their own `resume` (the next bounded turn on the captured
+thread); see `amux-spawn resume --help`.
+
 ## Listing and tearing down
 
 ```bash
@@ -132,6 +168,12 @@ amux-spawn rm <name> --force      # kill and reap a stuck/running worker
 
 Event logs (`~/.amux/spawn/<name>.lifecycle.jsonl`) survive `rm` — they are
 the post-mortem record.
+
+The handle (`~/.amux/spawn/<name>.json`) holds only the fields listed and
+documented in `HANDLE_FIELDS` in `.claude/hooks/amux_spawn_lib.py`. Since
+epic 50 that includes `profile`, `model`, `effort` and `pinned_env`, which
+`spawn` records for Claude sessions and `resume` reads. Older handles do not
+have these fields, and readers treat them as null.
 
 ## Self-exclusion
 
@@ -155,6 +197,7 @@ Override with `--include-self` for testing only.
 | `--exclude <name>` | `watch` | none | Manually exclude a handle |
 | `--handle <name>` | `watch` | none | Watch specific handles (repeatable) |
 | `--force` | `rm` | off | Kill before reaping |
+| `--pin-env KEY=VALUE` | `spawn` (Claude) | none | Pin a compaction variable in the pane, over the profile; recorded for `resume`. Keys: `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`, `CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS` (repeatable) |
 
 Model selection has its own three flags — use the `--flag=value` form:
 
@@ -166,7 +209,10 @@ Model selection has its own three flags — use the `--flag=value` form:
 
 An automated spawn should pin both `--model=` and `--effort=`; unpinned, the
 child reads the operator's last interactive `/model`, and amux-spawn warns on
-stderr. `--profile` alone pins neither. See
+stderr. `--profile` alone pins neither. For Claude, amux-spawn rewrites
+`--model=X`/`--effort=X` to `--model X`/`--effort X` before calling amux,
+because amux persists only the space form in `CC_FLAGS` — that is what lets a
+`resume` restart on the same model and effort. See
 [`amux-spawn-model-selection.md`](./amux-spawn-model-selection.md) for the
 full rules, the `--model opus` space-form trap, and `amux-spawn profiles`.
 

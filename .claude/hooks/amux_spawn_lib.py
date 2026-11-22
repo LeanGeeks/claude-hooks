@@ -151,6 +151,53 @@ def tmux_has_session(name: str) -> bool:
     return result.returncode == 0
 
 
+def tmux_pane_dead(name: str) -> bool:
+    """True iff the live tmux session for ``name`` has only dead panes.
+
+    A session outlives its process when ``remain-on-exit`` is on: tmux keeps
+    the session with a dead pane. ``list-panes -s`` lists every pane of the
+    session; the session counts as dead only when every pane reports
+    ``pane_dead == 1``. Any error or a missing session returns False — callers
+    check :func:`tmux_has_session` first and treat "unknown" as alive (the
+    safe answer for a resume, which must never start a second process).
+    """
+    if not shutil.which("tmux"):
+        return False
+    try:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", f"={tmux_session_name(name)}",
+             "-F", "#{pane_dead}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    flags = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return bool(flags) and all(flag == "1" for flag in flags)
+
+
+def tmux_kill_session(name: str) -> None:
+    """Kill the tmux session for ``name`` (exact match), fail-soft.
+
+    Only the tmux session goes: amux's ``<name>.env`` and ``<name>.meta.json``
+    stay, unlike ``amux rm`` — a resume needs both (``CC_FLAGS`` and the
+    Claude session id).
+    """
+    if not shutil.which("tmux"):
+        return
+    try:
+        subprocess.run(
+            ["tmux", "kill-session", "-t", f"={tmux_session_name(name)}"],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def resolve_amux_session() -> str | None:
     """Return the *current* pane's amux session name, or None.
 
@@ -488,6 +535,24 @@ PROVIDERS = (PROVIDER_CLAUDE, PROVIDER_CODEX)
 # the turn end" — the hook knows the turn ended and knows when.  Kept
 # alongside ``mtime_at_stop`` (which stays for non-breaking compatibility);
 # ``stopped_at`` is the authoritative clock once 37-02 lands.
+#
+# Epic 50 added ``profile``, ``model``, ``effort`` and ``pinned_env`` (task
+# 50-01, epic-50 architecture §13.1): what a Claude resume needs to restart a
+# driven session on the SAME model and effort (review B1). All four are written
+# by ``spawn`` only, for Claude spawns; Codex handles and legacy handles hold
+# null, and nothing rewrites an old handle to add them.
+#
+#   ``profile``     str | None   the ``--profile`` name (``~/.claude/profiles.toml``);
+#                                the resume re-exports it, because the same
+#                                ``--model fable`` means different models with
+#                                and without ``profile.claude``.
+#   ``model``       str | None   the ``--model`` value forwarded to amux, as given
+#                                (alias or id; the caller's, else the one
+#                                inherited from the parent) — never resolved.
+#   ``effort``      str | None   the ``--effort`` value forwarded to amux.
+#   ``pinned_env``  dict | None  the ``--pin-env KEY=VALUE`` pairs (keys from
+#                                :data:`PINNABLE_ENV_KEYS`), re-passed to amux as
+#                                ``--env`` on every resume.
 HANDLE_FIELDS = (
     "name",
     "provider",
@@ -509,8 +574,26 @@ HANDLE_FIELDS = (
     "permission_pending",
     "mtime_at_stop",
     "stopped_at",
+    "profile",
+    "model",
+    "effort",
+    "pinned_env",
     "created_at",
     "updated_at",
+)
+
+# Fields added by epic 50 (task 50-01). Absent from every handle written before
+# it; readers treat a missing key as null.
+HANDLE_FIELDS_ADDED_50_01 = ("profile", "model", "effort", "pinned_env")
+
+# The environment keys ``spawn --pin-env KEY=VALUE`` accepts (epic-50
+# architecture §11.6 / §13.1): the compaction knobs a driven session pins so
+# its context is not rewritten behind the driver's back. amux applies them last
+# in the pane (``amux --env``), over the profile's value. Non-secret by
+# construction — amux inlines ``--env`` on the tmux command line (ps-visible).
+PINNABLE_ENV_KEYS = (
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS",
 )
 
 # Fields added by the epic-20 migration. A legacy handle has none of them; the
@@ -588,6 +671,8 @@ def upgrade_handle(handle: dict[str, Any]) -> dict[str, Any]:
         upgraded.setdefault(key, None)
     upgraded.setdefault("attempt", 1)
     upgraded.setdefault("stopped_at", None)
+    for key in HANDLE_FIELDS_ADDED_50_01:
+        upgraded.setdefault(key, None)
     return upgraded
 
 
@@ -668,6 +753,10 @@ def new_handle(
     result_path: str | None = None,
     process_pid: int | None = None,
     attempt: int = 1,
+    profile: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
+    pinned_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build a fresh handle in state ``spawning`` (architecture s6.0 + s3).
 
@@ -688,6 +777,11 @@ def new_handle(
     fake identity, so both stay ``None`` until real evidence exists. Task 20-04's
     resume path is the one writer that later fills ``session_id`` with the
     captured id (validated against ``meta.json``) and bumps ``attempt``.
+
+    Epic 50: ``profile`` / ``model`` / ``effort`` / ``pinned_env`` record what
+    a Claude resume must restore (see the :data:`HANDLE_FIELDS` comment); all
+    default to ``None``. ``pinned_env`` is copied, so the caller's dict is not
+    aliased into the handle.
     """
     now = iso_now()
     return {
@@ -711,6 +805,10 @@ def new_handle(
         "permission_pending": False,
         "mtime_at_stop": None,
         "stopped_at": None,
+        "profile": profile,
+        "model": model,
+        "effort": effort,
+        "pinned_env": dict(pinned_env) if pinned_env else None,
         "created_at": now,
         "updated_at": now,
     }
@@ -870,6 +968,32 @@ def read_codex_thread_id(name: str) -> str | None:
     if not isinstance(value, str) or not value.strip():
         return None
     return value.strip()
+
+
+#: The meta.json keys amux's Claude path uses (E4): the minted session id and
+#: whether the first start has consumed it. With ``started`` true, ``amux
+#: start`` appends ``--resume <claude_session_id>`` to the claude argv itself.
+CLAUDE_SESSION_KEY = "claude_session_id"
+CLAUDE_STARTED_KEY = "started"
+
+
+def read_claude_session_meta(name: str) -> tuple[str | None, bool]:
+    """``(claude_session_id, started)`` from amux's ``<name>.meta.json``.
+
+    Fail-soft: a missing or malformed file, or a missing/empty id, yields
+    ``(None, False)`` / ``(None, started)``. ``started`` is True only for the
+    JSON boolean ``true`` amux's ``meta_set`` writes.
+    """
+    try:
+        with open(meta_path(name)) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    value = data.get(CLAUDE_SESSION_KEY)
+    sid = value.strip() if isinstance(value, str) and value.strip() else None
+    return sid, data.get(CLAUDE_STARTED_KEY) is True
 
 
 # Same shape amux's ``_is_uuid`` enforces pre-launch: a non-UUID resume id is
@@ -1328,6 +1452,58 @@ def resolve_profile(name: str, path: str | Path | None = None) -> dict[str, str]
     if name not in profiles:
         raise ValueError(f"Unknown profile: {name!r}")
     return profiles[name]
+
+
+# ── Expected model (epic 50, architecture §13.2) ─────────────────────────────
+
+#: The tier aliases Claude Code resolves through ``ANTHROPIC_DEFAULT_<ALIAS>_MODEL``.
+MODEL_ALIASES = ("opus", "sonnet", "haiku", "fable")
+
+
+def _alias_base(model: str) -> str:
+    """``model`` lower-cased, without a trailing ``[...]`` context suffix."""
+    return model.strip().split("[", 1)[0].lower()
+
+
+def expected_model_id(model: str | None, profile_env: dict[str, str] | None) -> str | None:
+    """The model id a session spawned with ``--model <model>`` should report.
+
+    - an alias (``opus``, ``sonnet``, ``haiku``, ``fable``; case-insensitive,
+      optionally with a context suffix such as ``opus[1m]``) maps through ``profile_env["ANTHROPIC_DEFAULT_<ALIAS>_MODEL"]`` when the
+      profile sets it (``profile.claude`` maps ``fable`` to ``claude-opus-5-5``);
+    - an alias with no mapping returns ``None``: the harness resolves it, so
+      only a family match is possible (see :func:`model_matches`);
+    - anything else is a full model id and is returned as given;
+    - no model returns ``None``.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    value = model.strip()
+    alias = _alias_base(value)
+    if alias in MODEL_ALIASES:
+        mapped = (profile_env or {}).get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL")
+        if isinstance(mapped, str) and mapped.strip():
+            return mapped.strip()
+        return None
+    return value
+
+
+def model_matches(expected: str | None, alias: str | None, observed: str | None) -> bool:
+    """Does the *observed* assistant model satisfy the expectation?
+
+    Exact comparison when *expected* (a full id) is known; otherwise the
+    *alias* (without a ``[...]`` context suffix) must be a substring of the
+    observed id (``opus`` in ``claude-opus-4-6``), case-insensitively. Nothing
+    observed, or nothing to compare against, is not a match.
+    """
+    if not isinstance(observed, str) or not observed.strip():
+        return False
+    seen = observed.strip()
+    if isinstance(expected, str) and expected.strip():
+        return seen == expected.strip()
+    if isinstance(alias, str) and _alias_base(alias):
+        return _alias_base(alias) in seen.lower()
+    return False
 
 
 def profile_names(path: str | Path | None = None) -> list[str]:

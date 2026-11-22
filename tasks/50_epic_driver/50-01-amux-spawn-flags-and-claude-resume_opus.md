@@ -32,8 +32,8 @@ on the harness default: amux persists only `--model X`, never `--model=X`, and n
 5. **Claude resume branch** in `cmd_resume`, per architecture §13.3 steps 1–6: refusals first; under `SpawnLock` the
    terminated check (removing a dead pane's tmux session), the missing-transcript refusal; profile re-export,
    `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1`, no `CLAUDE_CODE_CHILD_SESSION`; `amux start <name> --no-attach
-   [--env …] [--model M] [--effort E] [-- <prompt>]` with model/effort added only when the persisted `CC_FLAGS` lack
-   them, and a refusal when neither `CC_FLAGS` nor the handle has them; launch confirmation, then transcript growth
+   [--env …] [--model M] [--effort E] [<prompt>]` (no `--`: architecture §13.3 step 4) with model/effort added only when the persisted `CC_FLAGS` lack
+   them, and a refusal when neither `CC_FLAGS` nor the handle has a model (a missing effort is passed when known, not refused); launch confirmation, then transcript growth
    within 30 s; the handle write (`attempt` + 1, `state = "spawning"`). Verify the `amux start` argv for a Claude
    session against amux 0.3.0's `cmd_start` before writing it, and extend `tests/fake_amux_env.py` to model it
    (inline args after `--`, `--env`, `--resume <id>` added by amux when `meta.json` has `started=true`).

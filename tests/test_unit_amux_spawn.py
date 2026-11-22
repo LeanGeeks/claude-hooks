@@ -1764,5 +1764,283 @@ class TestPersistenceDefault(unittest.TestCase):
             )
 
 
+# ── Epic 50, task 50-01: flag persistence, --pin-env, the new handle fields ──
+
+
+def _handle_of(tmp: Path, name: str):
+    with _redirect_amux_home(tmp):
+        return lib.read_handle(name)
+
+
+class TestClaudeFlagNormalisation(unittest.TestCase):
+    """--model=X / --effort=X reach amux in the space form (review B1)."""
+
+    def test_normalise_value_flags_unit(self):
+        self.assertEqual(
+            cli.normalise_value_flags(
+                ["--model=opus", "--effort=high", "--verbose",
+                 "--append-system-prompt=a=b", "--model="]),
+            ["--model", "opus", "--effort", "high", "--verbose",
+             "--append-system-prompt=a=b", "--model="])
+
+    def test_eq_form_reaches_amux_in_space_form(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--dir", str(ws), "--model=opus",
+                      "--effort=high", "--", "go"])
+            self.assertEqual(rc, 0)
+            call = _amux_exec_call(calls)
+            i = call.index("--model")
+            self.assertEqual(call[i:i + 4], ["--model", "opus", "--effort", "high"])
+            self.assertFalse(any(t.startswith(("--model=", "--effort=")) for t in call))
+            self.assertEqual(call[-1], "go")
+
+    def test_space_form_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "w1", "--dir", str(ws), "--model", "opus",
+                      "--effort", "high", "--", "go"])
+            self.assertEqual(rc, 0)
+            call = _amux_exec_call(calls)
+            self.assertEqual(call[2], "myproj-w1")
+            i = call.index("--model")
+            self.assertEqual(call[i:i + 4], ["--model", "opus", "--effort", "high"])
+
+    def test_codex_keeps_the_eq_form(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--model=gpt-5.5", "--effort=high", "--", "go"])
+            self.assertEqual(rc, 0)
+            call = _amux_exec_call(calls)
+            self.assertIn("--model=gpt-5.5", call)
+            self.assertIn("--effort=high", call)
+            self.assertNotIn("--model", call)
+
+    def test_claude_handle_records_profile_model_effort_pinned_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            with patch.object(cli.lib, "resolve_profile",
+                              return_value={"ANTHROPIC_DEFAULT_FABLE_MODEL": "x"}), \
+                    patch.dict(os.environ, {}):
+                rc, _calls, handles, _ = _spawn_capturing_argv(
+                    tmp, ["spawn", "--dir", str(ws), "--profile", "claude",
+                          "--model=fable", "--effort=xhigh",
+                          "--pin-env", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000",
+                          "--", "go"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(handles, ["myproj.json"])
+            h = _handle_of(tmp, "myproj")
+            self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+            self.assertEqual(h["profile"], "claude")
+            self.assertEqual(h["model"], "fable")
+            self.assertEqual(h["effort"], "xhigh")
+            self.assertEqual(h["pinned_env"],
+                             {"CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "400000"})
+
+    def test_unpinned_claude_handle_holds_nulls(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--dir", str(ws), "--", "go"])
+            self.assertEqual(rc, 0)
+            h = _handle_of(tmp, "myproj")
+            for key in lib.HANDLE_FIELDS_ADDED_50_01:
+                self.assertIsNone(h[key], key)
+
+    def test_codex_handle_holds_nulls(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, _calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--provider", "codex", "--dir", str(ws),
+                      "--model=gpt-5.5", "--", "go"])
+            self.assertEqual(rc, 0)
+            h = _handle_of(tmp, "myproj")
+            self.assertEqual(set(h.keys()), set(lib.HANDLE_FIELDS))
+            for key in lib.HANDLE_FIELDS_ADDED_50_01:
+                self.assertIsNone(h[key], key)
+
+
+class TestPinEnv(unittest.TestCase):
+    """--pin-env KEY=VALUE: Claude only, PINNABLE_ENV_KEYS only, refused early."""
+
+    def test_allowed_keys_are_forwarded_as_amux_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            rc, calls, _h, _ = _spawn_capturing_argv(
+                tmp, ["spawn", "--dir", str(ws),
+                      "--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80",
+                      "--pin-env=CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000",
+                      "--", "go"])
+            self.assertEqual(rc, 0)
+            handle = _handle_of(tmp, "myproj")
+            self.assertEqual(_amux_exec_call(calls), [
+                "amux", "exec", "myproj", "--no-attach", "--no-default-model",
+                "--dir", str(ws), "--session-id", handle["session_id"],
+                "--env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80",
+                "--env", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=400000",
+                "go",
+            ])
+            self.assertEqual(handle["pinned_env"], {
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+                "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS": "400000",
+            })
+
+    def _refused(self, extra: list[str], needle: str):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            ws = tmp / "myproj"
+            ws.mkdir()
+            messages: list[str] = []
+            with patch.object(cli, "_eprint", side_effect=messages.append):
+                rc, calls, handles, _ = _spawn_capturing_argv(
+                    tmp, ["spawn", "--dir", str(ws), *extra, "--", "go"])
+            self.assertEqual(rc, 1)
+            self.assertEqual(calls, [], "nothing may be created")
+            self.assertEqual(handles, [])
+            self.assertIn(needle, "\n".join(messages))
+
+    def test_unknown_key_refused(self):
+        self._refused(["--pin-env", "ANTHROPIC_MODEL=opus"], "cannot pin")
+
+    def test_key_without_equals_refused(self):
+        self._refused(["--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], "KEY=VALUE")
+
+    def test_duplicate_key_refused(self):
+        self._refused(["--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80",
+                       "--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70"], "twice")
+
+    def test_codex_refused(self):
+        self._refused(["--provider", "codex",
+                       "--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80"], "codex")
+
+    def test_parse_pin_env_messages(self):
+        with self.assertRaisesRegex(ValueError, "only the compaction keys"):
+            cli.parse_pin_env(["ANTHROPIC_MODEL=opus"])
+        with self.assertRaisesRegex(ValueError, "expects KEY=VALUE"):
+            cli.parse_pin_env(["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"])
+        with self.assertRaisesRegex(ValueError, "expects KEY=VALUE"):
+            cli.parse_pin_env(["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="])
+        self.assertEqual(cli.parse_pin_env(None), {})
+
+
+class TestExpectedModel(unittest.TestCase):
+    """amux_spawn_lib.expected_model_id / model_matches (architecture §13.2)."""
+
+    PROFILE_CLAUDE = {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-opus-5-5",
+                      "ANTHROPIC_BASE_URL": "https://api.anthropic.com"}
+
+    def test_alias_maps_through_the_profile(self):
+        self.assertEqual(lib.expected_model_id("fable", self.PROFILE_CLAUDE),
+                         "claude-opus-5-5")
+        self.assertEqual(lib.expected_model_id("FABLE", self.PROFILE_CLAUDE),
+                         "claude-opus-5-5")
+        self.assertEqual(lib.expected_model_id("fable[1m]", self.PROFILE_CLAUDE),
+                         "claude-opus-5-5")
+
+    def test_alias_without_a_mapping_is_unknown(self):
+        self.assertIsNone(lib.expected_model_id("opus", self.PROFILE_CLAUDE))
+        self.assertIsNone(lib.expected_model_id("fable", None))
+        self.assertIsNone(lib.expected_model_id("sonnet", {}))
+
+    def test_full_id_is_returned_as_given(self):
+        self.assertEqual(lib.expected_model_id("claude-sonnet-4-6", self.PROFILE_CLAUDE),
+                         "claude-sonnet-4-6")
+        self.assertIsNone(lib.expected_model_id(None, self.PROFILE_CLAUDE))
+        self.assertIsNone(lib.expected_model_id("  ", self.PROFILE_CLAUDE))
+
+    def test_model_matches_exact_when_expected_is_known(self):
+        self.assertTrue(lib.model_matches("claude-opus-5-5", "fable", "claude-opus-5-5"))
+        self.assertFalse(lib.model_matches("claude-opus-5-5", "fable", "claude-fable-5"))
+        self.assertFalse(lib.model_matches("claude-opus-5-5", "opus", "claude-opus-4-6"))
+
+    def test_model_matches_family_when_expected_is_unknown(self):
+        self.assertTrue(lib.model_matches(None, "opus", "claude-opus-4-6"))
+        self.assertTrue(lib.model_matches(None, "opus[1m]", "claude-opus-4-6"))
+        self.assertFalse(lib.model_matches(None, "opus", "claude-sonnet-4-6"))
+        self.assertFalse(lib.model_matches(None, None, "claude-opus-4-6"))
+        self.assertFalse(lib.model_matches("claude-opus-4-6", "opus", None))
+
+
+class TestHandleFields50(unittest.TestCase):
+    """The epic-50 handle fields: documented in HANDLE_FIELDS, null by default."""
+
+    def test_fields_are_documented(self):
+        for key in ("profile", "model", "effort", "pinned_env"):
+            self.assertIn(key, lib.HANDLE_FIELDS)
+            self.assertIn(key, lib.HANDLE_FIELDS_ADDED_50_01)
+        self.assertEqual(lib.PINNABLE_ENV_KEYS, (
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS"))
+
+    def test_new_handle_accepts_and_copies_them(self):
+        pinned = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80"}
+        h = lib.new_handle(name="n", session_id="s", run_id="r", abs_dir="/d",
+                           transcript_path="/t", stuck_after_s=600,
+                           profile="claude", model="opus", effort="high",
+                           pinned_env=pinned)
+        self.assertEqual((h["profile"], h["model"], h["effort"]),
+                         ("claude", "opus", "high"))
+        self.assertEqual(h["pinned_env"], pinned)
+        self.assertIsNot(h["pinned_env"], pinned)
+        bare = lib.new_handle(name="n", session_id="s", run_id="r", abs_dir="/d",
+                              transcript_path="/t", stuck_after_s=600)
+        for key in lib.HANDLE_FIELDS_ADDED_50_01:
+            self.assertIsNone(bare[key])
+
+    def test_legacy_handle_reads_as_null_without_a_rewrite(self):
+        legacy = {"name": "old", "session_id": "s", "state": "idle"}
+        upgraded = lib.upgrade_handle(legacy)
+        for key in lib.HANDLE_FIELDS_ADDED_50_01:
+            self.assertIsNone(upgraded[key])
+            self.assertNotIn(key, legacy)
+
+
+class TestSpawnPersistsFlagsInFakeAmux(unittest.TestCase):
+    """End to end through the fake amux 0.3.0 Claude path: what amux PERSISTS."""
+
+    def setUp(self):
+        from fake_amux_env import new_env
+        self.env, self.tmp = new_env(tmux_mode="state")
+        self.addCleanup(self.env.teardown)
+        self.ws = self.tmp / "ws"
+        self.ws.mkdir()
+
+    def test_eq_form_lands_in_persisted_cc_flags(self):
+        proc = self.env.run_cli("spawn", "drv", "--dir", str(self.ws),
+                                "--model=opus", "--effort=high", "--", "go")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.env.session_env("ws-drv")["CC_FLAGS"],
+                         "--model opus --effort high")
+        exec_call = next(c for c in self.env.amux_calls() if c[0] == "exec")
+        self.assertNotIn("--model=opus", exec_call)
+
+    def test_fake_amux_models_b1_eq_form_is_not_persisted(self):
+        """The fidelity the normalisation exists for: amux itself drops the
+        `=` form into the first start's extra args, never into CC_FLAGS."""
+        import subprocess as sp
+        proc = sp.run(["amux", "exec", "raw", "--no-attach", "--no-default-model",
+                       "--dir", str(self.ws), "--model=opus", "go"],
+                      capture_output=True, text=True, env=self.env.base_env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.env.session_env("raw")["CC_FLAGS"], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
