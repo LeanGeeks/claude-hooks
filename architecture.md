@@ -47,8 +47,10 @@ relay HTTP API itself.
     questions_git.py             the only module that runs git: claims an id on the upstream, commits/pushes queue files (opt-in, [questions] sync)
     questions_ops.py             withdraw / claim / sync — shared by the MCP server and claude-questions
     questions_listen_lib.py      index + listener runtime: poll loop, watermark, pending retry, git-sync retry
+    epic_driver_lib.py           epic driver (epic 50): all tick logic — ledger, schedule, checks, state, events, session policy, reconcile, alarms, tmux; effects behind one `World`
   bin/
     questions-listen             listener process lifecycle (systemd ExecStart); logic lives in questions_listen_lib.py
+    epic-driver                  epic driver CLI (validate, enable, disable, pause, resume, status, tick, mark, queue); argparse, path setup and the stamp check, then epic_driver_lib (see docs/epic-driver.md)
   settings.json                  permissions allow/deny (+ statusline); hooks merged in by installer
 questions-mcp/
   server.py                      questions MCP server: ask, notify, withdraw, claim (uv --script, registered user-scoped)
@@ -67,6 +69,9 @@ docs/
   questions-prompt-example.md    agent-facing prose for async ask (when/body/options/citing id)
   async-questions.md             operator guide: config, listener, diagnostics, "answer didn't arrive" walkthrough
   questions-contract.md          adopter-facing statement of the six parse-contract rules + --check-contract
+  epic-driver.md                 epic-author and operator guide for the epic driver: ledger, approvals, on/off, attaching, status, alarms, the silent-stall gap
+  prompts/epic-driver-driver.md  role prompt of the epic driver's driver session (installed under ~/.claude/epic-driver/prompts/)
+  prompts/epic-driver-worker.md  role prompt wrapper for the driver's implementer and reviewer sessions
 relay-server/
   relay_server/
     app.py                       FastAPI app: HTTP API + Telegram webhook + update dispatch

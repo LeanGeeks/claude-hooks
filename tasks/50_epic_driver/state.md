@@ -44,7 +44,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | done | 50-04 | P0-7 |
 | 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | done | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
 | 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | done | 50-06, 50-08 | |
-| 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | todo | 50-08, 50-09 | P0-12 (stamps); units |
+| 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | done | 50-08, 50-09 | P0-12 (stamps); units |
 | 50-11 | Workstation root setup (sleep lock with no login) | dropped (P0-6) | — | No file. The id is kept so 50-12 keeps its number. |
 | 50-12 | [Live verification](./50-12-live-verification_human.md) | todo | 50-10 | **human** |
 
@@ -181,3 +181,12 @@ Phase 0 decisions. They stay listed here for the reasoning.
   command carries `git -C <worktree>`; merge conflict ⇒ `merge --abort` in the integration worktree and `HALT`; workers
   may end a rotate turn with `HANDOFF:` (the code already accepted it; now pinned). Architecture §14.3 corrected to
   `queue <step> --to <role>`. Known limit accepted: the push-without-`-C` test is per-line (a second needle test covers it).
+- **2026-11-23 — 50-10 done** (1 review, 1 fix; suite 3056 OK, 2 skipped). Installer feature `epic-driver` (off by
+  default; requires amux, statusline, keep-awake, questions; three units written, none enabled; uninstall keeps the
+  state dir), `stamps.json` written last in every run where the feature is installed (16 entries = the CLI's
+  `STAMPED_FILES`, drift-tested; §17's list lacked `questions_git.py`/`questions_ops.py`), `docs/epic-driver.md`,
+  `docs/installer.md`, top-level `architecture.md`. Sandbox install (temp HOME, feature on): `epic-driver validate`
+  runs from `~/.local/bin` with stamps agreeing; a tampered file is refused. **The real `./install.sh --yes` was
+  re-run** (lead-allowed): the ten selected features updated, installed hooks now match the repo (50-01…50-09 live);
+  `epic-driver` stays off, no unit exists; the install manifest now records `epic-driver` as `skipped` — turn it on
+  with `./install.sh --yes --with epic-driver`.

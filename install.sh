@@ -119,6 +119,7 @@ FEATURES=(
     claude-history
     questions
     daily-review
+    epic-driver
 )
 
 # Full list of hook .py modules this project installs (brd constraint 2.1).
@@ -147,6 +148,7 @@ REQUIRED_HOOKS=(
     "questions_git.py"
     "questions_ops.py"
     "questions_listen_lib.py"
+    "epic_driver_lib.py"
 )
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1189,236 @@ feature_daily_review_cron_probe() {
 }
 
 # ---------------------------------------------------------------------------
+# Feature: epic-driver (epic 50, architecture §17 / §22)
+# ---------------------------------------------------------------------------
+# Runs one epic's step ledger unattended from three systemd user units. The
+# feature copies the CLI, its own module, the three files it carries from the
+# MCP servers, the two role prompts and the units, writes stamps.json, and
+# enables NOTHING: `epic-driver enable <ledger>` does that, gate by gate.
+feature_epic_driver_title()      { echo "Epic driver (unattended step-ledger runner)"; }
+feature_epic_driver_writes()     { echo "~/.local/bin/epic-driver, ~/.claude/epic-driver/, 3 systemd unit files (none enabled)"; }
+feature_epic_driver_default()    { echo "skip"; }  # off by default: it schedules autonomous work
+feature_epic_driver_requires()   { echo "amux statusline keep-awake questions"; }
+feature_epic_driver_modules()    { echo "epic_driver_lib.py"; }
+feature_epic_driver_suboptions() { echo ""; }
+
+feature_epic_driver_probe() {
+    [[ -f "$HOME/.claude/bin/epic-driver" ]]
+}
+
+# The stamp set: "<manifest name>|<path under ~/.claude>". It is exactly the
+# CLI's STAMPED_FILES (.claude/bin/epic-driver), which also lists the
+# questions_git.py / questions_ops.py modules of the notify import closure that
+# architecture §17 does not name; tests/test_unit_installer.py compares the two.
+EPIC_DRIVER_STAMPED=(
+    "epic-driver|bin/epic-driver"
+    "epic_driver_lib.py|hooks/epic_driver_lib.py"
+    "amux_spawn_lib.py|hooks/amux_spawn_lib.py"
+    "claude_event_reducer.py|hooks/claude_event_reducer.py"
+    "keep_awake_hook.py|hooks/keep_awake_hook.py"
+    "questions_store.py|hooks/questions_store.py"
+    "questions_listen_lib.py|hooks/questions_listen_lib.py"
+    "questions_git.py|hooks/questions_git.py"
+    "questions_ops.py|hooks/questions_ops.py"
+    "roles_config.py|hooks/roles_config.py"
+    "statusline.py|statusline/statusline.py"
+    "context_mcp_lib.py|epic-driver/lib/context_mcp_lib.py"
+    "models.json|epic-driver/lib/models.json"
+    "questions_mcp_lib.py|epic-driver/lib/questions_mcp_lib.py"
+    "epic-driver-driver.md|epic-driver/prompts/epic-driver-driver.md"
+    "epic-driver-worker.md|epic-driver/prompts/epic-driver-worker.md"
+)
+
+# _epic_driver_write_stamps — hash every installed file of the stamp set and
+# write ~/.claude/epic-driver/stamps.json (atomically). Fails, naming them, if
+# any file is missing: a manifest that skipped one would let the CLI run with
+# an unchecked import.
+_epic_driver_write_stamps() {
+    local claude_dir="$HOME/.claude"
+    local stamps_file="$claude_dir/epic-driver/stamps.json"
+    local revision
+    revision="$(git -C "$SCRIPT_DIR" describe --always --dirty 2>/dev/null || echo "unknown")"
+    mkdir -p "$claude_dir/epic-driver"
+    python3 - "$stamps_file" "$revision" "$claude_dir" "${EPIC_DRIVER_STAMPED[@]}" <<'PYEOF'
+import hashlib, json, os, sys, tempfile
+from datetime import datetime, timezone
+
+stamps_file, revision, claude_dir = sys.argv[1:4]
+modules, missing = {}, []
+for item in sys.argv[4:]:
+    name, rel = item.split("|", 1)
+    path = os.path.join(claude_dir, rel)
+    try:
+        with open(path, "rb") as fh:
+            modules[name] = {"path": path, "sha256": hashlib.sha256(fh.read()).hexdigest()}
+    except OSError:
+        missing.append(path)
+if missing:
+    sys.stderr.write("epic-driver stamps: installed files missing: %s\n" % ", ".join(missing))
+    sys.exit(1)
+doc = {"revision": revision,
+       "installed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+       "modules": modules}
+fd, tmp = tempfile.mkstemp(prefix=".stamps.", suffix=".tmp", dir=os.path.dirname(stamps_file))
+with os.fdopen(fd, "w") as fh:
+    json.dump(doc, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, stamps_file)
+PYEOF
+}
+
+# _epic_driver_place_files — copy the feature's own files (not the shared
+# modules; those come from the module closure and their owners).
+_epic_driver_place_files() {
+    local claude_dir="$HOME/.claude"
+    local user_bin_dir="$HOME/.local/bin"
+    local lib_dir="$claude_dir/epic-driver/lib"
+    local prompts_dir="$claude_dir/epic-driver/prompts"
+    local src
+
+    for src in \
+        "$SCRIPT_DIR/.claude/bin/epic-driver" \
+        "$SCRIPT_DIR/context-mcp/context_mcp_lib.py" \
+        "$SCRIPT_DIR/context-mcp/models.json" \
+        "$SCRIPT_DIR/questions-mcp/questions_mcp_lib.py" \
+        "$SCRIPT_DIR/docs/prompts/epic-driver-driver.md" \
+        "$SCRIPT_DIR/docs/prompts/epic-driver-worker.md"; do
+        if [[ ! -f "$src" ]]; then
+            log_error "epic-driver: $src not found in the checkout"
+            return 1
+        fi
+    done
+
+    mkdir -p "$claude_dir/bin" "$lib_dir" "$prompts_dir" "$user_bin_dir"
+    cp "$SCRIPT_DIR/.claude/bin/epic-driver" "$claude_dir/bin/epic-driver"
+    chmod +x "$claude_dir/bin/epic-driver"
+    log_info "Installed: epic-driver → $claude_dir/bin/epic-driver"
+    cp "$SCRIPT_DIR/context-mcp/context_mcp_lib.py" "$lib_dir/context_mcp_lib.py"
+    cp "$SCRIPT_DIR/context-mcp/models.json" "$lib_dir/models.json"
+    cp "$SCRIPT_DIR/questions-mcp/questions_mcp_lib.py" "$lib_dir/questions_mcp_lib.py"
+    cp "$SCRIPT_DIR/docs/prompts/epic-driver-driver.md" "$prompts_dir/epic-driver-driver.md"
+    cp "$SCRIPT_DIR/docs/prompts/epic-driver-worker.md" "$prompts_dir/epic-driver-worker.md"
+    log_info "Installed: epic-driver lib (3 files) → $lib_dir, prompts (2 files) → $prompts_dir"
+    ext_symlink_add "$claude_dir/bin/epic-driver" "$user_bin_dir/epic-driver"
+}
+
+# _epic_driver_write_units — the three unit files of architecture §22. Written
+# and daemon-reloaded; never enabled (that is `epic-driver enable`'s job).
+_epic_driver_write_units() {
+    local systemd_user_dir="$HOME/.config/systemd/user"
+    mkdir -p "$systemd_user_dir"
+
+    cat > "$systemd_user_dir/claude-epic-driver.service" << 'EOF'
+[Unit]
+Description=Claude epic driver: one tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+KillMode=process
+TimeoutStartSec=5min
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/epic-driver tick
+EOF
+
+    cat > "$systemd_user_dir/claude-epic-driver.timer" << 'EOF'
+[Unit]
+Description=Claude epic driver tick timer
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+AccuracySec=30s
+Unit=claude-epic-driver.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    cat > "$systemd_user_dir/claude-epic-driver-inhibit.service" << 'EOF'
+[Unit]
+Description=Claude epic driver: block sleep while the driver is on
+
+[Service]
+ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --mode=block --who=claude-epic-driver --why="epic driver is on" sleep infinity
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target
+EOF
+    log_info "Installed systemd units (not enabled): claude-epic-driver.service, claude-epic-driver.timer, claude-epic-driver-inhibit.service"
+    ext_systemd_daemon_reload
+}
+
+feature_epic_driver_install() {
+    log_step "Installing: $(feature_epic_driver_title)"
+    _install_modules "$(feature_epic_driver_modules)" || return 1
+    _epic_driver_place_files || return 1
+    _epic_driver_write_units
+    _epic_driver_write_stamps || return 1
+    log_info "epic-driver installed; it is OFF. Turn it on with: epic-driver enable <ledger>"
+}
+
+feature_epic_driver_uninstall() {
+    log_step "Uninstalling: $(feature_epic_driver_title)"
+
+    local claude_dir="$HOME/.claude"
+    local systemd_user_dir="$HOME/.config/systemd/user"
+    local unit
+    # Stop and disable first (--now), so nothing ticks while the files go.
+    for unit in claude-epic-driver.timer claude-epic-driver-inhibit.service claude-epic-driver.service; do
+        ext_systemd_disable "$unit"
+        rm -f "$systemd_user_dir/$unit"
+    done
+    ext_systemd_daemon_reload
+
+    ext_symlink_remove "$HOME/.local/bin/epic-driver"
+    rm -f "$claude_dir/bin/epic-driver"
+    rm -f "$claude_dir/epic-driver/stamps.json" \
+          "$claude_dir/epic-driver/lib/context_mcp_lib.py" \
+          "$claude_dir/epic-driver/lib/models.json" \
+          "$claude_dir/epic-driver/lib/questions_mcp_lib.py" \
+          "$claude_dir/epic-driver/prompts/epic-driver-driver.md" \
+          "$claude_dir/epic-driver/prompts/epic-driver-worker.md"
+    rm -rf "$claude_dir/epic-driver/lib/__pycache__"   # written when the CLI imports the lib copies
+    rmdir "$claude_dir/epic-driver/lib" "$claude_dir/epic-driver/prompts" \
+          "$claude_dir/epic-driver" 2>/dev/null || true
+    # epic_driver_lib.py goes with the refcounted module removal. The run state,
+    # ~/.local/state/epic-driver/, is the operator's data and is left alone.
+    log_info "epic-driver uninstalled (~/.local/state/epic-driver/ preserved — run state)"
+}
+
+# _epic_driver_finalize_stamps — end of every run in which the feature is on.
+# Shared modules belong to other features and may have been refreshed after the
+# feature's own copy, so the manifest is rewritten last, after every feature ran.
+# A "keep" run refreshes the feature's own files first, so the manifest never
+# vouches for a stale CLI or prompt.
+_epic_driver_finalize_stamps() {
+    local action="${FEATURE_ACTIONS[epic-driver]:-skip}"
+    case "$action" in
+        install|update|keep) ;;
+        *) return 0 ;;
+    esac
+    [[ "${FEATURE_STATE[epic-driver]:-}" == "failed" ]] && return 0
+    if [[ "$action" == "keep" ]]; then
+        _epic_driver_place_files || { _epic_driver_fail; return 0; }
+    fi
+    if _epic_driver_write_stamps; then
+        log_info "epic-driver: stamps.json written (after all features)"
+    else
+        _epic_driver_fail
+    fi
+}
+
+_epic_driver_fail() {
+    log_error "Feature 'epic-driver' failed while writing its stamps"
+    FEATURE_STATE["epic-driver"]="failed"
+    FAILED_FEATURES+=("epic-driver")
+}
+
+# ---------------------------------------------------------------------------
 # Sub-toggle display helpers — title and writes for each sub-toggle id.
 # These are NOT features (not in FEATURES[]) but are referenced by the
 # interactive selector renderer and plan renderer.
@@ -1237,6 +1469,7 @@ declare -A MODULE_OWNERS=(
     [questions_git.py]="questions"
     [questions_ops.py]="questions"
     [questions_listen_lib.py]="questions"
+    [epic_driver_lib.py]="epic-driver"
 )
 
 assert_registry_integrity() {
@@ -4355,6 +4588,10 @@ done
 # Build and write settings (validate-then-replace)
 log_step "Merging and writing settings"
 build_and_write_settings
+
+# The epic-driver stamps go last, after every other feature has installed (their
+# shared modules are what the stamps cover)
+_epic_driver_finalize_stamps
 
 # Write manifest once at end of successful run
 manifest_write

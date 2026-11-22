@@ -86,7 +86,7 @@ from the repo, so the user's hooks really are broken on disk.
 
 ## Feature inventory
 
-Eleven features, in registry (execution) order. The registry order matters:
+Twelve features, in registry (execution) order. The registry order matters:
 `profiles` precedes `amux` because `amux-spawn.bash` sources
 `claude-profiles.bash`.
 
@@ -103,8 +103,9 @@ Eleven features, in registry (execution) order. The registry order matters:
 | `claude-history` | `claude-history` diagnostic tool | install | `~/.local/bin/claude-history` | — |
 | `questions` | Async questions (queue + listener + MCP server) | **skip** | `~/.local/bin/{claude-questions,questions-listen}`, systemd unit file | `telegram` |
 | `daily-review` | Daily permission review (cron launcher) | **skip** | — | `amux` |
+| `epic-driver` | Epic driver (unattended step-ledger runner) | **skip** | `~/.local/bin/epic-driver`, three systemd unit files (none enabled) | `amux`, `statusline`, `keep-awake`, `questions` |
 
-`questions` and `daily-review` default to **skip** on a fresh machine (brd D14)
+`questions`, `daily-review` and `epic-driver` default to **skip** on a fresh machine (brd D14)
 because they schedule ongoing autonomous activity. Every other feature defaults
 to install.
 
@@ -192,6 +193,53 @@ to install.
 
 **`daily-review`**
 - No files installed — the only artifact is the `daily-review-cron` sub-toggle
+
+**`epic-driver`** (epic 50; the operator guide is [epic-driver.md](./epic-driver.md))
+- `~/.claude/bin/epic-driver` — the CLI; `~/.local/bin/epic-driver` symlinks to it
+  (the units' `ExecStart` is the symlink)
+- `~/.claude/hooks/epic_driver_lib.py` — the lib (a module with one owner, so
+  uninstall removes it)
+- `~/.claude/epic-driver/lib/` — `context_mcp_lib.py` and `models.json` (from
+  `context-mcp/`), `questions_mcp_lib.py` (from `questions-mcp/`); the CLI puts
+  this directory on `sys.path`
+- `~/.claude/epic-driver/prompts/` — `epic-driver-driver.md` and
+  `epic-driver-worker.md`, the role prompts (from `docs/prompts/`)
+- `~/.claude/epic-driver/stamps.json` — see below
+- `~/.config/systemd/user/claude-epic-driver.service`, `claude-epic-driver.timer`
+  and `claude-epic-driver-inhibit.service`, followed by a `daemon-reload` through
+  the `ext_systemd_*` seam. **The installer enables none of them**: that is
+  `epic-driver enable <ledger>`, which runs its gates first.
+
+`stamps.json` is `{"revision": "<git describe --always --dirty of the repo>",
+"installed_at": "…", "modules": {"<name>": {"path": "<installed path>",
+"sha256": "…"}}}`. It lists every file the installed CLI imports or reads: the
+CLI itself, `epic_driver_lib.py`, the shared modules other features own
+(`amux_spawn_lib.py`, `claude_event_reducer.py`, `keep_awake_hook.py`, the
+`questions_*` modules and `roles_config.py`, `statusline.py`), the three lib files
+and the two prompts. The CLI hashes each file before it imports anything but the
+standard library; a missing manifest, a missing file or a changed hash is
+`stamp_mismatch` and the driver does nothing (architecture, epic 50, §17).
+
+When `stamps.json` is (re)written:
+
+- **Every run in which the feature is installed or already recorded as installed.**
+  The feature's own install step writes it, and `_epic_driver_finalize_stamps` writes it
+  again at the very end of the run, after every other feature has installed. This
+  holds for a fresh install, an update, and a `keep` run: a run that selects only other
+  features (for example `./install.sh --only keep-awake`, or a `--yes` replay) still
+  refreshes the shared modules and, because `epic-driver` is detected as installed,
+  rewrites the manifest. A `keep` run also re-copies the feature's own files (CLI, lib
+  files, prompts) first, so the manifest never vouches for a stale one.
+- A `keep` happens only when the run installs or updates at least one feature. A run
+  that plans nothing but uninstalls leaves the manifest as it is.
+- **Feature off: no manifest is written or kept.** If `epic-driver` is not installed
+  (never turned on, or uninstalled) and not in the plan, the run writes no
+  `stamps.json`; the feature's files and manifest do not exist, so nothing is stale.
+- **Uninstall** (`--uninstall epic-driver`) stops and disables the units, then removes
+  `stamps.json` with the other files listed above (and `~/.claude/epic-driver/` once it
+  is empty). It leaves `~/.local/state/epic-driver/` (run state) alone.
+- If an installed file the manifest covers is missing when it is written, the run fails
+  the feature (`epic-driver` is reported failed) instead of writing a manifest that skips it.
 
 ---
 
@@ -378,6 +426,7 @@ via the `--uninstall` flag:
 - Removes the feature's entry from the manifest
 
 **What uninstall deliberately never removes:**
+- `~/.local/state/epic-driver/` — the epic driver's run state
 - `~/.claude/profiles.toml` — holds API tokens and the user's profile definitions
 - `~/.claude/projects/` — Claude Code's own per-project session storage
 - `~/.claude/history.jsonl` — Claude Code's command history

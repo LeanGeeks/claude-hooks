@@ -9,6 +9,7 @@ Run this module alone:
     python3 tests/run_all_tests.py --module unit_installer
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -273,8 +274,8 @@ class TestRegistryIntegrity(InstallerTestBase):
         # Inject a fake module into REQUIRED_HOOKS. The array in install.sh is
         # multi-line with ) on its own line, so we insert after the last entry.
         patched = text.replace(
-            '    "questions_listen_lib.py"\n)',
-            '    "questions_listen_lib.py"\n    "fake_orphan_module.py"\n)',
+            '    "epic_driver_lib.py"\n)',
+            '    "epic_driver_lib.py"\n    "fake_orphan_module.py"\n)',
             1,
         )
         self.assertIn("fake_orphan_module.py", patched, "Patch must apply")
@@ -5143,6 +5144,16 @@ def _parse_feature_module_lists() -> dict:
     return found
 
 
+def _parse_feature_requires() -> dict:
+    """Parse `feature_<id>_requires() { echo "a b" }` out of install.sh, keyed by feature id."""
+    by_shell_name = {fid.replace("-", "_"): fid for fid in _parse_features()}
+    return {
+        by_shell_name.get(name, name): reqs.split()
+        for name, reqs in _re.findall(
+            r'feature_(\w+)_requires\(\)\s*\{\s*echo "([^"]*)"', INSTALL_SH.read_text())
+    }
+
+
 def _parse_module_owners() -> dict:
     """Parse `declare -A MODULE_OWNERS=( [mod.py]="a b" ... )` out of install.sh."""
     block = _re.search(r"declare -A MODULE_OWNERS=\((.*?)\n\)",
@@ -5218,9 +5229,25 @@ class TestFeatureModuleClosure(unittest.TestCase):
         import sys
 
         failures = []
-        for feature, modules in sorted(_parse_feature_module_lists().items()):
-            if not modules:
+        lists = _parse_feature_module_lists()
+        requires = _parse_feature_requires()
+
+        def with_requires(feature, seen=None):
+            """The feature's modules plus those of every feature it (transitively) requires:
+            the installer guarantees those are installed whenever the feature is."""
+            seen = set() if seen is None else seen
+            if feature in seen:
+                return []
+            seen.add(feature)
+            mods = list(lists.get(feature, []))
+            for req in requires.get(feature, []):
+                mods += with_requires(req, seen)
+            return mods
+
+        for feature, own in sorted(lists.items()):
+            if not own:
                 continue
+            modules = sorted(set(with_requires(feature)))
             staged = Path(tempfile.mkdtemp(prefix=f"closure-{feature}-"))
             try:
                 for mod in modules:
@@ -5254,6 +5281,249 @@ class TestFeatureModuleClosure(unittest.TestCase):
             "feature module lists that cannot import standalone:\n"
             + "\n".join(failures),
         )
+
+
+# =============================================================================
+# epic-driver feature (epic 50, task 50-10; architecture §17, §22)
+# =============================================================================
+
+#: architecture §22, exactly (the [Service]/[Timer]/[Install] lines of the three units).
+_EPIC_DRIVER_UNITS = {
+    "claude-epic-driver.service": [
+        "[Unit]", "Description=Claude epic driver: one tick", "After=network-online.target", "",
+        "[Service]", "Type=oneshot", "KillMode=process", "TimeoutStartSec=5min",
+        "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin",
+        "ExecStart=%h/.local/bin/epic-driver tick",
+    ],
+    "claude-epic-driver.timer": [
+        "[Unit]", "Description=Claude epic driver tick timer", "",
+        "[Timer]", "OnCalendar=*:0/10", "Persistent=true", "AccuracySec=30s",
+        "Unit=claude-epic-driver.service", "",
+        "[Install]", "WantedBy=timers.target",
+    ],
+    "claude-epic-driver-inhibit.service": [
+        "[Unit]", "Description=Claude epic driver: block sleep while the driver is on", "",
+        "[Service]",
+        'ExecStart=/usr/bin/systemd-inhibit --what=sleep:idle --mode=block --who=claude-epic-driver '
+        '--why="epic driver is on" sleep infinity',
+        "Restart=on-failure", "RestartSec=30", "",
+        "[Install]", "WantedBy=default.target",
+    ],
+}
+
+#: Everything the feature places, relative to the home directory (the units are separate).
+_EPIC_DRIVER_FILES = [
+    ".claude/bin/epic-driver",
+    ".claude/hooks/epic_driver_lib.py",
+    ".claude/epic-driver/lib/context_mcp_lib.py",
+    ".claude/epic-driver/lib/models.json",
+    ".claude/epic-driver/lib/questions_mcp_lib.py",
+    ".claude/epic-driver/prompts/epic-driver-driver.md",
+    ".claude/epic-driver/prompts/epic-driver-worker.md",
+    ".claude/epic-driver/stamps.json",
+]
+
+
+def _cli_stamped_files() -> dict:
+    """STAMPED_FILES of .claude/bin/epic-driver (the CLI is the authority on what it checks)."""
+    from importlib.machinery import SourceFileLoader
+    mod = SourceFileLoader("epic_driver_cli_for_installer_test",
+                           str(REPO / ".claude" / "bin" / "epic-driver")).load_module()
+    return dict(mod.STAMPED_FILES)
+
+
+class TestEpicDriverFeature(InstallerTestBase):
+    """The epic-driver installer feature, under CLAUDE_INSTALL_NO_EXTERNAL=1."""
+
+    def _install(self, extra=None, repo_copy=None):
+        env = _make_fake_uv(self.tmp_home)
+        if repo_copy is not None:
+            env["CLAUDE_INSTALL_SCRIPT_DIR"] = str(repo_copy)
+        return run_installer(self.tmp_home, extra_args=["--only", "epic-driver", "--yes"] + (extra or []),
+                             extra_env=env)
+
+    def _stamps(self) -> dict:
+        return json.loads((self.tmp_home / ".claude" / "epic-driver" / "stamps.json").read_text())
+
+    def test_off_by_default_and_a_replay_does_not_turn_it_on(self):
+        text = INSTALL_SH.read_text()
+        self.assertIn('feature_epic_driver_default()    { echo "skip"; }', text)
+        listing = run_installer(self.tmp_home, extra_args=["--list"])
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        row = [ln for ln in listing.stdout.splitlines() if "epic-driver" in ln]
+        self.assertTrue(row, "--list must show the epic-driver feature")
+        self.assertIn("skip", row[0])
+        # a recorded selection without it: the replay reports it as newly offered, installs nothing
+        env = _make_fake_uv(self.tmp_home)
+        self.assertEqual(run_installer(self.tmp_home, ["--only", "statusline", "--yes"], env).returncode, 0)
+        replay = run_installer(self.tmp_home, ["--yes"], env)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertFalse((self.tmp_home / ".claude" / "bin" / "epic-driver").exists())
+        self.assertFalse((self.tmp_home / ".claude" / "epic-driver").exists())
+        self.assertFalse((self.tmp_home / ".config" / "systemd" / "user" / "claude-epic-driver.timer").exists())
+
+    def test_requires_and_registry(self):
+        text = INSTALL_SH.read_text()
+        self.assertIn('feature_epic_driver_requires()   { echo "amux statusline keep-awake questions"; }', text)
+        self.assertEqual(_parse_module_owners()["epic_driver_lib.py"], ["epic-driver"])
+        self.assertIn("epic_driver_lib.py", _parse_feature_module_lists()["epic-driver"])
+        self.assertEqual(sorted(_parse_feature_requires()["epic-driver"]),
+                         ["amux", "keep-awake", "questions", "statusline"])
+
+    def test_on_places_every_file_and_the_three_units_and_enables_none(self):
+        result = self._install()
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        self.assertNotIn("Registry:", out)
+        for rel in _EPIC_DRIVER_FILES:
+            self.assertTrue((self.tmp_home / rel).is_file(), f"missing {rel}")
+        self.assertTrue(os.access(str(self.tmp_home / ".claude" / "bin" / "epic-driver"), os.X_OK))
+        # the CLI is the repo's, byte for byte; the three lib files and two prompts likewise
+        for dst, src in [
+            (".claude/bin/epic-driver", ".claude/bin/epic-driver"),
+            (".claude/hooks/epic_driver_lib.py", ".claude/hooks/epic_driver_lib.py"),
+            (".claude/epic-driver/lib/context_mcp_lib.py", "context-mcp/context_mcp_lib.py"),
+            (".claude/epic-driver/lib/models.json", "context-mcp/models.json"),
+            (".claude/epic-driver/lib/questions_mcp_lib.py", "questions-mcp/questions_mcp_lib.py"),
+            (".claude/epic-driver/prompts/epic-driver-driver.md", "docs/prompts/epic-driver-driver.md"),
+            (".claude/epic-driver/prompts/epic-driver-worker.md", "docs/prompts/epic-driver-worker.md"),
+        ]:
+            self.assertEqual((self.tmp_home / dst).read_bytes(), (REPO / src).read_bytes(), dst)
+        # the symlink goes through ext_symlink_add (not created under NO_EXTERNAL; the seam says so)
+        self.assertIn("[NO_EXTERNAL] ext_symlink_add: would create symlink "
+                      f"{self.tmp_home}/.local/bin/epic-driver -> {self.tmp_home}/.claude/bin/epic-driver", out)
+        unit_dir = self.tmp_home / ".config" / "systemd" / "user"
+        for name, lines in _EPIC_DRIVER_UNITS.items():
+            self.assertEqual((unit_dir / name).read_text().splitlines(), lines, name)
+        # daemon-reload went through the seam; no unit was enabled or started
+        self.assertIn("ext_systemd_daemon_reload", out)
+        self.assertNotIn("ext_systemd_enable", out)
+        self.assertEqual([p.name for p in unit_dir.iterdir() if p.is_dir() or p.is_symlink()], [])
+        self.assertFalse((self.tmp_home / ".local" / "state" / "epic-driver").exists())
+        # the probe sees it, and the manifest records it
+        self.assertTrue(run_probe(self.tmp_home, "epic-driver"))
+        self.assertEqual(read_manifest(self.tmp_home)["features"]["epic-driver"]["state"], "installed")
+
+    def test_stamps_match_the_installed_files_and_cover_what_the_cli_checks(self):
+        self.assertEqual(self._install().returncode, 0)
+        stamps = self._stamps()
+        self.assertEqual(set(stamps), {"revision", "installed_at", "modules"})
+        self.assertTrue(stamps["revision"])
+        claude = self.tmp_home / ".claude"
+        expected = _cli_stamped_files()
+        self.assertTrue(set(expected) <= set(stamps["modules"]),
+                        f"stamps.json lacks {set(expected) - set(stamps['modules'])}")
+        for name, rel in expected.items():
+            entry = stamps["modules"][name]
+            self.assertEqual(entry["path"], str(claude / rel), name)
+            self.assertEqual(entry["sha256"], hashlib.sha256((claude / rel).read_bytes()).hexdigest(), name)
+        for name, entry in stamps["modules"].items():
+            self.assertEqual(entry["sha256"], hashlib.sha256(Path(entry["path"]).read_bytes()).hexdigest(), name)
+
+    def test_stamps_installer_list_equals_the_cli_list(self):
+        block = _re.search(r"EPIC_DRIVER_STAMPED=\((.*?)\n\)", INSTALL_SH.read_text(), _re.DOTALL)
+        self.assertIsNotNone(block)
+        listed = dict(item.split("|", 1) for item in _re.findall(r'"([^"]+\|[^"]+)"', block.group(1)))
+        self.assertEqual(listed, _cli_stamped_files())
+
+    def test_reinstall_after_another_features_module_changed_updates_the_manifest(self):
+        repo_copy = self.tmp_home / "repo-copy"
+        shutil.copytree(str(REPO), str(repo_copy), ignore=shutil.ignore_patterns(
+            ".git", "tests", "agents_output", "tasks", "temp", "__pycache__", "node_modules", ".venv"))
+        self.assertEqual(self._install(repo_copy=repo_copy).returncode, 0)
+        before = self._stamps()["modules"]["keep_awake_hook.py"]["sha256"]
+        mod = repo_copy / ".claude" / "hooks" / "keep_awake_hook.py"
+        mod.write_text(mod.read_text() + "\n# changed by the test\n")
+        result = self._install(repo_copy=repo_copy)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        after = self._stamps()["modules"]["keep_awake_hook.py"]["sha256"]
+        self.assertNotEqual(before, after)
+        installed = self.tmp_home / ".claude" / "hooks" / "keep_awake_hook.py"
+        self.assertEqual(after, hashlib.sha256(installed.read_bytes()).hexdigest())
+
+    def test_stamps_are_written_after_a_later_feature_changes_a_covered_module(self):
+        """Not tied to epic-driver being the last registry entry: in a patched copy of the
+        installer statusline is moved AFTER epic-driver (and dropped from its requires, which
+        the registry-integrity check would otherwise reject). statusline copies its own
+        file (not part of the up-front module closure) after epic-driver's install step, and
+        statusline.py is stamped; the manifest must still match the final installed bytes."""
+        repo_copy = self.tmp_home / "repo-copy"
+        shutil.copytree(str(REPO), str(repo_copy), ignore=shutil.ignore_patterns(
+            ".git", "tests", "agents_output", "tasks", "temp", "__pycache__", "node_modules", ".venv"))
+        self.assertEqual(self._install(repo_copy=repo_copy).returncode, 0)   # everything installed once
+        script = repo_copy / "install.sh"
+        text = script.read_text()
+        for old, new in [
+            ("FEATURES=(\n    statusline\n", "FEATURES=(\n"),
+            ("    epic-driver\n)", "    epic-driver\n    statusline\n)"),
+            ('{ echo "amux statusline keep-awake questions"; }', '{ echo "amux keep-awake questions"; }'),
+        ]:
+            self.assertIn(old, text)
+            text = text.replace(old, new, 1)
+        script.write_text(text)
+        mod = repo_copy / ".claude" / "statusline" / "statusline.py"
+        mod.write_text(mod.read_text() + "\n# changed by the test, after epic-driver ran\n")
+        old_sha = self._stamps()["modules"]["statusline.py"]["sha256"]
+        env = _make_fake_uv(self.tmp_home)
+        env["CLAUDE_INSTALL_SCRIPT_DIR"] = str(repo_copy)
+        # replay of the recorded selection, running the PATCHED script (run_installer runs the repo's)
+        result = subprocess.run(
+            ["bash", str(script), "--yes"], capture_output=True, text=True, cwd=str(repo_copy), timeout=60,
+            env={**os.environ, "HOME": str(self.tmp_home), "CLAUDE_INSTALL_NO_EXTERNAL": "1",
+                 "CLAUDE_INSTALL_ASSUME_TTY": "0", **env})
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        self.assertNotIn("Registry:", out)
+        # the patched order really ran epic-driver before statusline
+        self.assertLess(out.index("Installing: Epic driver"), out.rindex("Installing: Statusline"), out)
+        installed = self.tmp_home / ".claude" / "statusline" / "statusline.py"
+        self.assertEqual(installed.read_bytes(), mod.read_bytes())
+        entry = self._stamps()["modules"]["statusline.py"]
+        self.assertNotEqual(entry["sha256"], old_sha)
+        self.assertEqual(entry["sha256"], hashlib.sha256(installed.read_bytes()).hexdigest())
+
+    def test_a_replay_keeps_the_stamps_current(self):
+        self.assertEqual(self._install().returncode, 0)
+        stamps_path = self.tmp_home / ".claude" / "epic-driver" / "stamps.json"
+        stamps_path.write_text("{}")
+        replay = run_installer(self.tmp_home, ["--yes"], _make_fake_uv(self.tmp_home))
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertIn("epic-driver", self._stamps()["modules"])
+        self.assertIn("stamps.json written", replay.stdout)
+
+    def test_the_guide_and_the_installer_doc_cover_the_feature(self):
+        guide = (REPO / "docs" / "epic-driver.md").read_text()
+        for needle in ("epic-driver enable", "./install.sh", "startup_dialogs", "amux-spawn a ",
+                       "silent-stall gap", "last_tick", "last tick", "architecture.md#162-catalogue",
+                       "D1", "mark --grant", "$EPIC_DRIVER_SSH_OPTS", "20 minutes"):
+            self.assertIn(needle, guide, f"docs/epic-driver.md lacks {needle!r}")
+        installer_doc = (REPO / "docs" / "installer.md").read_text()
+        for needle in ("`epic-driver`", "stamps.json", "claude-epic-driver.timer", "~/.local/state/epic-driver/"):
+            self.assertIn(needle, installer_doc)
+        self.assertIn("epic_driver_lib.py", (REPO / "architecture.md").read_text())
+
+    def test_uninstall_removes_files_and_units_and_keeps_the_state_directory(self):
+        self.assertEqual(self._install().returncode, 0)
+        state = self.tmp_home / ".local" / "state" / "epic-driver" / "run-1"
+        state.mkdir(parents=True)
+        (state / "state.json").write_text("{}")
+        # running the installed CLI leaves a bytecode cache in the lib directory
+        pycache = self.tmp_home / ".claude" / "epic-driver" / "lib" / "__pycache__"
+        pycache.mkdir()
+        (pycache / "context_mcp_lib.cpython-312.pyc").write_bytes(b"x")
+        result = run_installer(self.tmp_home, ["--uninstall", "epic-driver", "--yes"],
+                               _make_fake_uv(self.tmp_home))
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, out)
+        for rel in _EPIC_DRIVER_FILES:
+            self.assertFalse((self.tmp_home / rel).exists(), f"{rel} left behind")
+        self.assertFalse((self.tmp_home / ".claude" / "epic-driver").exists())
+        unit_dir = self.tmp_home / ".config" / "systemd" / "user"
+        for name in _EPIC_DRIVER_UNITS:
+            self.assertFalse((unit_dir / name).exists(), name)
+            self.assertIn(f"ext_systemd_disable: would disable {name}", out)
+        self.assertTrue((state / "state.json").is_file(), "the run state must survive an uninstall")
+        self.assertFalse(run_probe(self.tmp_home, "epic-driver"))
 
 
 if __name__ == "__main__":
