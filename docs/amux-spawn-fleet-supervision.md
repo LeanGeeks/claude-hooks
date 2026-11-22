@@ -324,6 +324,10 @@ The most recent `stop` event carries the worker's final `last_message` and
 `state`. A `turn_start` with no following `stop` means a turn is currently
 open.
 
+`session_end` reads `terminated` only until the next `turn_start`: a
+session that ended and was resumed reads `running`/`idle` again, and a later
+`session_end` marks it terminated again.
+
 ### Tell "no events" from "no worker"
 
 ```bash

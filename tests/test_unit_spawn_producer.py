@@ -778,6 +778,27 @@ class TestUserPromptSubmit(unittest.TestCase):
                 h = lib.read_handle("proj-2")
                 self.assertEqual(h["state"], "running")
 
+    def test_turn_start_on_terminated_handle_writes_running(self):
+        """P0-4: UserPromptSubmit on a stored-terminated handle (resumed
+        session) writes running and appends a turn_start event."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                tpath = tmp / "proj" / "sid.jsonl"
+                _write_transcript(tpath)
+                h0 = _seed_handle("proj-2", "/ws/proj", str(tpath))
+                h0["state"] = "terminated"
+                lib.write_handle("proj-2", h0)
+
+                code = _run("UserPromptSubmit", {}, amux_name="proj-2")
+                self.assertEqual(code, 0)
+
+                self.assertEqual(lib.read_handle("proj-2")["state"], "running")
+                log = lib.SPAWN_DIR / "proj-2.lifecycle.jsonl"
+                events = [json.loads(l) for l in log.read_text().splitlines() if l]
+                self.assertEqual(events[-1]["event"], "turn_start")
+
     def test_turn_start_is_handle_gated(self):
         """UserPromptSubmit with no tracked handle produces nothing."""
         with tempfile.TemporaryDirectory() as d:

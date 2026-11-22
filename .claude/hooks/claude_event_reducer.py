@@ -21,7 +21,7 @@ stating, or parsing the worker's transcript.
 +-----------------------------------------------------+-------------------+
 | Evidence in the log                                 | ``state_hint``    |
 +=====================================================+===================+
-| ``session_end`` seen                                | ``"terminated"``  |
+| ``session_end`` seen, no later ``turn_start``       | ``"terminated"``  |
 +-----------------------------------------------------+-------------------+
 | ``turn_start`` not yet closed by a ``stop``         | ``"running"``     |
 +-----------------------------------------------------+-------------------+
@@ -37,6 +37,12 @@ stating, or parsing the worker's transcript.
 |                                                     | (caller uses      |
 |                                                     | stored state)     |
 +-----------------------------------------------------+-------------------+
+
+The ``terminated`` latch is not permanent (epic 50, P0-4): a ``turn_start``
+after a ``session_end`` clears it, so a session that ended and was resumed
+reads ``running``/``idle`` again by the normal rules; a later ``session_end``
+sets it again.  A partial (truncated) tail line is never parsed, so it cannot
+clear the latch.
 
 The watchdog (``stale_activity``) is derived **at read time** by the caller
 and is **never appended** to the log (state.md §12 / architecture §7 inv 12).
@@ -159,6 +165,8 @@ def reduce_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 
         if etype == EVENT_TURN_START:
             out["turn_open"] = True
+            # A turn after session_end is a resumed session: clear the latch.
+            out["terminated"] = False
             # A new turn starting means any prior permission gate was resolved.
             out["permission_pending"] = False
 

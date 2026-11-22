@@ -366,6 +366,25 @@ class TestReactivation(unittest.TestCase):
                 self.assertFalse(r["signals"]["open_turn"])
 
 
+class TestResumedAfterSessionEnd(unittest.TestCase):
+    def test_spawning_handle_with_session_end_then_turn_start_reads_running(self):
+        """P0-4: a resumed session (stored spawning, log session_end then
+        turn_start) reads running from the reducer, not terminated."""
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            with _redirect_amux_home(tmp):
+                lib.ensure_dirs()
+                h = _seed_handle("p-2", "/ws/p", "/ws/p/sid.jsonl",
+                                 state="spawning", background_tasks=[])
+                _write_lifecycle_log(lib.SPAWN_DIR, "p-2", [
+                    _make_lifecycle_event("session_end", "terminated", seq=1),
+                    _make_lifecycle_event("turn_start", "running", seq=2),
+                ])
+                with patch.object(lib, "tmux_has_session", return_value=True):
+                    r = cli._derive_status(h, None)
+                self.assertEqual(r["state"], "running")
+
+
 class TestHungFirstTurn(unittest.TestCase):
     def test_spawning_old_activity_goes_stuck(self):
         """A spawning handle with no events and an old created_at goes stuck.

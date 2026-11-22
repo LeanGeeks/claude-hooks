@@ -223,14 +223,49 @@ class TestReduceEventsSessionEnd(unittest.TestCase):
         self.assertTrue(r["terminated"])
         self.assertFalse(r["turn_open"])
 
-    def test_terminated_dominates_open_turn(self):
-        """session_end wins even if we later see a stale turn_start (edge case)."""
-        events = [_ev("turn_start"), _ev("session_end"), _ev("turn_start")]
-        r = reducer.reduce_events(events)
-        # Terminated is set; state_hint must be terminated because we set
-        # turn_open=True again but then the hint logic checks terminated first.
-        # Note: turn_open is technically True here, but state_hint is still
-        # terminated because the check is ordered: terminated → running → …
+    def test_turn_start_after_session_end_clears_latch(self):
+        """P0-4: a turn_start after session_end is a resumed session."""
+        r = reducer.reduce_events(
+            [_ev("turn_start"), _ev("session_end"), _ev("turn_start")])
+        self.assertEqual(r["state_hint"], "running")
+        self.assertFalse(r["terminated"])
+        self.assertTrue(r["turn_open"])
+
+    def test_turn_open_before_session_end_stays_terminated(self):
+        """A turn opened BEFORE session_end (no stop) does not clear the latch."""
+        r = reducer.reduce_events([_ev("turn_start"), _ev("session_end")])
+        self.assertEqual(r["state_hint"], "terminated")
+        self.assertTrue(r["terminated"])
+
+    def test_session_end_alone_terminated(self):
+        r = reducer.reduce_events([_ev("session_end")])
+        self.assertEqual(r["state_hint"], "terminated")
+        self.assertTrue(r["terminated"])
+
+    def test_resumed_then_stop_is_idle(self):
+        r = reducer.reduce_events([
+            _ev("session_end"), _ev("turn_start"),
+            _ev("stop", background_tasks_count=0)])
+        self.assertEqual(r["state_hint"], "idle")
+        self.assertFalse(r["terminated"])
+
+    def test_second_session_end_latches_again(self):
+        r = reducer.reduce_events([
+            _ev("session_end"), _ev("turn_start"),
+            _ev("stop", background_tasks_count=0), _ev("session_end")])
+        self.assertEqual(r["state_hint"], "terminated")
+        self.assertTrue(r["terminated"])
+
+    def test_partial_tail_after_session_end_does_not_clear(self):
+        with tempfile.TemporaryDirectory() as d:
+            spawn = Path(d)
+            log = spawn / f"w1{reducer.CLAUDE_EVENT_SUFFIX}"
+            log.write_text(
+                json.dumps(_ev("session_end")) + "\n"
+                + '{"event": "turn_start", "state": "runn')
+            r = reducer.reduce_log(spawn, "w1")
+        self.assertTrue(r["truncated_tail"])
+        self.assertTrue(r["terminated"])
         self.assertEqual(r["state_hint"], "terminated")
 
 

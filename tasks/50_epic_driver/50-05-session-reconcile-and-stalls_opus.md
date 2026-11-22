@@ -20,6 +20,9 @@ In `epic_driver_lib.py`:
 1. **Session readings** (§11.1): one `SessionReading` per session record and per handle of the run id, built through
    `World` (tmux display of `pane_dead`, `pane_in_mode`, `session_attached`, `pane_pid`; the derived state; the
    handle's `last_message`; the 50-03 helpers).
+   Note (50-02 review): `_derive_claude_status` still short-circuits to `terminated` on a stored `terminated` handle
+   ahead of the reducer, until the next `UserPromptSubmit` (or a resume's `spawning`) rewrites it; read liveness from
+   tmux (`pane_dead`, session present) and the reducer, never from the stored state alone.
 2. **Verdict parser** (§10): the full grammar, merged-event coverage, the invalid cases (code fence, two lines,
    unknown step, `HANDOFF` outside rotate, `DONE` from the driver), exemptions (no event id in the turn's prompt; the
    ping). Application to the state: `ADVANCED` → `verifying` (approval ids: verified against `state.grants`),
