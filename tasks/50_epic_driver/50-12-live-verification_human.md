@@ -31,7 +31,7 @@ OQ-2. (Task 50-11 was dropped with P0-6; this task keeps its id.)
    --grant` lands in the state; a second question withdrawn closes (use a question with buttons: the no-button path
    needs task 49's relay redeploy — review m7).
 9. **A never-seen worktree** (review m9): a worker spawned unattended into a fresh worktree path runs its seeded
-   prompt (no trust dialog stalls it; if one does, record it — `delivery_unconfirmed` must fire).
+   prompt (no trust dialog stalls it; if one does, record it — `startup_dialog` must fire and nothing is typed into it).
 10. **The toy ledger end to end**: every step done, verdicts in the log, each check re-run before done, the worker step
     merged into `epic/<epic>` with the sha check passing, nothing in the scratch repo's primary checkout changed, no
     force-push in the remote's reflog.
@@ -40,5 +40,9 @@ OQ-2. (Task 50-11 was dropped with P0-6; this task keeps its id.)
     attempt.
 12. **Liveness by hand** (P0-11): with the timer stopped for 30 min, `epic-driver status` shows the stale
     `last_tick_at`; after a forced tick error it shows that error. No daily line is ever sent.
+13. **A startup dialog** (lead note, 2026-11-22): a session spawned while Claude Code shows a startup dialog (the
+    "Code Mode (experimental)" opt-in if the installed version still shows it, otherwise any dialog that blocks the
+    seed). Unlisted: `startup_dialog` reaches Telegram, nothing is answered or typed. Listed in the toy ledger's
+    `startup_dialogs` with its safe default: answered once, the seeded prompt runs, no alarm.
 
 Record in a sibling `50-12-signoff-evidence.md` (commands, timestamps, screenshots where useful).

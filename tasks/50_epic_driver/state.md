@@ -35,7 +35,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 
 | # | Task | Status | Depends on | Notes |
 |---|------|--------|------------|-------|
-| 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | todo | Phase 0 | P0-3, P0-9 (spawn side) |
+| 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | in_progress | Phase 0 | P0-3, P0-9 (spawn side) |
 | 50-02 | [Lifecycle: clear the `terminated` latch](./50-02-lifecycle-terminated-latch_sonnet.md) | todo | Phase 0 | P0-4 |
 | 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | todo | Phase 0 | context, cache TTL, compaction, last assistant entry |
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | todo | Phase 0 | P0-10, P0-13 (selection side) |
@@ -108,3 +108,10 @@ Phase 0 decisions. They stay listed here for the reasoning.
   autocompact 65 with idle compaction pinned to 300000 and `cap < both` validated; a `stamps.json` manifest; `epic-driver
   queue` for driver → worker feedback; a driver `HALT` and usage limits as `ack=True` alarms). The folder is handed
   over to the implementation manager.
+- **2026-11-22 — startup dialogs added (lead note).** At the manager session's own start Claude Code showed a
+  "Code Mode (experimental)" opt-in (Enter = "No, start without it") that blocked the seeded prompt until the lead
+  pressed Enter. Spawned sessions can sit on such dialogs (this one, folder trust, others). Added: architecture §12.11
+  (detect on the pane at spawn/resume while the prompt is unconfirmed), the `startup_dialog` alarm (§16.2), the ledger
+  key `startup_dialogs` (§5.2, §5.5; empty by default, so nothing is auto-answered unless listed). Scope: 50-04
+  (schema), 50-05 (classifier, condition), 50-06 (the one listed key, committed before the send), 50-12 check 13
+  (and check 9 now expects `startup_dialog`). The implementation manager started 50-01.

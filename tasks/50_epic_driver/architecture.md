@@ -143,6 +143,7 @@ edits it; grants and progress live in the runtime state (P0-13).
 | `notify` | map | no | `role`: the questions role for alarms and heartbeats, default the workspace default. (No daily alive line exists, P0-11.) |
 | `roles` | map role → §5.3 | yes | must contain `driver` |
 | `resources` | map name → int | no | named caps (`mirror: 2`) |
+| `startup_dialogs` | list of `{id, match, key}` | no | known-safe startup dialogs the tick may answer (§12.11). `id` `[a-z0-9-]+`, unique; `match` a regex that must match the captured pane, including the highlighted safe option; `key` one of `Enter`, `Escape`. Default empty: no dialog is ever answered. |
 | `approvals` | ordered map id → `{conditions: [step_id]}` | no | standing approvals; **map order is ask order** (P0-13). No `granted` key: grants live in the runtime state |
 | `steps` | list of §5.4 | yes | the program |
 
@@ -208,7 +209,8 @@ and unique by `realpath`; `name` defaults to the basename and must be unique (P0
 - resources: an unknown resource, or a request above its cap;
 - repos: a relative or duplicate path, a duplicate `name`, a path that is not a git work tree (`enable` and the tick
   also verify `base_ref` with `git rev-parse --verify <base_ref>^{commit}`);
-- compaction: a role whose `cap` is not below its compaction point (§11.6).
+- compaction: a role whose `cap` is not below its compaction point (§11.6);
+- startup dialogs: a duplicate `id`, a `match` that does not compile, a `key` outside `Enter`/`Escape`.
 
 Warnings (printed, not fatal): a driver step with no `check`; a `check` that calls `ssh` without `ConnectTimeout`.
 
@@ -696,6 +698,17 @@ All from ground truth, each pass, for every session record and every handle of t
 10. **Infrastructure**: the listener (`systemctl --user is-active claude-questions-listen.service`; one `start`
     attempt, then `listener_down`), the inhibitor (§22; one `start` attempt, then `inhibitor_down`), the tmux
     server (§21).
+11. **Startup dialogs** (lead note, 2026-11-22). Claude Code can open an interactive dialog at startup — an opt-in
+    such as "Code Mode (experimental)" (Enter = "No, start without it"), folder trust, others — and it blocks the seeded
+    prompt until someone answers. For every session spawned or resumed whose seed/resume prompt is not yet confirmed
+    (§9.3 confirmation), the tick captures the pane (`tmux capture-pane -p -t =amux-<name>:`) and classifies it with a
+    pure parser pinned by captured fixtures: *no dialog*, *dialog* (a selection menu or confirmation that is not the
+    input box), or *unreadable*. A dialog ⇒ `startup_dialog` alarm, detail = the dialog's first lines. The tick
+    **never answers a dialog**, except one whose capture matches a `startup_dialogs` entry of the ledger (§5.2): then it
+    sends that entry's `key` once per spawn/resume and dialog id (recorded in the session record before the send,
+    invariant 5), with no alarm; if the same dialog is still there on the next pass, the alarm is raised and no second
+    key is sent. A pane showing a dialog is never a delivery target (§9.3: it is not an empty input box). Folder trust
+    is a security decision and belongs in no default list.
 
 ## 13. amux-spawn and lifecycle changes (P0-3, P0-4, D13)
 
@@ -888,6 +901,7 @@ All alarms are sent with `ack=True` (P0-8).
 | `resume_failed` | session | `amux-spawn resume` failed or the transcript did not grow | resumed |
 | `model_mismatch` | session | the first assistant model after a spawn/resume ≠ expected (§12.5) | the session is reaped or rotated |
 | `compaction` | session | a compact boundary after spawn/resume (§11.6) | the rotation that follows completes |
+| `startup_dialog` | session | a startup dialog on the pane of a spawned/resumed session whose prompt is unconfirmed, not listed in `startup_dialogs` or still there after its one listed key (§12.11) | the dialog is gone from the pane |
 | `foreign_handle` | handle | a handle with this run id that the tick did not create | the handle is gone |
 | `orphan_session` | name | a session named by this run's grammar with no record and no handle | it is gone |
 | `worktree_refused` | step | §14.1/§14.2 refusals | the condition goes |

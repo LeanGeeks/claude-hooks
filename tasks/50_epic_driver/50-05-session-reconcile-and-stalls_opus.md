@@ -35,10 +35,16 @@ In `epic_driver_lib.py`:
    boundaries after spawn/resume (§11.6); permission prompt / `AskUserQuestion` open > 10 min; clock (boot id, NTP
    jump, suspend) with stuck suppression for one tick; foreign handles and orphan sessions (alarm only, never adopt —
    review m4).
-5. **Question reconcile** (§15.2): statuses through `questions_store.open_store(workspace).all_entries()` for the ids
+5. **Startup dialogs** (§12.11, lead note 2026-11-22): for a spawned/resumed session whose prompt is unconfirmed,
+   classify the captured pane (no dialog / dialog / unreadable) with a pure parser pinned by captured fixtures of the
+   installed Claude Code version (at least the "Code Mode (experimental)" opt-in and the folder-trust dialog);
+   match it against the ledger's `startup_dialogs`; produce either the `startup_dialog` condition or, for a listed
+   dialog not yet answered for this spawn/resume, a "answer once with `key`" item for 50-06. Never an answer for an
+   unlisted dialog.
+6. **Question reconcile** (§15.2): statuses through `questions_store.open_store(workspace).all_entries()` for the ids
    in `state.questions`; one `answer` event item per newly resolved id; withdrawn closes and frees
    `approval_question`.
-6. Output: alarm **conditions** (`(id, subject, detail)`) and event **items** for the dispatcher; nothing is sent or
+7. Output: alarm **conditions** (`(id, subject, detail)`) and event **items** for the dispatcher; nothing is sent or
    notified in this task.
 
 ## Tests
@@ -58,6 +64,9 @@ Fixture transcripts, lifecycle logs, handles and captured `tmux display` values;
 - `AskUserQuestion` in flight 11 min raises; 9 min does not. Permission prompt likewise.
 - Clock: boot id change ⇒ reboot facts (which sessions had a turn open or a step in flight).
 - Orphan: a grammar name in `amux ls` with no record ⇒ condition, no adoption. Foreign handle ⇒ condition.
+- Startup dialogs: an unlisted dialog ⇒ condition, no answer item; a listed one ⇒ one answer item, then the
+  condition if it is still there next pass and no second item; a confirmed prompt ⇒ no capture classified; the input
+  box and an unreadable pane are not dialogs; the dialog gone ⇒ cleared.
 - Questions: resolved ⇒ one answer item, not repeated next pass; withdrawn ⇒ closed, no item.
 
 ## Done when

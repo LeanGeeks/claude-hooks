@@ -41,6 +41,8 @@ New module `.claude/hooks/epic_driver_lib.py` (this task creates it; later tasks
    §4 (`state_root()`, `state_dir(run_id)`, honouring an env override for tests).
 7. Constants of the architecture (*defaults*) as module-level names, in one block.
 
+Also: the ledger key `startup_dialogs` (architecture §5.2, §5.5) — schema and validation only; 50-05 and 50-06 use it.
+
 Out of scope: sessions, delivery, verdict parsing, alarms' notify side, the CLI.
 
 ## Tests

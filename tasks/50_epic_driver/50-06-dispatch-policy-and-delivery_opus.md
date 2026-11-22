@@ -37,7 +37,10 @@ In `epic_driver_lib.py`:
 8. **Commit points** (§23 step 6): event file + outbox entry + inflight markers + session record (`spawning`/
    `resuming`) committed before the side effect, the result committed after. Expressed as a sequence of
    `(state mutation, effect)` pairs that 50-08's tick executes, so a fake `World` can kill the pass between any two.
-9. The `feedback` event built from an `epic-driver queue` request (OQ-4) — the request is stored in the state by the
+9. **Startup-dialog answer** (§12.11): the 50-05 item becomes one `(state mutation, effect)` pair — the dialog id
+   recorded as answered in the session record, then one key (`Enter`/`Escape`) sent with `tmux send-keys`. At most
+   once per spawn/resume and dialog id; a pane showing a dialog is never a delivery target.
+10. The `feedback` event built from an `epic-driver queue` request (OQ-4) — the request is stored in the state by the
    CLI (50-08); this task turns it into an event under the same policy.
 
 ## Tests
@@ -50,6 +53,8 @@ In `epic_driver_lib.py`:
 - Delivery: copy-mode defers; typed text in the input box defers (attached and detached); a multi-line draft defers;
   an unparseable pane defers; 3 deferrals ⇒ condition; confirm on first send; retry once when absent; no third
   send; a line sitting in the input box is not re-sent.
+- Startup dialog: the listed key is sent once, recorded before the send; a crash between the commit and the send
+  never sends a second key; no event is typed while a dialog shows.
 - Keep-warm: inside and outside the 40–50 min window; next event inside and outside `k·B/C`; Fable vs Opus `k`;
   overage and limits suppress.
 - Crash safety: killing the pass between each commit and its effect, then running the next pass, never sends an event
