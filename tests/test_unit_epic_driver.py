@@ -1747,13 +1747,25 @@ class TestModuleContract(unittest.TestCase):
         src = (_REPO / ".claude" / "hooks" / "epic_driver_lib.py").read_text()
         code = re.sub(r"#[^\n]*", "", re.sub(r'""".*?"""', "", src, flags=re.S))
         self.assertIn("def run_check", code)   # the stripping kept the code
-        for needle in ('"amux-spawn"', '"amux"', "send-keys", "new-session", "kill-session", "questions_mcp_lib",
-                       ".notify(", "systemctl"):
+        for needle in ("new-session", "kill-session", "questions_mcp_lib", ".notify(", "systemctl"):
             self.assertNotIn(needle, code, needle)
-        # 50-05: tmux is read only (display-message, capture-pane), and only through RealWorld._tmux_read.
-        self.assertEqual(code.count("TMUX_BIN"), 2, "TMUX_BIN is defined once and used once")
+        # 50-05: tmux reads (display-message, capture-pane) only through RealWorld._tmux_read.
         verbs = set(re.findall(r'_tmux_read\(\["([a-z-]+)"', code))
         self.assertEqual(verbs, {"display-message", "capture-pane"})
+        # 50-06: amux, amux-spawn and the one tmux write (send-keys) are each named once and run only
+        # inside RealWorld; the pure dispatcher calls the World effects only from run_effect.
+        start = code.index("class RealWorld(World):")
+        real = code[start:start + 1 + re.search(r"\n(?=\S)", code[start + 1:]).start()]
+        for literal in ('"amux-spawn"', '"amux"', '"send-keys"'):
+            self.assertEqual(code.count(literal), 1, literal)
+        self.assertEqual(real.count('"send-keys"'), 1)
+        for const, uses in (("TMUX_BIN", 2), ("AMUX_BIN", 1), ("AMUX_SPAWN_BIN", 2)):
+            self.assertEqual(real.count(const), uses, const)
+            self.assertEqual(code.count(const), uses + 1, f"{const}: defined once, used only in RealWorld")
+        run_effect = code[code.index("def run_effect("):code.index("def execute_dispatch(")]
+        for call in ("world.spawn(", "world.resume(", "world.reap(", "world.amux_send(", "world.send_keys("):
+            self.assertEqual(code.count(call), 1, call)
+            self.assertIn(call, run_effect)
 
     def test_world_fakes_fail_loudly(self):
         w = edl.World()
@@ -2163,6 +2175,15 @@ class TestPaneClassifier(unittest.TestCase):
             "synth-blank.txt": edl.PANE_UNREADABLE,
             "synth-conversation-quote.txt": edl.PANE_NO_DIALOG,
             "synth-conversation-quote-pointer.txt": edl.PANE_NO_DIALOG,
+            # 50-06: real captures of the input box (see the 50-06 section's provenance note)
+            "cc-2.1.330-input-typed.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-input-multiline-paste.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-input-pasted-placeholder.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-input-event-line.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-input-wrapped-40col.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-input-empty-after-clear.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-copy-mode-empty-box.txt": edl.PANE_NO_DIALOG,
+            "cc-2.1.330-shell-mode.txt": edl.PANE_UNREADABLE,
         }
         self.assertEqual(set(expect), {p.name for p in PANES.glob("*.txt")})
         for name, kind in expect.items():
@@ -3246,6 +3267,1555 @@ class TestReconcileContract(_Recon):
         with mock.patch.object(edl.asl, "SPAWN_DIR", spawn):
             got = edl.RealWorld().lifecycle_events("n")
         self.assertEqual([e["event"] for e in got], ["turn_start"])
+
+
+# =============================================================================
+# 50-06 — dispatch: session policy (D4) and delivery (D5) (§9, §11, §12.11, §23)
+# =============================================================================
+#
+# Pane fixtures added by 50-06 (Claude Code 2.1.330, real captures): a throwaway Claude
+# Code in its own tmux server (`tmux -L`), a fresh /tmp directory, hooks disabled with
+# `--settings '{"disableAllHooks": true}'`, text typed or pasted with send-keys -l /
+# paste-buffer -p and never submitted; the server was killed afterwards. Scrubbed: the
+# temp path → /tmp/epic-driver-fixture, the account tier, the login notice.
+#   cc-2.1.330-input-typed.txt              one line typed
+#   cc-2.1.330-input-multiline-paste.txt    a two-line draft (bracketed paste)
+#   cc-2.1.330-input-pasted-placeholder.txt a 40-line paste: "[Pasted text #2 +40 lines]"
+#   cc-2.1.330-input-event-line.txt         an EVENT line sitting in the box, not submitted
+#   cc-2.1.330-input-wrapped-40col.txt      the same line wrapped by the TUI at 40 columns
+#   cc-2.1.330-input-empty-after-clear.txt  the box emptied again (a "ctrl+y" hint above it)
+#   cc-2.1.330-copy-mode-empty-box.txt      captured while #{pane_in_mode} was 1
+#   cc-2.1.330-shell-mode.txt               "! " (shell mode): no prompt glyph
+
+class Killed(Exception):
+    """The test's stand-in for the tick being killed."""
+
+
+def usage_entry(ts, ctx=100000, bucket="1h", text="ok"):
+    """An assistant entry with a usage record: context ``ctx`` tokens, cache bucket 1h or 5m."""
+    creation = {"ephemeral_1h_input_tokens": 1000} if bucket == "1h" else {"ephemeral_5m_input_tokens": 1000}
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"id": f"m-{ts}", "role": "assistant", "model": "claude-opus-5-5",
+                        "content": [{"type": "text", "text": text}],
+                        "usage": {"input_tokens": 10, "cache_creation_input_tokens": 1000,
+                                  "cache_read_input_tokens": ctx - 1010, "output_tokens": 50,
+                                  "cache_creation": creation}}}
+
+
+IDLE_DISPLAY = {"pane_dead": "0", "pane_in_mode": "0", "session_attached": "0", "pane_pid": "4242"}
+
+
+def typed_pane(text):
+    """The real emptied box with ``text`` typed after the glyph."""
+    empty = pane("cc-2.1.330-input-empty-after-clear.txt")
+    out = re.sub(r"(?m)^❯\s*$", lambda m: f"❯\xa0{text}", empty, count=1)
+    assert out != empty
+    return out
+
+
+class DispatchWorld(ReconWorld):
+    """ReconWorld plus the dispatch effects, which change the fake world as amux would.
+
+    A spawn creates the tmux session, the handle and the transcript; a spawn, a
+    resume or a send "lands" by default: the line becomes a user prompt and a
+    ``turn_start`` 1 s later, and a turn that ends with ``reply[name]`` 30 s
+    later (None: the turn stays open). ``mode[name]``: ``lost`` (nothing lands)
+    or ``box`` (the line stays in the input box).
+    """
+
+    def __init__(self, tdir, **kw):
+        super().__init__(**kw)
+        self.tdir = tdir
+        self.spawns, self.created, self.resumes, self.sends, self.keys, self.reaps = [], [], [], [], [], []
+        self.landed = []
+        self.mode = {}
+        self.reply = {}
+        self.spawn_error = None
+        self.resume_error = None
+        self.key_error = None
+
+    def _stamp(self, seconds):
+        return edl.iso(self.clock + timedelta(seconds=seconds))
+
+    def _handle(self, name):
+        return next((h for h in self.handles if h.get("name") == name), None)
+
+    def _append(self, name, *entries):
+        tp = self.tdir / f"{name}.jsonl"
+        with open(tp, "a", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def _turn(self, name, line):
+        mode = self.mode.get(name, "land")
+        if mode == "lost":
+            return
+        if mode == "box":
+            self.tmux[name]["pane"] = typed_pane(line)
+            return
+        self.landed.append(line)
+        t1 = self._stamp(1)
+        self._append(name, u(t1.replace("Z", ".200Z"), line))
+        self.events.setdefault(name, []).append(ev("turn_start", t1))
+        reply = self.reply.get(name)
+        if reply is not None:
+            t2 = self._stamp(30)
+            self._append(name, a(t2, reply))
+            self.events[name].append(ev("stop", t2, state="idle", last_message=reply))
+            h = self._handle(name)
+            if h is not None:
+                h.update(last_message=reply, stopped_at=t2, state="idle")
+
+    def spawn(self, args):
+        args = list(args)
+        self.spawns.append(args)
+        directory = args[args.index("--dir") + 1]
+        name = f"{os.path.basename(directory.rstrip('/'))}-{args[1]}"
+        if self.spawn_error:
+            return edl.CommandResult(rc=1, stderr=self.spawn_error)
+        if self.tmux.get(name, {}).get("present") or self._handle(name) or name in self.amux:
+            return edl.CommandResult(rc=1, stderr=f"amux-spawn: error: session name already in use: {name}\n")
+        self.created.append(name)
+        tp = self.tdir / f"{name}.jsonl"
+        tp.write_text(json.dumps(u(self._stamp(0), "(session start)")) + "\n")
+        model = next(x.split("=", 1)[1] for x in args if x.startswith("--model="))
+        profile = args[args.index("--profile") + 1] if "--profile" in args else None
+        self.handles.append({"name": name, "provider": "claude", "run_id": args[args.index("--run-id") + 1],
+                             "transcript_path": str(tp), "state": "spawning", "model": model, "profile": profile,
+                             "created_at": self._stamp(0), "last_message": None, "stopped_at": None, "attempt": 1})
+        self.tmux[name] = {"present": True, "display": dict(IDLE_DISPLAY),
+                           "pane": pane("cc-2.1.330-startup-no-dialog.txt")}
+        self.events[name] = []
+        self.amux.append(name)
+        self._turn(name, args[-1])
+        return edl.CommandResult(rc=0, stdout=f"amux-spawn: spawned tracked session '{name}'\n")
+
+    def resume(self, args):
+        args = list(args)
+        self.resumes.append(args)
+        name = args[1]
+        if self.resume_error:
+            return edl.CommandResult(rc=1, stderr=self.resume_error)
+        t = self.tmux.get(name, {})
+        if t.get("present") and (t.get("display") or {}).get("pane_dead") != "1":
+            return edl.CommandResult(rc=1, stderr=f"amux-spawn: error: session '{name}' is live\n")
+        self.tmux[name] = {"present": True, "display": dict(IDLE_DISPLAY),
+                           "pane": pane("cc-2.1.330-input-empty-after-clear.txt")}
+        h = self._handle(name)
+        if h is not None:
+            h.update(state="spawning", attempt=int(h.get("attempt") or 1) + 1)
+        self._turn(name, args[-1])
+        return edl.CommandResult(rc=0, stdout=json.dumps({"name": name, "state": "spawning"}) + "\n")
+
+    def reap(self, args):
+        name = list(args)[1]
+        self.reaps.append(name)
+        self.tmux[name] = {"present": False}
+        self.handles = [h for h in self.handles if h.get("name") != name]
+        self.amux = [n for n in self.amux if n != name]
+        return edl.CommandResult(rc=0, stdout=f"amux-spawn rm: {name} (idle) removed\n")
+
+    def amux_send(self, name, line):
+        self.sends.append((name, line))
+        if not self.tmux.get(name, {}).get("present"):
+            return edl.CommandResult(rc=1, stderr=f"error: session '{name}' is not running")
+        self._turn(name, line)
+        return edl.CommandResult(rc=0, stdout=f"sent to {name}: {line}\n")
+
+    def send_keys(self, name, key):
+        self.keys.append((name, key))
+        if self.key_error:
+            return edl.CommandResult(rc=1, stderr=self.key_error)      # ran, but failed: the key may have landed
+        self.tmux[name]["pane"] = pane("cc-2.1.330-startup-no-dialog.txt")    # the dialog is answered
+        return edl.CommandResult(rc=0)
+
+
+class _Disp(_Recon):
+    NOW = "2026-11-24T10:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.world = DispatchWorld(self.tdir, now=T(self.NOW), profiles={
+            "claude": {"ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-opus-5-5"}})
+        self.paths = edl.run_paths("epic-t")
+
+    def live(self, st, key="driver", name="ws-t-driver-g1", *, entries=None, events=None, **kw):
+        """A live idle session that answered an earlier turn, with an empty input box on its pane."""
+        if entries is None:
+            entries = [u("2026-11-24T09:00:01Z", "EVENT E-0: read /x"), usage_entry("2026-11-24T09:55:00Z")]
+        if events is None:
+            events = [ev("turn_start", "2026-11-24T09:00:01Z"), ev("stop", "2026-11-24T09:55:00Z", state="idle")]
+        kw.setdefault("pane", pane("cc-2.1.330-input-empty-after-clear.txt"))
+        return self.session(st, key=key, name=name, entries=entries, events=events, **kw)
+
+    def tick(self, L, st, *, items=(), crash_at=None, crash_mode="after", worker_dirs=None, paused=False,
+             advance=None):
+        """One pass: readings → reconcile → schedule → plan → execute; ``crash_at`` kills it at a commit.
+
+        Returns ``(persisted state, plan, recon, commits)``; the persisted state is
+        what a killed tick leaves on disk (the last commit, else the input).
+        """
+        if advance:
+            self.world.advance(advance)
+        w = self.world
+        now = w.now()
+        readings = edl.take_readings(L, st, w, now)
+        res = edl.reconcile(L, st, readings, now)
+        s = res.state
+        edl.advance_schedule(L, s, now)
+        sel = edl.select(L, s, now, paused=paused)
+        plan = edl.plan_dispatch(L, s, res, readings, now, paths=self.paths, selection=sel, items=items,
+                                 host="ws", paused=paused, worker_dirs=worker_dirs)
+        commits = []
+
+        def commit(x):
+            n = len(commits) + 1
+            if crash_at == n and crash_mode == "before":
+                raise Killed()
+            commits.append(copy.deepcopy(x))
+            if crash_at == n and crash_mode == "after":
+                raise Killed()
+        try:
+            edl.execute_dispatch(plan, s, w, commit)
+            persisted = copy.deepcopy(s)
+        except Killed:
+            persisted = copy.deepcopy(commits[-1]) if commits else copy.deepcopy(st)
+        return persisted, plan, res, commits
+
+    def entry(self, st, event):
+        return next((e for e in st["outbox"] if e["event"] == event), None)
+
+    def conds(self, L, st, alarm_id=None):
+        return sorted(c.key for c in edl.dispatch_conditions(L, st, self.world.now())
+                      if alarm_id is None or c.id == alarm_id)
+
+
+# -- the input box parser (§9.3, M6) ------------------------------------------------
+
+class TestInputBox(unittest.TestCase):
+    def test_fixtures(self):
+        expect = {
+            "cc-2.1.330-idle-input-box.txt": (edl.BOX_EMPTY, ""),
+            "cc-2.1.330-startup-no-dialog.txt": (edl.BOX_EMPTY, ""),
+            "cc-2.1.330-input-empty-after-clear.txt": (edl.BOX_EMPTY, ""),
+            "cc-2.1.330-copy-mode-empty-box.txt": (edl.BOX_EMPTY, ""),
+            "cc-2.1.330-input-typed.txt": (edl.BOX_TEXT, "please also check the deploy log before you continue"),
+            "cc-2.1.330-input-multiline-paste.txt": (edl.BOX_TEXT, "first line of a draft\nsecond line of the same draft"),
+            "cc-2.1.330-input-pasted-placeholder.txt": (edl.BOX_TEXT, "[Pasted text #2 +40 lines]"),
+            "cc-2.1.330-input-event-line.txt": (edl.BOX_TEXT, "EVENT E-41: read /tmp/epic-driver-fixture/events/E-41.md"),
+            "cc-2.1.330-input-wrapped-40col.txt": (edl.BOX_TEXT, "EVENT E-41: read /tmp/epic-driver-fi\nxture/events/E-41.md"),
+            "synth-input-box-typed.txt": (edl.BOX_TEXT, "please also check the deploy log before you continue"),
+            "synth-input-box-multiline.txt": (edl.BOX_TEXT, "first line of a draft\nsecond line of the same draft"),
+            "cc-2.1.330-folder-trust.txt": (edl.BOX_DIALOG, ""),
+            "cc-2.1.330-folder-trust-wide.txt": (edl.BOX_DIALOG, ""),
+            "synth-code-mode-optin.txt": (edl.BOX_DIALOG, ""),
+            "cc-2.1.330-shell-mode.txt": (edl.BOX_UNREADABLE, ""),
+            "synth-booting-splash.txt": (edl.BOX_UNREADABLE, ""),
+            "synth-blank.txt": (edl.BOX_UNREADABLE, ""),
+            "synth-conversation-quote.txt": (edl.BOX_EMPTY, ""),
+            "synth-conversation-quote-pointer.txt": (edl.BOX_EMPTY, ""),
+        }
+        self.assertEqual(set(expect), {p.name for p in PANES.glob("*.txt")})
+        for name, (state, text) in expect.items():
+            with self.subTest(name=name):
+                box = edl.parse_input_box(pane(name))
+                self.assertEqual((box.state, box.text), (state, text))
+        self.assertEqual(edl.parse_input_box(None).state, edl.BOX_UNREADABLE)
+
+    def test_the_empty_box_is_the_glyph_and_whitespace_only(self):
+        empty = pane("cc-2.1.330-idle-input-box.txt")
+        self.assertIn("❯\xa0\n", empty)                       # the real empty row: glyph + no-break space
+        self.assertTrue(edl.parse_input_box(empty).empty)
+        self.assertTrue(edl.parse_input_box(empty.replace("❯", ">")).empty)
+        for typed in ("x", ".", "/", "!", "  a"):
+            with self.subTest(typed=typed):
+                self.assertEqual(edl.parse_input_box(empty.replace("❯\xa0", "❯\xa0" + typed, 1)).state,
+                                 edl.BOX_TEXT)
+
+    def test_only_the_bottom_most_box_counts(self):
+        rule = "─" * 40
+        text_above = f"{rule}\n❯ an old draft quoted in the output\n{rule}\nmore output\n{rule}\n❯ \n{rule}\n  status\n"
+        self.assertTrue(edl.parse_input_box(text_above).empty)
+        empty_above = f"{rule}\n❯ \n{rule}\nmore output\n{rule}\n❯ typed\n{rule}\n  status\n"
+        self.assertEqual(edl.parse_input_box(empty_above).state, edl.BOX_TEXT)
+
+    def test_a_box_far_above_the_bottom_is_unreadable(self):
+        rule = "─" * 40
+        far = f"{rule}\n❯ \n{rule}\n" + "".join(f"row {i}\n" for i in range(edl.INPUT_BOX_FOOTER_MAX_ROWS + 1))
+        self.assertEqual(edl.parse_input_box(far).state, edl.BOX_UNREADABLE)
+        near = f"{rule}\n❯ \n{rule}\n" + "".join(f"row {i}\n" for i in range(edl.INPUT_BOX_FOOTER_MAX_ROWS)) + "\n\n"
+        self.assertTrue(edl.parse_input_box(near).empty)
+
+    def test_pane_ready_reasons(self):
+        empty = pane("cc-2.1.330-input-empty-after-clear.txt")
+        self.assertIsNone(edl.pane_ready(False, empty))
+        self.assertEqual(edl.pane_ready(True, pane("cc-2.1.330-copy-mode-empty-box.txt")), "copy-mode")
+        self.assertEqual(edl.pane_ready(None, empty), "pane mode unknown")
+        self.assertEqual(edl.pane_ready(False, pane("cc-2.1.330-input-typed.txt")), "input box not empty")
+        self.assertEqual(edl.pane_ready(False, pane("synth-code-mode-optin.txt")), "a dialog shows")
+        self.assertEqual(edl.pane_ready(False, pane("cc-2.1.330-shell-mode.txt")), "pane unreadable")
+        self.assertEqual(edl.pane_ready(False, None), "pane unreadable")
+
+    def test_lines_of_9_2(self):
+        self.assertEqual(edl.event_line("E-41", "/s/events/E-41.md"), "EVENT E-41: read /s/events/E-41.md")
+        self.assertEqual(edl.resume_line("E-4", "/p"), "RESUME E-4: read /p")
+        self.assertEqual(edl.rotate_line("E-4", "/p"), "ROTATE E-4: read /p")
+        self.assertEqual(edl.reminder_line("E-4", "/p"),
+                         "VERDICT? E-4: end this turn with exactly one verdict line (see /p)")
+        self.assertEqual(edl.PING_LINE, 'PING: no action needed; reply exactly "WAITING: ping"')
+
+
+# -- the decision table (§11.2) with fixture readings ------------------------------
+
+class TestPolicy(_Disp):
+    def decide(self, L, st, key="driver"):
+        res, readings = self.reconcile(L, st)
+        rec = res.state["sessions"].get(key)
+        reading = readings.by_name().get((rec or {}).get("name"))
+        return edl.choose_action(L, res.state, key, res.sessions.get(key), self.now(),
+                                 handoff_done=edl.handoff_complete(rec, reading))
+
+    def idle(self, st, entry, **kw):
+        return self.live(st, entries=[u("2026-11-24T09:00:01Z", "EVENT E-0: read /x"), entry],
+                         events=[ev("turn_start", "2026-11-24T09:00:01Z"),
+                                 ev("stop", entry["timestamp"], state="idle")], **kw)
+
+    def test_no_session_yet_spawns(self):
+        L, st = self.ledger()
+        self.assertEqual(self.decide(L, st).action, edl.ACT_SPAWN)
+
+    def test_warm_reuses(self):
+        L, st = self.ledger()
+        self.idle(st, usage_entry("2026-11-24T09:50:00Z"))          # 1 h bucket, 50 min left
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_REUSE, d.reason)
+        self.assertIn("warm", d.reason)
+
+    def test_cold_on_the_hour_bucket_rotates(self):
+        L, st = self.ledger()
+        self.idle(st, usage_entry("2026-11-24T08:30:00Z"))          # expired 30 min ago
+        self.assertEqual(self.decide(L, st).action, edl.ACT_ROTATE)
+        L, st = self.ledger()
+        self.world.handles = []
+        self.idle(st, usage_entry("2026-11-24T09:04:00Z"))          # 4 min left: under the 5 min floor
+        self.assertEqual(self.decide(L, st).action, edl.ACT_ROTATE)
+
+    def test_over_cap_rotates(self):
+        L, st = self.ledger()
+        self.idle(st, usage_entry("2026-11-24T09:55:00Z", ctx=250000))
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_ROTATE)
+        self.assertIn("cap 250000", d.reason)
+
+    def test_overage_cold_reuses_in_place(self):
+        L, st = self.ledger()
+        self.idle(st, usage_entry("2026-11-24T09:40:00Z", bucket="5m"))   # 5m bucket, cold for 15 min
+        res, _ = self.reconcile(L, st)
+        self.assertTrue(res.sessions["driver"].overage)
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_REUSE)
+        self.assertIn("m2", d.reason)
+        # m2: rotation stays for over-cap sessions, overage or not
+        L, st = self.ledger()
+        self.world.handles = []
+        self.idle(st, usage_entry("2026-11-24T09:40:00Z", ctx=260000, bucket="5m"))
+        self.assertEqual(self.decide(L, st).action, edl.ACT_ROTATE)
+
+    def test_dead_resumes_in_place_even_cold(self):
+        L, st = self.ledger()
+        self.idle(st, usage_entry("2026-11-24T06:00:00Z"), alive=False)
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_RESUME)
+
+    def test_dead_with_a_completed_handoff_spawns_the_next_generation(self):
+        L, st = self.ledger()
+        handoff = self.tmp / "h.md"
+        handoff.write_text("# Handoff\n")
+        os.utime(str(handoff), (self.epoch("2026-11-24T09:30:00Z"),) * 2)
+        self.idle(st, usage_entry("2026-11-24T09:30:00Z"), alive=False, rotation={
+            "event": "E-7", "requested_at": "2026-11-24T09:20:00Z", "handoff_path": str(handoff), "ticks": 0,
+            "handoff": {"path": str(handoff), "at": "2026-11-24T09:30:00Z", "event": "E-7"}})
+        self.assertEqual(self.decide(L, st).action, edl.ACT_SPAWN_NEXT)
+        # the same record without the HANDOFF verdict: resume in place
+        st["sessions"]["driver"]["rotation"]["handoff"] = None
+        self.assertEqual(self.decide(L, st).action, edl.ACT_RESUME)
+
+    def test_busy_waits(self):
+        L, st = self.ledger()
+        self.live(st, events=[ev("turn_start", "2026-11-24T09:59:00Z")])
+        self.assertEqual(self.decide(L, st).action, edl.ACT_WAIT)
+
+    def test_limited_holds(self):
+        L, st = self.ledger()
+        self.live(st, entries=[u("2026-11-24T09:50:00Z", "EVENT E-0: read /x"),
+                               limit("2026-11-24T09:51:00Z", "limit · resets 3pm")],
+                  events=[ev("turn_start", "2026-11-24T09:50:00Z"), ev("stop", "2026-11-24T09:51:00Z")])
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_HOLD)
+        # a held role with no session yet is not spawned either
+        L2, st2 = self.ledger()
+        st2["limits"] = {"claude-opus-5-5": {"until": "2026-11-24T15:00:00Z", "source": "reset", "ladder_step": 0}}
+        self.assertEqual(edl.choose_action(L2, st2, "driver", None, self.now()).action, edl.ACT_HOLD)
+
+    def test_compacted_rotates(self):
+        L, st = self.ledger()
+        self.live(st, entries=[u("2026-11-24T09:00:01Z", "EVENT E-0: read /x"), compact("2026-11-24T09:30:00Z"),
+                               usage_entry("2026-11-24T09:55:00Z", ctx=40000)])
+        d = self.decide(L, st)
+        self.assertEqual(d.action, edl.ACT_ROTATE)
+        self.assertIn("compacted", d.reason)
+
+    def test_a_launch_not_up_and_a_rotation_under_way_wait(self):
+        L, st = self.ledger()
+        self.session(st, alive=False, status="spawning", handle=False)
+        self.assertEqual(self.decide(L, st).action, edl.ACT_WAIT)
+        L, st = self.ledger()
+        self.world.handles = []
+        self.idle(st, usage_entry("2026-11-24T09:55:00Z"), rotation={
+            "event": "E-7", "requested_at": "2026-11-24T09:56:00Z", "handoff_path": "/nowhere.md", "ticks": 0})
+        self.assertEqual(self.decide(L, st).action, edl.ACT_WAIT)
+
+
+# -- event files and spawn ---------------------------------------------------------
+
+class TestEventsAndSpawn(_Disp):
+    def test_a_fresh_session_is_spawned_seeded_with_its_event(self):
+        L, st = self.ledger(roles={"driver": {"model": "fable", "effort": "high", "profile": "claude",
+                                              "pinned_env": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "65"}}})
+        st["next_event_n"] = 41
+        self.world.reply["ws-t-driver-g1"] = None
+        st2, plan, _, commits = self.tick(L, st)
+        self.assertEqual([op.effect.kind for op in plan.ops], [edl.EFFECT_SPAWN])
+        path = str(self.paths.events / "E-41.md")
+        self.assertEqual(self.world.spawns, [[
+            "spawn", "t-driver-g1", "--dir", str(self.ws), "--yolo", "--model=fable", "--effort=high",
+            "--profile", "claude", "--run-id", "epic-t", "--pin-env", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65",
+            "--detach", "--", f"EVENT E-41: read {path}"]])
+        self.assertEqual(self.world.created, ["ws-t-driver-g1"])
+        # binding: the commit before the spawn holds the event file, the outbox entry, the inflight
+        # marker and the session record in `spawning` with its launch_event
+        before = commits[0]
+        rec = before["sessions"]["driver"]
+        self.assertEqual((rec["status"], rec["name"], rec["gen"], rec["launch_event"]),
+                         ("spawning", "ws-t-driver-g1", 1, "E-41"))
+        e = self.entry(before, "E-41")
+        self.assertEqual((e["to"], e["session"], e["kinds"], e["steps"], e["via"], e["sends"]),
+                         ("driver", "ws-t-driver-g1", ["step_due"], ["A"], "spawn", [self.NOW]))
+        self.assertEqual(before["steps"]["A"]["status"], "inflight")
+        self.assertEqual(before["steps"]["A"]["inflight"],
+                         {"step": "A", "event": "E-41", "started_at": self.NOW, "host": "ws", "session": "ws-t-driver-g1"})
+        self.assertEqual(before["next_event_n"], 42)
+        text = Path(path).read_text()
+        self.assertTrue(text.startswith("---\nevent: E-41\nrun_id: epic-t\ncreated_at: 2026-11-24T10:00:00Z\n"
+                                        "to: driver\nsession: ws-t-driver-g1\nkinds: [step_due]\nsteps: [A]\n"
+                                        "needs_verdict: true\n---\n# E-41 — step due: A\n"))
+        # §19: a fresh session's first event opens with the role item naming the installed driver prompt
+        self.assertIn("## 1. role\n- Read your role prompt at "
+                      + str(edl.ROLE_PROMPTS_DIR / edl.DRIVER_PROMPT_FILE) + " first.", text)
+        self.assertIn("## 2. step_due — A (occurrence 1)\n- Card: " + str(self.plan / "cards" / "c.md"), text)
+        self.assertIn("## Reply\nEnd this turn with exactly one verdict line (architecture §10), covering every "
+                      "step above: A.", text)
+        self.assertEqual(st2["sessions"]["driver"]["launch_error"], None)
+        self.assertEqual(plan.dispatched_steps, ["A"])
+
+    def test_one_driver_event_per_pass_merges_every_item(self):
+        L, st = self.ledger([self.driver("A"), self.driver("B")])
+        self.live(st)
+        items = [edl.EventItem(edl.ITEM_ALARM_CLEARED, "driver", None, {"alarm": "listener_down", "subject": "run"})]
+        st2, plan, _, _ = self.tick(L, st, items=items)
+        self.assertEqual(len(plan.events), 1)
+        pe = plan.events[0]
+        self.assertEqual((pe.event, pe.kinds, pe.steps), ("E-1", ["step_due", "alarm_cleared"], ["A", "B"]))
+        self.assertEqual(self.world.sends, [("ws-t-driver-g1", f"EVENT E-1: read {pe.path}")])
+
+    def test_one_event_per_worker_and_a_worker_report_path(self):
+        L, st = self.worker_ledger()
+        wdir = self.tmp / "wt" / "t-w"
+        wdir.mkdir(parents=True)
+        st2, plan, _, _ = self.tick(L, st, worker_dirs={"W": str(wdir)})
+        keys = sorted(pe.to for pe in plan.events)
+        self.assertEqual(keys, ["driver", "impl:W"])
+        worker = next(pe for pe in plan.events if pe.to == "impl:W")
+        self.assertEqual(worker.report, str(self.paths.reports / f"W-implementation-{worker.n}.md"))
+        spawn = next(s for s in self.world.spawns if s[1] == "t-impl-w-g1")
+        self.assertEqual(spawn[:4], ["spawn", "t-impl-w-g1", "--dir", str(wdir)])
+        self.assertIn("t-w-t-impl-w-g1", self.world.created)
+        self.assertIn(str(edl.ROLE_PROMPTS_DIR / edl.WORKER_PROMPT_FILE), worker.text)
+        self.assertIn(f"`DONE: W`", worker.text)
+        # a worker step without its directory from 50-07 is not dispatched
+        L, st = self.worker_ledger()
+        self.world.handles, self.world.spawns = [], []
+        _, plan, _, _ = self.tick(L, st, worker_dirs={})
+        self.assertEqual([pe.to for pe in plan.events], ["driver"])
+
+    def test_name_in_use_is_spawn_failed_and_the_same_event_is_tried_again(self):
+        L, st = self.ledger()
+        self.world.spawn_error = "amux-spawn: error: session name already in use: ws-t-driver-g1\n"
+        st2, plan, _, _ = self.tick(L, st)
+        rec = st2["sessions"]["driver"]
+        self.assertEqual((rec["status"], rec["launch_error"]["reason"]), ("spawning", "name_in_use"))
+        self.assertEqual(self.entry(st2, "E-1")["sends"], [])             # nothing was launched
+        self.assertEqual(self.conds(L, st2), ["spawn_failed:ws-t-driver-g1"])
+        self.assertEqual(st2["steps"]["A"]["inflight"]["event"], "E-1")    # the marker is kept
+        # next pass: the same event, not a new one; it comes up and the alarm clears
+        self.world.spawn_error = None
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual([op.effect.kind for op in plan.ops], [edl.EFFECT_SPAWN])
+        self.assertEqual(self.world.spawns[-1][-1].split(":")[0], "EVENT E-1")
+        self.assertEqual(st3["next_event_n"], 2)
+        st4, _, _, _ = self.tick(L, st3, advance=600)
+        self.assertEqual(self.conds(L, st4, "spawn_failed"), [])
+
+    def test_the_launch_retry_schedule(self):
+        wait = edl.launch_retry_wait_s
+        t0 = edl.from_iso("2026-11-24T10:00:00Z")
+        for attempts, interval in ((1, 600), (2, 1200), (3, 2400), (4, 4800), (5, 9600), (6, 14400), (9, 14400)):
+            rec = {"launch_attempts": attempts, "launch_error": {"reason": "failed", "at": "2026-11-24T10:00:00Z"}}
+            self.assertEqual(wait(rec, t0 + timedelta(seconds=interval - 1)), 1, attempts)
+            self.assertIsNone(wait(rec, t0 + timedelta(seconds=interval)), attempts)
+        # no error, or name_in_use: no wait
+        self.assertIsNone(wait({"launch_attempts": 3, "launch_error": None}, t0))
+        self.assertIsNone(wait({"launch_attempts": 3, "launch_error": {"reason": "name_in_use",
+                                                                        "at": "2026-11-24T10:00:00Z"}}, t0))
+        self.assertEqual((edl.LAUNCH_RETRY_BASE_S, edl.LAUNCH_RETRY_MAX_S), (600, 4 * 3600))
+
+    def test_a_failed_spawn_backs_off_doubling_to_the_cap_and_resets_on_success(self):
+        L, st = self.ledger()
+        self.world.spawn_error = "amux-spawn: error: boom\n"
+        st, _, _, _ = self.tick(L, st)
+        self.assertEqual((len(self.world.spawns), st["sessions"]["driver"]["launch_attempts"]), (1, 1))
+        elapsed = 0
+        for n, interval in enumerate((600, 1200, 2400, 4800, 9600, 14400, 14400), start=2):
+            with self.subTest(attempt=n):
+                st, plan, _, _ = self.tick(L, st, advance=interval - 1 - elapsed)
+                self.assertEqual(len(self.world.spawns), n - 1)                 # not before the interval
+                self.assertEqual([op.effect.kind for op in plan.ops], [])
+                st, plan, _, _ = self.tick(L, st, advance=1)
+                self.assertEqual(len(self.world.spawns), n)                     # at the interval
+                self.assertEqual(st["sessions"]["driver"]["launch_attempts"], n)
+                self.assertEqual(self.conds(L, st, "spawn_failed"), ["spawn_failed:ws-t-driver-g1"])   # stays raised
+                elapsed = 0
+        # the next attempt succeeds: the error clears and the schedule starts over
+        self.world.spawn_error = None
+        st, _, _, _ = self.tick(L, st, advance=14400 - 1)
+        self.assertEqual(len(self.world.spawns), 8)
+        st, _, _, _ = self.tick(L, st, advance=1)
+        self.assertEqual(len(self.world.spawns), 9)
+        self.assertEqual((st["sessions"]["driver"]["launch_error"], st["sessions"]["driver"]["launch_attempts"]),
+                         (None, 1))
+
+    def test_name_in_use_keeps_its_every_tick_retry(self):
+        L, st = self.ledger()
+        self.world.spawn_error = "amux-spawn: error: session name already in use: ws-t-driver-g1\n"
+        st, _, _, _ = self.tick(L, st)
+        self.world.spawn_error = None
+        st, _, _, _ = self.tick(L, st, advance=1)
+        self.assertEqual(len(self.world.spawns), 2)
+
+    def test_a_failed_resume_backs_off_too(self):
+        L, st = self.ledger()
+        self.inflight(st, "A", event="E-3")
+        st["next_event_n"] = 4
+        self.live(st, alive=False, status="dead")
+        self.world.resume_error = "amux-spawn: error: boom\n"
+        st, _, _, _ = self.tick(L, st)
+        st, _, _, _ = self.tick(L, st, advance=599)
+        self.assertEqual(len(self.world.resumes), 1)
+        st, _, _, _ = self.tick(L, st, advance=1)
+        self.assertEqual(len(self.world.resumes), 2)
+        st, _, _, _ = self.tick(L, st, advance=1199)
+        self.assertEqual(len(self.world.resumes), 2)
+        st, _, _, _ = self.tick(L, st, advance=1)
+        self.assertEqual(len(self.world.resumes), 3)
+
+    def test_a_re_issued_launch_is_committed_before_it_runs(self):
+        L, st = self.ledger()
+        self.world.spawn_error = "amux-spawn: error: boom\n"
+        st, _, _, _ = self.tick(L, st)
+        before = st["sessions"]["driver"]["launch_error"]["at"]
+        st2, _, _, commits = self.tick(L, st, advance=600, crash_at=1)          # killed after the commit
+        self.assertEqual(len(self.world.spawns), 1)                              # the effect did not run
+        self.assertEqual(st2["sessions"]["driver"]["launch_attempts"], 2)        # but the attempt is recorded
+        self.assertEqual(self.entry(st2, "E-1")["sends"], ["2026-11-24T10:10:00Z"])
+        self.assertEqual(st2["sessions"]["driver"]["launch_error"]["at"], before)
+
+    def reboot(self, st):
+        """Make the next pass see a boot id change (the fake clock sample says ``boot-1``)."""
+        st["clock"] = {"boot_id": "boot-0", "wall": 1.0, "boottime": 1.0, "monotonic": 1.0}
+
+    def test_a_reboot_resets_the_launch_backoff_and_the_next_pass_launches(self):
+        L, st = self.ledger()
+        self.world.spawn_error = "amux-spawn: error: boom\n"
+        st, _, _, _ = self.tick(L, st)
+        st, _, _, _ = self.tick(L, st, advance=600)
+        self.assertEqual((len(self.world.spawns), st["sessions"]["driver"]["launch_attempts"]), (2, 2))
+        st, _, _, _ = self.tick(L, st, advance=60)                       # 20 m wait: gated
+        self.assertEqual(len(self.world.spawns), 2)
+        self.reboot(st)
+        st1, _, res, commits = self.tick(L, st, advance=60, crash_at=1)   # killed after the reset commit
+        self.assertIsNotNone(res.reboot)
+        self.assertEqual(len(self.world.spawns), 2)                      # the reset is committed before the effect
+        self.assertEqual(st1["sessions"]["driver"]["launch_attempts"], 0)
+        self.assertEqual(st1["sessions"]["driver"]["launch_error"]["reason"], "failed")   # alarm not cleared
+        st2, _, _, _ = self.tick(L, st)
+        self.assertEqual(len(self.world.spawns), 3)                      # launched at once (a pass of its own)
+        # the post-reboot launch failed too: the ladder restarts at 10 m, not 40 m
+        rec = st2["sessions"]["driver"]
+        self.assertEqual(rec["launch_attempts"], 1)
+        self.assertEqual(self.conds(L, st2, "spawn_failed"), ["spawn_failed:ws-t-driver-g1"])
+        st3, _, _, _ = self.tick(L, st2, advance=599)
+        self.assertEqual(len(self.world.spawns), 3)
+        st3, _, _, _ = self.tick(L, st3, advance=1)
+        self.assertEqual(len(self.world.spawns), 4)
+        self.assertEqual(st3["sessions"]["driver"]["launch_attempts"], 2)
+        st4, _, _, _ = self.tick(L, st3, advance=1199)
+        self.assertEqual(len(self.world.spawns), 4)
+
+    def test_a_name_known_to_amux_is_never_spawned(self):
+        L, st = self.ledger()
+        self.world.amux = ["ws-t-driver-g1"]          # an orphan by the grammar
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.spawns, [])
+        self.assertEqual(st2["sessions"]["driver"]["launch_error"]["reason"], "name_in_use")
+        self.assertEqual(self.conds(L, st2, "spawn_failed"), ["spawn_failed:ws-t-driver-g1"])
+
+    def test_a_held_item_is_still_committed_into_an_event(self):
+        """Reconcile emits an answer once; a limited model holds delivery, the event keeps it."""
+        L, st = self.ledger([])
+        st["limits"] = {"claude-opus-5-5": {"until": "2026-11-24T15:00:00Z", "source": "reset", "ladder_step": 0}}
+        item = edl.EventItem(edl.ITEM_ANSWER, "driver", None, {"question": "Q-3", "approval": "SA4", "answer": "yes",
+                                                               "path": "/q.md", "asked_event": "E-0"})
+        st2, plan, _, _ = self.tick(L, st, items=[item])
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_HOLD)
+        self.assertEqual(self.world.spawns, [])
+        e = self.entry(st2, "E-1")
+        self.assertEqual((e["sends"], e["approvals"], e["kinds"]), ([], ["SA4"], ["answer"]))
+        # the limit lifts: spawned seeded with that same queued event folded in
+        st2["limits"] = {}
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        seed = plan.events[0]
+        self.assertEqual((seed.supersedes, seed.approvals), (["E-1"], ["SA4"]))
+        self.assertIn("queued as E-1", seed.text)
+        self.assertIsNone(self.entry(st3, "E-1"))
+
+    def test_check_failed_and_worker_items_carry_what_the_driver_needs(self):
+        L, st = self.worker_ledger()
+        st["steps"]["W"]["status"] = "inflight"
+        st["steps"]["A"]["status"] = "failed"
+        self.live(st)
+        out = edl.CheckOutcome(step_id="A", kind=edl.KIND_CHECK, outcome=edl.OUTCOME_FAILED, rc=2,
+                               output_tail="node down\n```\nx", attempt=1, consecutive_errors=0)
+        settled = edl.EventItem(edl.ITEM_WORKER_SETTLED, "driver", "W", {
+            "role": "rev", "worker": "reviewer", "verdict": "DONE: W", "event": "E-7"})
+        readings = edl.take_readings(L, st, self.world, self.now())
+        res = edl.reconcile(L, st, readings, self.now())
+        plan = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths,
+                                 check_outcomes=[out], items=[settled], host="ws")
+        pe = plan.events[0]
+        self.assertEqual((pe.to, pe.kinds, pe.steps), ("driver", ["check_failed", "worker_settled"], ["A", "W"]))
+        self.assertIn("## 1. check_failed — A (attempt 1)", pe.text)
+        self.assertIn("- Check exit code: 2.", pe.text)
+        self.assertIn("    node down\n    ```\n    x", pe.text)            # indented: a fence in the tail is inert
+        self.assertIn(f"- Report: {self.paths.reports / 'W-review-7.md'}", pe.text)
+        preview = plan.preview["steps"]
+        self.assertEqual((preview["A"]["status"], preview["A"]["inflight"]["event"]), ("failed", pe.event))
+        self.assertEqual(preview["W"]["inflight"]["session"], "ws-t-driver-g1")
+
+    def test_approval_needed_is_raised_once_per_ask_cycle(self):
+        L, st = self.ledger([self.driver("C0"), self.driver("A", approval="SA4", needs=["C0"])],
+                            approvals={"SA4": {"conditions": ["C0"]}})
+        st["steps"]["C0"].update(status="done", done_at="2026-11-24T08:00:00Z")
+        self.live(st)
+        self.world.reply["ws-t-driver-g1"] = "WAITING: SA4 the operator is away"
+        st1, plan, _, _ = self.tick(L, st)
+        pe = plan.events[0]
+        self.assertEqual((pe.kinds, pe.approvals, pe.steps), (["approval_needed"], ["SA4"], []))
+        self.assertIn("then end with `ASKED: Q-<n> SA4`", pe.text)
+        self.assertEqual(st1["approval_raised"]["SA4"]["event"], pe.event)
+        # pending, then answered WAITING without a question: not raised again
+        for _ in range(2):
+            st1, plan, _, _ = self.tick(L, st1, advance=600)
+            self.assertEqual(plan.events, [])
+        # a question about it was asked and then closed after the raise: a new cycle
+        st1["questions"]["Q-9"] = {"step": None, "approval": "SA4", "asked_event": pe.event, "status": "resolved",
+                                   "asked_at": edl.iso(self.now()), "answer_event": None}
+        _, plan, _, _ = self.tick(L, st1, advance=600)
+        self.assertEqual([p.kinds for p in plan.events], [["approval_needed"]])
+
+    def test_feedback_from_a_queue_request(self):
+        L, st = self.worker_ledger()
+        req = edl.queue_request(L, st, "W", "impl", "/plan/feedback/W-1.md", self.now())
+        self.assertEqual(req["id"], "R-1")
+        with self.assertRaises(ValueError):
+            edl.queue_request(L, st, "A", "impl", "/f.md", self.now())
+        with self.assertRaises(ValueError):
+            edl.queue_request(L, st, "W", "driver", "/f.md", self.now())
+        with self.assertRaises(ValueError):
+            edl.queue_request(L, st, "W", "impl", "relative.md", self.now())
+        st["steps"]["A"]["status"] = "done"          # nothing else due
+        self.inflight(st, "W", event="E-0", name="t-w-t-impl-w-g1")
+        self.live(st, key="impl:W", name="t-w-t-impl-w-g1")
+        st2, plan, _, _ = self.tick(L, st)
+        pe = next(p for p in plan.events if p.to == "impl:W")
+        self.assertEqual((pe.kinds, pe.steps), (["feedback"], ["W"]))
+        self.assertIn("Read the driver's feedback at /plan/feedback/W-1.md", pe.text)
+        self.assertEqual(st2["queue"][0]["event"], pe.event)
+        self.assertEqual(self.world.sends[-1], ("t-w-t-impl-w-g1", f"EVENT {pe.event}: read {pe.path}"))
+        _, plan2, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual([p for p in plan2.events if p.to == "impl:W"], [])     # consumed once
+
+
+# -- rotation (§11.3) ---------------------------------------------------------------
+
+class TestRotation(_Disp):
+    def over_cap(self, st, **kw):
+        return self.live(st, entries=[u("2026-11-24T09:00:01Z", "EVENT E-0: read /x"),
+                                      usage_entry("2026-11-24T09:55:00Z", ctx=260000)], **kw)
+
+    def test_the_full_sequence(self):
+        L, st = self.ledger([self.driver("A"), self.driver("B", not_before="2026-11-24T10:05:00Z")])
+        self.over_cap(st)
+        name = "ws-t-driver-g1"
+        self.world.reply[name] = None                     # the rotate turn is still running
+        st1, plan, _, commits = self.tick(L, st)
+        hp = str(self.paths.handoffs / "driver-g1.md")
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_ROTATE)
+        queued = self.entry(st1, "E-1")
+        self.assertEqual((queued["kinds"], queued["steps"], queued["sends"]), (["step_due"], ["A"], []))
+        rot_entry = self.entry(st1, "E-2")
+        self.assertEqual(rot_entry["kinds"], ["rotate"])
+        self.assertEqual(self.world.sends, [(name, f"ROTATE E-2: read {rot_entry['path']}")])
+        self.assertIn(f"`HANDOFF: {hp}`", Path(rot_entry["path"]).read_text())
+        rot = st1["sessions"]["driver"]["rotation"]
+        self.assertEqual((rot["event"], rot["requested_at"], rot["handoff_path"]), ("E-2", self.NOW, hp))
+        # the session writes the handoff and ends HANDOFF; B becomes due meanwhile
+        self.world.advance(600)
+        Path(hp).parent.mkdir(parents=True, exist_ok=True)
+        Path(hp).write_text("# Handoff\n")
+        os.utime(hp, (self.epoch("2026-11-24T10:07:00Z"),) * 2)
+        self.world.events[name] += [ev("stop", "2026-11-24T10:08:00Z", state="idle", last_message=f"HANDOFF: {hp}")]
+        self.world._append(name, a("2026-11-24T10:08:00Z", f"HANDOFF: {hp}"))
+        self.world._handle(name).update(last_message=f"HANDOFF: {hp}", stopped_at="2026-11-24T10:08:00Z")
+        self.world.reply["ws-t-driver-g2"] = "WAITING: soak"
+        st2, plan, res, commits = self.tick(L, st1)
+        self.assertTrue(res.sessions["driver"].rotation_ready)
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_SPAWN_NEXT)
+        seed = next(pe for pe in plan.events if pe.via == "spawn")
+        self.assertEqual(self.world.created, ["ws-t-driver-g2"])
+        self.assertEqual(self.world.spawns[-1][1], "t-driver-g2")
+        self.assertEqual(self.world.spawns[-1][-1], f"EVENT {seed.event}: read {seed.path}")
+        # E-m: the role, then the handoff first, then every event queued meanwhile (and B, new now)
+        kinds = [it.kind for it in seed.items]
+        self.assertEqual(kinds[:2], ["role", "handoff"])
+        self.assertIn(f"Read the handoff at {hp} first", seed.text)
+        self.assertEqual(sorted(seed.steps), ["A", "B"])
+        self.assertEqual(seed.supersedes, ["E-1"])
+        self.assertIsNone(self.entry(st2, "E-1"))                        # moved to the new session
+        self.assertEqual(st2["steps"]["A"]["inflight"]["event"], seed.event)
+        self.assertEqual(st2["steps"]["A"]["inflight"]["session"], "ws-t-driver-g2")
+        # binding: the rotation spawn writes launch_event in the same commit as `spawning`
+        spawn_commit = next(c for c in commits if c["sessions"]["driver"]["name"] == "ws-t-driver-g2")
+        rec = spawn_commit["sessions"]["driver"]
+        self.assertEqual((rec["status"], rec["gen"], rec["launch_event"]), ("spawning", 2, seed.event))
+        self.assertEqual([p["name"] for p in rec["parked"]], [name])
+        self.assertEqual(self.world.reaps, [])                          # not before the new session started
+        # the new session's first turn_start is seen: the old one is reaped
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual(self.world.reaps, [name])
+        self.assertEqual(st3["sessions"]["driver"]["parked"], [])
+
+    def test_an_unsent_rotate_waits_for_a_busy_session(self):
+        L, st = self.ledger([])
+        self.over_cap(st, events=[ev("turn_start", "2026-11-24T09:59:00Z")],      # the operator's turn
+                      rotation={"event": "E-2", "requested_at": None, "handoff_path": "/h.md", "ticks": 0})
+        self.outbox(st, "E-2", steps=(), kinds=("rotate",), sends=[], line="ROTATE E-2: read /e2")
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.sends, [])
+        self.assertEqual(self.entry(st2, "E-2")["deferrals"], 0)
+        self.assertIsNone(st2["sessions"]["driver"]["rotation"]["requested_at"])
+
+    def rotated_with_parked(self, attached):
+        L, st = self.ledger([])
+        self.live(st, key=None, name="ws-t-driver-g1",
+                  display={"pane_dead": "0", "pane_in_mode": "0", "session_attached": str(attached), "pane_pid": "9"})
+        self.live(st, name="ws-t-driver-g2", gen=2, launch_event="E-5",
+                  parked=[{"name": "ws-t-driver-g1", "since": "2026-11-24T09:00:00Z", "gen": 1}])
+        return L, st
+
+    def test_an_attached_client_delays_reaping(self):
+        L, st = self.rotated_with_parked(attached=1)
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.reaps, [])
+        self.assertTrue(any("attached" in n for n in plan.notes))
+        self.world.tmux["ws-t-driver-g1"]["display"]["session_attached"] = "0"
+        st3, _, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual(self.world.reaps, ["ws-t-driver-g1"])
+        self.assertEqual(st3["sessions"]["driver"]["parked"], [])
+
+    def test_no_handoff_after_two_ticks_falls_back_to_reuse(self):
+        L, st = self.ledger()
+        self.over_cap(st)
+        name = "ws-t-driver-g1"
+        self.world.mode[name] = "lost"                    # the rotate line never produces a handoff
+        st1, _, _, _ = self.tick(L, st)
+        self.assertEqual([x[1].split(":")[0] for x in self.world.sends], ["ROTATE E-2"])
+        st2, plan, _, _ = self.tick(L, st1, advance=600)
+        self.assertEqual(st2["sessions"]["driver"]["rotation"]["ticks"], 1)
+        self.assertEqual(self.conds(L, st2, "handoff_timeout"), [])
+        self.world.mode[name] = "land"
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        self.assertIsNone(st3["sessions"]["driver"]["rotation"])
+        self.assertEqual(self.conds(L, st3, "handoff_timeout"), [f"handoff_timeout:{name}"])
+        self.assertIsNone(self.entry(st3, "E-2"))
+        # the queued event goes to the old session instead
+        self.assertEqual(self.world.sends[-1], (name, f"EVENT E-1: read {self.paths.events / 'E-1.md'}"))
+        self.assertEqual(self.world.spawns, [])
+
+    def timed_out(self, at):
+        """A session over the cap that timed out a handoff at ``at``, with a new event waiting."""
+        L, st = self.ledger()
+        self.over_cap(st, handoff_timeout={"at": at, "event": "E-0", "requested_at": at})
+        st["next_event_n"] = 5
+        return L, st
+
+    def test_inside_the_cool_down_after_a_handoff_timeout_the_session_is_reused(self):
+        L, st = self.timed_out("2026-11-24T09:10:01Z")                 # 49m59s before NOW
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_REUSE)
+        self.assertEqual([x[1].split(":")[0] for x in self.world.sends], ["EVENT E-5"])
+        self.assertIsNone(st2["sessions"]["driver"]["rotation"])
+        self.assertEqual(self.conds(L, st2, "handoff_timeout"), ["handoff_timeout:ws-t-driver-g1"])
+
+    def test_after_the_cool_down_a_rotation_is_attempted_again(self):
+        self.assertEqual(edl.ROTATE_RETRY_AFTER_S, 3600)
+        L, st = self.timed_out("2026-11-24T09:00:00Z")                 # exactly 1 h before NOW
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_ROTATE)
+        self.assertEqual([x[1].split(":")[0] for x in self.world.sends], ["ROTATE E-6"])
+        self.assertIsNotNone(st2["sessions"]["driver"]["rotation"])
+
+
+# -- resume (§11.4) -------------------------------------------------------------------
+
+class TestResume(_Disp):
+    def test_a_dead_session_with_a_step_in_flight_resumes_in_place(self):
+        L, st = self.ledger()
+        self.inflight(st, "A", event="E-3")
+        st["next_event_n"] = 4
+        self.live(st, alive=False, status="dead", last_event="E-3")
+        self.outbox(st, "E-3", confirmed_at="2026-11-24T09:00:05Z")
+        st2, plan, _, commits = self.tick(L, st)
+        pe = plan.events[0]
+        self.assertEqual(self.world.resumes, [["resume", "ws-t-driver-g1", "--json", "--",
+                                               f"RESUME E-4: read {pe.path}"]])
+        self.assertEqual(self.world.spawns, [])
+        self.assertEqual((pe.kinds, pe.steps, pe.supersedes), (["resume", "step_due"], ["A"], ["E-3"]))
+        self.assertIn("- In flight: A (event E-3, since 2026-11-24T09:00:00Z).", pe.text)
+        self.assertIn("- The last event you received: E-3", pe.text)
+        self.assertIn("Check the last action against ground truth before continuing.", pe.text)
+        self.assertIn("## 1. role", pe.text)
+        # binding: launch_event in the same commit as `resuming`
+        rec = commits[0]["sessions"]["driver"]
+        self.assertEqual((rec["status"], rec["launch_event"], rec["name"], rec["gen"]),
+                         ("resuming", "E-4", "ws-t-driver-g1", 1))
+        self.assertEqual(rec["resumed_at"], [self.NOW])
+        self.assertEqual(commits[0]["steps"]["A"]["inflight"]["event"], "E-4")
+
+    def test_after_a_reboot_only_the_sessions_that_should_resume_at_once_do(self):
+        L, st = self.worker_ledger()
+        st["clock"] = {"boot_id": "boot-0", "wall": 1.0, "boottime": 1.0, "monotonic": 1.0}
+        st["steps"]["A"]["status"] = "done"
+        # the driver had a turn open; the implementer has W in flight; the reviewer was idle
+        self.live(st, alive=False, events=[ev("turn_start", "2026-11-24T09:50:00Z")])
+        self.live(st, key="impl:W", name="t-w-t-impl-w-g1", alive=False)
+        self.inflight(st, "W", event="E-2", name="t-w-t-impl-w-g1")
+        self.live(st, key="rev:W", name="t-w-t-rev-w-g1", alive=False)
+        st2, plan, res, _ = self.tick(L, st)
+        self.assertEqual(sorted(res.reboot.resume_now), ["driver", "impl:W"])
+        self.assertEqual(sorted(r[1] for r in self.world.resumes), ["t-w-t-impl-w-g1", "ws-t-driver-g1"])
+        self.assertEqual(st2["sessions"]["rev:W"]["status"], "dead")
+        # the reviewer resumes when its role next gets an event
+        item = edl.EventItem(edl.ITEM_REVIEW_DUE, "rev:W", "W", {"implementer": "impl", "verdict": "DONE: W",
+                                                                 "event": "E-2"})
+        st3, plan, _, _ = self.tick(L, st2, items=[item], advance=600)
+        self.assertEqual(self.world.resumes[-1][1], "t-w-t-rev-w-g1")
+        pe = next(p for p in plan.events if p.to == "rev:W")
+        self.assertIn(f"Implementer report: {self.paths.reports / 'W-implementation-2.md'}", pe.text)
+
+    def test_a_failed_resume_is_resume_failed_and_tried_again_with_the_same_event(self):
+        L, st = self.ledger()
+        self.inflight(st, "A", event="E-3")
+        st["next_event_n"] = 4
+        self.live(st, alive=False, status="dead")
+        self.world.resume_error = "amux-spawn: error: the transcript of session 'x' is missing\n"
+        st2, _, _, _ = self.tick(L, st)
+        rec = st2["sessions"]["driver"]
+        self.assertEqual((rec["status"], rec["launch_error"]["kind"]), ("resuming", "resume"))
+        self.assertEqual(self.entry(st2, "E-4")["sends"], [])
+        self.assertEqual(self.conds(L, st2), ["resume_failed:ws-t-driver-g1"])
+        self.world.resume_error = None
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual([r[-1].split(":")[0] for r in self.world.resumes], ["RESUME E-4", "RESUME E-4"])
+        st4, _, _, _ = self.tick(L, st3, advance=600)
+        self.assertEqual(self.conds(L, st4, "resume_failed"), [])
+
+    def test_resumed_but_not_growing_keeps_the_send(self):
+        L, st = self.ledger()
+        self.inflight(st, "A", event="E-3")
+        self.live(st, alive=False, status="dead")
+        self.world.resume_error = "amux-spawn: error: session 'x' resumed but the transcript is not growing\n"
+        st2, _, _, _ = self.tick(L, st)
+        e = self.entry(st2, "E-1")
+        self.assertEqual(e["sends"], [self.NOW])
+        self.assertEqual(st2["sessions"]["driver"]["launch_error"]["reason"], "not_growing")
+
+
+# -- delivery (§9.3) -------------------------------------------------------------------
+
+class TestDelivery(_Disp):
+    def due_with_live(self, **kw):
+        L, st = self.ledger()
+        self.live(st, **kw)
+        return L, st
+
+    def test_copy_mode_defers(self):
+        L, st = self.due_with_live(display=dict(IDLE_DISPLAY, pane_in_mode="1"),
+                                   pane=pane("cc-2.1.330-copy-mode-empty-box.txt"))
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.sends, [])
+        e = self.entry(st2, "E-1")
+        self.assertEqual((e["sends"], e["deferrals"], e["last_deferral"]["why"]), ([], 1, "copy-mode"))
+
+    def test_typed_text_defers_attached_and_detached(self):
+        for attached in ("0", "1"):
+            for fixture in ("cc-2.1.330-input-typed.txt", "cc-2.1.330-input-multiline-paste.txt",
+                            "cc-2.1.330-input-pasted-placeholder.txt", "cc-2.1.330-input-wrapped-40col.txt"):
+                with self.subTest(attached=attached, fixture=fixture):
+                    self.world.handles, self.world.sends = [], []
+                    L, st = self.due_with_live(display=dict(IDLE_DISPLAY, session_attached=attached))
+                    # the operator types after the readings: the check just before the send refuses
+                    self.world.tmux["ws-t-driver-g1"]["pane"] = pane(fixture)
+                    st2, plan, _, commits = self.tick(L, st)
+                    self.assertEqual(self.world.sends, [])
+                    e = self.entry(st2, "E-1")
+                    self.assertEqual((e["sends"], e["deferrals"]), ([], 1))
+                    self.assertEqual(e["last_deferral"]["why"], "input box not empty")
+                    # invariant 5: the send was committed before the check, then taken back
+                    self.assertEqual(self.entry(commits[-2], "E-1")["sends"], [self.NOW])
+
+    def test_a_typed_draft_seen_by_the_readings_defers_without_a_send_commit(self):
+        L, st = self.ledger()
+        self.live(st, pane=pane("cc-2.1.330-input-multiline-paste.txt"))
+        self.outbox(st, "E-9", steps=(), kinds=("alarm_cleared",), sends=[], confirmed_at=None, line="EVENT E-9: read /x")
+        st["next_event_n"] = 10
+        st["steps"]["A"]["status"] = "done"
+        self.outbox(st, "E-8", steps=(), sends=["2026-11-24T09:59:30Z"])       # captured: a send is unconfirmed
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.sends, [])
+        self.assertEqual(self.entry(st2, "E-9")["last_deferral"]["why"], "input box not empty")
+
+    def test_an_unparseable_pane_defers(self):
+        for fixture in ("cc-2.1.330-shell-mode.txt", "synth-blank.txt", "synth-booting-splash.txt"):
+            with self.subTest(fixture=fixture):
+                self.world.handles, self.world.sends = [], []
+                L, st = self.due_with_live()
+                self.world.tmux["ws-t-driver-g1"]["pane"] = pane(fixture)
+                st2, _, _, _ = self.tick(L, st)
+                self.assertEqual(self.world.sends, [])
+                self.assertEqual(self.entry(st2, "E-1")["last_deferral"]["why"], "pane unreadable")
+
+    def test_three_deferrals_raise_delivery_deferred_until_delivered(self):
+        L, st = self.due_with_live()
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("cc-2.1.330-input-typed.txt")
+        for i in range(3):
+            st, _, _, _ = self.tick(L, st, advance=600 if i else None)
+            self.assertEqual(self.conds(L, st, "delivery_deferred"),
+                             ["delivery_deferred:E-1"] if i == 2 else [])
+        self.assertEqual(self.entry(st, "E-1")["deferrals"], 3)
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("cc-2.1.330-input-empty-after-clear.txt")
+        st, _, _, _ = self.tick(L, st, advance=600)
+        self.assertEqual(len(self.world.sends), 1)
+        self.assertEqual(self.conds(L, st, "delivery_deferred"), [])
+
+    def test_a_busy_session_is_waited_for_not_deferred(self):
+        L, st = self.due_with_live(events=[ev("turn_start", "2026-11-24T09:59:00Z")])
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(plan.decisions["driver"].action, edl.ACT_WAIT)
+        self.assertEqual((self.entry(st2, "E-1")["deferrals"], self.world.sends), (0, []))
+
+    def test_confirmed_on_the_first_send(self):
+        L, st = self.due_with_live()
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        st1, _, _, _ = self.tick(L, st)
+        st2, plan, res, _ = self.tick(L, st1, advance=600)
+        self.assertEqual(res.confirmed, ["E-1"])
+        self.assertEqual(len(self.world.sends), 1)
+        self.assertEqual(st2["steps"]["A"]["status"], "verifying")
+        self.assertIsNone(self.entry(st2, "E-1"))               # complete: it left the outbox
+        self.assertEqual([c["left"] for c in plan.completed], ["completed"])
+
+    def test_retry_once_when_provably_absent_then_no_third_send(self):
+        L, st = self.due_with_live()
+        name = "ws-t-driver-g1"
+        self.world.mode[name] = "lost"
+        st1, _, _, _ = self.tick(L, st)
+        st2, _, _, _ = self.tick(L, st1, advance=600)
+        e = self.entry(st2, "E-1")
+        self.assertEqual(len(self.world.sends), 2)
+        self.assertEqual(e["retry"]["sent"], True)
+        self.assertEqual(self.conds(L, st2, "delivery_unconfirmed"), [])
+        st3, _, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual(self.conds(L, st3, "delivery_unconfirmed"), ["delivery_unconfirmed:E-1"])
+        for _ in range(3):
+            st3, _, _, _ = self.tick(L, st3, advance=600)
+        self.assertEqual(len(self.world.sends), 2)                # never a third send
+        # a late confirmation clears it
+        self.world._append(name, u("2026-11-24T10:45:00.100Z", "EVENT E-1: read /x"))
+        self.world.events[name].append(ev("turn_start", "2026-11-24T10:45:00Z"))
+        st4, _, _, _ = self.tick(L, st3, advance=600)
+        self.assertEqual(self.conds(L, st4, "delivery_unconfirmed"), [])
+
+    def test_a_line_sitting_in_the_input_box_is_not_resent(self):
+        L, st = self.due_with_live()
+        name = "ws-t-driver-g1"
+        self.world.mode[name] = "box"                         # Enter did not register
+        st1, _, _, _ = self.tick(L, st)
+        self.assertIn("EVENT E-1: read", self.world.tmux[name]["pane"])
+        st2, plan, _, _ = self.tick(L, st1, advance=600)
+        e = self.entry(st2, "E-1")
+        self.assertEqual((len(self.world.sends), e["retry"]["sent"], e["retry"]["why"]),
+                         (1, False, "absence not provable"))
+        st3, _, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual(self.conds(L, st3, "delivery_unconfirmed"), ["delivery_unconfirmed:E-1"])
+        self.assertEqual(len(self.world.sends), 1)
+
+    def lost_entry(self, **kw):
+        L, st = self.due_with_live()
+        self.world.mode["ws-t-driver-g1"] = "lost"
+        self.inflight(st, "A", event="E-1")
+        self.outbox(st, "E-1", sends=["2026-11-24T09:56:00Z"], **kw)
+        st["next_event_n"] = 2
+        return L, st
+
+    def test_a_retry_without_a_line_falls_back_to_the_event_line(self):
+        L, st = self.lost_entry(path="/x/events/E-1.md")
+        st["outbox"][0].pop("line", None)
+        self.tick(L, st)
+        self.assertEqual(self.world.sends, [("ws-t-driver-g1", "EVENT E-1: read /x/events/E-1.md")])
+
+    def test_a_retry_with_neither_line_nor_path_sends_nothing_and_keeps_the_entry(self):
+        L, st = self.lost_entry()
+        st["outbox"][0].pop("line", None)
+        st["outbox"][0].pop("path", None)
+        st2, _, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.sends, [])
+        e = self.entry(st2, "E-1")
+        self.assertEqual(e["sends"], ["2026-11-24T09:56:00Z"])
+
+    def test_binding_b_no_retry_when_absence_is_not_provable(self):
+        """50-05's delivery_provably_absent is False (here: no transcript covering the send) ⇒ no retry,
+        and at the following tick delivery_unconfirmed with no further sends (invariant 2)."""
+        L, st = self.due_with_live()
+        name = "ws-t-driver-g1"
+        self.world.mode[name] = "lost"
+        st1, _, _, _ = self.tick(L, st)
+        Path(self.world.handles[0]["transcript_path"]).unlink()        # nothing can prove absence now
+        st2, _, res, _ = self.tick(L, st1, advance=600)
+        self.assertEqual(self.entry(st2, "E-1")["retry"]["sent"], False)
+        self.assertEqual(len(self.world.sends), 1)
+        self.assertEqual(self.conds(L, st2, "delivery_unconfirmed"), [])
+        st3, plan, _, _ = self.tick(L, st2, advance=600)
+        self.assertEqual(self.conds(L, st3, "delivery_unconfirmed"), ["delivery_unconfirmed:E-1"])
+        self.assertEqual([op.effect.kind for op in plan.ops if op.effect.kind != edl.EFFECT_NONE], [])
+        st4, _, _, _ = self.tick(L, st3, advance=600)
+        self.assertEqual(len(self.world.sends), 1)
+
+    def test_no_judgement_on_a_send_seconds_old(self):
+        L, st = self.due_with_live()
+        self.world.mode["ws-t-driver-g1"] = "lost"
+        st1, _, _, _ = self.tick(L, st)
+        st2, _, _, _ = self.tick(L, st1, advance=5)                 # a hand-run tick 5 s later
+        self.assertNotIn("retry", self.entry(st2, "E-1"))
+        self.assertEqual(len(self.world.sends), 1)
+
+    def test_binding_a_the_reminder_commits_reminded_at_before_the_send_and_only_once(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "Rolled it, checking.")
+        self.live(st, entries=entries, events=events)
+        self.outbox(st, "E-1", path=str(self.paths.events / "E-1.md"))
+        st["next_event_n"] = 2
+        st1, plan, res, commits = self.tick(L, st)
+        self.assertEqual([x.kind for x in res.actions], ["verdict_reminder"])
+        self.assertEqual(self.world.sends, [("ws-t-driver-g1", "VERDICT? E-1: end this turn with exactly one "
+                                             f"verdict line (see {self.paths.events / 'E-1.md'})")])
+        self.assertEqual(self.entry(commits[0], "E-1")["reminded_at"], self.NOW)   # before the send
+        # the pass after the commit: no reminder item, nothing sent
+        self.world.mode["ws-t-driver-g1"] = "lost"
+        st2, plan2, res2, _ = self.tick(L, st1, advance=300)
+        self.assertEqual(res2.actions, [])
+        self.assertEqual(len(self.world.sends), 1)
+        # killed between the commit and the send: never a reminder after all, never a second one
+        L, st = self.ledger()
+        self.world.handles, self.world.sends = [], []
+        self.inflight(st, "A")
+        self.live(st, entries=entries, events=events)
+        self.outbox(st, "E-1")
+        st1, _, _, _ = self.tick(L, st, crash_at=1)
+        self.assertEqual((self.entry(st1, "E-1")["reminded_at"], self.world.sends), (edl.iso(self.now()), []))
+        _, _, res3, _ = self.tick(L, st1, advance=300)
+        self.assertEqual((res3.actions, self.world.sends), ([], []))
+
+    def test_a_reminder_the_pane_refuses_is_not_sent_and_not_recorded(self):
+        L, st = self.ledger()
+        self.inflight(st, "A")
+        entries, events = self.answered_turn("E-1", "Rolled it, checking.")
+        self.live(st, entries=entries, events=events, pane=pane("cc-2.1.330-input-typed.txt"))
+        self.outbox(st, "E-1")
+        st1, plan, _, _ = self.tick(L, st)                  # the readings see the draft: no op at all
+        self.assertEqual((self.entry(st1, "E-1")["reminded_at"], self.world.sends, plan.ops), (None, [], []))
+        # the draft appears after the readings: committed, refused by the check, taken back
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("cc-2.1.330-input-empty-after-clear.txt")
+        readings = edl.take_readings(L, st1, self.world, self.now())
+        res = edl.reconcile(L, st1, readings, self.now())
+        plan = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths, host="ws")
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("cc-2.1.330-input-typed.txt")
+        s, commits = res.state, []
+        edl.execute_dispatch(plan, s, self.world, lambda x: commits.append(copy.deepcopy(x)))
+        self.assertEqual(self.entry(commits[0], "E-1")["reminded_at"], self.NOW)
+        self.assertEqual((self.entry(s, "E-1")["reminded_at"], self.world.sends), (None, []))
+
+
+# -- the startup-dialog answer (§12.11) -------------------------------------------------
+
+class TestStartupDialogAnswer(_Disp):
+    def launched(self):
+        L, st = self.ledger([], startup_dialogs=[{"id": "code-mode", "match": CODE_MODE_MATCH, "key": "Enter"}])
+        self.outbox(st, "E-1", steps=(), kinds=("alarm_cleared",), via="spawn", line="EVENT E-1: read /x")
+        self.session(st, status="live", pane=pane("synth-code-mode-optin.txt"), launch_event="E-1",
+                     entries=[u("2026-11-24T09:00:00Z", "(session start)")])
+        st["next_event_n"] = 2
+        return L, st
+
+    def test_the_listed_key_is_sent_once_recorded_before_the_send(self):
+        L, st = self.launched()
+        st1, plan, res, commits = self.tick(L, st)
+        self.assertEqual(self.world.keys, [("ws-t-driver-g1", "Enter")])
+        answers = commits[0]["sessions"]["driver"]["dialog_answers"]
+        self.assertEqual([(x["dialog"], x["key"], x["launch"]) for x in answers],
+                         [("code-mode", "Enter", "2026-11-24T09:00:00Z")])      # committed before the key
+        self.assertEqual(st1["sessions"]["driver"]["dialog_answers"][0]["sent_at"], self.NOW)
+        # binding: a second pass after the commit emits no item and sends no key
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("synth-code-mode-optin.txt")   # still showing
+        st2, plan2, res2, _ = self.tick(L, st1, advance=60)
+        self.assertEqual([x.kind for x in res2.actions], [])
+        self.assertEqual(len(self.world.keys), 1)
+        self.assertEqual(self.keys(res2, "startup_dialog"), ["startup_dialog:ws-t-driver-g1"])
+
+    def test_a_crash_between_the_commit_and_the_key_never_sends_a_key(self):
+        L, st = self.launched()
+        st1, _, _, _ = self.tick(L, st, crash_at=1)
+        self.assertEqual(self.world.keys, [])
+        self.assertEqual(len(st1["sessions"]["driver"]["dialog_answers"]), 1)
+        st2, _, res2, _ = self.tick(L, st1, advance=60)
+        self.assertEqual((self.world.keys, res2.actions), ([], []))
+        self.assertIn("still showing after its listed key", res2.conditions[0].detail)
+
+    def test_the_key_is_not_sent_once_the_dialog_is_gone(self):
+        L, st = self.launched()
+        readings = edl.take_readings(L, st, self.world, self.now())
+        res = edl.reconcile(L, st, readings, self.now())
+        plan = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths, host="ws")
+        self.world.tmux["ws-t-driver-g1"]["pane"] = typed_pane("the operator answered it and is typing")
+        s = res.state
+        edl.execute_dispatch(plan, s, self.world, lambda x: None)
+        self.assertEqual(self.world.keys, [])
+        # the guard refused and nothing was sent: the record is cleared so a later pass may answer once
+        self.assertEqual(s["sessions"]["driver"]["dialog_answers"], [])
+
+    def test_a_refused_key_is_answered_on_the_next_pass_and_only_once(self):
+        L, st = self.launched()
+        self.world.tmux["ws-t-driver-g1"]["display"]["pane_in_mode"] = "1"        # copy-mode at the send
+        st1, _, _, commits = self.tick(L, st)
+        self.assertEqual(self.world.keys, [])
+        self.assertEqual(len(commits[0]["sessions"]["driver"]["dialog_answers"]), 1)    # recorded before
+        self.assertEqual(st1["sessions"]["driver"]["dialog_answers"], [])               # cleared after the refusal
+        self.world.tmux["ws-t-driver-g1"]["display"]["pane_in_mode"] = "0"
+        st2, _, _, _ = self.tick(L, st1, advance=60)
+        self.assertEqual(self.world.keys, [("ws-t-driver-g1", "Enter")])
+        self.assertEqual(len(st2["sessions"]["driver"]["dialog_answers"]), 1)
+        st3, _, _, _ = self.tick(L, st2, advance=60)
+        self.assertEqual(len(self.world.keys), 1)
+
+    def test_a_key_sent_before_a_crash_is_never_resent(self):
+        L, st = self.launched()
+        # killed as the result is committed: the key went out, its outcome is unknown
+        st1, _, _, _ = self.tick(L, st, crash_at=2, crash_mode="before")
+        self.assertEqual(len(self.world.keys), 1)
+        self.assertEqual(len(st1["sessions"]["driver"]["dialog_answers"]), 1)
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("synth-code-mode-optin.txt")   # even if it shows again
+        for _ in range(2):
+            st1, _, _, _ = self.tick(L, st1, advance=60)
+        self.assertEqual(len(self.world.keys), 1)
+
+    def test_a_key_that_ran_and_failed_keeps_its_record_and_is_never_sent_again(self):
+        L, st = self.launched()
+        self.world.key_error = "tmux: send-keys failed\n"
+        st1, _, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.keys, [("ws-t-driver-g1", "Enter")])
+        answers = st1["sessions"]["driver"]["dialog_answers"]
+        self.assertEqual(len(answers), 1)                  # the key may have reached the pane: stays recorded
+        self.assertTrue(answers[0].get("not_sent"))
+        self.assertNotIn("sent_at", answers[0])
+        for _ in range(3):
+            st1, _, _, _ = self.tick(L, st1, advance=60)
+        self.assertEqual(len(self.world.keys), 1)          # and no second key on later passes
+        self.assertEqual(len(st1["sessions"]["driver"]["dialog_answers"]), 1)
+
+    def test_no_event_is_typed_while_a_dialog_shows(self):
+        L, st = self.ledger()
+        self.live(st, pane=pane("synth-code-mode-optin.txt"), launch_event="E-0")
+        self.outbox(st, "E-0", steps=(), kinds=("alarm_cleared",), via="spawn")   # launch unconfirmed: captured
+        st["next_event_n"] = 1
+        self.world.events["ws-t-driver-g1"] = [ev("turn_start", "2026-11-24T09:00:01Z"),
+                                               ev("stop", "2026-11-24T09:55:00Z", state="idle")]
+        st2, plan, _, _ = self.tick(L, st)
+        self.assertEqual(self.world.sends, [])
+        self.assertEqual(self.entry(st2, "E-1")["last_deferral"]["why"], "a dialog shows")
+        # and at the moment of sending, too
+        L, st = self.ledger()
+        self.world.handles = []
+        self.live(st)
+        readings = edl.take_readings(L, st, self.world, self.now())
+        res = edl.reconcile(L, st, readings, self.now())
+        sel = edl.select(L, res.state, self.now())
+        plan = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths, selection=sel, host="ws")
+        self.world.tmux["ws-t-driver-g1"]["pane"] = pane("synth-code-mode-optin.txt")
+        outcomes = edl.execute_dispatch(plan, res.state, self.world, lambda x: None)
+        self.assertEqual([o.deferred for o in outcomes], ["a dialog shows"])
+        self.assertEqual(self.world.sends, [])
+
+
+# -- keep warm (§11.5) ---------------------------------------------------------------
+
+class TestKeepWarm(_Disp):
+    def facts(self, age_min=45, ctx=100000, ttl=3600, **kw):
+        f = edl.SessionFacts(key="driver", name="ws-t-driver-g1", alive=True, status=edl.ST_IDLE,
+                             context_tokens=ctx, cache_left_s=ttl - age_min * 60, cache_ttl=ttl,
+                             overage=ttl == 300)
+        for k, v in kw.items():
+            setattr(f, k, v)
+        return f
+
+    def warm_ledger(self, model="claude-opus-5-5", due="2026-11-24T14:00:00Z", **role):
+        r = {"model": model, "effort": "high"}
+        r.update(role)
+        L, st = self.ledger([self.driver("A", not_before=due)], roles={"driver": r})
+        st["sessions"]["driver"] = {"name": "ws-t-driver-g1", "gen": 1, "status": "live"}
+        return L, st
+
+    def check(self, L, st, facts):
+        return edl.keep_warm_check(L, st, "driver", facts, self.now())
+
+    def test_the_40_to_50_minute_window(self):
+        L, st = self.warm_ledger()
+        for age, ok in ((39, False), (40, True), (45, True), (50, True), (51, False)):
+            with self.subTest(age=age):
+                self.assertEqual(self.check(L, st, self.facts(age_min=age))[0], ok)
+
+    def test_next_event_inside_and_outside_k_b_over_c(self):
+        # Opus: k=40, B=40000, C=100000 ⇒ 16 h
+        L, st = self.warm_ledger(due="2026-11-25T01:59:00Z")
+        ok, why = self.check(L, st, self.facts())
+        self.assertTrue(ok, why)
+        self.assertIn("k=40", why)
+        L, st = self.warm_ledger(due="2026-11-25T02:01:00Z")
+        ok, why = self.check(L, st, self.facts())
+        self.assertFalse(ok)
+        self.assertIn("beyond k·B/C = 16h", why)
+        # a bigger context shrinks the horizon: C=400000 ⇒ 4 h
+        L, st = self.warm_ledger(due="2026-11-24T15:00:00Z")
+        self.assertFalse(self.check(L, st, self.facts(ctx=400000))[0])
+        # no scheduled event (a trigger is not predicted)
+        L, st = self.ledger([self.driver("A", trigger="true")])
+        st["sessions"]["driver"] = {"name": "n", "status": "live"}
+        self.assertEqual(self.check(L, st, self.facts()), (False, "no scheduled event for the role"))
+
+    def test_fable_doubles_k(self):
+        L, st = self.warm_ledger(model="fable", due="2026-11-25T08:00:00Z")    # 22 h: within 32 h, beyond 16 h
+        self.assertEqual(edl.price_class(L.roles["driver"]), "fable")
+        self.assertEqual(edl.keep_warm_k(L.roles["driver"]), 80)
+        ok, why = self.check(L, st, self.facts())
+        self.assertTrue(ok, why)
+        # fable mapped to an Opus id by the profile is Opus-priced
+        L2, st2 = self.warm_ledger(model="fable", profile="claude", due="2026-11-25T08:00:00Z")
+        self.assertEqual(L2.roles["driver"].expected_model_id, "claude-opus-5-5")
+        self.assertEqual(edl.keep_warm_k(L2.roles["driver"]), 40)
+        self.assertFalse(self.check(L2, st2, self.facts())[0])
+
+    def test_window_opening_counts_as_the_next_event(self):
+        L, st = self.ledger([self.driver("A", window="20:00-22:00Z")], roles={
+            "driver": {"model": "claude-opus-5-5", "effort": "high"}})
+        nxt = edl.next_scheduled_event(L, st, "driver", self.now())
+        self.assertEqual(nxt, T("2026-11-24T20:00:00Z"))
+
+    def test_overage_limits_and_keep_warm_false_suppress(self):
+        L, st = self.warm_ledger()
+        self.assertEqual(self.check(L, st, self.facts(ttl=300, age_min=1))[1], "overage (5m bucket)")
+        self.assertEqual(self.check(L, st, self.facts(limited="claude-opus-5-5"))[1], "model limited (claude-opus-5-5)")
+        st["limits"] = {"claude-opus-5-5": {"until": "2026-11-24T15:00:00Z"}}
+        self.assertFalse(self.check(L, st, self.facts())[0])
+        L, st = self.warm_ledger(keep_warm=False)
+        self.assertEqual(self.check(L, st, self.facts()), (False, "keep_warm: false"))
+        L, st = self.warm_ledger()
+        self.assertEqual(self.check(L, st, self.facts(turn_open=True))[1], "not idle")
+
+    def test_the_ping_goes_through_the_dispatch_once(self):
+        L, st = self.ledger([self.driver("A", not_before="2026-11-24T14:00:00Z")])
+        self.live(st, entries=[u("2026-11-24T09:15:00Z", "EVENT E-0: read /x"), usage_entry("2026-11-24T09:15:00Z")],
+                  events=[ev("turn_start", "2026-11-24T09:15:00Z"), ev("stop", "2026-11-24T09:15:00Z")])
+        self.world.reply["ws-t-driver-g1"] = None
+        st1, plan, _, commits = self.tick(L, st)
+        self.assertEqual(self.world.sends, [("ws-t-driver-g1", edl.PING_LINE)])
+        self.assertEqual(commits[0]["sessions"]["driver"]["last_ping_at"], self.NOW)
+        st2, _, _, _ = self.tick(L, st1, advance=60)
+        self.assertEqual(len(self.world.sends), 1)
+
+
+# -- crash safety (invariants 2 and 5) ---------------------------------------------------
+
+class TestCrashSafety(_Disp):
+    """Kill the pass at every commit (after it, and as it is written), then run the next passes:
+    no event lands twice, no name is spawned twice, no inflight marker is lost."""
+
+    def scenarios(self):
+        def spawn_fresh(self_):
+            L, st = self_.ledger()
+            self_.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+            return L, st
+
+        def send_into_live(self_):
+            L, st = self_.ledger()
+            self_.live(st)
+            self_.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+            return L, st
+
+        def retry_after_a_lost_send(self_):
+            L, st = self_.ledger()
+            self_.inflight(st, "A", event="E-1")
+            self_.live(st)
+            self_.outbox(st, "E-1", sends=["2026-11-24T09:56:00Z"], line="EVENT E-1: read /e1",
+                         path=str(self_.paths.events / "E-1.md"))
+            st["next_event_n"] = 2
+            self_.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+            return L, st
+
+        def resume_dead(self_):
+            L, st = self_.ledger()
+            self_.inflight(st, "A", event="E-1")
+            self_.live(st, alive=False, status="dead")
+            st["next_event_n"] = 2
+            self_.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+            return L, st
+
+        def rotation_spawn(self_):
+            L, st = self_.ledger()
+            hp = self_.tmp / "handoff.md"
+            hp.write_text("# Handoff\n")
+            name = "ws-t-driver-g1"
+            entries = [u("2026-11-24T09:50:01.200Z", "ROTATE E-2: read /e2"), a("2026-11-24T09:55:00Z", f"HANDOFF: {hp}")]
+            events = [ev("turn_start", "2026-11-24T09:50:01Z"),
+                      ev("stop", "2026-11-24T09:55:00Z", state="idle", last_message=f"HANDOFF: {hp}")]
+            _, h, _ = self_.live(st, entries=entries, events=events, rotation={
+                "event": "E-2", "requested_at": "2026-11-24T09:50:00Z", "handoff_path": str(hp), "ticks": 0})
+            h.update(last_message=f"HANDOFF: {hp}", stopped_at="2026-11-24T09:55:00Z")
+            os.utime(str(hp), (self_.epoch("2026-11-24T09:54:00Z"),) * 2)
+            self_.outbox(st, "E-2", steps=(), kinds=("rotate",), sends=["2026-11-24T09:50:00Z"])
+            self_.inflight(st, "A", event="E-1", name=name)
+            self_.outbox(st, "E-1", sends=[])
+            st["steps"]["A"]["status"] = "inflight"
+            st["next_event_n"] = 3
+            self_.world.reply["ws-t-driver-g2"] = "ADVANCED: A"
+            return L, st
+
+        def dialog_answer(self_):
+            L, st = self_.ledger([], startup_dialogs=[{"id": "code-mode", "match": CODE_MODE_MATCH, "key": "Enter"}])
+            self_.outbox(st, "E-1", steps=(), kinds=("alarm_cleared",), via="spawn", line="EVENT E-1: read /x")
+            self_.session(st, pane=pane("synth-code-mode-optin.txt"), launch_event="E-1",
+                          entries=[u("2026-11-24T09:00:00Z", "(start)")])
+            st["next_event_n"] = 2
+            return L, st
+
+        def dialog_refused(self_):
+            L, st = dialog_answer(self_)
+            w, real, left = self_.world, self_.world.tmux_display, [1]
+
+            def display(name, fields):          # the first key guard sees copy-mode, later ones do not
+                if tuple(fields) == ("pane_in_mode",) and left[0]:
+                    left[0] -= 1
+                    return {"pane_in_mode": "1"}
+                return real(name, fields)
+            w.tmux_display = display
+            return L, st
+
+        def reminder(self_):
+            L, st = self_.ledger()
+            self_.inflight(st, "A")
+            entries, events = self_.answered_turn("E-1", "Rolled it, checking.")
+            self_.live(st, entries=entries, events=events)
+            self_.outbox(st, "E-1")
+            st["next_event_n"] = 2
+            self_.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+            return L, st
+
+        return [spawn_fresh, send_into_live, retry_after_a_lost_send, resume_dead, rotation_spawn,
+                dialog_answer, dialog_refused, reminder]
+
+    def fresh(self, i):
+        self.tmp_i = self.tmp / f"run-{i}"
+        (self.tmp_i / "t").mkdir(parents=True)
+        self.tdir = self.tmp_i / "t"
+        os.environ[edl.STATE_ROOT_ENV] = str(self.tmp_i / "state")
+        self.paths = edl.run_paths("epic-t")
+        self.world = DispatchWorld(self.tdir, now=T(self.NOW))
+
+    def check_invariants(self, label, L, st, first_markers):
+        w = self.world
+        counted = {}
+        for line in w.landed:
+            m = re.match(r"^(EVENT|RESUME|ROTATE|VERDICT\?) (E-\d+)", line)
+            if m:
+                counted[(m.group(1), m.group(2))] = counted.get((m.group(1), m.group(2)), 0) + 1
+        self.assertTrue(all(n == 1 for n in counted.values()), f"{label}: an event landed twice: {counted}")
+        sent = {}
+        for _, line in w.sends:
+            m = re.match(r"^(EVENT|RESUME|ROTATE|VERDICT\?) (E-\d+)", line)
+            if m:
+                sent[m.group(2)] = sent.get(m.group(2), 0) + 1
+        self.assertTrue(all(n <= 2 for n in sent.values()), f"{label}: more than two sends: {sent}")
+        self.assertEqual(len(w.created), len(set(w.created)), f"{label}: a name spawned twice: {w.created}")
+        self.assertLessEqual(len(w.keys), 1, f"{label}: a second dialog key")
+        for sid in first_markers:
+            rec = st["steps"][sid]
+            self.assertTrue(rec.get("inflight") or rec.get("last_verdict"),
+                            f"{label}: the marker of {sid} was lost: {rec}")
+        for sid, rec in st["steps"].items():
+            if rec.get("status") == "inflight":
+                self.assertTrue(rec.get("inflight"), f"{label}: {sid} inflight without a marker")
+
+    def run_scenario(self, i, build, crash_at, mode):
+        self.fresh(i)
+        L, st = build(self)
+        first = [sid for sid, r in st["steps"].items() if r.get("inflight")]
+        st, _, _, _ = self.tick(L, st, crash_at=crash_at, crash_mode=mode)
+        first += [sid for sid, r in st["steps"].items() if r.get("inflight") and sid not in first]
+        for _ in range(4):
+            st, _, _, _ = self.tick(L, st, advance=600)
+        self.check_invariants(f"{build.__name__} killed at commit {crash_at} ({mode})", L, st, first)
+        return st
+
+    def test_killed_between_every_commit_and_its_effect(self):
+        i = 0
+        for build in self.scenarios():
+            self.fresh(i)
+            i += 1
+            L, st = build(self)
+            _, plan, _, commits = self.tick(L, st)
+            self.assertTrue(any(op.effect.kind != edl.EFFECT_NONE for op in plan.ops), build.__name__)
+            for k in range(1, len(commits) + 1):
+                for mode in ("after", "before"):
+                    with self.subTest(scenario=build.__name__, commit=k, mode=mode):
+                        self.run_scenario(i, build, k, mode)
+                        i += 1
+
+    def test_the_uncrashed_scenarios_make_progress(self):
+        expect = {"spawn_fresh": "verifying", "send_into_live": "verifying", "retry_after_a_lost_send": "verifying",
+                  "resume_dead": "verifying", "rotation_spawn": "verifying"}
+        for i, build in enumerate(self.scenarios()):
+            with self.subTest(scenario=build.__name__):
+                st = self.run_scenario(100 + i, build, None, "after")
+                if build.__name__ in expect:
+                    self.assertEqual(st["steps"]["A"]["status"], expect[build.__name__])
+                if build.__name__ == "dialog_refused":      # refused once, then answered once
+                    self.assertEqual(len(self.world.keys), 1)
+
+
+class TestDispatchContract(_Disp):
+    def test_plan_is_pure_and_the_input_state_untouched(self):
+        L, st = self.ledger()
+        self.live(st)
+        readings = edl.take_readings(L, st, self.world, self.now())
+        res = edl.reconcile(L, st, readings, self.now())
+        sel = edl.select(L, res.state, self.now())
+        before = copy.deepcopy(res.state)
+        p1 = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths, selection=sel, host="ws")
+        p2 = edl.plan_dispatch(L, res.state, res, readings, self.now(), paths=self.paths, selection=sel, host="ws")
+        self.assertEqual(res.state, before)
+        self.assertEqual([op.label for op in p1.ops], [op.label for op in p2.ops])
+        self.assertEqual([op.effect for op in p1.ops], [op.effect for op in p2.ops])
+        self.assertEqual(p1.preview, p2.preview)
+        self.assertEqual((self.world.sends, self.world.spawns), ([], []))
+        self.assertFalse((self.paths.events).exists())          # files are written by the executor only
+
+    def test_paused_writes_events_and_starts_nothing(self):
+        L, st = self.ledger([])
+        self.live(st)
+        item = edl.EventItem(edl.ITEM_ALARM_CLEARED, "driver", None, {"alarm": "x", "subject": "run"})
+        st2, plan, _, _ = self.tick(L, st, items=[item], paused=True)
+        self.assertEqual([op.effect.kind for op in plan.ops], [edl.EFFECT_NONE])
+        self.assertEqual(self.entry(st2, "E-1")["sends"], [])
+        self.assertEqual(self.world.sends, [])
+
+    def test_world_effect_methods_fail_loudly_on_the_base_class(self):
+        w = edl.World()
+        for call in (lambda: w.spawn(["spawn"]), lambda: w.resume(["resume"]), lambda: w.reap(["rm"]),
+                     lambda: w.amux_send("n", "x"), lambda: w.send_keys("n", "Enter")):
+            with self.assertRaises(NotImplementedError):
+                call()
+
+    def test_real_world_effects_build_their_commands(self):
+        rw = edl.RealWorld()
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+        with mock.patch.object(edl.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(edl.shutil, "which", return_value="/bin/amux-spawn"):
+            self.assertTrue(rw.spawn(["spawn", "s"]).ok)
+            rw.resume(["resume", "n", "--json", "--", "RESUME E-1: read /p"])
+            rw.reap(["rm", "n"])
+            rw.amux_send("n", "EVENT E-1: read /p")
+            rw.send_keys("n", "Enter")
+            self.assertIsNone(rw.send_keys("n", "C-c").rc)          # only Enter / Escape
+        self.assertEqual(calls, [["/bin/amux-spawn", "spawn", "s"],
+                                 ["/bin/amux-spawn", "resume", "n", "--json", "--", "RESUME E-1: read /p"],
+                                 ["/bin/amux-spawn", "rm", "n"],
+                                 ["amux", "send", "n", "EVENT E-1: read /p"],
+                                 ["tmux", "send-keys", "-t", "=amux-n:", "Enter"]])
+        with mock.patch.object(edl.subprocess, "run", side_effect=OSError("gone")):
+            self.assertIsNone(rw.amux_send("n", "x").rc)
+
+    def test_the_resume_form_matches_amux_spawns_parser(self):
+        """`amux-spawn resume <name> --json -- "<prompt>"`: the prompt is split off at the first `--`."""
+        import importlib.machinery
+        import importlib.util
+        path = str(_REPO / ".claude" / "bin" / "amux-spawn")
+        loader = importlib.machinery.SourceFileLoader("amux_spawn_cli", path)
+        spec = importlib.util.spec_from_loader("amux_spawn_cli", loader)
+        cli = importlib.util.module_from_spec(spec)
+        loader.exec_module(cli)
+        args = edl.resume_args("n", "RESUME E-4: read /s/events/E-4.md")
+        before, prompt = cli._split_prompt(args[1:])
+        self.assertEqual((before, prompt), (["n", "--json"], "RESUME E-4: read /s/events/E-4.md"))
+        ns, rest = cli.build_parser().parse_known_args(["resume", *before])
+        self.assertEqual((ns.handle, ns.json, rest), ("n", True, []))
+        spawn = edl.spawn_args(*self.ledger()[:1], "driver", 1, str(self.ws), "EVENT E-1: read /p")
+        before, prompt = cli._split_prompt(spawn[1:])
+        ns, claude_flags = cli.build_parser().parse_known_args(["spawn", *before])
+        self.assertEqual((ns.suffix, ns.dir, ns.yolo, ns.run_id, ns.detach, prompt),
+                         ("t-driver-g1", str(self.ws), True, "epic-t", True, "EVENT E-1: read /p"))
+        self.assertEqual(claude_flags, ["--model=claude-opus-5-5", "--effort=high"])
 
 
 if __name__ == "__main__":

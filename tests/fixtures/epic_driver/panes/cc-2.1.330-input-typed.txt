@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Opus 5.5 with high effort · Claude
+ ▝▝   ▝▝   /tmp/epic-driver-fixture
+
+⚠ Code Mode (experimental) is on · this session can be resumed only with Code Mode on
+⚠ Example notice line
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  No Chrome or computer use: exit and run CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0 claude for a new session without Code …
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ please also check the deploy log before you continue
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on

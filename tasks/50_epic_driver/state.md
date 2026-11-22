@@ -40,7 +40,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | done | Phase 0 | context, cache TTL, compaction, last assistant entry |
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | done | Phase 0 | P0-10, P0-13 (selection side) |
 | 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | done | 50-01, 50-02, 50-03, 50-04 | |
-| 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | todo | 50-05 | D4, D5, M6, m2 |
+| 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | done | 50-05 | D4, D5, M6, m2 |
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | todo | 50-04 | P0-7 |
 | 50-08 | [Tick, CLI, alarms, notify, tmux server](./50-08-tick-cli-alarms_opus.md) | todo | 50-04, 50-05, 50-06, 50-07 | P0-5, P0-8, P0-11 (`last_tick_*`), P0-12 (check) |
 | 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | todo | 50-06, 50-08 | |
@@ -148,3 +148,10 @@ Phase 0 decisions. They stay listed here for the reasoning.
   opt-in pane is synthesised (not reproducible here); account details scrubbed. Obligations moved into 50-06's task
   file: commit `record_dialog_answer`, `launch_event` and `reminded_at` before their sends; `delivery_unconfirmed`
   with no further sends when absence is unprovable.
+- **2026-11-22 — 50-06 done** (2 reviews, 2 fixes; suite 2861 OK, 2 skipped). Dispatcher: event files, the §11.2
+  policy, rotation, resume, spawn, keep-warm, delivery with the input-box parser (8 new real pane captures from a
+  throwaway tmux server), `(mutation, effect)` pairs with a crash matrix; all four 50-05 Binding obligations tested.
+  Manager decisions on review LOWs: a failed spawn/resume backs off 10 m → 20 m → 40 m → 1 h 20 m, capped at 4 h,
+  reset on success and on a reboot (alarm stays until a launch succeeds); a dialog key the guard refused (never ran)
+  may be answered on a later pass, a key whose command ran is never re-sent; a retry falls back to `event_line`, never
+  an empty send; after `handoff_timeout` the same generation is reused for `ROTATE_RETRY_AFTER = 1h`.

@@ -1,0 +1,30 @@
+
+           Claude Code v2.1.330
+ ▐▛███▛█   Opus 5.5 with high effort
+▝▜██████▀  Claude
+ ▝▝   ▝▝   /epic-driver-fixture
+
+⚠ Code Mode (experimental) is on · this
+  session can be resumed only with Code
+  Mode on
+⚠ Example notice line
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  No Chrome or computer use: exit and…
+────────────────────────────────────────
+❯ EVENT E-41: read /tmp/epic-driver-fi
+  xture/events/E-41.md
+────────────────────────────────────────
+  ⏸ manual mode on

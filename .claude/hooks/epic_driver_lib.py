@@ -22,6 +22,12 @@ Delivery (reading)    §9.3 confirmation, "provably did not land"  50-05
 Usage limits          §12.4 classification, reset times, ladder   50-05
 Startup dialogs       §12.11 pane classifier and listed answers   50-05
 Session reconcile     ``reconcile``: §12 facts, conditions, items 50-05
+Input box             §9.3 prompt-box parser, send preconditions  50-06
+Events                §9.1 items and event files, §9.2 lines      50-06
+Session policy        §11.2 decision table, §11.5 keep-warm       50-06
+Dispatch plan         ``plan_dispatch``: (mutation, effect) ops   50-06
+Dispatch execution    ``execute_dispatch``: COMMIT → effect → COMMIT 50-06
+Dispatch conditions   delivery/handoff/spawn/resume alarm rows    50-06
 ====================  ==========================================  ======
 
 Later tasks append their own sections (reconcile §12, dispatch §9/§11,
@@ -50,7 +56,9 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -60,7 +68,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypedDict
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypedDict
 
 try:  # PyYAML is a system package (6.0.3 on the workstation); optional at import.
     import yaml  # type: ignore[import-untyped]
@@ -196,6 +204,41 @@ QUESTION_TEXT_MAX = 8000             # the answer text carried in an `answer` it
 DIALOG_DETAIL_LINES = 2              # the startup_dialog alarm detail: the dialog's first lines
 DIALOG_DETAIL_MAX = 160
 PROMPT_GLYPHS = ("❯", ">")           # the TUI's prompt glyph (input box and menu pointer)
+
+# -- 50-06: dispatch — session policy (§11) and delivery (§9) --
+AMUX_BIN = "amux"                    # `amux send` only (RealWorld.amux_send)
+AMUX_SPAWN_BIN = "amux-spawn"        # spawn / resume / rm (RealWorld._amux_spawn)
+SPAWN_TIMEOUT_S = 180                # *default*: amux-spawn spawn confirms the launch before it returns
+RESUME_TIMEOUT_S = 120               # *default*: the resume waits up to 30 s for transcript growth
+REAP_TIMEOUT_S = 60
+SEND_TIMEOUT_S = 30
+KEYS_TIMEOUT_S = 10
+REUSE_MIN_TTL_S = 5 * 60             # §11.2: Reuse needs ≥ 5 min of prompt cache left
+OVERAGE_TTL_S = 300                  # §11.1: the 5m bucket = overage
+HOUR_TTL_S = 3600                    # the 1 h bucket
+DEFERRALS_ALARM_AT = 3               # §9.3: delivery_deferred at 3 deferrals
+#: §9.3 retry: a send younger than this is not judged yet (a hand-run tick seconds after the send
+#: would otherwise see a line the TUI has consumed but not yet written to the transcript).
+DELIVERY_RETRY_AFTER_S = 120         # *default*
+HANDOFF_TIMEOUT_TICKS = 2            # §11.3 step 5: no handoff after 2 ticks ⇒ handoff_timeout
+#: After a handoff timeout the session (that generation) is reused, not rotated again, for this long
+#: (measured from the timeout); then a rotation may be attempted again.
+ROTATE_RETRY_AFTER_S = 3600
+#: A failed spawn/resume (other than ``name_in_use``) is tried again after a doubling wait from
+#: ``launch_error.at``: one tick period, then 2x, 4x, ... capped. ``launch_attempts`` picks the step.
+LAUNCH_RETRY_BASE_S = 600            # one tick period (10 min)
+LAUNCH_RETRY_MAX_S = 4 * 3600
+KEEP_WARM_MIN_AGE_S = 40 * 60        # §11.5: the last assistant entry is 40–50 min old
+KEEP_WARM_MAX_AGE_S = 50 * 60
+KEEP_WARM_K_OPUS = 40                # §11.5 / D4: Opus $8 write / $0.20 hit
+KEEP_WARM_K_FABLE = 80               # Fable $16 / $0.20
+#: §9.3: rows below the input box's closing rule (mode line, status line, hints); more ⇒ unreadable.
+INPUT_BOX_FOOTER_MAX_ROWS = 12
+#: §19: the installed role prompts (a role's `prompt` overrides).
+ROLE_PROMPTS_DIR = Path.home() / ".claude" / "epic-driver" / "prompts"
+DRIVER_PROMPT_FILE = "epic-driver-driver.md"
+WORKER_PROMPT_FILE = "epic-driver-worker.md"
+PING_LINE = 'PING: no action needed; reply exactly "WAITING: ping"'
 
 
 # =============================================================================
@@ -342,6 +385,29 @@ class World:
         None when the workspace declares no ``[questions]`` section.
         """
         raise NotImplementedError("World.question_entries")
+
+    # -- 50-06: the dispatch effects (§9.2, §11, §12.11, §13). The pure dispatcher builds every
+    # argument list (``spawn_args``, ``resume_args``, ``reap_args``); these only run them. --
+
+    def spawn(self, args: Sequence[str]) -> CommandResult:
+        """``amux-spawn <args>`` where ``args`` starts with ``spawn`` (:func:`spawn_args`)."""
+        raise NotImplementedError("World.spawn")
+
+    def resume(self, args: Sequence[str]) -> CommandResult:
+        """``amux-spawn <args>`` where ``args`` starts with ``resume`` (:func:`resume_args`)."""
+        raise NotImplementedError("World.resume")
+
+    def reap(self, args: Sequence[str]) -> CommandResult:
+        """``amux-spawn <args>`` where ``args`` starts with ``rm`` (:func:`reap_args`)."""
+        raise NotImplementedError("World.reap")
+
+    def amux_send(self, name: str, line: str) -> CommandResult:
+        """``amux send <name> <line>``: the text, then Enter (§9.2)."""
+        raise NotImplementedError("World.amux_send")
+
+    def send_keys(self, name: str, key: str) -> CommandResult:
+        """``tmux send-keys -t =amux-<name>: <key>``, one key of ``STARTUP_DIALOG_KEYS`` (§12.11)."""
+        raise NotImplementedError("World.send_keys")
 
 
 def _git_env() -> Dict[str, str]:
@@ -583,6 +649,41 @@ class RealWorld(World):
             withdrawn_word=fmt.withdrawn.lower(),
             entries=entries,
         )
+
+    # -- 50-06: the dispatch effects; each runs one command and reports it, never raises --
+
+    def _run_tool(self, argv: Sequence[str], timeout_s: float) -> CommandResult:
+        try:
+            proc = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout_s,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return CommandResult(rc=None, error=f"{os.path.basename(argv[0])} timed out after {timeout_s:g}s")
+        except OSError as exc:
+            return CommandResult(rc=None, error=f"{os.path.basename(argv[0])} could not run: {exc}")
+        return CommandResult(rc=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    def _amux_spawn(self, args: Sequence[str], timeout_s: float) -> CommandResult:
+        # The unit's PATH (§22) may lack ~/.local/bin, where install.sh puts amux-spawn.
+        binary = shutil.which(AMUX_SPAWN_BIN) or str(Path.home() / ".local" / "bin" / AMUX_SPAWN_BIN)
+        return self._run_tool([binary, *args], timeout_s)
+
+    def spawn(self, args: Sequence[str]) -> CommandResult:
+        return self._amux_spawn(args, SPAWN_TIMEOUT_S)
+
+    def resume(self, args: Sequence[str]) -> CommandResult:
+        return self._amux_spawn(args, RESUME_TIMEOUT_S)
+
+    def reap(self, args: Sequence[str]) -> CommandResult:
+        return self._amux_spawn(args, REAP_TIMEOUT_S)
+
+    def amux_send(self, name: str, line: str) -> CommandResult:
+        return self._run_tool([AMUX_BIN, "send", name, line], SEND_TIMEOUT_S)
+
+    def send_keys(self, name: str, key: str) -> CommandResult:
+        if key not in STARTUP_DIALOG_KEYS:
+            return CommandResult(rc=None, error=f"refusing key {key!r}: not one of {STARTUP_DIALOG_KEYS}")
+        return self._run_tool([TMUX_BIN, "send-keys", "-t", f"={asl.tmux_session_name(name)}:", key],
+                              KEYS_TIMEOUT_S)
 
 
 # =============================================================================
@@ -4058,15 +4159,23 @@ class PaneClass:
     detail: str = ""     # a dialog's first lines (the alarm detail)
 
 
-def _input_box_rows(lines: List[str]) -> set:
-    rows: set = set()
+def _input_boxes(lines: List[str]) -> List[Tuple[int, int]]:
+    """Every ``(opening rule, closing rule)`` row pair that frames a prompt-glyph row, top to bottom."""
+    boxes: List[Tuple[int, int]] = []
     for i, ln in enumerate(lines):
         if i == 0 or not _GLYPH_ROW_RE.match(ln) or not _RULE_RE.match(lines[i - 1]):
             continue
         for j in range(i + 1, min(len(lines), i + 1 + _INPUT_BOX_MAX_ROWS)):
             if _RULE_RE.match(lines[j]):
-                rows.update(range(i - 1, j + 1))
+                boxes.append((i - 1, j))
                 break
+    return boxes
+
+
+def _input_box_rows(lines: List[str]) -> set:
+    rows: set = set()
+    for top, bottom in _input_boxes(lines):
+        rows.update(range(top, bottom + 1))
     return rows
 
 
@@ -4917,3 +5026,1753 @@ def reconcile(ledger: Ledger, state: RunState, readings: Readings, now: datetime
     _reconcile_questions(p)
     _reconcile_rotation(p)
     return p.result
+
+
+# =============================================================================
+# Input box and delivery preconditions (§9.3, review M6) — 50-06
+# =============================================================================
+#
+# The rule is derived from captured panes of the installed Claude Code (2.1.330;
+# tests/fixtures/epic_driver/panes/). The prompt box is the bottom-most block that
+# opens with a full-width rule, carries the prompt glyph (``❯``, or ``>``) on its
+# first row and closes with another rule; the mode line, the status line and hints
+# follow it. Typed text sits after the glyph on the first row; a multi-line draft or
+# a line the TUI wrapped continues on rows indented by two spaces; a large paste
+# shows as ``[Pasted text #n +k lines]``. The empty box is the glyph and a no-break
+# space. A shell-mode box (``! ``) carries no prompt glyph and reads as unreadable,
+# so it defers like every pane the rule cannot read. Copy-mode does not change the
+# capture (``capture-pane`` reads the pane, not the mode): ``#{pane_in_mode}`` is
+# what defers it. A ghost suggestion drawn dim in the box would read as text (the
+# capture has no attributes): that errs on the safe side, a deferral.
+
+BOX_EMPTY = "empty"
+BOX_TEXT = "text"
+BOX_DIALOG = "dialog"
+BOX_UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class InputBox:
+    """The prompt box as :func:`parse_input_box` read it; ``state`` is one of the ``BOX_*`` values."""
+
+    state: str
+    text: str = ""
+
+    @property
+    def empty(self) -> bool:
+        return self.state == BOX_EMPTY
+
+
+def parse_input_box(text: Optional[str]) -> InputBox:
+    """Read the prompt box of a captured pane (``tmux capture-pane -p``), §9.3.
+
+    Empty only when the bottom-most box holds nothing but the prompt glyph and
+    whitespace. Anything else is not empty: typed text, a multi-line or wrapped
+    draft, a paste placeholder (``BOX_TEXT``); a dialog anywhere on the pane
+    (``BOX_DIALOG``: never a delivery target, §12.11); a pane the rule cannot
+    read (``BOX_UNREADABLE``: blank, no box, a box with another glyph such as
+    shell mode's ``!``, or more rows under the box than the TUI draws there).
+    """
+    if text is None or not text.strip():
+        return InputBox(BOX_UNREADABLE)
+    if classify_pane(text).kind == PANE_DIALOG:
+        return InputBox(BOX_DIALOG)
+    lines = [ln.rstrip() for ln in text.replace("\r\n", "\n").split("\n")]
+    boxes = _input_boxes(lines)
+    if not boxes:
+        return InputBox(BOX_UNREADABLE)
+    top, bottom = boxes[-1]
+    footer = list(lines[bottom + 1:])
+    while footer and not footer[-1].strip():
+        footer.pop()
+    if len(footer) > INPUT_BOX_FOOTER_MAX_ROWS:
+        return InputBox(BOX_UNREADABLE)
+    rows = lines[top + 1:bottom]
+    first = _GLYPH_ROW_RE.sub("", rows[0], count=1)
+    content = "\n".join(r.strip() for r in [first, *rows[1:]]).strip()
+    return InputBox(BOX_TEXT, content) if content else InputBox(BOX_EMPTY)
+
+
+def pane_ready(pane_in_mode: Optional[bool], pane_text: Optional[str]) -> Optional[str]:
+    """§9.3 preconditions 2 and 3: None when a line may be sent, else why the send defers."""
+    if pane_in_mode is None:
+        return "pane mode unknown"
+    if pane_in_mode:
+        return "copy-mode"
+    box = parse_input_box(pane_text)
+    if box.state == BOX_EMPTY:
+        return None
+    if box.state == BOX_TEXT:
+        return "input box not empty"
+    if box.state == BOX_DIALOG:
+        return "a dialog shows"
+    return "pane unreadable"
+
+
+def session_ready(facts: Optional[SessionFacts]) -> Optional[str]:
+    """§9.3 precondition 1 (and §11.2 "alive, turn open: wait"): None when the session is idle.
+
+    A session that is not idle is waited for, not deferred: the outbox keeps
+    the event and no deferral is counted (only a pane that refuses the line
+    counts, :func:`pane_ready`).
+    """
+    if facts is None or not facts.alive:
+        return "dead"
+    if facts.permission_pending:
+        return "permission prompt pending"
+    if facts.turn_open or facts.status != ST_IDLE:
+        return f"not idle ({facts.status})"
+    return None
+
+
+def _plan_pane_check(reading: Optional[SessionReading]) -> Optional[str]:
+    """The pane check on this pass's reading. The box is checked again just before the send
+    (:func:`run_effect`); a pane the reading did not capture is left to that check."""
+    if reading is None:
+        return "no reading"
+    if reading.pane_in_mode is None:
+        return "pane mode unknown"
+    if reading.pane_in_mode:
+        return "copy-mode"
+    if reading.captured:
+        return pane_ready(False, reading.pane_text)
+    return None
+
+
+# =============================================================================
+# Events (§9.1, §9.2) and their items — 50-06
+# =============================================================================
+
+ITEM_STEP_DUE = "step_due"
+ITEM_CHECK_FAILED = "check_failed"
+ITEM_FEEDBACK = "feedback"
+ITEM_APPROVAL_NEEDED = "approval_needed"
+ITEM_ALARM_CLEARED = "alarm_cleared"
+ITEM_RESUME = "resume"
+ITEM_ROTATE = "rotate"
+#: Structural items: the role prompt (§19), the handoff of a rotation (§11.3), and a queued
+#: event folded into a later one (rotation, resume, a new event for a busy session).
+ITEM_ROLE = "role"
+ITEM_HANDOFF = "handoff"
+ITEM_QUEUED = "queued"
+
+VIA_SEND = "send"        # the event line goes by ``amux send``
+VIA_SPAWN = "spawn"      # the seed prompt of a spawn (§9.2: a fresh session's first event)
+VIA_RESUME = "resume"    # the resume prompt (§11.4)
+
+SESSION_SPAWNING = "spawning"
+SESSION_RESUMING = "resuming"
+SESSION_LIVE = "live"
+SESSION_DEAD = "dead"
+
+
+def event_id(n: int) -> str:
+    return f"E-{int(n)}"
+
+
+def event_number(event: Any) -> Optional[int]:
+    m = re.match(r"^E-(\d+)$", str(event or ""))
+    return int(m.group(1)) if m else None
+
+
+def event_line(event: str, path: str) -> str:
+    """§9.2 ``EVENT E-<n>: read <abs path>`` (also a fresh session's seed prompt)."""
+    return f"EVENT {event}: read {path}"
+
+
+def resume_line(event: str, path: str) -> str:
+    return f"RESUME {event}: read {path}"
+
+
+def rotate_line(event: str, path: str) -> str:
+    return f"ROTATE {event}: read {path}"
+
+
+def reminder_line(event: str, path: str) -> str:
+    return f"VERDICT? {event}: end this turn with exactly one verdict line (see {path})"
+
+
+def report_path(paths: RunPaths, step_id: str, worker: Optional[str], event: str) -> str:
+    """§4 ``reports/<step>-<kind>-<n>.md``: the report a worker event names (``n`` = its event number)."""
+    kind = "review" if worker == "reviewer" else "implementation"
+    return str(paths.reports / f"{step_id}-{kind}-{event_number(event)}.md")
+
+
+def handoff_path(paths: RunPaths, key: str, gen: int) -> str:
+    """§11.3 ``handoffs/<role>[-<step>]-g<gen>.md``."""
+    role, step = _role_of(key)
+    return str(paths.handoffs / (role + (f"-{step}" if step else "") + f"-g{int(gen)}.md"))
+
+
+def session_key_for_step(step: Step) -> Optional[str]:
+    """The session key a dispatch of ``step`` goes to: ``driver``, or ``<implementer>:<step>``."""
+    if step.role_kind == ROLE_KIND_DRIVER:
+        return "driver"
+    if step.worker is not None:
+        return f"{step.worker.implementer}:{step.id}"
+    return None
+
+
+def role_prompt_paths(ledger: Ledger, key: str) -> Tuple[str, Optional[str]]:
+    """§19: the role prompt (the role's ``prompt``, else the installed one) and a worker's ``epic_prompt``."""
+    role_key, step = _role_of(key)
+    role = ledger.roles.get(role_key)
+    default = ROLE_PROMPTS_DIR / (WORKER_PROMPT_FILE if step else DRIVER_PROMPT_FILE)
+    prompt = (role.prompt if role is not None and role.prompt else None) or str(default)
+    return prompt, (role.epic_prompt if role is not None and step else None)
+
+
+def session_dir_for(ledger: Ledger, key: str, worker_dirs: Optional[Dict[str, str]] = None) -> str:
+    """The ``--dir`` of a session: the workspace for the driver; a worker step's directory (§14.2,
+    from 50-07's ``worker_dirs``, else ``<worktree_root>/<epic>-<step>``)."""
+    _, step = _role_of(key)
+    if step is None:
+        return ledger.workspace
+    if worker_dirs and step in worker_dirs:
+        return worker_dirs[step]
+    return os.path.join(ledger.worktree_root, worker_dir_name(ledger.epic, step))
+
+
+def session_name_for(ledger: Ledger, key: str, gen: int, worker_dirs: Optional[Dict[str, str]] = None,
+                     directory: Optional[str] = None) -> str:
+    """``basename(<dir>)-<epic>-<role>[-<step>]-g<gen>`` (§3, P0-1)."""
+    role, step = _role_of(key)
+    d = directory or session_dir_for(ledger, key, worker_dirs)
+    return session_name(os.path.basename(d.rstrip("/")), session_suffix(ledger.epic, role, step, gen))
+
+
+def spawn_args(ledger: Ledger, key: str, gen: int, directory: str, line: str) -> List[str]:
+    """``spawn <suffix> --dir <dir> --yolo --model=<m> --effort=<e> [--profile <p>] --run-id <run_id>
+    [--pin-env K=V …] --detach -- "<line>"`` (item 5; amux-spawn normalises the ``=`` form, P0-3)."""
+    role_key, step = _role_of(key)
+    role = ledger.roles[role_key]
+    args = ["spawn", session_suffix(ledger.epic, role_key, step, gen), "--dir", directory, "--yolo",
+            f"--model={role.model}", f"--effort={role.effort}"]
+    if role.profile:
+        args += ["--profile", role.profile]
+    args += ["--run-id", ledger.run_id]
+    for k in sorted(role.pinned_env):
+        args += ["--pin-env", f"{k}={role.pinned_env[k]}"]
+    return args + ["--detach", "--", line]
+
+
+def resume_args(name: str, line: str) -> List[str]:
+    """``resume <name> --json -- "<line>"``: amux-spawn splits the prompt off at its own ``--`` and
+    hands it to ``amux start`` as one trailing argv element, without ``--`` (§13.3 as amended)."""
+    return ["resume", name, "--json", "--", line]
+
+
+def reap_args(name: str) -> List[str]:
+    """``rm <name>``: never ``--force`` (amux-spawn refuses a running session; the tick retries)."""
+    return ["rm", name]
+
+
+# -- item builders ---------------------------------------------------------------
+
+def step_due_items(ledger: Ledger, state: RunState, selection: Optional[Selection],
+                   worker_dirs: Optional[Dict[str, str]] = None) -> List[EventItem]:
+    """One ``step_due`` item per dispatchable step (a group's members go to the same session).
+
+    With ``worker_dirs`` given (50-07), a worker step without its directory is
+    not dispatched.
+    """
+    if selection is None:
+        return []
+    due = {d.step_id: d for d in selection.due}
+    out: List[EventItem] = []
+    for unit in selection.units:
+        for sid in unit:
+            step = ledger.step(sid)
+            key = session_key_for_step(step)
+            if key is None:
+                continue
+            if step.worker is not None and worker_dirs is not None and sid not in worker_dirs:
+                continue
+            rec = (state.get("steps") or {}).get(sid) or {}
+            d = due.get(sid)
+            dl = occurrence_deadline(step, rec, state)
+            data = {"card": ledger.resolve_path(step.card), "title": step.title,
+                    "why": d.why if d else "", "due_since": iso(d.due_at) if d else None,
+                    "occurrence": int(rec.get("occurrence", 0)), "attempt": int(rec.get("attempts", 0)) + 1,
+                    "deadline": iso(dl[1]) if dl else None, "warn_from": iso(dl[0]) if dl else None}
+            if step.worker is not None:
+                data["worktree"] = session_dir_for(ledger, key, worker_dirs)
+            out.append(EventItem(ITEM_STEP_DUE, key, sid, data))
+    return out
+
+
+def check_failed_items(ledger: Ledger, outcomes: Iterable[CheckOutcome]) -> List[EventItem]:
+    """``check_failed`` → the driver: the step, its card (the rollback), rc, output tail, attempt."""
+    out: List[EventItem] = []
+    for o in outcomes:
+        if o.kind != KIND_CHECK or o.outcome != OUTCOME_FAILED or not ledger.has_step(o.step_id):
+            continue
+        step = ledger.step(o.step_id)
+        out.append(EventItem(ITEM_CHECK_FAILED, "driver", o.step_id, {
+            "card": ledger.resolve_path(step.card), "rc": o.rc, "output_tail": o.output_tail,
+            "attempt": o.attempt}))
+    return out
+
+
+def approval_needed_items(ledger: Ledger, state: RunState, selection: Optional[Selection]) -> List[EventItem]:
+    """``approval_needed`` for :func:`next_approval_to_ask` (§15.1), raised once per ask cycle.
+
+    The selection names the same approval every pass until the driver asks;
+    ``state.approval_raised`` keeps it from being raised again while its event
+    is pending, and until a question about it was opened and closed after the
+    raise (a "no", or a withdrawal, starts a new cycle).
+    """
+    ask = selection.approval_to_ask if selection is not None else None
+    if ask is None:
+        return []
+    if any(ask.approval_id in (e.get("approvals") or []) for e in state.get("outbox") or []):
+        return []
+    raised = (state.get("approval_raised") or {}).get(ask.approval_id)
+    if raised:
+        at = from_iso(raised.get("at"))
+        closed_after = any(
+            isinstance(q, dict) and q.get("approval") == ask.approval_id and q.get("status") != "open"
+            and at is not None and (from_iso(q.get("asked_at")) or at) >= at
+            for q in (state.get("questions") or {}).values())
+        if not closed_after:
+            return []
+    return [EventItem(ITEM_APPROVAL_NEEDED, "driver", None, {
+        "approval": ask.approval_id, "steps": list(ask.steps), "conditions": list(ask.conditions)})]
+
+
+def queue_request(ledger: Ledger, state: RunState, step_id: str, to_role: str, file: str,
+                  now: datetime) -> Dict[str, Any]:
+    """``epic-driver queue <step> --to <role> --file <path>`` (OQ-4; 50-08's CLI calls this).
+
+    Stores the request in ``state.queue``; the next dispatch turns it into a
+    ``feedback`` event for ``<role>:<step>`` under the session policy. Raises
+    ``ValueError`` for a step that is not a worker step, a role that is not its
+    implementer or reviewer, or a path that is not absolute.
+    """
+    if not ledger.has_step(step_id):
+        raise ValueError(f"unknown step {step_id!r}")
+    step = ledger.step(step_id)
+    if step.worker is None:
+        raise ValueError(f"step {step_id} has no workers; queue is for worker steps")
+    if to_role not in (step.worker.implementer, step.worker.reviewer):
+        raise ValueError(f"--to must be {step.worker.implementer} or {step.worker.reviewer}, got {to_role!r}")
+    if not isinstance(file, str) or not os.path.isabs(file):
+        raise ValueError(f"--file must be an absolute path, got {file!r}")
+    queue = state.setdefault("queue", [])   # type: ignore[typeddict-unknown-key]
+    req = {"id": f"R-{len(queue) + 1}", "step": step_id, "to": to_role, "file": file,
+           "queued_at": iso(now), "event": None}
+    while any(r.get("id") == req["id"] for r in queue):
+        req["id"] = f"R-{int(req['id'][2:]) + 1}"
+    queue.append(req)
+    return req
+
+
+def feedback_items(state: RunState) -> List[EventItem]:
+    """A ``feedback`` item per queue request not yet in an event."""
+    out: List[EventItem] = []
+    for req in state.get("queue") or []:    # type: ignore[typeddict-item]
+        if isinstance(req, dict) and not req.get("event"):
+            out.append(EventItem(ITEM_FEEDBACK, f"{req.get('to')}:{req.get('step')}", req.get("step"),
+                                 {"file": req.get("file"), "request": req.get("id")}))
+    return out
+
+
+# -- planned events and their text -------------------------------------------------
+
+@dataclass
+class PlannedEvent:
+    """One event file and its outbox entry, as a dispatch commit writes them (§9.1)."""
+
+    event: str
+    n: int
+    path: str
+    to: str                        # the session key
+    session: str                   # the session name it is addressed to
+    via: str                       # VIA_SEND / VIA_SPAWN / VIA_RESUME
+    line: str                      # the §9.2 line (the seed / resume prompt for a launch)
+    items: List[EventItem]
+    kinds: List[str]
+    steps: List[str]
+    approvals: List[str]
+    created_at: str
+    worker: Optional[str] = None   # implementer / reviewer when the session is a worker
+    report: Optional[str] = None   # the report path a worker event names
+    supersedes: List[str] = field(default_factory=list)   # queued events folded into this one
+    due_steps: List[str] = field(default_factory=list)    # steps that move due → inflight
+    requests: List[str] = field(default_factory=list)     # queue requests consumed
+    raised_approvals: List[str] = field(default_factory=list)
+    text: str = ""
+
+
+_KIND_TITLES = {
+    ITEM_STEP_DUE: "step due", ITEM_CHECK_FAILED: "check failed", ITEM_WORKER_SETTLED: "worker settled",
+    ITEM_REVIEW_DUE: "review due", ITEM_FEEDBACK: "feedback", ITEM_ANSWER: "answer",
+    ITEM_APPROVAL_NEEDED: "approval needed", ITEM_ALARM_CLEARED: "alarm cleared", ITEM_RESUME: "resume",
+    ITEM_ROTATE: "rotate", ITEM_HANDOFF: "handoff", ITEM_QUEUED: "queued",
+}
+
+
+def _indented(text: Any) -> List[str]:
+    lines = str(text or "").rstrip("\n").split("\n")
+    return ["    " + ln for ln in lines] if any(ln.strip() for ln in lines) else ["    (empty)"]
+
+
+def _item_lines(i: int, item: EventItem) -> List[str]:
+    d, k, s = item.data, item.kind, item.step
+    if k == ITEM_ROLE:
+        out = [f"## {i}. role", f"- Read your role prompt at {d.get('prompt')} first."]
+        if d.get("epic_prompt"):
+            out.append(f"- It wraps the epic's own prompt at {d['epic_prompt']}; read that too.")
+        return out
+    if k == ITEM_HANDOFF:
+        return [f"## {i}. handoff — from {d.get('from')}",
+                f"- Read the handoff at {d.get('path')} first: it is where things stand.",
+                "- Run its \"First thing to check\" against ground truth before acting."]
+    if k == ITEM_STEP_DUE:
+        out = [f"## {i}. step_due — {s} (occurrence {int(d.get('occurrence') or 0) + 1})",
+               f"- Card: {d.get('card')}"]
+        if d.get("title") and d.get("title") != s:
+            out.append(f"- Title: {d['title']}")
+        out.append(f"- Why now: {d.get('why') or 'due'}"
+                   + (f" (due since {d['due_since']})" if d.get("due_since") else "") + ".")
+        if d.get("deadline"):
+            out.append(f"- Deadline: {d['deadline']}" + (f" (warning from {d['warn_from']})." if d.get("warn_from") else "."))
+        out.append(f"- In flight: marker written {d.get('marker_at')}, attempt {d.get('attempt')}.")
+        if d.get("worktree"):
+            out.append(f"- Worktree: {d['worktree']}")
+        if d.get("report"):
+            out.append(f"- Write your report to {d['report']}.")
+        return out
+    if k == ITEM_CHECK_FAILED:
+        return [f"## {i}. check_failed — {s} (attempt {d.get('attempt')})",
+                f"- Card: {d.get('card')} (its rollback applies).", f"- Check exit code: {d.get('rc')}.",
+                "- Output tail:", *_indented(d.get("output_tail"))]
+    if k == ITEM_WORKER_SETTLED:
+        return [f"## {i}. worker_settled — {s}", f"- Worker: {d.get('role')} ({d.get('worker')}), event {d.get('event')}.",
+                f"- Verdict: {d.get('verdict')}", f"- Report: {d.get('report')}"]
+    if k == ITEM_REVIEW_DUE:
+        out = [f"## {i}. review_due — {s}", f"- Worktree: {d.get('worktree')}",
+               f"- Implementer report: {d.get('implementer_report')}",
+               f"- Implementer verdict: {d.get('verdict')} ({d.get('implementer')}, event {d.get('event')})."]
+        if d.get("report"):
+            out.append(f"- Write your review report to {d['report']}.")
+        return out
+    if k == ITEM_FEEDBACK:
+        out = [f"## {i}. feedback — {s}", f"- Read the driver's feedback at {d.get('file')}."]
+        if d.get("report"):
+            out.append(f"- Write your report to {d['report']}.")
+        return out
+    if k == ITEM_ANSWER:
+        target = s or d.get("approval")
+        return [f"## {i}. answer — {d.get('question')}" + (f" ({target})" if target else ""),
+                f"- Asked in: {d.get('asked_event')}.", f"- Queue file: {d.get('path')}",
+                "- The answer as written:", *_indented(d.get("answer"))]
+    if k == ITEM_APPROVAL_NEEDED:
+        return [f"## {i}. approval_needed — {d.get('approval')}",
+                f"- Gates: {', '.join(d.get('steps') or [])}.",
+                f"- Conditions (all done): {', '.join(d.get('conditions') or []) or 'none'}.",
+                "- Ask the operator with mcp__questions__ask, with your recommendation, then end with "
+                f"`ASKED: Q-<n> {d.get('approval')}`."]
+    if k == ITEM_ALARM_CLEARED:
+        return [f"## {i}. alarm_cleared — {d.get('alarm')} {d.get('subject')}"] + (
+            [f"- {d['detail']}"] if d.get("detail") else [])
+    if k == ITEM_RESUME:
+        out = [f"## {i}. resume — {d.get('name')}",
+               "- This session ended and was resumed in place (architecture §11.4)."]
+        for m in d.get("markers") or []:
+            out.append(f"- In flight: {m.get('step')} (event {m.get('event')}, since {m.get('started_at')}).")
+        last = d.get("last_event")
+        if last:
+            out.append(f"- The last event you received: {last.get('event')} ({last.get('path')}).")
+        out.append("- Check the last action against ground truth before continuing.")
+        return out
+    if k == ITEM_ROTATE:
+        return [f"## {i}. rotate — {d.get('name')} → g{int(d.get('gen') or 1) + 1}",
+                f"- Write the handoff to {d.get('handoff_path')} with the sections of your role prompt "
+                "(Where things stand, Decisions made here, Open threads, First thing to check, Files).",
+                f"- Then end this turn with exactly `HANDOFF: {d.get('handoff_path')}` alone on the line."]
+    if k == ITEM_QUEUED:
+        steps = d.get("steps") or []
+        return [f"## {i}. {', '.join(d.get('kinds') or ['event'])} — queued as {d.get('event')}"
+                + (f" ({', '.join(steps)})" if steps else ""),
+                f"- Read {d.get('path')}; answer its steps in this turn."]
+    return [f"## {i}. {k}" + (f" — {s}" if s else "")] + [f"- {kk}: {vv}" for kk, vv in sorted(d.items())]
+
+
+def render_event(pe: PlannedEvent, run_id: str) -> str:
+    """The event file of §9.1: front matter, one section per item, the reply rule."""
+    fm = ["---", f"event: {pe.event}", f"run_id: {run_id}", f"created_at: {pe.created_at}", f"to: {pe.to}",
+          f"session: {pe.session}", f"kinds: [{', '.join(pe.kinds)}]", f"steps: [{', '.join(pe.steps)}]"]
+    if pe.approvals:
+        fm.append(f"approvals: [{', '.join(pe.approvals)}]")
+    fm += ["needs_verdict: true", "---"]
+    main = [it for it in pe.items if it.kind not in (ITEM_ROLE,)]
+    head = main[0] if main else None
+    title = _KIND_TITLES.get(head.kind, head.kind) if head else "event"
+    subject = ", ".join(pe.steps or pe.approvals) or (head.data.get("question") or head.data.get("name") or ""
+                                                      if head else "")
+    body = [f"# {pe.event} — {title}" + (f": {subject}" if subject else ""), ""]
+    for i, item in enumerate(pe.items, 1):
+        body += _item_lines(i, item) + [""]
+    body.append("## Reply")
+    ids = [*pe.steps, *pe.approvals]
+    if pe.kinds == [ITEM_ROTATE]:
+        hp = pe.items[0].data.get("handoff_path") if pe.items else ""
+        body.append(f"End this turn with exactly `HANDOFF: {hp}` alone on the line, once the handoff is written.")
+    elif pe.worker is not None:
+        step = pe.steps[0] if pe.steps else "<step>"
+        body.append(f"Write your report to {pe.report}, then end this turn with exactly one verdict line: "
+                    f"`DONE: {step}`, or `HALT: <reason>` if you cannot (architecture §10).")
+    elif ids:
+        body.append("End this turn with exactly one verdict line (architecture §10), covering every step above: "
+                    + ", ".join(ids) + ".")
+    else:
+        body.append("End this turn with exactly one verdict line (architecture §10).")
+    return "\n".join(fm + body) + "\n"
+
+
+# =============================================================================
+# Session policy (§11.2, D4, OD-6, OD-7, review m2) — 50-06
+# =============================================================================
+
+ACT_SPAWN = "spawn"              # no session yet: spawn gen 1 seeded with the event
+ACT_RESUME = "resume"            # dead, no completed handoff: resume in place, even cold (OD-7)
+ACT_SPAWN_NEXT = "spawn_next"    # a completed handoff: spawn gen + 1 seeded with it (§11.3)
+ACT_WAIT = "wait"                # alive and not idle, a launch pending or a rotation under way
+ACT_ROTATE = "rotate"            # idle and over the cap, compacted, or cold on the 1 h bucket
+ACT_REUSE = "reuse"              # deliver into the session (§9)
+ACT_HOLD = "hold"                # the role's model is limited: no dispatch, no ping (§12.4)
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    action: str
+    reason: str
+
+
+def handoff_complete(rec: Optional[Dict[str, Any]], reading: Optional[SessionReading]) -> bool:
+    """A rotation's handoff is done: the ``HANDOFF:`` verdict was read and the file is newer
+    than the request (§11.3 step 2, without the idle part, which a dead session cannot meet)."""
+    rot = (rec or {}).get("rotation") or {}
+    requested = from_iso(rot.get("requested_at"))
+    return bool(rot.get("handoff") and requested is not None and reading is not None
+                and reading.handoff_mtime is not None and reading.handoff_mtime > requested.timestamp())
+
+
+def choose_action(ledger: Ledger, state: RunState, key: str, facts: Optional[SessionFacts],
+                  now: datetime, *, handoff_done: bool = False) -> PolicyDecision:
+    """§11.2 for an event aimed at the session ``key``, from this pass's facts (50-05).
+
+    Order: a limited model holds everything; no record ⇒ spawn; a launch not up
+    yet ⇒ wait; dead ⇒ spawn gen + 1 with a completed handoff, else resume (even
+    cold); not idle ⇒ wait; a rotation under way ⇒ wait for it (or spawn gen + 1
+    once ready); compacted or ``C ≥ cap`` ⇒ rotate; ≥ 5 min of cache ⇒ reuse;
+    cold only because of the 5m bucket ⇒ reuse in place (m2: rotation is for
+    over-cap sessions); cold on the 1 h bucket ⇒ rotate; no cache reading ⇒ reuse.
+    """
+    now = require_aware(now)
+    role_key = _role_of(key)[0]
+    limited = (facts.limited if facts is not None else None) or model_limited(ledger, state, role_key, now)
+    if limited:
+        return PolicyDecision(ACT_HOLD, f"model limited ({limited})")
+    rec = (state.get("sessions") or {}).get(key)
+    if rec is None:
+        return PolicyDecision(ACT_SPAWN, "no session yet")
+    alive = bool(facts is not None and facts.alive)
+    if rec.get("status") in (SESSION_SPAWNING, SESSION_RESUMING) and not alive:
+        return PolicyDecision(ACT_WAIT, f"{rec.get('status')}: the launch is not up yet")
+    if not alive:
+        if handoff_done:
+            return PolicyDecision(ACT_SPAWN_NEXT, "dead, a completed handoff exists")
+        return PolicyDecision(ACT_RESUME, "dead, no completed handoff: resume in place")
+    assert facts is not None
+    if facts.permission_pending or facts.turn_open or facts.status != ST_IDLE:
+        return PolicyDecision(ACT_WAIT, f"alive, not idle ({facts.status})")
+    if rec.get("rotation"):
+        if facts.rotation_ready:
+            return PolicyDecision(ACT_SPAWN_NEXT, "rotation ready: handoff written")
+        return PolicyDecision(ACT_WAIT, "rotation under way")
+    role = ledger.roles.get(role_key)
+    cap = role.cap if role is not None else DEFAULT_CAP_TOKENS
+    if facts.compacted:
+        return PolicyDecision(ACT_ROTATE, "compacted (P0-9: an unplanned rotation)")
+    if facts.context_tokens is not None and facts.context_tokens >= cap:
+        return PolicyDecision(ACT_ROTATE, f"context {facts.context_tokens} ≥ cap {cap}")
+    left = facts.cache_left_s
+    if left is not None and left >= REUSE_MIN_TTL_S:
+        return PolicyDecision(ACT_REUSE, f"warm: {int(left)}s of cache left")
+    if facts.overage or facts.cache_ttl == OVERAGE_TTL_S:
+        return PolicyDecision(ACT_REUSE, "cold only because of overage (5m bucket): reuse in place (m2)")
+    if left is not None and facts.cache_ttl is not None:
+        return PolicyDecision(ACT_ROTATE, f"cold: the {facts.cache_ttl}s bucket has {int(left)}s left")
+    return PolicyDecision(ACT_REUSE, "no cache reading")
+
+
+# -- keep warm (§11.5) ---------------------------------------------------------------
+
+def price_class(role: Role) -> str:
+    """``fable`` when the expected model (else the alias) is Fable-priced, else ``opus`` (D4)."""
+    model = (role.expected_model_id or role.model or "").lower()
+    return "fable" if "fable" in model else "opus"
+
+
+def keep_warm_k(role: Role) -> int:
+    return KEEP_WARM_K_FABLE if price_class(role) == "fable" else KEEP_WARM_K_OPUS
+
+
+def keep_warm_horizon_s(role: Role, context_tokens: int) -> float:
+    """``k·B/C`` hours, in seconds: a ping pays while the next event is closer than this."""
+    return keep_warm_k(role) * role.bootstrap_tokens / float(context_tokens) * 3600.0
+
+
+def next_scheduled_event(ledger: Ledger, state: RunState, key: str, now: datetime) -> Optional[datetime]:
+    """§11.5: the earliest future due time among the role's steps not yet started.
+
+    From 50-04's due conditions (``after``, ``not_before``, ``every``/``at``, the
+    same as :func:`step_due_at`, where a step with no time condition is due
+    now), moved to the window's next opening when it falls outside the window or
+    past its latest start; a due time already past counts as now. Triggers are
+    not predicted: a step waiting on one that has not fired has no due time.
+    """
+    now = require_aware(now)
+    role_key, step_id = _role_of(key)
+    best: Optional[datetime] = None
+    for step in ledger.steps:
+        if step_id is None:
+            if step.role_kind != ROLE_KIND_DRIVER:
+                continue
+        elif step.id != step_id or step.worker is None or step.worker.implementer != role_key:
+            continue
+        rec = (state.get("steps") or {}).get(step.id) or {}
+        if rec.get("status", PENDING) not in (PENDING, DUE):
+            continue
+        ok, t, _ = _time_conditions(ledger, state, step)
+        if not ok:
+            continue
+        if step.trigger is not None:
+            fired = _trigger_fired(rec)
+            if fired is None:
+                continue
+            t = max(t, fired) if t is not None else fired
+        t = max(t, now) if t is not None else now
+        if step.window is not None:
+            off = step.window.offset(t)
+            latest = step.latest_start_offset_s()
+            if off is None:
+                t = step.window.next_open(t)
+            elif latest is not None and off > latest:
+                t = step.window.next_open(t + timedelta(seconds=step.window.length_s - off))
+        if best is None or t < best:
+            best = t
+    return best
+
+
+def keep_warm_check(ledger: Ledger, state: RunState, key: str, facts: Optional[SessionFacts],
+                    now: datetime) -> Tuple[bool, str]:
+    """``(ping?, why)`` for one session (§11.5); the delivery preconditions apply on top."""
+    now = require_aware(now)
+    rec = (state.get("sessions") or {}).get(key) or {}
+    role = ledger.roles.get(_role_of(key)[0])
+    if role is None:
+        return False, "unknown role"
+    if not role.keep_warm:
+        return False, "keep_warm: false"
+    if facts is None or session_ready(facts) is not None:
+        return False, "not idle"
+    if facts.overage or facts.cache_ttl == OVERAGE_TTL_S:
+        return False, "overage (5m bucket)"
+    limited = facts.limited or model_limited(ledger, state, role.key, now)
+    if limited:
+        return False, f"model limited ({limited})"
+    if facts.cache_ttl != HOUR_TTL_S or facts.cache_left_s is None:
+        return False, "not on the 1 h bucket"
+    age = facts.cache_ttl - facts.cache_left_s
+    if not KEEP_WARM_MIN_AGE_S <= age <= KEEP_WARM_MAX_AGE_S:
+        return False, f"last assistant entry {int(age // 60)} min old (window 40–50 min)"
+    last_ping = from_iso(rec.get("last_ping_at"))
+    if last_ping is not None and last_ping.timestamp() >= now.timestamp() - age:
+        return False, "already pinged since the last reply"
+    if not facts.context_tokens:
+        return False, "no context measure"
+    nxt = next_scheduled_event(ledger, state, key, now)
+    if nxt is None:
+        return False, "no scheduled event for the role"
+    horizon = keep_warm_horizon_s(role, facts.context_tokens)
+    ahead = (nxt - now).total_seconds()
+    if ahead > horizon:
+        return False, f"next event in {format_duration(int(ahead))}, beyond k·B/C = {format_duration(int(horizon))}"
+    return True, (f"next event {iso(nxt)} within k·B/C = {format_duration(int(horizon))} "
+                  f"(k={keep_warm_k(role)}, B={role.bootstrap_tokens}, C={facts.context_tokens})")
+
+
+# =============================================================================
+# Dispatch plan (§9, §11.3–§11.5, §12.11, §23 step 6–7) — 50-06
+# =============================================================================
+#
+# ``plan_dispatch`` is pure: from the reconciled state, this pass's readings and
+# facts, the selection and the items, it returns a sequence of ``DispatchOp``:
+#
+#     (files + state mutation, effect, result mutation)
+#
+# that :func:`execute_dispatch` (50-08's tick) runs as: write the files, apply the
+# mutation, COMMIT, run the effect through ``World``, apply the result mutation,
+# COMMIT. Every effect is preceded by a committed state that records it
+# (invariant 5): a send is in ``sends`` before ``amux send`` runs; a spawn or
+# resume is a session record in ``spawning``/``resuming`` with its
+# ``launch_event``; a dialog key is in ``dialog_answers``; a reminder is
+# ``reminded_at``. Mutations look everything up by key, so they apply to the
+# state as it is when they run.
+
+EFFECT_NONE = "none"
+EFFECT_SEND = "send"        # amux send <name> <line>; the pane is checked again first
+EFFECT_KEYS = "keys"        # tmux send-keys (a listed startup dialog); the dialog is checked again first
+EFFECT_SPAWN = "spawn"      # amux-spawn spawn …
+EFFECT_RESUME = "resume"    # amux-spawn resume <name> --json -- "<line>"
+EFFECT_REAP = "reap"        # amux-spawn rm <name>
+
+
+@dataclass(frozen=True)
+class Effect:
+    """One side effect. ``args`` is the amux-spawn argument list (spawn/resume/reap)."""
+
+    kind: str = EFFECT_NONE
+    session: Optional[str] = None        # the session key
+    name: Optional[str] = None           # the session (tmux) name
+    args: Tuple[str, ...] = ()
+    line: Optional[str] = None           # EFFECT_SEND: the §9.2 line
+    key: Optional[str] = None            # EFFECT_KEYS: Enter / Escape
+    event: Optional[str] = None
+    dialog_match: Optional[str] = None   # EFFECT_KEYS: the listed dialog's regex
+
+
+@dataclass
+class EffectOutcome:
+    """What running an effect did. ``ran`` False: the check before it refused (``deferred`` says why)."""
+
+    effect: Effect
+    ran: bool
+    deferred: Optional[str] = None
+    result: Optional[CommandResult] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.ran and self.result is not None and self.result.ok
+
+
+@dataclass
+class DispatchOp:
+    """One ``(state mutation, effect)`` pair, with the files its commit writes and its result mutation."""
+
+    label: str
+    mutate: Callable[[RunState], None]
+    effect: Effect = field(default_factory=Effect)
+    files: Dict[str, str] = field(default_factory=dict)
+    on_result: Optional[Callable[[RunState, EffectOutcome, datetime], None]] = None
+
+
+@dataclass
+class DispatchPlan:
+    ops: List[DispatchOp] = field(default_factory=list)
+    events: List[PlannedEvent] = field(default_factory=list)
+    decisions: Dict[str, PolicyDecision] = field(default_factory=dict)
+    dispatched_steps: List[str] = field(default_factory=list)   # for note_undispatched (§6.2)
+    completed: List[Dict[str, Any]] = field(default_factory=list)   # outbox entries leaving: for tick.log
+    notes: List[str] = field(default_factory=list)
+    preview: Optional[RunState] = None    # the state after every mutation, before any result (--dry-run)
+
+
+def _entry_complete(e: Dict[str, Any]) -> bool:
+    return bool(e.get("confirmed_at")) and (e.get("needs_verdict") is False
+                                            or bool((e.get("verdict") or {}).get("complete")))
+
+
+def _unsent(e: Dict[str, Any]) -> bool:
+    return not e.get("sends")
+
+
+def _find_entry(state: RunState, event: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not event:
+        return None
+    for e in state.get("outbox") or []:
+        if e.get("event") == event:
+            return e
+    return None
+
+
+def _drop_send(entry: Optional[Dict[str, Any]], stamp: str) -> None:
+    """Undo a send the check before it refused (nothing reached the pane)."""
+    if entry is None:
+        return
+    sends = list(entry.get("sends") or [])
+    if stamp in sends:
+        sends.remove(stamp)
+    entry["sends"] = sends
+
+
+def _commit_event(st: RunState, pe: PlannedEvent, now: datetime, host: str) -> Dict[str, Any]:
+    """The event's part of a dispatch commit: the outbox entry, the inflight markers, the steps it
+    starts, the queue requests it consumes, the approvals it raises; queued events it folds leave."""
+    stamp = iso(now)
+    outbox = list(st.get("outbox") or [])
+    carried = 0
+    if pe.supersedes:
+        kept = []
+        for e in outbox:
+            if e.get("event") in pe.supersedes:
+                if _unsent(e):
+                    carried = max(carried, int(e.get("deferrals") or 0))
+                continue
+            kept.append(e)
+        outbox = kept
+    entry: Dict[str, Any] = {
+        "event": pe.event, "to": pe.to, "session": pe.session, "kinds": list(pe.kinds),
+        "steps": list(pe.steps), "created_at": pe.created_at, "sends": [], "deferrals": carried,
+        "confirmed_at": None, "verdict": None, "reminded_at": None, "needs_verdict": True,
+        "path": pe.path, "line": pe.line, "via": pe.via}
+    if pe.approvals:
+        entry["approvals"] = list(pe.approvals)
+    if pe.report:
+        entry["report"] = pe.report
+    if pe.supersedes:
+        entry["supersedes"] = list(pe.supersedes)
+    outbox.append(entry)
+    st["outbox"] = outbox
+    st["next_event_n"] = max(int(st.get("next_event_n") or 1), pe.n + 1)
+    steps = st.setdefault("steps", {})
+    for sid in pe.steps:
+        rec = steps.get(sid)
+        if rec is None:
+            continue
+        old = rec.get("inflight") or {}
+        started = old.get("started_at") if old.get("step") == sid else None
+        rec["inflight"] = {"step": sid, "event": pe.event, "started_at": started or stamp,
+                           "host": host, "session": pe.session}
+    for sid in pe.due_steps:
+        rec = steps.get(sid)
+        if rec is not None and rec.get("status") == DUE:
+            set_status(rec, INFLIGHT)
+            rec["started_at"] = stamp
+    for req in st.get("queue") or []:      # type: ignore[typeddict-item]
+        if isinstance(req, dict) and req.get("id") in pe.requests:
+            req["event"] = pe.event
+    if pe.raised_approvals:
+        raised = st.setdefault("approval_raised", {})   # type: ignore[typeddict-unknown-key]
+        for aid in pe.raised_approvals:
+            raised[aid] = {"event": pe.event, "at": stamp}
+    return entry
+
+
+def launch_retry_wait_s(rec: Dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
+    """Seconds still to wait before a failed launch of ``rec`` may be run again, else None.
+
+    Only a recorded failure other than ``name_in_use`` waits (that keeps its every-tick handling):
+    ``LAUNCH_RETRY_BASE_S`` doubled per earlier attempt, capped at ``LAUNCH_RETRY_MAX_S``, from
+    ``launch_error.at``. ``now`` None reads the clock the caller passes as ``_Dispatch.now``.
+    """
+    err = rec.get("launch_error")
+    if not isinstance(err, dict) or err.get("reason") == "name_in_use" or now is None:
+        return None
+    if rec.get("launch_attempts") == 0:
+        return None         # a reboot opened the gate (``_Dispatch.reset_launch_backoff``)
+    at = from_iso(err.get("at"))
+    if at is None:
+        return None
+    attempts = max(1, int(rec.get("launch_attempts") or 1))
+    interval = min(LAUNCH_RETRY_BASE_S * (2 ** min(attempts - 1, 30)), LAUNCH_RETRY_MAX_S)
+    left = at.timestamp() + interval - now.timestamp()
+    return left if left > 0 else None
+
+
+def _launch_result(key: str, event: str, via: str) -> Callable[[RunState, EffectOutcome, datetime], None]:
+    """After ``amux-spawn spawn|resume``: success clears the launch error; a failure records it
+    (``spawn_failed`` / ``resume_failed``) and, when nothing was launched, takes the send back."""
+    def apply(st: RunState, outcome: EffectOutcome, at: datetime) -> None:
+        rec = (st.get("sessions") or {}).get(key)
+        entry = _find_entry(st, event)
+        if rec is None:
+            return
+        if outcome.ok:
+            rec["launch_error"] = None
+            rec["launch_attempts"] = 1      # the backoff starts over
+            return
+        res = outcome.result or CommandResult(rc=None, error=outcome.deferred)
+        text = ((res.stderr or "") + (res.error or "")).strip()
+        reason = ("name_in_use" if "already in use" in text
+                  else "not_growing" if "not growing" in text else "failed")
+        rec["launch_error"] = {"kind": via, "at": iso(at), "rc": res.rc, "reason": reason, "error": text[-500:]}
+        if not (via == VIA_RESUME and reason == "not_growing") and entry is not None:
+            entry["sends"] = []      # amux-spawn rolled the launch back: the prompt went nowhere
+    return apply
+
+
+def _send_result(event: str, stamp: str, *, rotation_key: Optional[str] = None,
+                 retry: bool = False) -> Callable[[RunState, EffectOutcome, datetime], None]:
+    """After a guarded ``amux send`` of an event line: a refused check takes the send back and counts
+    a deferral. A send that ran stays recorded even when ``amux`` failed: it may have reached the pane."""
+    def apply(st: RunState, outcome: EffectOutcome, at: datetime) -> None:
+        entry = _find_entry(st, event)
+        if entry is None:
+            return
+        if outcome.ran:
+            if outcome.result is not None and not outcome.result.ok:
+                entry["send_error"] = {"at": iso(at), "rc": outcome.result.rc,
+                                       "error": ((outcome.result.stderr or "") + (outcome.result.error or ""))[-300:]}
+            return
+        _drop_send(entry, stamp)
+        if retry:
+            entry["retry"] = {"at": stamp, "sent": False, "why": outcome.deferred}
+        else:
+            entry["deferrals"] = int(entry.get("deferrals") or 0) + 1
+            entry["last_deferral"] = {"at": iso(at), "why": outcome.deferred}
+        if rotation_key is not None:
+            rot = ((st.get("sessions") or {}).get(rotation_key) or {}).get("rotation")
+            if isinstance(rot, dict) and rot.get("event") == event:
+                rot["requested_at"] = None
+    return apply
+
+
+class _Dispatch:
+    """The working set of one :func:`plan_dispatch` call. ``st`` is a copy of the state to which each
+    op's mutation is applied as it is planned, so later decisions see earlier ones."""
+
+    def __init__(self, ledger: Ledger, state: RunState, recon: ReconcileResult, readings: Readings,
+                 now: datetime, paths: RunPaths, host: str, paused: bool,
+                 worker_dirs: Optional[Dict[str, str]]) -> None:
+        self.ledger = ledger
+        self.st: RunState = json.loads(json.dumps(state))
+        self.recon = recon
+        self.readings = readings
+        self.now = now
+        self.stamp = iso(now) or ""
+        self.paths = paths
+        self.host = host
+        self.paused = paused
+        self.worker_dirs = worker_dirs
+        self.by_name = readings.by_name()
+        self.plan = DispatchPlan()
+        self.next_n = int(self.st.get("next_event_n") or 1)
+        self.sent: set = set()          # session keys that got a send, a key or a launch this pass
+        self.resume_now: set = set()
+
+    # -- helpers --
+    def add(self, op: DispatchOp) -> None:
+        op.mutate(self.st)
+        self.plan.ops.append(op)
+
+    def commit_only(self, label: str, fn: Callable[[RunState], None]) -> None:
+        self.add(DispatchOp(label=label, mutate=fn))
+
+    def rec(self, key: str) -> Optional[Dict[str, Any]]:
+        return (self.st.get("sessions") or {}).get(key)
+
+    def reading(self, name: Optional[str]) -> Optional[SessionReading]:
+        return self.by_name.get(name) if name else None
+
+    def note(self, text: str) -> None:
+        self.plan.notes.append(text)
+
+    def alloc(self) -> int:
+        n = self.next_n
+        self.next_n += 1
+        return n
+
+    # -- events --
+    def build_event(self, key: str, name: str, via: str, items: List[EventItem],
+                    folded: List[Dict[str, Any]]) -> PlannedEvent:
+        n = self.alloc()
+        ev = event_id(n)
+        path = str(self.paths.events / f"{ev}.md")
+        worker = _worker_kind(self.ledger, key)
+        refs = [EventItem(ITEM_QUEUED, key, None, {
+            "event": e.get("event"), "path": e.get("path") or str(self.paths.events / f"{e.get('event')}.md"),
+            "kinds": list(e.get("kinds") or []), "steps": list(e.get("steps") or []),
+            "approvals": list(e.get("approvals") or [])}) for e in folded]
+        all_items = list(items) + refs
+        kinds: List[str] = []
+        steps: List[str] = []
+        approvals: List[str] = []
+        due_steps: List[str] = []
+        requests: List[str] = []
+        raised: List[str] = []
+        for it in all_items:
+            if it.kind == ITEM_ROLE:
+                continue
+            for k in (it.data.get("kinds") or []) if it.kind == ITEM_QUEUED else [it.kind]:
+                if k not in kinds:
+                    kinds.append(k)
+            for sid in (it.data.get("steps") or []) if it.kind == ITEM_QUEUED else ([it.step] if it.step else []):
+                if sid not in steps:
+                    steps.append(sid)
+            if it.kind == ITEM_RESUME:
+                for m in it.data.get("markers") or []:
+                    if m.get("step") and m["step"] not in steps:
+                        steps.append(m["step"])
+            for aid in (it.data.get("approvals") or []) if it.kind == ITEM_QUEUED else (
+                    [it.data.get("approval")] if it.kind in (ITEM_ANSWER, ITEM_APPROVAL_NEEDED) else []):
+                if aid and aid not in approvals:
+                    approvals.append(aid)
+            if it.kind == ITEM_STEP_DUE and it.step:
+                due_steps.append(it.step)
+            if it.kind == ITEM_FEEDBACK and it.data.get("request"):
+                requests.append(it.data["request"])
+            if it.kind == ITEM_APPROVAL_NEEDED and it.data.get("approval"):
+                raised.append(it.data["approval"])
+        report = None
+        if worker is not None and steps:
+            report = report_path(self.paths, steps[0], worker, ev)
+        for it in items:
+            if it.kind == ITEM_STEP_DUE:
+                it.data["marker_at"] = self.stamp
+            if it.kind in (ITEM_STEP_DUE, ITEM_FEEDBACK, ITEM_REVIEW_DUE) and report:
+                it.data["report"] = report
+        line = {VIA_RESUME: resume_line}.get(via, event_line)(ev, path)
+        if kinds == [ITEM_ROTATE]:
+            line = rotate_line(ev, path)
+        pe = PlannedEvent(event=ev, n=n, path=path, to=key, session=name, via=via, line=line, items=all_items,
+                          kinds=kinds, steps=steps, approvals=approvals, created_at=self.stamp, worker=worker,
+                          report=report, supersedes=[str(e.get("event")) for e in folded],
+                          due_steps=due_steps, requests=requests, raised_approvals=raised)
+        pe.text = render_event(pe, self.ledger.run_id)
+        self.plan.events.append(pe)
+        self.plan.dispatched_steps.extend(s for s in due_steps if s not in self.plan.dispatched_steps)
+        self.plan.completed.extend({**e, "left": "superseded", "by": ev} for e in folded)
+        return pe
+
+    def role_item(self, key: str) -> EventItem:
+        prompt, epic_prompt = role_prompt_paths(self.ledger, key)
+        return EventItem(ITEM_ROLE, key, None, {"prompt": prompt, "epic_prompt": epic_prompt})
+
+    def queued_for(self, key: str) -> List[Dict[str, Any]]:
+        """Unsent events for ``key`` that a later event may fold: never a launch prompt or a rotate."""
+        return [e for e in self.st.get("outbox") or []
+                if e.get("to") == key and _unsent(e) and e.get("via", VIA_SEND) == VIA_SEND
+                and ITEM_ROTATE not in (e.get("kinds") or [])]
+
+    def queue_event(self, key: str, items: List[EventItem], name: Optional[str] = None) -> PlannedEvent:
+        """Persist this pass's items as one event (commit only), folding the unsent ones queued before."""
+        rec = self.rec(key)
+        name = name or (rec or {}).get("name") or session_name_for(self.ledger, key, 1, self.worker_dirs)
+        pe = self.build_event(key, name, VIA_SEND, items, self.queued_for(key))
+        now, host = self.now, self.host
+        self.add(DispatchOp(label=f"event {pe.event} → {key} (queued)",
+                            mutate=lambda st, pe=pe: _commit_event(st, pe, now, host),
+                            files={pe.path: pe.text}))
+        return pe
+
+    # -- sends --
+    def deliver(self, key: str, event: str, facts: Optional[SessionFacts]) -> bool:
+        """Send a queued event (§9.3): idle ⇒ the pane check; a refused pane counts a deferral."""
+        rec = self.rec(key)
+        entry = _find_entry(self.st, event)
+        if rec is None or entry is None or key in self.sent or self.paused:
+            return False
+        if session_ready(facts) is not None:
+            return False
+        name = rec.get("name")
+        why = _plan_pane_check(self.reading(name))
+        stamp = self.stamp
+        if why is not None:
+            def defer(st: RunState, event: str = event, why: str = why) -> None:
+                e = _find_entry(st, event)
+                if e is not None:
+                    e["deferrals"] = int(e.get("deferrals") or 0) + 1
+                    e["last_deferral"] = {"at": stamp, "why": why}
+            self.commit_only(f"defer {event} ({why})", defer)
+            return False
+        rotation_key = key if ITEM_ROTATE in (entry.get("kinds") or []) else None
+
+        def send(st: RunState, event: str = event) -> None:
+            e = _find_entry(st, event)
+            r = (st.get("sessions") or {}).get(key) or {}
+            if e is None:
+                return
+            e["sends"] = list(e.get("sends") or []) + [stamp]
+            e["session"] = r.get("name")
+            r["last_event"] = event
+            rot = r.get("rotation")
+            if rotation_key is not None and isinstance(rot, dict) and rot.get("event") == event:
+                rot["requested_at"] = stamp
+        self.add(DispatchOp(label=f"send {event} → {name}", mutate=send,
+                            effect=Effect(EFFECT_SEND, key, name, line=entry.get("line") or event_line(
+                                event, entry.get("path") or str(self.paths.events / f"{event}.md")), event=event),
+                            on_result=_send_result(event, stamp, rotation_key=rotation_key)))
+        self.sent.add(key)
+        return True
+
+    # -- launches --
+    def spawn(self, key: str, gen: int, items: List[EventItem], folded: List[Dict[str, Any]],
+              handoff: Optional[Dict[str, Any]] = None) -> None:
+        old = self.rec(key)
+        directory = (old or {}).get("dir") if handoff else None
+        directory = directory or session_dir_for(self.ledger, key, self.worker_dirs)
+        name = session_name_for(self.ledger, key, gen, directory=directory)
+        lead = [self.role_item(key)]
+        if handoff:
+            lead.append(EventItem(ITEM_HANDOFF, key, None, handoff))
+        pe = self.build_event(key, name, VIA_SPAWN, lead + list(items), folded)
+        args = spawn_args(self.ledger, key, gen, directory, pe.line)
+        taken = name in set(self.readings.amux_names) | set(self.readings.handle_names)
+        now, host, stamp = self.now, self.host, self.stamp
+        parked = list((old or {}).get("parked") or [])
+        if handoff and old is not None:
+            parked.append({"name": old.get("name"), "since": stamp, "gen": old.get("gen")})
+
+        def mutate(st: RunState, pe: PlannedEvent = pe) -> None:
+            entry = _commit_event(st, pe, now, host)
+            st.setdefault("sessions", {})[key] = {
+                "name": name, "gen": gen, "dir": directory, "status": SESSION_SPAWNING, "spawned_at": stamp,
+                "resumed_at": [], "model_verified": None, "compacted": False, "parked": list(parked),
+                "rotation": None, "launch_event": pe.event, "launch_via": VIA_SPAWN, "launch_attempts": 1,
+                "launch_error": None, "dialog_answers": [], "last_event": pe.event}
+            if taken:
+                st["sessions"][key]["launch_error"] = {
+                    "kind": VIA_SPAWN, "at": stamp, "rc": None, "reason": "name_in_use",
+                    "error": f"session name already in use: {name} (not spawned)"}
+            else:
+                entry["sends"] = [stamp]
+        if taken:
+            self.add(DispatchOp(label=f"spawn {name} refused: name in use", mutate=mutate, files={pe.path: pe.text}))
+            self.note(f"{key}: {name} is already in use; not spawned (spawn_failed)")
+            return
+        self.add(DispatchOp(label=f"spawn {name} seeded with {pe.event}", mutate=mutate,
+                            effect=Effect(EFFECT_SPAWN, key, name, args=tuple(args), event=pe.event),
+                            files={pe.path: pe.text}, on_result=_launch_result(key, pe.event, VIA_SPAWN)))
+        self.sent.add(key)
+
+    def relaunch(self, key: str, rec: Dict[str, Any], entry: Dict[str, Any]) -> None:
+        """A launch that did not run (the pass died before it) or failed: run it again, same event."""
+        via = entry.get("via") or (VIA_RESUME if rec.get("status") == SESSION_RESUMING else VIA_SPAWN)
+        name = rec.get("name") or ""
+        event = str(entry.get("event"))
+        wait = launch_retry_wait_s(rec, self.now)
+        if wait is not None:
+            self.note(f"{key}: the {via} of {name} failed; the next attempt waits {int(wait)}s")
+            return
+        line = entry.get("line") or (resume_line if via == VIA_RESUME else event_line)(
+            event, entry.get("path") or str(self.paths.events / f"{event}.md"))
+        stamp = self.stamp
+        if via == VIA_SPAWN:
+            if name in set(self.readings.amux_names) | set(self.readings.handle_names):
+                def refuse(st: RunState) -> None:
+                    r = (st.get("sessions") or {}).get(key)
+                    if r is not None:
+                        r["launch_error"] = {"kind": VIA_SPAWN, "at": stamp, "rc": None, "reason": "name_in_use",
+                                             "error": f"session name already in use: {name} (not spawned)"}
+                self.commit_only(f"spawn {name} refused: name in use", refuse)
+                return
+            args = spawn_args(self.ledger, key, int(rec.get("gen") or 1), rec.get("dir") or
+                              session_dir_for(self.ledger, key, self.worker_dirs), line)
+            effect = Effect(EFFECT_SPAWN, key, name, args=tuple(args), event=event)
+        else:
+            effect = Effect(EFFECT_RESUME, key, name, args=tuple(resume_args(name, line)), event=event)
+
+        def mutate(st: RunState) -> None:
+            r = (st.get("sessions") or {}).get(key)
+            e = _find_entry(st, event)
+            if r is None or e is None:
+                return
+            if via == VIA_SPAWN:
+                r["spawned_at"] = stamp
+            else:
+                r["resumed_at"] = list(r.get("resumed_at") or []) + [stamp]
+            n = r.get("launch_attempts")
+            r["launch_attempts"] = (1 if n is None else int(n)) + 1     # 0 (after a reboot) restarts at 1
+            e["sends"] = [stamp]
+            e["line"] = line
+        self.add(DispatchOp(label=f"{via} {name} again with {event}", mutate=mutate, effect=effect,
+                            on_result=_launch_result(key, event, via)))
+        self.sent.add(key)
+
+    def resume(self, key: str, items: List[EventItem]) -> None:
+        rec = self.rec(key) or {}
+        name = rec.get("name") or ""
+        markers = [dict(s.get("inflight")) for s in (self.st.get("steps") or {}).values()
+                   if isinstance(s.get("inflight"), dict) and s["inflight"].get("session") == name]
+        folded = [e for e in self.st.get("outbox") or []
+                  if (e.get("session") == name or (e.get("to") == key and _unsent(e))) and not _entry_complete(e)]
+        last = rec.get("last_event")
+        last_info = {"event": last, "path": str(self.paths.events / f"{last}.md")} if last else None
+        lead = [self.role_item(key), EventItem(ITEM_RESUME, key, None, {
+            "name": name, "markers": [{"step": m.get("step"), "event": m.get("event"),
+                                       "started_at": m.get("started_at")} for m in markers],
+            "last_event": last_info})]
+        pe = self.build_event(key, name, VIA_RESUME, lead + list(items), folded)
+        now, host, stamp = self.now, self.host, self.stamp
+
+        def mutate(st: RunState, pe: PlannedEvent = pe) -> None:
+            entry = _commit_event(st, pe, now, host)
+            r = (st.get("sessions") or {}).get(key)
+            if r is None:
+                return
+            r["status"] = SESSION_RESUMING
+            r["resumed_at"] = list(r.get("resumed_at") or []) + [stamp]
+            r["launch_event"] = pe.event
+            r["launch_via"] = VIA_RESUME
+            r["launch_attempts"] = 1
+            r["rotation"] = None
+            r["last_event"] = pe.event
+            entry["sends"] = [stamp]
+        self.add(DispatchOp(label=f"resume {name} with {pe.event}", mutate=mutate,
+                            effect=Effect(EFFECT_RESUME, key, name, args=tuple(resume_args(name, pe.line)),
+                                          event=pe.event),
+                            files={pe.path: pe.text}, on_result=_launch_result(key, pe.event, VIA_RESUME)))
+        self.sent.add(key)
+
+    def spawn_next(self, key: str, items: List[EventItem]) -> None:
+        """§11.3 steps 3–4: gen + 1 seeded with the handoff and every event queued meanwhile; the old
+        session is parked (reaped once the new one has started)."""
+        rec = self.rec(key) or {}
+        rot = rec.get("rotation") or {}
+        path = (rot.get("handoff") or {}).get("path") or rot.get("handoff_path")
+        folded = [e for e in self.st.get("outbox") or []
+                  if e.get("to") == key and ITEM_ROTATE not in (e.get("kinds") or [])
+                  and (_unsent(e) or (e.get("confirmed_at") and not _entry_complete(e)))]
+        self.spawn(key, int(rec.get("gen") or 1) + 1, items, folded,
+                   handoff={"path": path, "from": rec.get("name")})
+
+    def rotate(self, key: str, facts: Optional[SessionFacts]) -> None:
+        rec = self.rec(key) or {}
+        name = rec.get("name") or ""
+        gen = int(rec.get("gen") or 1)
+        hp = handoff_path(self.paths, key, gen)
+        pe = self.build_event(key, name, VIA_SEND, [EventItem(ITEM_ROTATE, key, None, {
+            "name": name, "gen": gen, "handoff_path": hp})], [])
+        now, host = self.now, self.host
+
+        def mutate(st: RunState, pe: PlannedEvent = pe) -> None:
+            _commit_event(st, pe, now, host)
+            r = (st.get("sessions") or {}).get(key)
+            if r is not None:
+                r["rotation"] = {"event": pe.event, "requested_at": None, "handoff_path": hp, "ticks": 0}
+        self.add(DispatchOp(label=f"event {pe.event} → {key} (rotate)", mutate=mutate, files={pe.path: pe.text}))
+        self.deliver(key, pe.event, facts)
+
+    # -- the pass --
+    def settle(self) -> None:
+        """Commit-only bookkeeping before any decision: completed outbox entries leave; a launch
+        whose session is up but whose result was never committed gets its send; a spawn whose session
+        already died is dead; a sent event addressed to an older generation is never retried."""
+        st = self.st
+        done = [e for e in st.get("outbox") or [] if _entry_complete(e)]
+        self.plan.completed.extend({**e, "left": "completed"} for e in done)
+        done_ids = {e.get("event") for e in done}
+        handles = set(self.readings.handle_names)
+        current = {r.get("name") for r in (st.get("sessions") or {}).values()}
+        changes: List[Callable[[RunState], None]] = []
+        if done_ids:
+            changes.append(lambda s: s.__setitem__("outbox", [e for e in s.get("outbox") or []
+                                                               if e.get("event") not in done_ids]))
+        now_s, stamp = self.now.timestamp(), self.stamp
+        for key, rec in (st.get("sessions") or {}).items():
+            name = rec.get("name")
+            reading = self.reading(name)
+            alive = bool(reading is not None and reading.alive)
+            entry = _find_entry(st, rec.get("launch_event"))
+            if alive and entry is not None and not entry.get("sends"):
+                launched = iso(session_launch_at(rec)) or stamp
+                changes.append(lambda s, ev=entry.get("event"), t=launched: (
+                    _find_entry(s, ev) or {}).__setitem__("sends", [t]))
+            if rec.get("launch_error") and alive and (entry is None or entry.get("confirmed_at")):
+                changes.append(lambda s, k=key: s["sessions"][k].__setitem__("launch_error", None))
+            if rec.get("status") == SESSION_SPAWNING and not alive and name in handles:
+                changes.append(lambda s, k=key: s["sessions"][k].__setitem__("status", SESSION_DEAD))
+        for e in st.get("outbox") or []:
+            sends = [x for x in (_epoch(v) for v in e.get("sends") or []) if x is not None]
+            if (e.get("session") not in current and sends and not e.get("confirmed_at")
+                    and not e.get("unconfirmed_at") and now_s - max(sends) >= DELIVERY_RETRY_AFTER_S):
+                changes.append(lambda s, ev=e.get("event"): (_find_entry(s, ev) or {}).__setitem__(
+                    "unconfirmed_at", stamp))
+        gone = [r.get("id") for r in st.get("queue") or []   # type: ignore[typeddict-item]
+                if isinstance(r, dict) and r.get("event")
+                and (r.get("event") in done_ids or _find_entry(st, r.get("event")) is None)]
+        if gone:
+            changes.append(lambda s: s.__setitem__("queue", [r for r in s.get("queue") or []
+                                                             if r.get("id") not in gone]))
+        if changes:
+            def apply(s: RunState) -> None:
+                for fn in changes:
+                    fn(s)
+            self.commit_only("settle", apply)
+
+    def reset_launch_backoff(self) -> None:
+        """§12.7: a reboot resets the launch backoff (what failed the launch, a dead tmux server, is gone).
+
+        ``launch_attempts`` goes to 0, which opens the gate once; the re-issue counts it as attempt 1, so a
+        failure after the reboot starts the ladder over at 10 m. ``launch_error`` (and so the
+        ``spawn_failed`` / ``resume_failed`` alarm) stays: only a successful launch clears it (§16.2).
+        Committed here, before any launch effect (invariant 5).
+        """
+        if self.recon.reboot is None:
+            return
+        keys = [k for k, r in (self.st.get("sessions") or {}).items()
+                if isinstance(r.get("launch_error"), dict) and r.get("launch_attempts") != 0]
+        if not keys:
+            return
+
+        def reset(st: RunState) -> None:
+            for k in keys:
+                (st["sessions"][k]).__setitem__("launch_attempts", 0)
+        self.commit_only("reboot: the launch backoff starts over", reset)
+
+    def compute_resume_now(self) -> None:
+        """§11.4: after a reboot, the sessions that had a turn open or a step in flight resume at once
+        (50-05's ``RebootFacts``); the others when their role next gets an event. Any dead session
+        with a step in flight on it, or an event not yet confirmed, also resumes at once: no other
+        event would come for it."""
+        reboot = self.recon.reboot
+        if reboot is not None:
+            self.resume_now.update(reboot.resume_now)
+        steps = self.st.get("steps") or {}
+        for key, rec in (self.st.get("sessions") or {}).items():
+            name = rec.get("name")
+            if rec.get("status") != SESSION_DEAD or not name:
+                continue
+            inflight = any((s.get("inflight") or {}).get("session") == name for s in steps.values())
+            pending = any(e.get("session") == name and not e.get("confirmed_at") for e in self.st.get("outbox") or [])
+            if inflight or pending:
+                self.resume_now.add(key)
+
+    def rotation_cooling_down(self, rec: Optional[Dict[str, Any]]) -> bool:
+        """A handoff timeout is younger than ``ROTATE_RETRY_AFTER_S``: reuse this generation."""
+        ht = (rec or {}).get("handoff_timeout")
+        at = from_iso(ht.get("at")) if isinstance(ht, dict) else None
+        return at is not None and self.now.timestamp() - at.timestamp() < ROTATE_RETRY_AFTER_S
+
+    def retry_decisions(self, key: str, rec: Dict[str, Any], facts: Optional[SessionFacts],
+                        reading: Optional[SessionReading]) -> None:
+        """§9.3: the single retry only when the first send provably did not land; otherwise none, and
+        at the following tick ``delivery_unconfirmed`` (``unconfirmed_at``) with no further sends."""
+        name = rec.get("name")
+        now_s, stamp = self.now.timestamp(), self.stamp
+        for e in list(self.st.get("outbox") or []):
+            if e.get("session") != name or not e.get("sends") or e.get("confirmed_at") or e.get("unconfirmed_at"):
+                continue
+            sends = [x for x in (_epoch(v) for v in e.get("sends") or []) if x is not None]
+            if not sends or now_s - max(sends) < DELIVERY_RETRY_AFTER_S:
+                continue
+            event = str(e.get("event"))
+            decided = e.get("retry")
+            if isinstance(decided, dict):
+                if now_s > (_epoch(decided.get("at")) or now_s):
+                    self.commit_only(f"{event} unconfirmed after the retry decision",
+                                     lambda s, ev=event: (_find_entry(s, ev) or {}).__setitem__("unconfirmed_at", stamp))
+                continue
+            if key in self.sent or self.paused:
+                continue            # decided on a later pass
+            if reading is None or not delivery_provably_absent(e, reading):
+                why: Optional[str] = "absence not provable"
+            elif len(e.get("sends") or []) >= 2:
+                why = "two sends already"
+            else:
+                why = session_ready(facts) or _plan_pane_check(reading)
+            if why is not None:
+                self.commit_only(f"{event}: no retry ({why})",
+                                 lambda s, ev=event, why=why: (_find_entry(s, ev) or {}).__setitem__(
+                                     "retry", {"at": stamp, "sent": False, "why": why}))
+                continue
+
+            line = e.get("line") or (event_line(event, e["path"]) if e.get("path") else None)
+            if not line:
+                continue            # nothing to send, and no empty send: the entry is kept
+
+            def resend(s: RunState, ev: str = event) -> None:
+                x = _find_entry(s, ev)
+                if x is not None:
+                    x["sends"] = list(x.get("sends") or []) + [stamp]
+                    x["retry"] = {"at": stamp, "sent": True, "why": "the first send provably did not land"}
+            self.add(DispatchOp(label=f"retry {event} → {name}", mutate=resend,
+                                effect=Effect(EFFECT_SEND, key, name, line=line, event=event),
+                                on_result=_send_result(event, stamp, retry=True)))
+            self.sent.add(key)
+
+    def actions(self, key: str, rec: Dict[str, Any], facts: Optional[SessionFacts],
+                reading: Optional[SessionReading]) -> None:
+        name = rec.get("name")
+        stamp, now = self.stamp, self.now
+        for act in self.recon.actions:
+            if act.session != key or self.paused or key in self.sent:
+                continue
+            if act.kind == ACTION_STARTUP_DIALOG_ANSWER:
+                dialog, k = act.data.get("dialog"), act.data.get("key")
+                launch = from_iso(act.data.get("launch"))
+                listed = next((d for d in self.ledger.startup_dialogs if d.id == dialog), None)
+                if listed is None or k not in STARTUP_DIALOG_KEYS:
+                    continue
+
+                def answer(st: RunState, dialog: str = dialog, k: str = k, launch: Any = launch) -> None:
+                    r = (st.get("sessions") or {}).get(key)
+                    if r is not None and not dialog_answered(r, launch, dialog):
+                        record_dialog_answer(r, launch, dialog, k, now)
+
+                def keyed(st: RunState, outcome: EffectOutcome, at: datetime, dialog: str = dialog) -> None:
+                    r = (st.get("sessions") or {}).get(key) or {}
+                    answers = r.get("dialog_answers") or []
+                    for i in range(len(answers) - 1, -1, -1):
+                        a = answers[i]
+                        if a.get("dialog") != dialog:
+                            continue
+                        if not outcome.ran:
+                            del answers[i]      # the guard refused: no key was sent, a later pass may answer once
+                        elif outcome.ok:
+                            a["sent_at"] = iso(at)
+                        else:                   # sent, outcome unknown: stays recorded (at most once)
+                            a["not_sent"] = (outcome.result.error if outcome.result else None) or "failed"
+                        break
+                self.add(DispatchOp(label=f"answer startup dialog {dialog} on {name} with {k}", mutate=answer,
+                                    effect=Effect(EFFECT_KEYS, key, name, key=k, dialog_match=listed.match),
+                                    on_result=keyed))
+                self.sent.add(key)
+            elif act.kind == ACTION_VERDICT_REMINDER:
+                event = act.data.get("event")
+                entry = _find_entry(self.st, event)
+                if entry is None or entry.get("reminded_at"):
+                    continue
+                if session_ready(facts) is not None or _plan_pane_check(reading) is not None:
+                    continue        # 50-05 emits it again next pass, until reminded_at is set
+                path = entry.get("path") or str(self.paths.events / f"{event}.md")
+
+                def remind(st: RunState, event: str = event) -> None:
+                    x = _find_entry(st, event)
+                    if x is not None:
+                        x["reminded_at"] = stamp
+
+                def reminded(st: RunState, outcome: EffectOutcome, at: datetime, event: str = event) -> None:
+                    x = _find_entry(st, event)
+                    if x is not None and not outcome.ran:
+                        x["reminded_at"] = None      # the check refused before anything was sent
+                self.add(DispatchOp(label=f"remind {event} on {name}", mutate=remind,
+                                    effect=Effect(EFFECT_SEND, key, name, line=reminder_line(str(event), path),
+                                                  event=event), on_result=reminded))
+                self.sent.add(key)
+
+    def keep_warm(self, key: str, facts: Optional[SessionFacts], reading: Optional[SessionReading]) -> None:
+        rec = self.rec(key)
+        if rec is None or key in self.sent or self.paused:
+            return
+        ok, why = keep_warm_check(self.ledger, self.st, key, facts, self.now)
+        if not ok:
+            return
+        pane = _plan_pane_check(reading)
+        if pane is not None:
+            self.note(f"{key}: ping skipped ({pane})")
+            return
+        name, stamp = rec.get("name"), self.stamp
+        previous = rec.get("last_ping_at")
+
+        def ping(st: RunState) -> None:
+            st["sessions"][key]["last_ping_at"] = stamp
+
+        def pinged(st: RunState, outcome: EffectOutcome, at: datetime) -> None:
+            if not outcome.ran:
+                st["sessions"][key]["last_ping_at"] = previous
+        self.add(DispatchOp(label=f"ping {name} ({why})", mutate=ping,
+                            effect=Effect(EFFECT_SEND, key, name, line=PING_LINE), on_result=pinged))
+        self.sent.add(key)
+
+    def session(self, key: str, new_items: List[EventItem]) -> None:
+        facts = self.recon.sessions.get(key)
+        rec = self.rec(key)
+        name = (rec or {}).get("name")
+        reading = self.reading(name)
+        alive = bool(facts is not None and facts.alive)
+
+        # A. a launch that never ran or failed: run it again with the same event
+        if rec is not None and rec.get("status") in (SESSION_SPAWNING, SESSION_RESUMING) and not alive:
+            entry = _find_entry(self.st, rec.get("launch_event"))
+            if entry is not None:
+                if not self.paused:
+                    self.relaunch(key, rec, entry)
+                if new_items:
+                    self.queue_event(key, new_items)
+                return
+            self.commit_only(f"{key}: launch prompt gone and no session: dead",
+                             lambda s: s["sessions"][key].__setitem__("status", SESSION_DEAD))
+            rec = self.rec(key)
+
+        force_reuse = False
+        # B. a rotation under way (§11.3)
+        if rec is not None and isinstance(rec.get("rotation"), dict) and not self.paused:
+            rot = rec["rotation"]
+            done = handoff_complete(rec, reading)
+            if (not alive and done) or (alive and facts is not None and facts.rotation_ready):
+                decision = PolicyDecision(ACT_SPAWN_NEXT, "handoff written" + ("" if alive else "; old session dead"))
+                self.plan.decisions[key] = decision
+                self.spawn_next(key, new_items)
+                return
+            if not alive:
+                self.commit_only(f"{key}: dead during its rotation, no handoff: resume in place",
+                                 lambda s: s["sessions"][key].__setitem__("rotation", None))
+            elif rot.get("requested_at"):
+                ticks = int(rot.get("ticks") or 0) + 1
+                stamp = self.stamp
+                if ticks >= HANDOFF_TIMEOUT_TICKS:
+                    rot_event = rot.get("event")
+
+                    def timeout(s: RunState) -> None:
+                        r = s["sessions"][key]
+                        r["handoff_timeout"] = {"at": stamp, "event": rot_event,
+                                                "requested_at": (r.get("rotation") or {}).get("requested_at")}
+                        r["rotation"] = None
+                        s["outbox"] = [e for e in s.get("outbox") or [] if e.get("event") != rot_event]
+                    self.plan.completed.extend({**e, "left": "handoff_timeout"} for e in self.st.get("outbox") or []
+                                               if e.get("event") == rot_event)
+                    self.commit_only(f"{key}: no handoff after {ticks} ticks: fall back to reuse", timeout)
+                    force_reuse = True
+                else:
+                    self.commit_only(f"{key}: waiting for the handoff (tick {ticks})",
+                                     lambda s, t=ticks: s["sessions"][key]["rotation"].__setitem__("ticks", t))
+            else:
+                rentry = _find_entry(self.st, rot.get("event"))
+                if rentry is None:
+                    self.commit_only(f"{key}: the rotate event is gone: rotation dropped",
+                                     lambda s: s["sessions"][key].__setitem__("rotation", None))
+                elif _unsent(rentry):
+                    self.deliver(key, str(rot.get("event")), facts)
+        rec = self.rec(key)
+
+        # C. sent and unconfirmed: the single retry, or none
+        if rec is not None and alive and (facts is None or facts.pane != PANE_DIALOG):
+            self.retry_decisions(key, rec, facts, reading)
+
+        # D. the startup-dialog key and the VERDICT? reminder (50-05's action items)
+        if rec is not None and alive:
+            self.actions(key, rec, facts, reading)
+
+        # E. events: this pass's items, the queue, resume-at-once
+        queued = self.queued_for(key)
+        rec = self.rec(key)
+        if new_items or queued or key in self.resume_now or force_reuse:
+            handoff_done = handoff_complete(rec, reading) if rec else False
+            decision = choose_action(self.ledger, self.st, key, facts, self.now, handoff_done=handoff_done)
+            if decision.action == ACT_ROTATE and (force_reuse or self.rotation_cooling_down(rec)):
+                decision = PolicyDecision(ACT_REUSE, "handoff_timeout: reuse (the rotation cool-down)")
+            self.plan.decisions[key] = decision
+            act = decision.action
+            if self.paused or act in (ACT_HOLD, ACT_WAIT):
+                if new_items:
+                    self.queue_event(key, new_items)
+            elif act == ACT_SPAWN:
+                self.spawn(key, 1, new_items, queued)
+            elif act == ACT_RESUME:
+                self.resume(key, new_items)
+            elif act == ACT_SPAWN_NEXT:
+                self.spawn_next(key, new_items)
+            elif act == ACT_ROTATE:
+                if new_items:
+                    self.queue_event(key, new_items)
+                self.rotate(key, facts)
+            elif act == ACT_REUSE:
+                target = self.queue_event(key, new_items).event if new_items else (
+                    str(queued[0].get("event")) if queued else None)
+                if target is not None:
+                    self.deliver(key, target, facts)
+
+        # F. keep warm (§11.5), only when nothing else went to the session this pass
+        if alive:
+            self.keep_warm(key, facts, reading)
+
+    def reap(self) -> None:
+        """§11.3 step 4: a parked generation is reaped once the new session's prompt is confirmed
+        (its first ``turn_start`` seen), unless a client is attached; then it is tried each tick."""
+        if self.paused:
+            return
+        for key, rec in (self.st.get("sessions") or {}).items():
+            parked = [p for p in rec.get("parked") or [] if isinstance(p, dict) and p.get("name")]
+            if not parked or rec.get("status") != SESSION_LIVE:
+                continue
+            entry = launch_entry(self.st, rec)
+            if not (entry is _CONFIRMED or (isinstance(entry, dict) and entry.get("confirmed_at"))):
+                continue
+            for p in parked:
+                pname = p["name"]
+                pr = self.reading(pname)
+                if pr is None or (not pr.tmux_present and pr.handle is None):
+                    self.commit_only(f"{pname} is gone: unpark",
+                                     lambda s, k=key, n=pname: s["sessions"][k].__setitem__(
+                                         "parked", [x for x in s["sessions"][k].get("parked") or []
+                                                    if x.get("name") != n]))
+                    continue
+                if pr.tmux_present and (pr.attached is None or pr.attached > 0):
+                    self.note(f"{pname}: a client is attached (or unknown); reaping retried next tick")
+                    continue
+                if pr.handle is None:
+                    self.note(f"{pname}: no handle; amux-spawn rm cannot reap it")
+                    continue
+                stamp = self.stamp
+
+                def mark(s: RunState, k: str = key, n: str = pname) -> None:
+                    for x in s["sessions"][k].get("parked") or []:
+                        if x.get("name") == n:
+                            x["reaping_at"] = stamp
+
+                def reaped(s: RunState, outcome: EffectOutcome, at: datetime, k: str = key, n: str = pname) -> None:
+                    r = s["sessions"][k]
+                    if outcome.ok:
+                        r["parked"] = [x for x in r.get("parked") or [] if x.get("name") != n]
+                        return
+                    for x in r.get("parked") or []:
+                        if x.get("name") == n:
+                            res = outcome.result
+                            x["reap_error"] = ((res.stderr or "") + (res.error or "")).strip()[-300:] if res else "failed"
+                self.add(DispatchOp(label=f"reap parked {pname}", mutate=mark,
+                                    effect=Effect(EFFECT_REAP, key, pname, args=tuple(reap_args(pname))),
+                                    on_result=reaped))
+
+
+def plan_dispatch(ledger: Ledger, state: RunState, recon: ReconcileResult, readings: Readings,
+                  now: datetime, *, paths: RunPaths, selection: Optional[Selection] = None,
+                  check_outcomes: Iterable[CheckOutcome] = (), items: Iterable[EventItem] = (),
+                  worker_dirs: Optional[Dict[str, str]] = None, host: Optional[str] = None,
+                  paused: bool = False) -> DispatchPlan:
+    """Tick step 6–7 (§23): every event, send, launch, key, reap and ping of this pass, as ops.
+
+    ``state`` is the reconciled state (``recon.state``, after checks and
+    ``advance_schedule``); it is not modified. Items: 50-05's (``recon.items``),
+    ``step_due`` for ``selection``'s units, ``check_failed`` for the check
+    outcomes, ``approval_needed`` for ``selection.approval_to_ask``, ``feedback``
+    for queue requests, and the caller's ``items`` (``alarm_cleared`` from 50-08).
+    They merge into at most one event per session (§9.1, D2 step 6); every item
+    is committed into an event this pass whatever the policy decides, since the
+    reconcile emits some of them only once. ``paused``: events are written, no
+    effect is planned ("starts nothing", §18).
+    """
+    now = require_aware(now)
+    d = _Dispatch(ledger, state, recon, readings, now, paths, host or socket.gethostname(), paused, worker_dirs)
+    all_items: List[EventItem] = []
+    all_items += step_due_items(ledger, state, selection, worker_dirs)
+    all_items += check_failed_items(ledger, check_outcomes)
+    all_items += approval_needed_items(ledger, state, selection)
+    all_items += list(recon.items)
+    all_items += feedback_items(state)
+    all_items += list(items)
+    all_items = [_with_report_paths(ledger, paths, it, worker_dirs) for it in all_items]
+    d.settle()
+    d.compute_resume_now()
+    d.reset_launch_backoff()
+    by_key: Dict[str, List[EventItem]] = {}
+    for it in all_items:
+        by_key.setdefault(it.to, []).append(EventItem(it.kind, it.to, it.step, dict(it.data)))
+    queued_keys = {e.get("to") for e in d.st.get("outbox") or [] if isinstance(e.get("to"), str)}
+    keys = sorted(set(d.st.get("sessions") or {}) | set(by_key) | queued_keys, key=lambda k: (k != "driver", k))
+    for key in keys:
+        d.session(key, by_key.get(key, []))
+    d.reap()
+    d.plan.preview = d.st
+    return d.plan
+
+
+def _with_report_paths(ledger: Ledger, paths: RunPaths, item: EventItem,
+                       worker_dirs: Optional[Dict[str, str]]) -> EventItem:
+    """50-05's worker items gain the report paths of the events they answer (§4, §14.3)."""
+    data = dict(item.data)
+    if item.kind == ITEM_WORKER_SETTLED and item.step and data.get("event"):
+        data["report"] = report_path(paths, item.step, data.get("worker"), data["event"])
+    if item.kind == ITEM_REVIEW_DUE and item.step:
+        if data.get("event"):
+            data["implementer_report"] = report_path(paths, item.step, "implementer", data["event"])
+        data["worktree"] = session_dir_for(ledger, item.to, worker_dirs)
+    return EventItem(item.kind, item.to, item.step, data)
+
+
+# =============================================================================
+# Dispatch execution (§23: COMMIT → effect → COMMIT) — 50-06
+# =============================================================================
+
+def _send_guard(world: World, name: str) -> Optional[str]:
+    """The §9.3 pane check read again just before a send (copy-mode, the input box, a dialog)."""
+    disp = world.tmux_display(name, ("pane_in_mode",))
+    raw = (disp or {}).get("pane_in_mode")
+    mode = None if raw is None or str(raw).strip() == "" else str(raw).strip() != "0"
+    return pane_ready(mode, world.capture_pane(name))
+
+
+def _keys_guard(world: World, name: str, match: Optional[str]) -> Optional[str]:
+    """A listed dialog's key goes only to a pane that still shows that dialog (never into a draft)."""
+    disp = world.tmux_display(name, ("pane_in_mode",))
+    if str((disp or {}).get("pane_in_mode", "")).strip() != "0":
+        return "copy-mode or pane mode unknown"
+    pane = world.capture_pane(name)
+    if classify_pane(pane).kind != PANE_DIALOG:
+        return "the dialog is gone"
+    if match and not re.search(match, pane or ""):
+        return "another dialog shows"
+    return None
+
+
+def run_effect(world: World, effect: Effect) -> EffectOutcome:
+    """Run one effect through ``World``; sends and keys check the pane first and may refuse."""
+    if effect.kind == EFFECT_NONE:
+        return EffectOutcome(effect, ran=False)
+    name = effect.name or ""
+    if effect.kind == EFFECT_SEND:
+        why = _send_guard(world, name)
+        if why is not None:
+            return EffectOutcome(effect, ran=False, deferred=why)
+        return EffectOutcome(effect, ran=True, result=world.amux_send(name, effect.line or ""))
+    if effect.kind == EFFECT_KEYS:
+        why = _keys_guard(world, name, effect.dialog_match)
+        if why is not None:
+            return EffectOutcome(effect, ran=False, deferred=why)
+        return EffectOutcome(effect, ran=True, result=world.send_keys(name, effect.key or ""))
+    if effect.kind == EFFECT_SPAWN:
+        return EffectOutcome(effect, ran=True, result=world.spawn(list(effect.args)))
+    if effect.kind == EFFECT_RESUME:
+        return EffectOutcome(effect, ran=True, result=world.resume(list(effect.args)))
+    if effect.kind == EFFECT_REAP:
+        return EffectOutcome(effect, ran=True, result=world.reap(list(effect.args)))
+    raise ValueError(f"unknown effect {effect.kind!r}")
+
+
+def execute_dispatch(plan: DispatchPlan, state: RunState, world: World,
+                     commit: Callable[[RunState], None]) -> List[EffectOutcome]:
+    """Run the plan on ``state`` (in place): per op, write its files, mutate, COMMIT, run the effect,
+    apply its result, COMMIT. ``commit`` is the tick's ``save_state`` (§23 step 6, invariant 5).
+
+    An event file whose number a crashed pass wrote but never committed is
+    overwritten: no state ever named it, so nothing was sent for it.
+    """
+    outcomes: List[EffectOutcome] = []
+    for op in plan.ops:
+        for path, text in op.files.items():
+            atomic_write_text(Path(path), text)
+        op.mutate(state)
+        commit(state)
+        if op.effect.kind == EFFECT_NONE:
+            continue
+        outcome = run_effect(world, op.effect)
+        outcomes.append(outcome)
+        if op.on_result is not None:
+            op.on_result(state, outcome, require_aware(world.now()))
+            commit(state)
+    return outcomes
+
+
+# =============================================================================
+# Dispatch alarm conditions (§16.2 rows of 50-06) — 50-06
+# =============================================================================
+
+def dispatch_conditions(ledger: Ledger, state: RunState, now: datetime) -> List[AlarmCondition]:
+    """``delivery_deferred``, ``delivery_unconfirmed`` (event), ``handoff_timeout``, ``spawn_failed``,
+    ``resume_failed`` (session), from the state the dispatch committed; 50-08 raises and clears them."""
+    out: List[AlarmCondition] = []
+    for e in state.get("outbox") or []:
+        ev = str(e.get("event"))
+        deferrals = int(e.get("deferrals") or 0)
+        if _unsent(e) and deferrals >= DEFERRALS_ALARM_AT:
+            why = (e.get("last_deferral") or {}).get("why")
+            out.append(AlarmCondition("delivery_deferred", ev, f"{deferrals} deferrals" + (f"; last: {why}" if why else "")))
+        if e.get("unconfirmed_at") and not e.get("confirmed_at"):
+            out.append(AlarmCondition("delivery_unconfirmed", ev,
+                                      f"{len(e.get('sends') or [])} send(s), the last {max(e.get('sends') or ['?'])}; "
+                                      "no further sends"))
+    for key, rec in (state.get("sessions") or {}).items():
+        name = str(rec.get("name"))
+        ht = rec.get("handoff_timeout")
+        if isinstance(ht, dict):
+            out.append(AlarmCondition("handoff_timeout", name,
+                                      f"no handoff for {ht.get('event')} within {HANDOFF_TIMEOUT_TICKS} ticks; reused"))
+        le = rec.get("launch_error")
+        if isinstance(le, dict):
+            alarm = "resume_failed" if le.get("kind") == VIA_RESUME else "spawn_failed"
+            out.append(AlarmCondition(alarm, name, f"{le.get('reason')}: {le.get('error')}"))
+    return out
