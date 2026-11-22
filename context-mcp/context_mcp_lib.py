@@ -40,6 +40,8 @@ it fails **loud** instead:
 * ``session_resolution`` marks the most-recent-``*.jsonl`` guess as a guess.
 """
 
+from __future__ import annotations
+
 import json
 import os
 from fnmatch import fnmatch

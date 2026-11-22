@@ -1157,7 +1157,16 @@ def _tail_entries(transcript_path: str | None, limit: int = MEASURE_TAIL_BYTES) 
 
 
 def _epoch_of(value: Any) -> float | None:
-    """Epoch seconds of an ISO-8601 string, a number, or a datetime; else None."""
+    """Private alias kept for this module's call sites; see :func:`epoch_of`."""
+    return epoch_of(value)
+
+
+def epoch_of(value: Any) -> float | None:
+    """Epoch seconds of an ISO-8601 string, a number, or a datetime; else None.
+
+    Public: the epic driver's ``from_iso`` (``epic_driver_lib``) reads state
+    timestamps through it (architecture §17: one parser, no private imports).
+    """
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):

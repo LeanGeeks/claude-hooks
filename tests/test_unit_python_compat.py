@@ -50,6 +50,15 @@ RELAY_CLIENT_MODULES = [
     REPO / "relay-server" / "relay_server" / "client_cli.py",
 ]
 
+# Modules outside .claude/hooks that the epic driver imports (epic-50
+# architecture §17): installed under ~/.claude/epic-driver/lib and
+# ~/.claude/statusline, and run by the same bare python3 as the hooks.
+EPIC_DRIVER_IMPORT_MODULES = [
+    REPO / "context-mcp" / "context_mcp_lib.py",
+    REPO / ".claude" / "statusline" / "statusline.py",
+    REPO / "questions-mcp" / "questions_mcp_lib.py",
+]
+
 _IMPORT_ERRORS = {"ImportError", "ModuleNotFoundError"}
 
 
@@ -311,7 +320,7 @@ class TestHookModulesParseUnderMinPython(unittest.TestCase):
     def test_hook_modules_parse(self):
         floor = min_python()
         failures = []
-        for path in hook_modules() + RELAY_CLIENT_MODULES:
+        for path in hook_modules() + RELAY_CLIENT_MODULES + EPIC_DRIVER_IMPORT_MODULES:
             try:
                 ast.parse(path.read_text(), feature_version=floor)
             except SyntaxError as exc:
@@ -322,12 +331,24 @@ class TestHookModulesParseUnderMinPython(unittest.TestCase):
         )
 
 
+class TestEpicDriverCovered(unittest.TestCase):
+    """The epic driver's lib and its §17 imports are inside the checks above."""
+
+    def test_epic_driver_lib_is_a_hook_module(self):
+        self.assertIn(HOOKS_DIR / "epic_driver_lib.py", hook_modules())
+
+    def test_driver_import_modules_exist(self):
+        for path in EPIC_DRIVER_IMPORT_MODULES:
+            with self.subTest(module=path.name):
+                self.assertTrue(path.is_file(), f"{path} is gone; update EPIC_DRIVER_IMPORT_MODULES")
+
+
 class TestTomllibIsGuarded(unittest.TestCase):
     """``import tomllib`` must always carry the tomli fallback."""
 
     def test_no_bare_tomllib_import(self):
         offenders = []
-        for path in hook_modules() + RELAY_CLIENT_MODULES:
+        for path in hook_modules() + RELAY_CLIENT_MODULES + EPIC_DRIVER_IMPORT_MODULES:
             tree = ast.parse(path.read_text())
             guarded = _guarded_import_nodes(tree)
             for node in ast.walk(tree):
@@ -342,7 +363,7 @@ class TestTomllibIsGuarded(unittest.TestCase):
         )
 
     def test_fallback_actually_resolves_to_tomli(self):
-        for path in hook_modules() + RELAY_CLIENT_MODULES:
+        for path in hook_modules() + RELAY_CLIENT_MODULES + EPIC_DRIVER_IMPORT_MODULES:
             text = path.read_text()
             if "import tomllib" not in text:
                 continue
@@ -358,7 +379,7 @@ class TestUnionAnnotations(unittest.TestCase):
         if floor >= (3, 10):
             self.skipTest("PEP 604 is native from 3.10")
         offenders = []
-        for path in hook_modules() + RELAY_CLIENT_MODULES:
+        for path in hook_modules() + RELAY_CLIENT_MODULES + EPIC_DRIVER_IMPORT_MODULES:
             tree = ast.parse(path.read_text())
             if _has_future_annotations(tree):
                 continue

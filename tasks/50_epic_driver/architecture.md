@@ -407,10 +407,11 @@ version 1:
       "started_at": "2026-11-24T06:00:05Z",
       "advanced_at": "2026-11-24T07:12:40Z",
       "done_at": null,
+      "by": null,
       "last_done_at": null,
       "inflight": null,
       "last_verdict": {"event": "E-37", "line": "ADVANCED: e1-useast01-roll", "at": "2026-11-24T07:12:40Z"},
-      "check": {"last_run_at": "…", "last_rc": 1, "consecutive_errors": 0, "output_tail": "…"},
+      "check": {"last_run_at": "…", "last_rc": 1, "consecutive_errors": 0, "last_error": null, "output_tail": "…"},
       "trigger": null,
       "window_covered_s": 0,
       "undispatched_ticks": 0,
@@ -454,6 +455,9 @@ version 1:
 Rules:
 
 - Session keys are `<role>` for the driver and `<role>:<step>` for workers.
+- `by` is who set `done`: `"check"` (a check returned 0), `"operator"` (`mark <step> done`) or `null` while not done.
+  `check.last_error` is the text of the latest check error (`cannot start: …`, `timed out after 60s`, `exit 7`) or
+  `null` after a clean run (0, 1 or 2); `consecutive_errors` counts the runs that set it.
 - `inflight` is written **before** delivery and cleared by the step's verdict (D7).
 - `notify_failures` keeps the last 20. `outbox` keeps unconfirmed entries and entries awaiting a verdict; completed
   entries move to `logs/tick.log`.

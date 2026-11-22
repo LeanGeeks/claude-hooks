@@ -38,7 +38,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | done | Phase 0 | P0-3, P0-9 (spawn side) |
 | 50-02 | [Lifecycle: clear the `terminated` latch](./50-02-lifecycle-terminated-latch_sonnet.md) | done | Phase 0 | P0-4 |
 | 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | done | Phase 0 | context, cache TTL, compaction, last assistant entry |
-| 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | todo | Phase 0 | P0-10, P0-13 (selection side) |
+| 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | done | Phase 0 | P0-10, P0-13 (selection side) |
 | 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | todo | 50-01, 50-02, 50-03, 50-04 | |
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | todo | 50-05 | D4, D5, M6, m2 |
 | 50-07 | [Worker waves (tick side)](./50-07-worker-waves_sonnet.md) | todo | 50-04 | P0-7 |
@@ -129,3 +129,12 @@ Phase 0 decisions. They stay listed here for the reasoning.
   `cache_seconds_left`, `last_assistant_entry`, `compaction_boundaries`; status line and context-mcp output unchanged.
   Timestamps with offsets and under a non-UTC `TZ` pinned; a naive timestamp reads as UTC. Known: a transcript with no
   usage record in its tail is parsed in full (as specified).
+- **2026-11-22 — 50-04 done** (2 reviews, 2 fixes; suite 2685 OK, 2 skipped). New `.claude/hooks/epic_driver_lib.py`
+  (grammar, ledger + validator incl. `startup_dialogs`, schedule, approvals selection, check runner, runtime state) and
+  `tests/test_unit_epic_driver.py`. Manager decisions on review LOWs: a check is not started past the ~150 s budget
+  (first job of a pass always runs; timeouts never clamped); `check_every` slack scales with the period; `grant()`
+  needs the ledger and refuses unknown ids (pre-granting allowed); duplicate YAML keys rejected, merge keys supported;
+  a zero duration is an error where meaningless; a `default-fallback` context window warns. Architecture §8 gained
+  the state keys `by` and `check.last_error`. Side edits: `context_mcp_lib` gets `from __future__ import annotations`
+  (Python 3.9 import crash), a public epoch helper in `amux_spawn_lib`, and `test_unit_context_mcp` is now registered
+  in the runner (it was never run there).
