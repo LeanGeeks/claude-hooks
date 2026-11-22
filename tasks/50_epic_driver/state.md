@@ -46,7 +46,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 | 50-09 | [Role prompts](./50-09-role-prompts_sonnet.md) | done | 50-06, 50-08 | |
 | 50-10 | [Docs and installation](./50-10-docs-and-installation_sonnet.md) | done | 50-08, 50-09 | P0-12 (stamps); units |
 | 50-11 | Workstation root setup (sleep lock with no login) | dropped (P0-6) | — | No file. The id is kept so 50-12 keeps its number. |
-| 50-12 | [Live verification](./50-12-live-verification_human.md) | todo | 50-10 | **human** |
+| 50-12 | [Live verification](./50-12-live-verification_human.md) | blocked | 50-10 | **human** |
 
 ## Cross-task invariants
 
@@ -190,3 +190,6 @@ Phase 0 decisions. They stay listed here for the reasoning.
   re-run** (lead-allowed): the ten selected features updated, installed hooks now match the repo (50-01…50-09 live);
   `epic-driver` stays off, no unit exists; the install manifest now records `epic-driver` as `skipped` — turn it on
   with `./install.sh --yes --with epic-driver`.
+- **2026-11-23 — 50-12 blocked: awaiting the operator.** Every engineering task (50-01…50-10) is done and committed on
+  `main` (not pushed). 50-12 is a `_human` live verification: no agent runs it and no live check is faked. It needs the
+  operator present (a reboot, an 8 h idle window, Telegram). Summary: `agents_output/50_manager_summary.md`.
