@@ -1117,6 +1117,135 @@ def read_transcript_tail(transcript_path: str | None, max_lines: int = TRANSCRIP
     return entries
 
 
+# Bytes read from the end of a transcript by the epic-50 measurement helpers
+# (``last_assistant_entry``, ``compaction_boundaries``). Bounded so a huge
+# transcript is cheap, and in bytes (not lines) so the read stays bounded when a
+# single tool result is enormous.
+MEASURE_TAIL_BYTES = 1024 * 1024
+
+
+def _tail_entries(transcript_path: str | None, limit: int = MEASURE_TAIL_BYTES) -> list[dict[str, Any]]:
+    """Parsed JSON entries from the last ``limit`` bytes of a transcript, oldest first.
+
+    Fail-soft: ``[]`` on a missing/unreadable file; malformed lines and a
+    mid-line start are skipped.
+    """
+    if not transcript_path:
+        return []
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            chunk = f.read()
+    except (OSError, ValueError):
+        return []
+    if size > limit:
+        _, _, chunk = chunk.partition(b"\n")
+    entries: list[dict[str, Any]] = []
+    for line in chunk.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries
+
+
+def _epoch_of(value: Any) -> float | None:
+    """Epoch seconds of an ISO-8601 string, a number, or a datetime; else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and value:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def last_assistant_entry(transcript_path: str | None, since: Any = None) -> dict[str, Any] | None:
+    """The newest assistant entry as ``{timestamp, model, error, is_api_error, text}``.
+
+    With ``since`` (ISO string, epoch number or datetime) it is instead the first
+    assistant entry at or after that time (entries without a parseable timestamp
+    are skipped then). ``error`` is the entry's ``error`` field (``"rate_limit"``)
+    or None; ``is_api_error`` is its ``isApiErrorMessage``; ``text`` joins the
+    message's text blocks. Bounded tail read, fail-soft: None when nothing matches.
+    """
+    since_epoch = _epoch_of(since) if since is not None else None
+    if since is not None and since_epoch is None:
+        return None
+    chosen: dict[str, Any] | None = None
+    for entry in _tail_entries(transcript_path):
+        if entry.get("type") != "assistant":
+            continue
+        if since_epoch is not None:
+            ts = _epoch_of(entry.get("timestamp"))
+            if ts is None or ts < since_epoch:
+                continue
+            chosen = entry
+            break
+        chosen = entry
+    if chosen is None:
+        return None
+    message = chosen.get("message")
+    message = message if isinstance(message, dict) else {}
+    text = "".join(
+        b.get("text", "") for b in _content_blocks(message)
+        if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+    )
+    error = chosen.get("error")
+    return {
+        "timestamp": chosen.get("timestamp"),
+        "model": message.get("model"),
+        "error": error if isinstance(error, str) and error else None,
+        "is_api_error": bool(chosen.get("isApiErrorMessage")),
+        "text": text,
+    }
+
+
+def compaction_boundaries(transcript_path: str | None, since: Any = None) -> list[dict[str, Any]]:
+    """Compaction boundaries as ``{timestamp, trigger, pre_tokens, post_tokens}``, oldest first.
+
+    Entries ``{"type": "system", "subtype": "compact_boundary"}``; the numbers come
+    from ``compactMetadata`` (None when absent). With ``since`` only boundaries at
+    or after that time. Bounded tail read, fail-soft: ``[]`` on any problem.
+    """
+    since_epoch = _epoch_of(since) if since is not None else None
+    if since is not None and since_epoch is None:
+        return []
+    found: list[dict[str, Any]] = []
+    for entry in _tail_entries(transcript_path):
+        if entry.get("type") != "system" or entry.get("subtype") != "compact_boundary":
+            continue
+        if since_epoch is not None:
+            ts = _epoch_of(entry.get("timestamp"))
+            if ts is None or ts < since_epoch:
+                continue
+        meta = entry.get("compactMetadata")
+        meta = meta if isinstance(meta, dict) else {}
+        found.append({
+            "timestamp": entry.get("timestamp"),
+            "trigger": meta.get("trigger"),
+            "pre_tokens": meta.get("preTokens"),
+            "post_tokens": meta.get("postTokens"),
+        })
+    return found
+
+
 def _content_blocks(message: Any) -> list[Any]:
     """Return a message's content as a list of blocks (wrapping a bare string)."""
     if not isinstance(message, dict):

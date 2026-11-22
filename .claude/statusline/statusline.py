@@ -1233,6 +1233,67 @@ def last_activity_epoch(path: str) -> Optional[float]:
         return None
 
 
+def _parse_iso_epoch(value) -> Optional[float]:
+    """Epoch seconds of a transcript ISO-8601 timestamp, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def last_assistant_epoch(path: str) -> Optional[float]:
+    """Epoch of the newest assistant entry that carries a timestamp, or None."""
+    if not path:
+        return None
+    try:
+        size = os.path.getsize(path)
+    except (OSError, ValueError):
+        return None
+    for limit in _TRANSCRIPT_TAIL_LIMITS:
+        for line in reversed(_read_transcript_tail(path, limit)):
+            if '"assistant"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(entry, dict) or entry.get("type") != "assistant":
+                continue
+            epoch = _parse_iso_epoch(entry.get("timestamp"))
+            if epoch is not None:
+                return epoch
+        if size <= limit:
+            break
+    return None
+
+
+def cache_seconds_left(path: str, now: Optional[float] = None) -> tuple:
+    """(seconds of prompt cache left, ttl) for a transcript; negative when cold.
+
+    The clock is the last assistant entry's own ``timestamp`` (not the file
+    mtime, which any later write moves) and the TTL is the 5m/1h bucket the last
+    call recorded, so a 5m entry (overage) is seen as such. ``(None, None)``
+    when there is no assistant entry with a timestamp, or no recorded bucket to
+    count down from.
+    """
+    try:
+        last = last_assistant_epoch(path)
+        if last is None:
+            return None, None
+        ttl = read_cache_ttl(path)[0]
+        if not ttl:
+            return None, None
+        current = time.time() if now is None else now
+        return last + ttl - current, ttl
+    except Exception:  # noqa: BLE001 - a reading helper must never raise
+        return None, None
+
+
 def format_cache_age(seconds: float) -> str:
     """Coarse duration for the cache cell: 45s, 58m, 2h15m."""
     seconds = max(0, int(seconds))

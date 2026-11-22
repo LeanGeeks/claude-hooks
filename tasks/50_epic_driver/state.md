@@ -37,7 +37,7 @@ prompt wraps the epic's own prompts). M8's silent-stall gap is stated in brd §6
 |---|------|--------|------------|-------|
 | 50-01 | [amux-spawn: flag persistence, pinned env, Claude resume](./50-01-amux-spawn-flags-and-claude-resume_opus.md) | done | Phase 0 | P0-3, P0-9 (spawn side) |
 | 50-02 | [Lifecycle: clear the `terminated` latch](./50-02-lifecycle-terminated-latch_sonnet.md) | done | Phase 0 | P0-4 |
-| 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | todo | Phase 0 | context, cache TTL, compaction, last assistant entry |
+| 50-03 | [Measurement helpers](./50-03-measurement-helpers_sonnet.md) | done | Phase 0 | context, cache TTL, compaction, last assistant entry |
 | 50-04 | [Ledger, schedule, checks, runtime state (pure)](./50-04-ledger-schedule-checks-state_opus.md) | todo | Phase 0 | P0-10, P0-13 (selection side) |
 | 50-05 | [Session reconcile and stall detection](./50-05-session-reconcile-and-stalls_opus.md) | todo | 50-01, 50-02, 50-03, 50-04 | |
 | 50-06 | [Dispatch: session policy and delivery](./50-06-dispatch-policy-and-delivery_opus.md) | todo | 50-05 | D4, D5, M6, m2 |
@@ -125,3 +125,7 @@ Phase 0 decisions. They stay listed here for the reasoning.
   the latch; a turn opened before the end still reads terminated (pinned). The old `test_terminated_dominates_open_turn`
   (order `turn_start, session_end, turn_start`) was inverted, as P0-4 requires. Review note carried into 50-05's scope:
   `_derive_claude_status` still short-circuits on a stored `terminated` until the next prompt hook rewrites it.
+- **2026-11-22 — 50-03 done** (1 review, 1 fix; suite 2520 OK, 2 skipped). `measure_transcript`,
+  `cache_seconds_left`, `last_assistant_entry`, `compaction_boundaries`; status line and context-mcp output unchanged.
+  Timestamps with offsets and under a non-UTC `TZ` pinned; a naive timestamp reads as UTC. Known: a transcript with no
+  usage record in its tail is parsed in full (as specified).

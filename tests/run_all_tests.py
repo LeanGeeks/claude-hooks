@@ -51,6 +51,7 @@ TEST_MODULES = {
     "unit_notification": "test_unit_notification_hook",
     "unit_reply_injector": "test_unit_reply_injector",
     "unit_amux_spawn": "test_unit_amux_spawn",
+    "unit_measurement_helpers": "test_unit_measurement_helpers",
     "unit_spawn_producer": "test_unit_spawn_producer",
     "unit_keep_awake": "test_unit_keep_awake",
     "unit_lifecycle_events": "test_unit_lifecycle_events",

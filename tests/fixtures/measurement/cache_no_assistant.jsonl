@@ -1,0 +1,2 @@
+{"type": "user", "timestamp": "2026-01-01T10:00:00.000Z", "message": {"role": "user", "content": "hello"}}
+{"type": "system", "subtype": "informational", "timestamp": "2026-01-01T10:00:01.000Z"}

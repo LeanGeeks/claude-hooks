@@ -133,51 +133,46 @@ def find_session_jsonl() -> tuple[Path | None, str]:
 # transcript parsing
 # --------------------------------------------------------------------------
 
-def parse_session(jsonl_path: Path) -> dict:
-    """Fold a transcript down to its latest usage record.
-
-    Deduplicates by message id: a streamed assistant message can appear more
-    than once, and counting it twice inflates ``cumulative_output_tokens``.
-    """
+def _fold_lines(lines) -> dict:
+    """Fold transcript lines down to the latest usage record (see parse_session)."""
     seen_ids: set[str] = set()
     latest_usage: dict | None = None
     latest_model: str = "unknown"
     cumulative_output: int = 0
     turns_count: int = 0
 
-    with open(jsonl_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-            if entry.get("type") != "assistant":
-                continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
 
-            message = entry.get("message")
-            if not message:
-                continue
+        message = entry.get("message")
+        if not message or not isinstance(message, dict):
+            continue
 
-            msg_id = message.get("id")
-            if not msg_id:
-                continue
+        msg_id = message.get("id")
+        if not msg_id:
+            continue
 
-            if msg_id in seen_ids:
-                continue
-            seen_ids.add(msg_id)
+        if msg_id in seen_ids:
+            continue
+        seen_ids.add(msg_id)
 
-            usage = message.get("usage")
-            if not usage:
-                continue
+        usage = message.get("usage")
+        if not usage or not isinstance(usage, dict):
+            continue
 
-            turns_count += 1
-            cumulative_output += usage.get("output_tokens", 0)
-            latest_usage = usage
-            latest_model = message.get("model", latest_model)
+        turns_count += 1
+        cumulative_output += usage.get("output_tokens", 0)
+        latest_usage = usage
+        latest_model = message.get("model", latest_model)
 
     return {
         "latest_usage": latest_usage,
@@ -185,6 +180,16 @@ def parse_session(jsonl_path: Path) -> dict:
         "cumulative_output": cumulative_output,
         "turns_count": turns_count,
     }
+
+
+def parse_session(jsonl_path: Path) -> dict:
+    """Fold a transcript down to its latest usage record.
+
+    Deduplicates by message id: a streamed assistant message can appear more
+    than once, and counting it twice inflates ``cumulative_output_tokens``.
+    """
+    with open(jsonl_path) as f:
+        return _fold_lines(f)
 
 
 def _measure(parsed: dict) -> dict | None:
@@ -223,6 +228,39 @@ def _measure(parsed: dict) -> dict | None:
         "remaining_tokens": remaining,
         "turns_count": parsed["turns_count"],
     }
+
+
+# Bytes read from the end of a transcript by ``measure_transcript`` before it
+# falls back to a full parse. The latest usage record and model sit near the end.
+MEASURE_TAIL_BYTES = 512 * 1024
+
+
+def measure_transcript(path: str | Path, tail_bytes: int = MEASURE_TAIL_BYTES) -> dict | None:
+    """Public ``_measure(parse_session(...))`` for an explicit transcript path.
+
+    Reads the last ``tail_bytes`` first and parses the whole file only when that
+    tail holds no usage record. When only the tail was read and the file is
+    larger than it, ``cumulative_output_tokens`` and ``turns_count`` cover just
+    the tail, and the result carries ``"approximate": true``; otherwise the
+    result has exactly the ``_measure`` shape. Returns None (never raises) for
+    a missing, unreadable, empty or malformed transcript.
+    """
+    try:
+        size = os.path.getsize(path)
+        if size > tail_bytes:
+            with open(path, "rb") as f:
+                f.seek(size - tail_bytes)
+                chunk = f.read()
+            # The read began mid-line; drop that fragment.
+            _, _, chunk = chunk.partition(b"\n")
+            parsed = _fold_lines(chunk.decode("utf-8", "replace").splitlines())
+            measured = _measure(parsed)
+            if measured is not None:
+                measured["approximate"] = True
+                return measured
+        return _measure(parse_session(Path(path)))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 # --------------------------------------------------------------------------
