@@ -256,7 +256,7 @@ SYSTEMCTL_BIN = "systemctl"          # always `systemctl --user` (RealWorld.syst
 SYSTEMD_RUN_BIN = "systemd-run"      # `systemd-run --user --scope …` (the tmux server, §21.1)
 SYSTEMD_INHIBIT_BIN = "systemd-inhibit"   # `systemd-inhibit --list` (the inhibitor's lock, §22)
 BUSCTL_BIN = "busctl"                # `busctl --user call … AttachProcessesToUnit|StartTransientUnit`
-CLAUDE_QUESTIONS_BIN = "claude-questions"   # `claude-questions --check --workspace-dir <ws>` (§18.1 gate 5)
+CLAUDE_QUESTIONS_BIN = "claude-questions"   # `claude-questions --check --workspace-dir <ws>` (§18.1 gate 7)
 SYSTEMCTL_TIMEOUT_S = 30
 SYSTEMD_RUN_TIMEOUT_S = 30
 INHIBIT_LIST_TIMEOUT_S = 10
@@ -283,8 +283,8 @@ RUN_SUBJECT = "run"                  # the subject of the run-level alarms (§16
 #: §16.2 in catalogue order: every alarm id the engine knows.
 ALARM_IDS = (
     "tick_error", "ledger_invalid", "stamp_mismatch", "tmux_server", "listener_down", "inhibitor_down",
-    "due_not_started", "step_timeout", "attempts_exhausted", "check_error", "deadline_near", "deadline_missed",
-    "halt", "delivery_deferred", "delivery_unconfirmed", "verdict_missing", "handoff_timeout", "session_stuck",
+    "login_expiring", "login_expired", "due_not_started", "step_timeout", "attempts_exhausted", "check_error",
+    "deadline_near", "deadline_missed", "halt", "delivery_deferred", "delivery_unconfirmed", "verdict_missing", "handoff_timeout", "session_stuck",
     "permission_open", "ask_user_question_open", "usage_limit", "spawn_failed", "resume_failed",
     "model_mismatch", "compaction", "startup_dialog", "foreign_handle", "orphan_session", "worktree_refused",
 )
@@ -594,11 +594,23 @@ class World:
         raise NotImplementedError("World.questions_settings")
 
     def questions_check(self, workspace: str) -> CommandResult:
-        """``claude-questions --check --workspace-dir <workspace>`` (§18.1 gate 5)."""
+        """``claude-questions --check --workspace-dir <workspace>`` (§18.1 gate 7)."""
         raise NotImplementedError("World.questions_check")
 
     def sleep(self, seconds: float) -> None:
         raise NotImplementedError("World.sleep")
+
+    # -- 50-13: folder trust and the login expiry (§18.1 gates 4-5, §16.2) --
+    def claude_config(self) -> Dict[str, Any]:
+        """Claude Code's global config (``~/.claude.json``), parsed; read only, never written.
+
+        Raises ``OSError`` (absent, unreadable) or ``ValueError`` (not a JSON object)."""
+        raise NotImplementedError("World.claude_config")
+
+    def login_expiry(self) -> Optional[datetime]:
+        """When the claude.ai login expires (:func:`login_expiry_from_credentials`), or None when
+        no such login is known. Never raises; never returns or logs a token."""
+        raise NotImplementedError("World.login_expiry")
 
 
 def _workspace_roles_path(workspace: str) -> Optional[Path]:
@@ -985,6 +997,19 @@ class RealWorld(World):
 
     def sleep(self, seconds: float) -> None:
         time.sleep(max(0.0, seconds))
+
+    def claude_config(self) -> Dict[str, Any]:
+        data = json.loads(claude_config_path().read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+        return data
+
+    def login_expiry(self) -> Optional[datetime]:
+        try:
+            data = json.loads(claude_credentials_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return login_expiry_from_credentials(data)
 
 
 # =============================================================================
@@ -1961,15 +1986,48 @@ def _command_script(command: str, plan_dir: str) -> Optional[str]:
     return path if os.path.isfile(path) else None
 
 
+#: ``. <file>`` / ``source <file>`` at the start of a shell line (50-13: a sourced lib may set the ssh options).
+_SOURCE_RE = re.compile(r"^[ \t]*(?:\.|source)[ \t]+(.+)$", re.M)
+#: The forms of "this script's directory" a sourced path may start with.
+_SCRIPT_DIR_FORMS = ('$(dirname "$0")', "$(dirname $0)", '"$(dirname "$0")"', "${0%/*}",
+                     '$(dirname "${BASH_SOURCE[0]}")', "$(dirname ${BASH_SOURCE[0]})")
+
+
+def _read_head(path: str) -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return f.read(_SSH_SCAN_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _sources_ssh_opts(text: str, script: str, plan_dir: str) -> bool:
+    """Whether a file the script sources (``. "$(dirname "$0")/lib.sh"``, a path relative to the script
+    or the plan dir, or absolute) applies ``$EPIC_DRIVER_SSH_OPTS`` or ``ConnectTimeout``: the script's
+    ssh then goes through that lib (a shell function, as 037's ``acdn037_ssh``)."""
+    here = os.path.dirname(script)
+    for raw in _SOURCE_RE.findall(text):
+        target = raw
+        for form in _SCRIPT_DIR_FORMS:
+            target = target.replace(form, here)
+        target = (target.replace('"', "").replace("'", "").split() or [""])[0]
+        if not target or "$" in target:
+            continue
+        cands = [target] if os.path.isabs(target) else [os.path.join(here, target), os.path.join(plan_dir, target)]
+        for cand in cands:
+            lib = _read_head(cand) if os.path.isfile(cand) else None
+            if lib is not None and ("EPIC_DRIVER_SSH_OPTS" in lib or "ConnectTimeout" in lib):
+                return True
+    return False
+
+
 def _warn_ssh(v: _Validator, spec: CommandSpec, where: str, plan_dir: str) -> None:
     texts = [spec.run]
     script = _command_script(spec.run, plan_dir)
     if script is not None:
-        try:
-            with open(script, "rb") as f:
-                texts.append(f.read(_SSH_SCAN_BYTES).decode("utf-8", errors="replace"))
-        except OSError:
-            pass
+        text = _read_head(script)
+        if text is not None and not (_ssh_without_timeout(text) and _sources_ssh_opts(text, script, plan_dir)):
+            texts.append(text)
     if any(_ssh_without_timeout(t) for t in texts):
         v.warn(W_SSH_NO_TIMEOUT, where,
                "calls ssh without ConnectTimeout (use $EPIC_DRIVER_SSH_OPTS)")
@@ -2488,7 +2546,7 @@ def new_step_state() -> StepState:
 
 
 def new_state(ledger: Ledger, now: datetime) -> RunState:
-    """A fresh state for ``ledger`` (``enable``, §18.1 gate 9)."""
+    """A fresh state for ``ledger`` (``enable``, §18.1 gate 11)."""
     return {
         "schema": STATE_SCHEMA, "run_id": ledger.run_id, "epic": ledger.epic,
         "ledger": ledger.path, "ledger_sha256": ledger.sha256, "enabled_at": iso(now),
@@ -2735,6 +2793,7 @@ def set_status(rec: StepState, new: str, *, by_mark: bool = False) -> None:
 HOLD_PAUSED = "paused"
 HOLD_APPROVAL = "approval"                       # ungranted, no approval question open
 HOLD_APPROVAL_ASKED = "approval_question_open"   # ungranted, an approval question is open
+HOLD_APPROVAL_ANSWERED = "approval_answered"     # ungranted, its question answered, the answer event unsettled
 HOLD_APPROVAL_CONDITIONS = "approval_conditions"  # granted, conditions not done
 HOLD_WINDOW = "window"
 HOLD_LATEST_START = "latest_start"
@@ -2744,11 +2803,11 @@ HOLD_GROUP = "group"
 HOLD_ATTEMPTS = "attempts_exhausted"
 
 #: Reasons the operator already sees, so they never raise ``due_not_started``
-#: (§6.2: paused, an approval question open, a model limit, a closed window —
-#: past the latest start is the window being closed for today; exhausted
-#: attempts have their own alarm).
-QUIET_HOLDS = frozenset({HOLD_PAUSED, HOLD_APPROVAL_ASKED, HOLD_MODEL_LIMIT, HOLD_WINDOW,
-                         HOLD_LATEST_START, HOLD_ATTEMPTS})
+#: (§6.2: paused, an approval question open or answered and not yet settled by
+#: the driver, a model limit, a closed window — past the latest start is the
+#: window being closed for today; exhausted attempts have their own alarm).
+QUIET_HOLDS = frozenset({HOLD_PAUSED, HOLD_APPROVAL_ASKED, HOLD_APPROVAL_ANSWERED, HOLD_MODEL_LIMIT,
+                         HOLD_WINDOW, HOLD_LATEST_START, HOLD_ATTEMPTS})
 
 
 @dataclass
@@ -3039,6 +3098,25 @@ def _resource_use(ledger: Ledger, state: RunState) -> Dict[str, int]:
     return use
 
 
+def approval_answer_unsettled(state: RunState, approval_id: str) -> Optional[str]:
+    """Why the answer to ``approval_id``'s question is still with the driver, or None (50-13 F-2).
+
+    Between "answered" and "granted" the operator already sees the approval (§6.2): the question
+    resolved this pass and its ``answer`` event is not committed yet (``answer_pending``, set by the
+    question reconcile and cleared by the event's commit), or an outbox event carrying the answer
+    has not settled (not confirmed, or no complete verdict yet). Once it settled without a grant the
+    approval is an ordinary hold again.
+    """
+    for e in state.get("outbox") or []:
+        if (isinstance(e, dict) and ITEM_ANSWER in (e.get("kinds") or [])
+                and approval_id in (e.get("approvals") or []) and not _entry_complete(e)):
+            return f"the answer event {e.get('event')} to the driver is not settled"
+    for qid, q in (state.get("questions") or {}).items():
+        if isinstance(q, dict) and q.get("approval") == approval_id and q.get("answer_pending"):
+            return f"question {qid} answered; its answer event is not queued yet"
+    return None
+
+
 def _individual_holds(ledger: Ledger, state: RunState, step: Step, now: datetime,
                       paused: bool) -> List[Hold]:
     holds: List[Hold] = []
@@ -3050,10 +3128,13 @@ def _individual_holds(ledger: Ledger, state: RunState, step: Step, now: datetime
     if step.approval is not None:
         if not approval_granted(state, step.approval):
             q = state.get("approval_question")
+            answered = approval_answer_unsettled(state, step.approval)
             if q:
                 holds.append(Hold(HOLD_APPROVAL_ASKED,
                                   f"{step.approval} ungranted; question {q.get('question')} open "
                                   f"for {q.get('id')}"))
+            elif answered:
+                holds.append(Hold(HOLD_APPROVAL_ANSWERED, f"{step.approval} ungranted; {answered}"))
             else:
                 holds.append(Hold(HOLD_APPROVAL, f"{step.approval} ungranted"))
         elif not approval_conditions_done(ledger, state, step.approval):
@@ -5348,6 +5429,7 @@ def _reconcile_questions(p: _Pass) -> None:
         if word == "resolved":
             q["status"] = "resolved"
             q["resolved_at"] = iso(p.now)
+            q["answer_pending"] = True        # until the answer event commits (approval_answer_unsettled)
             entry = snap.entries.get(qid)
             p.result.items.append(EventItem(ITEM_ANSWER, "driver", q.get("step"), {
                 "question": qid, "approval": q.get("approval"), "answer": entry.text if entry else "",
@@ -6231,6 +6313,12 @@ def _commit_event(st: RunState, pe: PlannedEvent, now: datetime, host: str) -> D
     for req in st.get("queue") or []:      # type: ignore[typeddict-item]
         if isinstance(req, dict) and req.get("id") in pe.requests:
             req["event"] = pe.event
+    questions = st.get("questions") or {}
+    for it in pe.items:
+        q = questions.get(it.data.get("question")) if it.kind == ITEM_ANSWER else None
+        if isinstance(q, dict):
+            q["answer_event"] = pe.event
+            q.pop("answer_pending", None)
     if pe.raised_approvals:
         raised = st.setdefault("approval_raised", {})   # type: ignore[typeddict-unknown-key]
         for aid in pe.raised_approvals:
@@ -7481,9 +7569,11 @@ class BoundedWorld:
     """``World`` whose ``git`` stops at a deadline: for code that makes an unknown number of git calls.
 
     ``remaining()`` is the seconds to the deadline. A call gets ``min(its timeout, remaining)``; with
-    less than a second left it is not made (``rc=None``). ``expired`` records that a call was refused
-    or clamped, so the caller can defer whatever it was doing instead of recording the git error.
-    Everything else is the wrapped world's.
+    less than a second left it is not made (``rc=None``). ``expired`` records that a call was refused,
+    or was clamped and then timed out (:func:`clamped_call_timed_out`), so the caller can defer whatever
+    it was doing instead of recording the git error. A clamped call that returned in time is a normal
+    result (50-13 F-1: the ledger stage's deadline equals ``GIT_TIMEOUT_S``, so every call there is
+    clamped). Everything else is the wrapped world's.
     """
 
     def __init__(self, world: World, remaining: Callable[[], float], *, assume_git: bool = False) -> None:
@@ -7505,10 +7595,20 @@ class BoundedWorld:
         if left < 1.0:
             self.expired = True
             return CommandResult(rc=None, error="pass deadline: git not run")
-        if left < timeout_s:
+        if left >= timeout_s:
+            return self._world.git(args, cwd, timeout_s)
+        res = self._world.git(args, cwd, left)
+        if clamped_call_timed_out(res, self._remaining()):
             self.expired = True
-            timeout_s = left
-        return self._world.git(args, cwd, timeout_s)
+        return res
+
+
+def clamped_call_timed_out(res: CommandResult, left_after: float) -> bool:
+    """A git call whose timeout was clamped to the deadline ran out of it: no exit code (``rc=None``),
+    and either the error says it timed out or the deadline has passed (under a second left)."""
+    if res.rc is not None:
+        return False
+    return "timed out" in (res.error or "") or left_after < 1.0
 
 
 def prepare_worker_steps(ledger: Ledger, state: RunState, world: World,
@@ -7518,8 +7618,9 @@ def prepare_worker_steps(ledger: Ledger, state: RunState, world: World,
 
     ``remaining()`` is the pass deadline for this phase (``PREPARE_END_S``). Its git calls are bounded
     by it (:class:`BoundedWorld`); a step that ran out of time is deferred: its record is put back as it
-    was (a clamped git error must not become ``worktree_refused``; what was created stays and is reused,
-    the call being idempotent) and so are all the steps after it. The next pass prepares them.
+    was (a clamped call that timed out must not become ``worktree_refused``; what was created stays and
+    is reused, the call being idempotent) and so are all the steps after it. The next pass prepares them.
+    A clamped call that returned in time is a normal result, refusal included.
     """
     bounded = BoundedWorld(world, remaining) if remaining is not None else None
     for step_id in step_ids:
@@ -8456,7 +8557,7 @@ def tick_pass(world: World, active: Dict[str, Any], paths: RunPaths, *, environ:
         if not bounded.expired:
             raise
     if bounded.expired:
-        # the validator's git calls ran out of time (a clamped call reads as an invalid ledger): look again
+        # the validator's git calls ran out of time (a refused or timed-out call reads as an invalid ledger): look again
         # with the git facts assumed (the structure is still validated) rather than alarm; the next pass
         # asks git again.
         ledger, run_conds = load_run_ledger(active, paths, BoundedWorld(world, lambda: 0.0, assume_git=True),
@@ -8477,6 +8578,7 @@ def tick_pass(world: World, active: Dict[str, Any], paths: RunPaths, *, environ:
                                  start_units=not dry_run, fits=clock.fits_by(INFRA_END_S))
     run_conds += infra.conditions
     result.notes += infra.notes
+    run_conds += login_conditions(world.login_expiry(), now)      # §16.2 (50-13 F-4): a file read
     # No server (and starting one failed): plan nothing that runs amux, which would start a server in
     # this service's cgroup (§21.1). A dry run starts nothing anyway, and plans as if the start worked.
     dispatch_paused = paused or (not infra.dispatch_ok and not dry_run)
@@ -8950,13 +9052,193 @@ def cmd_validate(world: World, ledger_path: str, out: Any, err: Any) -> int:
     return EXIT_OK
 
 
+# =============================================================================
+# Folder trust and the login expiry (50-13 F-3, F-4; §18.1 gates 4-5, §16.2)
+# =============================================================================
+#
+# Both are read from Claude Code's own files and never written: trust is the operator's security
+# decision, and the login is renewed only by ``/login``.
+
+CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+TRUST_KEY = "hasTrustDialogAccepted"
+#: §18.1 gate 5: ``enable`` refuses when the login expires within this many days (``--login-days``).
+LOGIN_ENABLE_DAYS = 7
+#: §16.2: ``login_expiring`` from this many days before the expiry (Claude Code's own banner window).
+LOGIN_ALARM_DAYS = 3
+ALARM_LOGIN_EXPIRING = "login_expiring"
+ALARM_LOGIN_EXPIRED = "login_expired"
+#: Claude Code ignores a refresh-token expiry when the access token outlives it by more than this.
+_LOGIN_SKEW_MS = 3 * DAY_S * 1000
+#: A millisecond epoch before 2001 is not an expiry.
+_LOGIN_MIN_MS = 10 ** 12
+
+
+def claude_config_path(environ: Any = None) -> Path:
+    """``$CLAUDE_CONFIG_DIR/.claude.json``, else ``~/.claude.json`` (where Claude Code keeps trust)."""
+    env = os.environ if environ is None else environ
+    base = env.get(CLAUDE_CONFIG_DIR_ENV)
+    return Path(base) / ".claude.json" if base else Path.home() / ".claude.json"
+
+
+def claude_credentials_path(environ: Any = None) -> Path:
+    """``$CLAUDE_CONFIG_DIR/.credentials.json``, else ``~/.claude/.credentials.json``."""
+    env = os.environ if environ is None else environ
+    base = env.get(CLAUDE_CONFIG_DIR_ENV)
+    return (Path(base) if base else Path.home() / ".claude") / ".credentials.json"
+
+
+def git_toplevel(path: str) -> Optional[str]:
+    """The nearest directory at or above ``path`` holding a ``.git`` entry (a directory, or a
+    worktree's file), or None. Read from the filesystem only."""
+    p = os.path.normpath(os.path.abspath(path))
+    while True:
+        if os.path.lexists(os.path.join(p, ".git")):
+            return p
+        parent = os.path.dirname(p)
+        if parent == p:
+            return None
+        p = parent
+
+
+def git_canonical_root(root: str) -> str:
+    """The main repository of a linked worktree at ``root`` (its ``.git`` file names the gitdir, whose
+    ``commondir`` is the main ``.git``), else ``root`` itself."""
+    dotgit = os.path.join(root, ".git")
+    try:
+        if not os.path.isfile(dotgit):
+            return root
+        with open(dotgit, encoding="utf-8") as f:
+            line = f.readline().strip()
+        if not line.startswith("gitdir:"):
+            return root
+        gitdir = os.path.normpath(os.path.join(root, line[len("gitdir:"):].strip()))
+        with open(os.path.join(gitdir, "commondir"), encoding="utf-8") as f:
+            common = os.path.normpath(os.path.join(gitdir, f.readline().strip()))
+    except (OSError, ValueError):
+        return root
+    return os.path.dirname(common) if os.path.basename(common) == ".git" else root
+
+
+def _trust_set(projects: Any, key: str) -> bool:
+    rec = projects.get(key) if isinstance(projects, dict) else None
+    return isinstance(rec, dict) and rec.get(TRUST_KEY) is True
+
+
+def trusted_by(config: Dict[str, Any], path: str) -> Optional[str]:
+    """The ``projects`` key whose ``hasTrustDialogAccepted`` is true and covers ``path``, or None.
+
+    Claude Code's rule, as read in its 2.1.330 bundle and confirmed with probe sessions (50-13 report):
+    a folder inside a git repository or worktree is covered by its main repository's root, or by the
+    folder itself or a parent up to and including its git root; trust on a folder above the git root
+    does not reach into the repository. A folder outside git is covered by itself or any parent.
+    """
+    projects = config.get("projects") if isinstance(config, dict) else None
+    for p in (os.path.realpath(path),):
+        root = git_toplevel(p)
+        if root is not None:
+            canonical = git_canonical_root(root)
+            if _trust_set(projects, canonical):
+                return canonical
+        g = p
+        while True:
+            if root is not None and not (g == root or g.startswith(root.rstrip("/") + "/")):
+                break
+            if _trust_set(projects, g):
+                return g
+            if g == root:
+                break
+            parent = os.path.dirname(g)
+            if parent == g:
+                break
+            g = parent
+    return None
+
+
+def trust_folders(ledger: Ledger) -> List[Tuple[str, str]]:
+    """``(what, folder)`` that must be trusted (gate 4): the workspace (the driver) and the driver state
+    root (wave directories, the default worktree root). Worker repos are not gated: whether a worktree
+    below a trusted state root still shows the dialog is an open point (50-12 check 9); the tick's
+    ``startup_dialog`` alarm reports it."""
+    return [("the workspace", ledger.workspace), ("the driver state root", str(state_root()))]
+
+
+def trust_refusal(config_error: Optional[str], config: Optional[Dict[str, Any]],
+                  folders: Sequence[Tuple[str, str]], config_path: Path) -> Optional[Tuple[str, str]]:
+    """``(reason, fix)`` of gate 4, or None when every folder is trusted."""
+    how = (f"open `claude` there once and answer \"Yes, I trust this folder\", or set "
+           f"projects[\"<folder>\"].{TRUST_KEY} = true in {config_path} yourself; "
+           f"epic-driver never writes that file")
+    if config_error is not None or config is None:
+        return (f"cannot read {config_path} ({config_error}): folder trust is unknown",
+                f"start `claude` once so that {config_path} exists, then trust "
+                + ", ".join(f for _, f in folders) + f": {how}")
+    bad = [(what, f) for what, f in folders if trusted_by(config, f) is None]
+    if not bad:
+        return None
+    names = "; ".join(f"{what} {f}" for what, f in bad)
+    return (f"not trusted in Claude Code: {names} (a session there stops on the folder-trust dialog)",
+            f"trust each: {how}")
+
+
+def login_expiry_from_credentials(data: Any) -> Optional[datetime]:
+    """The claude.ai login's expiry from ``.credentials.json``: ``claudeAiOauth.refreshTokenExpiresAt``
+    (milliseconds since the epoch), the date behind Claude Code's banner "Your login expires in N days
+    · run /login to renew". A token refresh never moves it (Claude Code keeps the earlier of the two
+    on a refresh); only ``/login`` does. Not ``expiresAt``, the short-lived access token.
+
+    None, as Claude Code does, when there is no such login: no ``claudeAiOauth``, no refresh token,
+    no plausible expiry, or an access token that outlives the refresh token by more than 3 days.
+    Only the presence of the refresh token is looked at; no token value is returned or kept.
+    """
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict) or not oauth.get("refreshToken"):
+        return None
+    exp = oauth.get("refreshTokenExpiresAt")
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) or exp != exp or exp < _LOGIN_MIN_MS:
+        return None
+    access = oauth.get("expiresAt")
+    if isinstance(access, (int, float)) and not isinstance(access, bool) and access > exp + _LOGIN_SKEW_MS:
+        return None
+    try:
+        return datetime.fromtimestamp(exp / 1000.0, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def login_days_left(expiry: datetime, now: datetime) -> int:
+    """Whole days left, rounded up as Claude Code's banner does (0 or less: expired)."""
+    left = (require_aware(expiry) - require_aware(now)).total_seconds()
+    return int(-(-left // DAY_S)) if left > 0 else 0
+
+
+def login_conditions(expiry: Optional[datetime], now: datetime) -> List[AlarmCondition]:
+    """§16.2: ``login_expiring`` (run) within ``LOGIN_ALARM_DAYS`` of the expiry, then ``login_expired``.
+    Nothing when the expiry is unknown; both clear after a ``/login`` moves the expiry out."""
+    if expiry is None:
+        return []
+    if require_aware(expiry) <= require_aware(now):
+        return [AlarmCondition(ALARM_LOGIN_EXPIRED, RUN_SUBJECT,
+                               f"the Claude login expired at {iso(expiry)}: every new or resumed session stops "
+                               "at login; run /login in claude to renew")]
+    if (expiry - now).total_seconds() <= LOGIN_ALARM_DAYS * DAY_S:
+        n = login_days_left(expiry, now)
+        return [AlarmCondition(ALARM_LOGIN_EXPIRING, RUN_SUBJECT,
+                               f"the Claude login expires in {n} day{'s' if n != 1 else ''} ({iso(expiry)}); "
+                               "run /login in claude to renew")]
+    return []
+
+
 def _rollback_units(world: World) -> CommandResult:
     return world.systemctl(["disable", "--now", TIMER_UNIT, INHIBIT_UNIT])
 
 
 def cmd_enable(world: World, ledger_path: str, stamps: Optional[Dict[str, Any]], *, environ: Dict[str, str],
-               out: Any, err: Any) -> int:
-    """``enable <ledger>`` (§18.1): the gates in order; the first failure refuses (exit 3) with its fix."""
+               out: Any, err: Any, login_days: Optional[int] = None) -> int:
+    """``enable <ledger>`` (§18.1): the gates in order; the first failure refuses (exit 3) with its fix.
+
+    ``login_days`` (``--login-days``, default ``LOGIN_ENABLE_DAYS``): gate 5 refuses when the login
+    expires within that many days; 0 turns the refusal off (an expired login still refuses)."""
+    login_days = LOGIN_ENABLE_DAYS if login_days is None else login_days
     def gate(n: int, name: str, reason: str, fix: str) -> Refused:
         return Refused(f"gate {n} ({name}): {reason}", fix)
 
@@ -8984,34 +9266,62 @@ def cmd_enable(world: World, ledger_path: str, stamps: Optional[Dict[str, Any]],
         for w in warnings:
             print(f"warning: [{w.category}] {w}", file=out)
         ws = ledger.workspace
-        # 4. the listener is active.
+        # 4. folder trust (50-13 F-3): every folder a driven session starts in is trusted in Claude Code,
+        # or its first spawn stalls on the trust dialog (which the tick never answers, §12.11).
+        cpath = claude_config_path(environ)
+        try:
+            config: Optional[Dict[str, Any]] = world.claude_config()
+            config_error: Optional[str] = None
+        except (OSError, ValueError) as exc:
+            config, config_error = None, f"{type(exc).__name__}: {exc}"
+        refusal = trust_refusal(config_error, config, trust_folders(ledger), cpath)
+        if refusal is not None:
+            raise gate(4, "folder trust", *refusal)
+        # 5. the claude.ai login does not expire within --login-days (50-13 F-4).
+        now5 = require_aware(world.now())
+        expiry = world.login_expiry()
+        if expiry is None:
+            print(f"epic-driver enable: no claude.ai login expiry in {claude_credentials_path(environ)}; "
+                  "the login is not checked", file=out)
+        else:
+            days = login_days_left(expiry, now5)
+            fix5 = ("renew it: run /login in claude, then enable again"
+                    + (f" (or --login-days 0 to enable anyway; the tick alarms {ALARM_LOGIN_EXPIRING} "
+                       f"{LOGIN_ALARM_DAYS} days before)" if expiry > now5 else ""))
+            if expiry <= now5:
+                raise gate(5, "login", f"the Claude login expired at {iso(expiry)}", fix5)
+            if login_days > 0 and (expiry - now5).total_seconds() <= login_days * DAY_S:
+                raise gate(5, "login", f"the Claude login expires in {days} day{'s' if days != 1 else ''} "
+                                       f"({iso(expiry)}), within --login-days {login_days}", fix5)
+            print(f"epic-driver enable: the Claude login expires {iso(expiry)} (in {days} days)", file=out)
+        # 6. the listener is active.
         if not unit_active(world, LISTENER_UNIT):
-            raise gate(4, "listener", f"{LISTENER_UNIT} is not active",
+            raise gate(6, "listener", f"{LISTENER_UNIT} is not active",
                        f"systemctl --user start {LISTENER_UNIT}")
-        # 5. claude-questions --check passes and sync is not "push" (review m8).
+        # 7. claude-questions --check passes and sync is not "push" (review m8).
         settings = world.questions_settings(ws)
         if settings is None:
-            raise gate(5, "questions", f"{ws} has no [questions] section in its .claude/roles.toml",
+            raise gate(7, "questions", f"{ws} has no [questions] section in its .claude/roles.toml",
                        "add [questions] (sync = \"commit\" or off) and a queue for the notify role")
         res = world.questions_check(ws)
         if not res.ok:
-            raise gate(5, "questions", f"claude-questions --check --workspace-dir {ws} failed: {_cmd_text(res)}",
+            raise gate(7, "questions", f"claude-questions --check --workspace-dir {ws} failed: {_cmd_text(res)}",
                        f"run claude-questions --check --workspace-dir {ws} and fix what it reports")
         if str(settings.get("sync", "")).lower() == "push":
-            raise gate(5, "questions", '[questions] sync = "push"',
+            raise gate(7, "questions", '[questions] sync = "push"',
                        'set [questions] sync = "commit" (or off) in the workspace\'s .claude/roles.toml')
-        # 6. a test notify (ack=False).
+        # 8. a test notify (ack=False).
         res6 = dict(world.notify(f"[epic-driver {ledger.epic}] test notify from epic-driver enable "
                                  "(no action needed)", role=ledger.notify_role, ack=False, workspace_dir=ws) or {})
         if not res6.get("dispatched"):
-            raise gate(6, "test notify", str(res6.get("error") or "not dispatched"),
+            raise gate(8, "test notify", str(res6.get("error") or "not dispatched"),
                        f"claude-questions --check --workspace-dir {ws}; check the relay binding")
-        # 7. the tmux server: none, or in its own scope; inside a terminal's scope ⇒ move it.
+        # 9. the tmux server: none, or in its own scope; inside a terminal's scope ⇒ move it.
         server = probe_tmux_server(world)
         if server.pid is not None and not server.own_scope:
             moved, why = move_tmux_server(world, server.pid)
             if not moved:
-                raise gate(7, "tmux server", tmux_move_instructions(server.pid, server.scope, why),
+                raise gate(9, "tmux server", tmux_move_instructions(server.pid, server.scope, why),
                            "see above; then epic-driver enable again")
             print(f"epic-driver enable: {why}", file=out)
         paths = run_paths(ledger.run_id)
@@ -9025,8 +9335,8 @@ def cmd_enable(world: World, ledger_path: str, stamps: Optional[Dict[str, Any]],
             try:
                 _enable_write_and_start(world, ledger, paths, pointer, environ, out)
             except Refused:
-                # Rollback of a refusal after gate 9: the units and active.json are undone where they were
-                # done (gate 10). The pointer file is the one write into the tracked tree: its prior bytes
+                # Rollback of a refusal after gate 11: the units and active.json are undone where they were
+                # done (gate 12). The pointer file is the one write into the tracked tree: its prior bytes
                 # are put back byte for byte, or the file is removed when it did not exist before.
                 # state.json, the env snapshot and the last-valid ledger copy stay: they live in the state
                 # dir, outside the repo, and a later enable reuses them.
@@ -9046,25 +9356,25 @@ def cmd_enable(world: World, ledger_path: str, stamps: Optional[Dict[str, Any]],
 
 def _enable_write_and_start(world: World, ledger: Ledger, paths: RunPaths, pointer: Path,
                             environ: Dict[str, str], out: Any) -> None:
-    """``enable`` gates 8 to 11, under the run's lock (:func:`cmd_enable` rolls the pointer file back on a refusal)."""
+    """``enable`` gates 10 to 13, under the run's lock (:func:`cmd_enable` rolls the pointer file back on a refusal)."""
     ws = ledger.workspace
 
     def gate(n: int, name: str, reason: str, fix: str) -> Refused:
         return Refused(f"gate {n} ({name}): {reason}", fix)
 
-    # 8. the environment snapshot (§21.2).
+    # 10. the environment snapshot (§21.2).
     try:
         write_env_snapshot(paths, env_snapshot(environ))
     except OSError as exc:
-        raise gate(8, "environment snapshot", f"cannot write it: {exc}",
+        raise gate(10, "environment snapshot", f"cannot write it: {exc}",
                    f"check that {paths.dir} is writable") from None
-    # 9. state.json (fresh, or the existing one of this run), active.json, the pointer file.
+    # 11. state.json (fresh, or the existing one of this run), active.json, the pointer file.
     now = require_aware(world.now())
     if paths.state.exists():
         try:
             state = load_state(paths.state, ledger.run_id)
         except StateError as exc:
-            raise gate(9, "state", str(exc), f"move {paths.state} aside to start the run afresh") from None
+            raise gate(11, "state", str(exc), f"move {paths.state} aside to start the run afresh") from None
         state["ledger"] = ledger.path
         ensure_step_states(ledger, state)
     else:
@@ -9081,12 +9391,12 @@ def _enable_write_and_start(world: World, ledger: Ledger, paths: RunPaths, point
         current = None
     if current != body:
         atomic_write_text(pointer, body, mode=0o644)
-    # 10. the timer and the inhibitor, then the inhibitor's lock (else roll back).
+    # 12. the timer and the inhibitor, then the inhibitor's lock (else roll back).
     res10 = world.systemctl(["enable", "--now", TIMER_UNIT, INHIBIT_UNIT])
     if not res10.ok:
         _rollback_units(world)
         remove_active()
-        raise gate(10, "units", f"systemctl --user enable --now failed: {_cmd_text(res10)}",
+        raise gate(12, "units", f"systemctl --user enable --now failed: {_cmd_text(res10)}",
                    "install the units (./install.sh --yes with epic-driver on), then enable again")
     held = False
     for i in range(INHIBIT_VERIFY_TRIES):
@@ -9098,10 +9408,10 @@ def _enable_write_and_start(world: World, ledger: Ledger, paths: RunPaths, point
     if not held:
         _rollback_units(world)
         remove_active()
-        raise gate(10, "inhibitor", f"no {INHIBIT_WHAT} block lock of {INHIBIT_WHO} in systemd-inhibit "
+        raise gate(12, "inhibitor", f"no {INHIBIT_WHAT} block lock of {INHIBIT_WHO} in systemd-inhibit "
                                     "--list; the timer was rolled back",
                    f"journalctl --user -u {INHIBIT_UNIT}")
-    # 11. one notify.
+    # 13. one notify.
     notifier = Notifier(world, paths, state, workspace=ws, role=ledger.notify_role, epic=ledger.epic)
     notifier.send("heartbeat enable", notifier.prefix(f"epic-driver on for {ledger.epic}"), ack=False)
     save_state(paths.state, state)
@@ -9246,7 +9556,8 @@ def cli(ns: Any, world: World, stamps: Optional[Dict[str, Any]] = None, *, envir
         if verb == "validate":
             return cmd_validate(world, ns.ledger, out, err)
         if verb == "enable":
-            return cmd_enable(world, ns.ledger, stamps, environ=dict(environ), out=out, err=err)
+            return cmd_enable(world, ns.ledger, stamps, environ=dict(environ), out=out, err=err,
+                              login_days=getattr(ns, "login_days", None))
         if verb == "disable":
             return cmd_disable(world, out=out, err=err)
         if verb == "pause":

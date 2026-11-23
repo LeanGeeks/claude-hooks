@@ -53,6 +53,13 @@ built) is inside `ptyxis-spawn-*.scope`, so `enable` will move it into `epic-dri
 claude-epic-driver.timer claude-epic-driver-inhibit.service` and verifies the `sleep:idle` lock; (11) one Telegram line
 "epic-driver on for rig50".
 
+> **Note (50-13, after this run was enabled).** `enable` now has two more gates after (3), and the later ones shift by
+> two (listener = 6 … notify = 13): (4) folder trust, (5) the claude.ai login. Before enabling a new run, trust once,
+> per `docs/epic-driver.md` section 4 "Folder trust": the state root `~/.local/state/epic-driver/` (covers the worker worktrees) and the
+> workspace. `enable` never writes
+> `~/.claude.json`; it refuses and names the untrusted folders. Gate 5 refuses when the login expires within 7 days
+> (`--login-days N`); the tick raises `login_expiring` 3 days before and `login_expired` after.
+
 Evidence (full output):
 
 ```
@@ -199,6 +206,10 @@ trusted). Observe the pane (`tmux capture-pane -p -t <name>`) right after spawn.
 
 Pass: the seeded prompt runs with no trust dialog stalling it. If a trust dialog appears, record it: the `startup_dialog` alarm must fire and nothing may have been typed into it
 (`tmux capture-pane` shows it unanswered). Evidence:
+
+> Open point (50-13), observe live: after the state root is trusted, does a new worker worktree still show the
+> trust dialog? (Probe sessions on Claude Code 2.1.330 suggested a git worktree takes trust from its main repo.)
+> `enable` does not gate on it; if the dialog shows, the tick's `startup_dialog` alarm reports it.
 
 ```
 

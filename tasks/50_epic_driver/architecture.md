@@ -329,7 +329,10 @@ units are free; the target model is not limited (§12.4); the run is not paused;
 dispatchable (one event, one session, the intersection of the windows).
 
 Ledger order breaks ties. Due but not dispatched for 2 ticks raises `due_not_started` unless the reason is one the
-operator already sees: paused, an approval question open, a model limit, or a closed window.
+operator already sees: paused, an approval question open, a model limit, or a closed window. An approval question
+that was answered counts as open until the answer has settled with the driver (50-13 F-2): from the pass that sees it
+resolved (`questions[Q].answer_pending`, cleared when the `answer` event commits) until the outbox entry carrying the
+answer is confirmed with a complete verdict. Settled without a grant, the approval is an ordinary hold again.
 
 ### 6.3 Recurrence
 
@@ -459,6 +462,8 @@ Rules:
   `check.last_error` is the text of the latest check error (`cannot start: …`, `timed out after 60s`, `exit 7`) or
   `null` after a clean run (0, 1 or 2); `consecutive_errors` counts the runs that set it.
 - `inflight` is written **before** delivery and cleared by the step's verdict (D7).
+- `questions[Q].answer_event` is the event that carried the answer (set when it commits); `answer_pending: true`
+  exists only between the pass that saw the question resolved and that commit (§6.2, 50-13).
 - `notify_failures` keeps the last 20. `outbox` keeps unconfirmed entries and entries awaiting a verdict; completed
   entries move to `logs/tick.log`.
 - **`mark <step> reset`**: status → `pending` (due is recomputed), `attempts` → 0, `inflight`, `last_verdict` and the
@@ -712,7 +717,8 @@ All from ground truth, each pass, for every session record and every handle of t
     sends that entry's `key` once per spawn/resume and dialog id (recorded in the session record before the send,
     invariant 5), with no alarm; if the same dialog is still there on the next pass, the alarm is raised and no second
     key is sent. A pane showing a dialog is never a delivery target (§9.3: it is not an empty input box). Folder trust
-    is a security decision and belongs in no default list.
+    is a security decision and belongs in no default list; `enable` gate 4 (§18.1) refuses up front when a folder a
+    session will start in is not trusted (50-13 F-3).
 
 ## 13. amux-spawn and lifecycle changes (P0-3, P0-4, D13)
 
@@ -890,6 +896,8 @@ All alarms are sent with `ack=True` (P0-8).
 | `tmux_server` | run | no server and starting one failed, or the server is in a terminal's scope | the server runs in its own scope |
 | `listener_down` | run | the listener is inactive after one start attempt | active |
 | `inhibitor_down` | run | the inhibitor service is inactive after one start attempt, or its lock is absent from `systemd-inhibit --list` | held |
+| `login_expiring` | run | the claude.ai login expires within 3 days: `~/.claude/.credentials.json` `claudeAiOauth.refreshTokenExpiresAt`, the date behind Claude Code's "Your login expires in N days" banner (50-13 F-4); detail = the days left | a `/login` moves the expiry past 3 days (or it passes: `login_expired`) |
+| `login_expired` | run | that expiry has passed: new and resumed sessions stop at login | a `/login` moves it into the future |
 | `due_not_started` | step | due and not dispatched for 2 ticks, for a reason the operator does not already see (§6.2) | dispatched, or no longer due |
 | `step_timeout` | step | no verdict (action step) or no passing check (watch step) within `timeout`, or past a `check_window.to` | a verdict, a pass, or `mark` |
 | `attempts_exhausted` | step | `attempts ≥ max_attempts` | `mark` |
@@ -966,7 +974,7 @@ Tests import the repo copies directly and set `EPIC_DRIVER_ALLOW_UNSTAMPED=1`; t
 
 ```
 epic-driver validate <ledger>                      lint only; exit 0/1
-epic-driver enable <ledger>                        §18.1; exit 0, or 3 with the failed gate
+epic-driver enable <ledger> [--login-days N]       §18.1; exit 0, or 3 with the failed gate
 epic-driver disable                                stop timer + inhibitor; sessions and state untouched; one notify
 epic-driver pause [--reason TEXT] | resume         the pause file; the tick still watches and alarms, starts nothing
 epic-driver status [--json]                        §20
@@ -985,17 +993,32 @@ waiting up to 300 s; a lock left by a crashed process is free, since flock dies 
 1. No other run is active (`active.json`), unless it names the same ledger.
 2. Stamps agree (§17).
 3. The ledger validates (§5.5), including every `base_ref`.
-4. The listener is active.
-5. `claude-questions --check --workspace-dir <workspace>` passes and `[questions] sync` is not `"push"` (review m8).
-6. A test notify (`ack=False`) succeeds.
-7. The tmux server: none running ⇒ fine (the tick starts it); in its own scope ⇒ fine; inside a terminal's scope ⇒
+4. Folder trust (50-13 F-3): Claude Code trusts each folder a driven session starts in, else its first spawn stops
+   on the trust dialog, which the tick never answers (§12.11). The folders: the workspace; the state root
+   `~/.local/state/epic-driver/` (wave directories, the default worktree root, hence the worker worktrees). Worker repos
+   are not gated; whether a worktree still shows the dialog is an open point (50-12 check 9), and `startup_dialog`
+   reports it. Trust is read from `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`
+   when set): `projects["<abs path>"].hasTrustDialogAccepted == true` on the folder or a parent, with Claude Code's
+   git rule (as read in its 2.1.330 bundle and confirmed with probe sessions): inside a git repository or worktree
+   only the main repository's root, or the folder and its parents up to the git root, count; trust above the git
+   root does not reach in. Refused with the folders named and how to trust them (open `claude` there once, or set the
+   key); a missing or unreadable `~/.claude.json` refuses too. `enable` never writes that file: trust is the
+   operator's security decision.
+5. The login (50-13 F-4): the claude.ai login (`~/.claude/.credentials.json` `claudeAiOauth.refreshTokenExpiresAt`,
+   §16.2 `login_expiring`) has expired ⇒ refuse; it expires within `--login-days N` (default 7; 0 = never refuse on
+   this) ⇒ refuse with the fix (`/login`, or `--login-days 0`). No such login (no file, an API key, …) ⇒ a note, no
+   refusal.
+6. The listener is active.
+7. `claude-questions --check --workspace-dir <workspace>` passes and `[questions] sync` is not `"push"` (review m8).
+8. A test notify (`ack=False`) succeeds.
+9. The tmux server: none running ⇒ fine (the tick starts it); in its own scope ⇒ fine; inside a terminal's scope ⇒
    move it (§21.1); the move fails ⇒ refuse with instructions.
-8. Snapshot the environment (§21.2).
-9. Write `state.json` (fresh, or keep the existing one for the same run id), `active.json` and the pointer file.
-10. `systemctl --user enable --now claude-epic-driver.timer claude-epic-driver-inhibit.service`; then
+10. Snapshot the environment (§21.2).
+11. Write `state.json` (fresh, or keep the existing one for the same run id), `active.json` and the pointer file.
+12. `systemctl --user enable --now claude-epic-driver.timer claude-epic-driver-inhibit.service`; then
     `systemd-inhibit --list` must show the driver's `sleep:idle` block lock, else roll back the timer and refuse.
     (P0-6: the lock only needs to hold while the operator is logged in; no polkit or greeter change is made.)
-11. One notify: "epic-driver on for <epic>".
+13. One notify: "epic-driver on for <epic>".
 
 ## 19. Role prompts (D8, D9, m10)
 
@@ -1148,7 +1171,7 @@ none of them** (that is `epic-driver enable`'s job). Uninstall stops and removes
     log and exit 0). Read active.json; none → exit 0.
  1. Read: pause file, ledger (validate; invalid → last valid copy + ledger_invalid), state.json. now = UTC.
     Clock (§12.7). Fix the env (unset a dead SSH_AUTH_SOCK). Ensure the tmux server (§21.1), the listener,
-    the inhibitor (§12.10).
+    the inhibitor (§12.10). Read the login expiry (§16.2 `login_expiring`/`login_expired`).
  2. Reconcile sessions (§12): liveness, open turn, tool shell, last_message + verdict, delivery confirmations,
     TTL/context, limits, compaction, model check, foreign/orphans. Apply verdicts (§10, §14.3).
  3. Reconcile questions (§15.2).

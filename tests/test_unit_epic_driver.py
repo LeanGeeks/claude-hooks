@@ -5644,6 +5644,19 @@ class TickWorld(DispatchWorld):
         self.qcheck = edl.CommandResult(rc=0, stdout="bound\n")
         self.slept = []
         self.cost = {}                     # World method name -> seconds the fake clock advances
+        # 50-13: ~/.claude.json (every folder trusted through "/"), or an exception to raise; the login
+        self.claude_json = {"projects": {"/": {"hasTrustDialogAccepted": True}}}
+        self.login_expires_at = None       # None: no claude.ai login known
+        self.login_reads = 0
+
+    def claude_config(self):
+        if isinstance(self.claude_json, Exception):
+            raise self.claude_json
+        return json.loads(json.dumps(self.claude_json))
+
+    def login_expiry(self):
+        self.login_reads += 1
+        return self.login_expires_at
 
     def _cost(self, what):
         if self.cost.get(what):
@@ -6606,7 +6619,7 @@ class TestAlarmCatalogue(_Engine):
 
     def test_the_catalogue_is_the_architectures(self):
         self.assertEqual(list(edl.ALARM_IDS), _arch_catalogue_ids())
-        self.assertEqual(len(edl.ALARM_IDS), 29)
+        self.assertEqual(len(edl.ALARM_IDS), 31)
 
     def cycle(self, key, produce, make_true, make_false):
         """``produce(st, now)`` → conditions; ``make_true``/``make_false`` change the state."""
@@ -6811,7 +6824,7 @@ class TestEnable(_Tick):
         self.assertIn("fix:", err)
         # the pointer file (the one write into the tracked tree) is not left behind by a refusal
         self.assertFalse((self.plan / "epic-driver.run.json").exists(), f"gate {n}: pointer file left behind")
-        if n == 10:      # enabled, then rolled back
+        if n == 12:      # enabled, then rolled back
             self.assertEqual(self.world.units[edl.TIMER_UNIT], "inactive")
             self.assertIsNone(edl.read_active())
         elif n == 1:     # the other run stays as it was
@@ -6826,15 +6839,15 @@ class TestEnable(_Tick):
             (1, "run epic-other", lambda: edl.write_active({"run_id": "epic-other", "ledger": "/x/other.yaml"})),
             (3, "version: must be 1", lambda: Path(self.lpath).write_text(Path(self.lpath).read_text().replace(
                 "version: 1", "version: 9"))),
-            (4, "claude-questions-listen.service is not active", lambda: w.units.update({edl.LISTENER_UNIT: "inactive"})),
-            (5, "no [questions] section", lambda: setattr(w, "settings", None)),
-            (5, "claude-questions --check", lambda: setattr(w, "qcheck", edl.CommandResult(rc=2, stdout="not bound"))),
-            (5, 'sync = "push"', lambda: setattr(w, "settings", {"nudge": "1h", "sync": "push"})),
-            (6, "Relay send failed: relay down", lambda: setattr(w, "notify_ok", False)),
-            (7, "could not be moved into epic-driver-tmux.scope (Call failed: Access denied)",
+            (6, "claude-questions-listen.service is not active", lambda: w.units.update({edl.LISTENER_UNIT: "inactive"})),
+            (7, "no [questions] section", lambda: setattr(w, "settings", None)),
+            (7, "claude-questions --check", lambda: setattr(w, "qcheck", edl.CommandResult(rc=2, stdout="not bound"))),
+            (7, 'sync = "push"', lambda: setattr(w, "settings", {"nudge": "1h", "sync": "push"})),
+            (8, "Relay send failed: relay down", lambda: setattr(w, "notify_ok", False)),
+            (9, "could not be moved into epic-driver-tmux.scope (Call failed: Access denied)",
              lambda: (w.cgroups.update({16651: TERM_CG}), setattr(w, "busctl_moves", False))),
-            (10, "systemctl --user enable --now failed", lambda: setattr(w, "enable_fails", True)),
-            (10, "no sleep:idle block lock", lambda: setattr(w, "inhibit_takes_lock", False)),
+            (12, "systemctl --user enable --now failed", lambda: setattr(w, "enable_fails", True)),
+            (12, "no sleep:idle block lock", lambda: setattr(w, "inhibit_takes_lock", False)),
         ]
         good = Path(self.lpath).read_text()
         for n, text, setup in cases:
@@ -6844,7 +6857,7 @@ class TestEnable(_Tick):
                 Path(self.lpath).write_text(good)
                 edl.remove_active()
                 self.gate_fails(n, text, setup)
-                if n == 10:
+                if n == 12:
                     self.assertIn(["disable", "--now", edl.TIMER_UNIT, edl.INHIBIT_UNIT], w.systemctl_calls)
                     self.assertEqual(w.units[edl.INHIBIT_UNIT], "inactive")     # rolled back
         with self.subTest(gate=2):
@@ -6884,41 +6897,41 @@ class TestEnable(_Tick):
     def pointer(self):
         return self.plan / "epic-driver.run.json"
 
-    def test_gate_8_the_snapshot_cannot_be_written(self):
+    def test_gate_10_the_snapshot_cannot_be_written(self):
         with mock.patch.object(edl, "write_env_snapshot", side_effect=OSError("No space left on device")):
             rc, out, err = self.enable_cli()
         self.assertEqual(rc, 3, err)
-        self.assertIn("refused: gate 8 (environment snapshot): cannot write it: No space left on device", err)
+        self.assertIn("refused: gate 10 (environment snapshot): cannot write it: No space left on device", err)
         self.assertNothingEnabled()
         self.assertFalse(self.pointer().exists())
 
-    def test_gate_9_an_unreadable_state_refuses(self):
+    def test_gate_11_an_unreadable_state_refuses(self):
         self.paths.dir.mkdir(parents=True, exist_ok=True)
         self.paths.state.write_text("{ this is not json")
         rc, out, err = self.enable_cli()
         self.assertEqual(rc, 3, err)
-        self.assertIn("refused: gate 9 (state)", err)
+        self.assertIn("refused: gate 11 (state)", err)
         self.assertNothingEnabled()
         self.assertFalse(self.pointer().exists())
 
-    def test_gate_10_removes_the_pointer_file_this_run_created(self):
+    def test_gate_12_removes_the_pointer_file_this_run_created(self):
         self.world.enable_fails = True
         rc, out, err = self.enable_cli()
         self.assertEqual(rc, 3, err)
-        self.assertIn("refused: gate 10 ", err)
+        self.assertIn("refused: gate 12 ", err)
         self.assertNotEqual(self.world.units.get(edl.TIMER_UNIT), "active")
         self.assertIsNone(edl.read_active())
         self.assertFalse(self.pointer().exists())               # created by this run: removed again
         self.assertTrue(self.paths.state.exists())              # state-dir files may stay
 
-    def test_gate_10_inhibitor_rollback_also_removes_it(self):
+    def test_gate_12_inhibitor_rollback_also_removes_it(self):
         self.world.inhibit_takes_lock = False
         rc, out, err = self.enable_cli()
         self.assertEqual(rc, 3, err)
         self.assertEqual(self.world.units[edl.TIMER_UNIT], "inactive")
         self.assertFalse(self.pointer().exists())
 
-    def test_gate_10_leaves_a_pointer_file_that_was_already_there(self):
+    def test_gate_12_leaves_a_pointer_file_that_was_already_there(self):
         self.pointer().write_text('{"run_id": "older"}\n')
         self.world.enable_fails = True
         rc, out, err = self.enable_cli()
@@ -6926,8 +6939,8 @@ class TestEnable(_Tick):
         self.assertEqual(self.pointer().read_bytes(), b'{"run_id": "older"}\n')   # restored byte for byte
 
     def test_a_refusal_restores_a_pre_existing_pointer_byte_for_byte_and_its_mode(self):
-        """Gate 9 overwrites the pointer with this run's body; a later refusal puts the old bytes back
-        (not valid JSON, no trailing newline, a non-default mode), for both gate 10 refusals."""
+        """Gate 11 overwrites the pointer with this run's body; a later refusal puts the old bytes back
+        (not valid JSON, no trailing newline, a non-default mode), for both gate 12 refusals."""
         prior = b'not json \xff\xfe, no newline'
         for fail in ("units", "inhibitor"):
             with self.subTest(fail=fail):
@@ -6937,7 +6950,7 @@ class TestEnable(_Tick):
                 self.world.inhibit_takes_lock = fail != "inhibitor"
                 rc, out, err = self.enable_cli()
                 self.assertEqual(rc, 3, err)
-                self.assertIn("refused: gate 10 ", err)
+                self.assertIn("refused: gate 12 ", err)
                 self.assertEqual(self.pointer().read_bytes(), prior)
                 self.assertEqual(self.pointer().stat().st_mode & 0o777, 0o640)
                 self.assertEqual([p.name for p in self.plan.iterdir() if p.name.endswith(".tmp")], [])
@@ -8197,3 +8210,547 @@ class TestRolePrompts(unittest.TestCase):
         self.assertIn("NEVER COMMIT", worker)
         self.assertIn("NEVER ASK THE OPERATOR", worker)
         self.assertIn("DONE: <step>", worker)
+
+
+# =============================================================================
+# 50-13 — fixes from the 50-12 live run (F-1 .. F-4, the ssh warning)
+# =============================================================================
+
+class TestBoundedWorldExpiry50_13(unittest.TestCase):
+    """F-1: ``expired`` only when a call is refused or a clamped call timed out."""
+
+    class _Git:
+        def __init__(self, result, cost=0.0, clock=None):
+            self.result, self.cost, self.clock, self.timeouts = result, cost, clock, []
+
+        def git(self, args, cwd, timeout_s=30.0):
+            self.timeouts.append(timeout_s)
+            if self.clock is not None:
+                self.clock[0] -= min(self.cost, timeout_s)
+            return self.result
+
+    def bounded(self, inner, left):
+        clock = [left]
+        inner.clock = clock
+        return edl.BoundedWorld(inner, lambda: clock[0]), clock
+
+    def test_a_fast_clamped_call_is_a_normal_result(self):
+        inner = self._Git(edl.CommandResult(rc=0, stdout="true\n"), cost=0.2)
+        bw, _ = self.bounded(inner, 29.5)                     # the ledger stage: left < GIT_TIMEOUT_S
+        res = bw.git(["rev-parse", "--is-inside-work-tree"], "/r")
+        self.assertTrue(res.ok)
+        self.assertFalse(bw.expired)
+        self.assertEqual(inner.timeouts, [29.5])               # still clamped to the deadline
+
+    def test_a_clamped_call_that_fails_in_time_is_a_normal_result(self):
+        bw, _ = self.bounded(self._Git(edl.CommandResult(rc=1, stderr="no such ref"), cost=0.1), 12)
+        self.assertEqual(bw.git(["rev-parse", "--verify", "x^{commit}"], "/r").rc, 1)
+        self.assertFalse(bw.expired)                          # a real answer: the validator reports it
+
+    def test_a_clamped_call_that_times_out_expires(self):
+        bw, _ = self.bounded(self._Git(edl.CommandResult(rc=None, error="git timed out after 12s"), cost=12), 12)
+        self.assertIsNone(bw.git(["status"], "/r").rc)
+        self.assertTrue(bw.expired)
+
+    def test_a_clamped_call_without_an_exit_code_at_the_deadline_expires(self):
+        bw, _ = self.bounded(self._Git(edl.CommandResult(rc=None, error="killed"), cost=5), 5)
+        bw.git(["status"], "/r")
+        self.assertTrue(bw.expired)
+
+    def test_an_unclamped_call_never_expires_and_a_refused_one_does(self):
+        bw, clock = self.bounded(self._Git(edl.CommandResult(rc=None, error="git timed out after 30s"), cost=30), 100)
+        bw.git(["status"], "/r")
+        self.assertFalse(bw.expired)                          # not clamped: an ordinary git error
+        clock[0] = 0.5
+        res = bw.git(["status"], "/r")
+        self.assertEqual((res.rc, res.error), (None, "pass deadline: git not run"))
+        self.assertTrue(bw.expired)
+
+    def test_prepare_worker_steps_keeps_going_after_fast_clamped_calls(self):
+        """The audit of the other user: a step whose calls were clamped but fast is prepared, not deferred."""
+        calls = []
+
+        class W(edl.World):
+            def git(self, args, cwd, timeout_s=30.0):
+                calls.append(timeout_s)
+                return edl.CommandResult(rc=0)
+        left = [20.0]                                          # every call is clamped (20 < 30)
+
+        def fake_ensure(ledger, st, world, step_id):
+            world.git(["status"], "/x")
+            left[0] -= 1
+            st.setdefault("worktrees", {}).setdefault("steps", {})[step_id] = {"dir": f"/d/{step_id}", "refused": None}
+
+        class Step:
+            def __init__(self, sid):
+                self.id, self.worker = sid, object()
+
+        class L:
+            steps = [Step("W0"), Step("W1"), Step("W2")]
+
+            def has_step(self, sid):
+                return True
+
+            def step(self, sid):
+                return next(s for s in self.steps if s.id == sid)
+        with mock.patch.object(edl, "ensure_step_worktrees", fake_ensure):
+            dirs = edl.prepare_worker_steps(L(), {}, W(), ["W0", "W1", "W2"], remaining=lambda: left[0])
+        self.assertEqual(sorted(dirs), ["W0", "W1", "W2"])
+        self.assertTrue(all(t < edl.GIT_TIMEOUT_S for t in calls))
+
+
+class TestTickLedgerGit50_13(_Tick):
+    """F-1 through the tick: the ledger stage verifies repos and base refs with git on a normal pass."""
+
+    def worker_enable(self):
+        repo = self.tmp / "repo"
+        repo.mkdir(exist_ok=True)
+        self.world.repos[str(repo)] = {"refs": {"main"}}
+        steps = [self.step("W", needs=["A"], role={"worker": {"implementer": "impl", "reviewer": "rev",
+                                                               "repos": [{"path": str(repo), "base_ref": "main"}]}}),
+                 self.driver("A")]                       # W waits for A: no worktree is prepared this pass
+        self.enable(steps, roles={"driver": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "impl": {"model": "claude-opus-5-5", "effort": "high"},
+                                  "rev": {"model": "claude-opus-5-5", "effort": "high"}})
+        return str(repo)
+
+    def ledger_git(self, cost, result=None):
+        """Every git call costs ``cost`` s on the fake clock; ``result(timeout)`` replaces its answer."""
+        orig = self.world.git
+        seen = []
+
+        def git(args, cwd, timeout_s=30.0):
+            seen.append((tuple(args), timeout_s))
+            self.world.advance(min(cost, timeout_s))
+            if result is not None:
+                r = result(timeout_s)
+                if r is not None:
+                    return r
+            return orig(args, cwd, timeout_s)
+        self.world.git = git
+        return seen
+
+    def test_a_normal_pass_verifies_base_refs_and_carries_no_deferral_note(self):
+        repo = self.worker_enable()
+        seen = self.ledger_git(cost=1.0)                        # fast calls; from the second on, clamped
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        verify = [t for a, t in seen if a[:2] == ("rev-parse", "--verify")]
+        self.assertTrue(verify, seen)                           # base refs were asked of git …
+        self.assertTrue(any(t < edl.GIT_TIMEOUT_S for _, t in seen))   # … with clamped timeouts
+        log = self.rp.tick_log.read_text()
+        self.assertNotIn("repos and base refs not checked with git this pass", log)
+        self.assertNotIn("ledger_invalid:run", self.active_alarms())
+        self.assertTrue(repo)
+
+    def test_a_missing_base_ref_found_by_a_clamped_call_is_ledger_invalid_not_a_deferral(self):
+        self.worker_enable()
+        self.world.repos[str(self.tmp / "repo")]["refs"] = set()      # main is gone
+        self.ledger_git(cost=1.0)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertNotIn("repos and base refs not checked with git this pass", self.rp.tick_log.read_text())
+        self.assertIn("ledger_invalid:run", self.active_alarms())
+
+    def test_a_clamped_call_that_times_out_defers_with_the_note(self):
+        self.worker_enable()
+        self.ledger_git(cost=29.0, result=lambda t: (edl.CommandResult(rc=None, error=f"git timed out after {t:g}s")
+                                                    if t < edl.GIT_TIMEOUT_S else None))
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertIn("repos and base refs not checked with git this pass (pass deadline)",
+                      self.rp.tick_log.read_text())
+        self.assertNotIn("ledger_invalid:run", self.active_alarms())
+
+
+class TestApprovalAnswerQuiet50_13(_Disp):
+    """F-2: no ``due_not_started`` between "approval answered" and "grant recorded"."""
+
+    def setup_run(self, *, question=True):
+        L, st = self.ledger([self.driver("roll", approval="SA4")], approvals={"SA4": {"conditions": []}})
+        st["steps"]["roll"].update(status="due", due_since=self.NOW, undispatched_ticks=2)
+        if question:
+            st["questions"] = {"Q-17": {"step": None, "approval": "SA4", "asked_event": "E-3", "status": "open",
+                                        "answer_event": None, "asked_at": "2026-11-24T09:00:00Z"}}
+            st["approval_question"] = {"id": "SA4", "question": "Q-17"}
+        return L, st
+
+    def snapshot(self, status):
+        return edl.QuestionsSnapshot(open_word="open", resolved_words=("resolved", "answered"),
+                                     withdrawn_word="withdrawn",
+                                     entries={"Q-17": edl.QuestionEntry("Q-17", status, text="## Q-17 answer: yes",
+                                                                        path="/q/for-anton.md")})
+
+    def due_alarm(self, L, st):
+        sel = edl.select(L, st, self.now())
+        return sel, [c.key for c in edl.step_alarm_conditions(L, st, self.now(), sel) if c.id == "due_not_started"]
+
+    def test_open_question_then_answered_unsettled_then_settled(self):
+        L, st = self.setup_run()
+        sel, due = self.due_alarm(L, st)                          # open: quiet (as before)
+        self.assertEqual([h.reason for h in sel.held["roll"]], [edl.HOLD_APPROVAL_ASKED])
+        self.assertEqual(due, [])
+        # the pass that sees the answer: the reconcile clears approval_question; the event is not built yet
+        self.world.queue = self.snapshot("resolved")
+        readings = edl.take_readings(L, st, self.world, self.now())
+        res = edl.reconcile(L, st, readings, self.now())
+        self.assertIsNone(res.state["approval_question"])
+        self.assertTrue(res.state["questions"]["Q-17"]["answer_pending"])
+        sel, due = self.due_alarm(L, res.state)
+        self.assertEqual([h.reason for h in sel.held["roll"]], [edl.HOLD_APPROVAL_ANSWERED])
+        self.assertIn("question Q-17 answered", sel.held["roll"][0].detail)
+        self.assertEqual(due, [])
+        self.assertIsNone(sel.approval_to_ask)                   # and it is not asked again meanwhile
+        # the same pass commits the answer event: answer_pending gives way to the unsettled outbox entry
+        st2, plan, _, _ = self.tick(L, st)
+        q = st2["questions"]["Q-17"]
+        self.assertNotIn("answer_pending", q)
+        ev = q["answer_event"]
+        entry = self.entry(st2, ev)
+        self.assertEqual((entry["kinds"], entry["approvals"]), (["answer"], ["SA4"]))
+        self.assertNotIn(edl.ITEM_APPROVAL_NEEDED, [k for e in plan.events for k in e.kinds])
+        self.world.advance(600)
+        sel, due = self.due_alarm(L, st2)
+        self.assertEqual([h.reason for h in sel.held["roll"]], [edl.HOLD_APPROVAL_ANSWERED])
+        self.assertIn(f"the answer event {ev} to the driver is not settled", sel.held["roll"][0].detail)
+        self.assertEqual(due, [])
+        # confirmed but no verdict yet: still with the driver
+        entry.update(sends=[self.NOW], confirmed_at=self.NOW)
+        self.assertEqual(self.due_alarm(L, st2)[1], [])
+        # settled (a complete verdict) without a grant: an ordinary hold again, and the alarm fires
+        entry["verdict"] = {"complete": True, "line": "WAITING: SA4 declined: not today"}
+        sel, due = self.due_alarm(L, st2)
+        self.assertEqual([h.reason for h in sel.held["roll"]], [edl.HOLD_APPROVAL])
+        self.assertEqual(due, ["due_not_started:roll"])
+        # granted: no approval hold at all; the step is dispatchable
+        edl.grant(L, st2, "SA4", "Q-17", None, self.now())
+        sel = edl.select(L, st2, self.now())
+        self.assertNotIn("roll", sel.held)
+        self.assertEqual(sel.dispatchable, ["roll"])
+
+    def test_without_a_question_the_alarm_still_fires(self):
+        L, st = self.setup_run(question=False)
+        sel, due = self.due_alarm(L, st)
+        self.assertEqual([h.reason for h in sel.held["roll"]], [edl.HOLD_APPROVAL])
+        self.assertEqual(due, ["due_not_started:roll"])
+
+    def test_an_answer_for_another_approval_does_not_quiet_this_one(self):
+        L, st = self.ledger([self.driver("roll", approval="SA4")],
+                            approvals={"SA4": {"conditions": []}, "SA5": {"conditions": []}})
+        st["steps"]["roll"].update(status="due", due_since=self.NOW, undispatched_ticks=2)
+        st["outbox"] = [{"event": "E-9", "to": "driver", "kinds": ["answer"], "approvals": ["SA5"], "steps": [],
+                         "sends": [], "confirmed_at": None, "verdict": None, "needs_verdict": True}]
+        st["questions"] = {"Q-2": {"approval": "SA5", "status": "resolved", "answer_pending": True}}
+        self.assertEqual(self.due_alarm(L, st)[1], ["due_not_started:roll"])
+
+
+class _TrustFs(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="epic-driver-trust-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def git(self, *args, cwd):
+        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                       env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"})
+
+    def make_repo(self, path):
+        path.mkdir(parents=True)
+        self.git("init", "-q", "-b", "main", cwd=path)
+        (path / "f").write_text("x")
+        self.git("add", "f", cwd=path)
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "i", cwd=path)
+        return path
+
+    @staticmethod
+    def cfg(*trusted, untrusted=()):
+        projects = {str(p): {"hasTrustDialogAccepted": True} for p in trusted}
+        projects.update({str(p): {"hasTrustDialogAccepted": False} for p in untrusted})
+        return {"projects": projects}
+
+
+class TestFolderTrust50_13(_TrustFs):
+    """F-3: Claude Code's trust lookup over a synthetic ``~/.claude.json``."""
+
+    def test_trusted_directly_and_through_a_parent_outside_git(self):
+        d = self.tmp / "state" / "run" / "wave"
+        d.mkdir(parents=True)
+        self.assertEqual(edl.trusted_by(self.cfg(d), str(d)), str(d))
+        self.assertEqual(edl.trusted_by(self.cfg(self.tmp / "state"), str(d)), str(self.tmp / "state"))
+        self.assertEqual(edl.trusted_by(self.cfg(self.tmp / "state"), str(self.tmp / "state")), str(self.tmp / "state"))
+
+    def test_not_trusted_key_missing_or_false(self):
+        d = self.tmp / "a" / "b"
+        d.mkdir(parents=True)
+        self.assertIsNone(edl.trusted_by({"projects": {}}, str(d)))
+        self.assertIsNone(edl.trusted_by({}, str(d)))
+        self.assertIsNone(edl.trusted_by(self.cfg(untrusted=[d]), str(d)))
+        self.assertIsNone(edl.trusted_by({"projects": {str(d): {}}}, str(d)))          # the key missing
+        self.assertIsNone(edl.trusted_by({"projects": {str(d): {"hasTrustDialogAccepted": "yes"}}}, str(d)))
+        self.assertIsNone(edl.trusted_by(self.cfg(self.tmp / "other"), str(d)))
+
+    def test_trust_above_a_git_root_does_not_reach_in(self):
+        repo = self.make_repo(self.tmp / "parent" / "repo")
+        sub = repo / "pkg"
+        sub.mkdir()
+        self.assertIsNone(edl.trusted_by(self.cfg(self.tmp / "parent"), str(repo)))
+        self.assertIsNone(edl.trusted_by(self.cfg(self.tmp / "parent"), str(sub)))
+        self.assertEqual(edl.trusted_by(self.cfg(repo), str(sub)), str(repo))        # a parent up to the root
+
+    def test_a_worktree_takes_its_main_repositorys_trust(self):
+        repo = self.make_repo(self.tmp / "src" / "repo")
+        wt = self.tmp / "state" / "worktrees" / "t-w"
+        wt.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "-b", "b1", str(wt), cwd=repo)
+        self.assertEqual(edl.git_canonical_root(str(wt)), str(repo))
+        self.assertIsNone(edl.trusted_by(self.cfg(self.tmp / "state"), str(wt)))     # the state root: not enough
+        self.assertEqual(edl.trusted_by(self.cfg(repo), str(wt)), str(repo))
+        self.assertEqual(edl.trusted_by(self.cfg(wt), str(wt)), str(wt))
+
+    def test_trust_folders_of_a_ledger_are_the_workspace_and_the_state_root(self):
+        class L:
+            workspace = "/ws"
+            worktree_root = "/elsewhere/wt"
+            steps = []
+        with mock.patch.dict(os.environ, {edl.STATE_ROOT_ENV: "/st"}):
+            self.assertEqual([f for _, f in edl.trust_folders(L())], ["/ws", "/st"])
+
+    def test_claude_config_path(self):
+        self.assertEqual(edl.claude_config_path({"CLAUDE_CONFIG_DIR": "/c"}), Path("/c/.claude.json"))
+        self.assertEqual(edl.claude_config_path({}), Path.home() / ".claude.json")
+        self.assertEqual(edl.claude_credentials_path({"CLAUDE_CONFIG_DIR": "/c"}), Path("/c/.credentials.json"))
+        self.assertEqual(edl.claude_credentials_path({}), Path.home() / ".claude" / ".credentials.json")
+
+    def test_realworld_reads_the_config_and_never_writes_it(self):
+        home = self.tmp / "home"
+        home.mkdir()
+        cfg = home / ".claude.json"
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(home)}):
+            with self.assertRaises(OSError):
+                edl.RealWorld().claude_config()
+            cfg.write_text("{not json")
+            with self.assertRaises(ValueError):
+                edl.RealWorld().claude_config()
+            cfg.write_text("[1]")
+            with self.assertRaises(ValueError):
+                edl.RealWorld().claude_config()
+            body = json.dumps(self.cfg("/x"))
+            cfg.write_text(body)
+            before = cfg.stat().st_mtime_ns
+            self.assertEqual(edl.RealWorld().claude_config(), self.cfg("/x"))
+            self.assertEqual((cfg.read_text(), cfg.stat().st_mtime_ns), (body, before))
+
+
+#: Synthetic credentials (no real token anywhere): the shape Claude Code writes.
+def _creds(refresh_exp_ms, *, access_exp_ms=None, refresh="synthetic-refresh", oauth=True):
+    inner = {"accessToken": "synthetic-access", "refreshToken": refresh,
+             "expiresAt": access_exp_ms if access_exp_ms is not None else 1795449208956,
+             "refreshTokenExpiresAt": refresh_exp_ms, "scopes": ["user:inference"]}
+    return {"claudeAiOauth": inner} if oauth else {"mcpOAuth": {"x": inner}}
+
+
+class TestLoginExpiry50_13(unittest.TestCase):
+    """F-4: the parser on synthetic JSON, the thresholds, the clear after a re-login."""
+
+    NOW = T("2026-11-24T10:00:00Z")
+
+    def ms(self, dt):
+        return int(dt.timestamp() * 1000)
+
+    def test_parser(self):
+        exp = T("2026-12-21T07:20:17Z")
+        self.assertEqual(edl.login_expiry_from_credentials(_creds(self.ms(exp))), exp)
+        for bad in (None, [], {}, _creds(self.ms(exp), oauth=False), _creds(self.ms(exp), refresh=""),
+                    _creds("2026-12-21"), _creds(True), _creds(12345), _creds(float("nan")),
+                    _creds(self.ms(exp), access_exp_ms=self.ms(exp) + 4 * 86400000)):   # access outlives refresh
+            with self.subTest(bad=str(bad)[:60]):
+                self.assertIsNone(edl.login_expiry_from_credentials(bad))
+        # an access token a little past the refresh expiry (≤ 3 days) is still a login, as in Claude Code
+        self.assertEqual(edl.login_expiry_from_credentials(
+            _creds(self.ms(exp), access_exp_ms=self.ms(exp) + 86400000)), exp)
+
+    def test_days_left_round_up_like_the_banner(self):
+        self.assertEqual(edl.login_days_left(self.NOW + timedelta(days=2, hours=1), self.NOW), 3)
+        self.assertEqual(edl.login_days_left(self.NOW + timedelta(days=3), self.NOW), 3)
+        self.assertEqual(edl.login_days_left(self.NOW + timedelta(minutes=5), self.NOW), 1)
+        self.assertEqual(edl.login_days_left(self.NOW - timedelta(minutes=5), self.NOW), 0)
+
+    def test_thresholds(self):
+        def ids(delta):
+            return [(c.id, c.subject) for c in edl.login_conditions(self.NOW + delta, self.NOW)]
+        self.assertEqual(edl.login_conditions(None, self.NOW), [])
+        self.assertEqual(ids(timedelta(days=3, seconds=1)), [])
+        self.assertEqual(ids(timedelta(days=3)), [("login_expiring", "run")])
+        self.assertEqual(ids(timedelta(hours=1)), [("login_expiring", "run")])
+        self.assertEqual(ids(timedelta(0)), [("login_expired", "run")])
+        self.assertEqual(ids(-timedelta(days=1)), [("login_expired", "run")])
+        c = edl.login_conditions(self.NOW + timedelta(days=2, hours=5), self.NOW)[0]
+        self.assertIn("expires in 3 days (2026-11-26T15:00:00Z); run /login", c.detail)
+        self.assertIn("expires in 1 day (", edl.login_conditions(self.NOW + timedelta(hours=2), self.NOW)[0].detail)
+
+    def test_realworld_reads_only_the_expiry(self):
+        tmp = Path(tempfile.mkdtemp(prefix="epic-driver-creds-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(tmp)}):
+            self.assertIsNone(edl.RealWorld().login_expiry())                  # absent: unknown
+            (tmp / ".credentials.json").write_text("{broken")
+            self.assertIsNone(edl.RealWorld().login_expiry())                  # unreadable: unknown
+            exp = T("2026-12-01T00:00:00Z")
+            (tmp / ".credentials.json").write_text(json.dumps(_creds(self.ms(exp))))
+            got = edl.RealWorld().login_expiry()
+            self.assertEqual(got, exp)
+            self.assertIsInstance(got, edl.datetime)                           # a date, never a token
+
+
+class TestLoginAlarm50_13(_Tick):
+    def test_the_tick_raises_expiring_then_expired_and_clears_after_a_relogin(self):
+        self.enable()
+        self.world.reply["ws-t-driver-g1"] = "ADVANCED: A"
+        self.world.login_expires_at = T(self.NOW) + timedelta(days=10)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual([k for k in self.active_alarms() if k.startswith("login")], [])
+        self.assertGreaterEqual(self.world.login_reads, 1)
+        self.world.login_expires_at = T(self.NOW) + timedelta(days=2, minutes=30)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        st = self.state()
+        self.assertIn("login_expiring:run", self.active_alarms(st))
+        self.assertIn("expires in 3 days", st["alarms"]["login_expiring:run"]["detail"])
+        self.assertTrue(any("ALARM login_expiring run" in n["text"] and n["ack"] for n in self.world.notifies))
+        self.world.advance(3 * 86400)
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        active = self.active_alarms()
+        self.assertIn("login_expired:run", active)
+        self.assertNotIn("login_expiring:run", active)
+        # /login: the expiry moves out; both clear on the next pass
+        self.world.login_expires_at = self.world.now() + timedelta(days=28)
+        self.assertEqual(self.run_pass(advance=600), 0, self.last_err)
+        self.assertEqual([k for k in self.active_alarms() if k.startswith("login")], [])
+        self.assertIsNotNone(self.state()["alarms"]["login_expired:run"]["cleared_at"])
+
+    def test_an_unknown_login_raises_nothing(self):
+        self.enable()
+        self.world.login_expires_at = None
+        self.assertEqual(self.run_pass(), 0, self.last_err)
+        self.assertEqual([k for k in self.active_alarms() if k.startswith("login")], [])
+
+
+class TestEnableTrustAndLogin50_13(TestEnable):
+    """F-3 and F-4 as ``enable`` gates 4 and 5 (through the CLI, with the fakes)."""
+
+    def refused(self, *argv):
+        rc, out, err = self.cli("enable", self.lpath, *argv)
+        self.assertEqual(rc, 3, (out, err))
+        self.assertNothingEnabled()
+        self.assertFalse(self.pointer().exists())
+        return out, err
+
+    def test_gate_4_names_each_untrusted_folder_and_the_fix(self):
+        root = os.environ[edl.STATE_ROOT_ENV]
+        cases = {
+            "nothing trusted": ({"projects": {}}, [str(self.ws), root]),
+            "workspace only": (_TrustFs.cfg(self.ws), [root]),
+            "state root only": (_TrustFs.cfg(root), [str(self.ws)]),
+            "false is not trust": (_TrustFs.cfg(root, untrusted=[self.ws]), [str(self.ws)]),
+        }
+        for name, (cfg, bad) in cases.items():
+            with self.subTest(name):
+                self.world = TickWorld(self.tdir, now=T(self.NOW))
+                self.world.claude_json = cfg
+                out, err = self.refused()
+                self.assertIn("refused: gate 4 (folder trust): not trusted in Claude Code:", err)
+                for f in bad:
+                    self.assertIn(f, err.split("fix:")[0])
+                self.assertIn("open `claude` there once", err)
+                self.assertIn("hasTrustDialogAccepted = true", err)
+                self.assertIn("epic-driver never writes that file", err)
+                self.assertEqual(self.world.notifies, [])               # refused before the test notify
+
+    def test_gate_4_passes_directly_and_through_a_parent(self):
+        root = os.environ[edl.STATE_ROOT_ENV]
+        for name, cfg in {"direct": _TrustFs.cfg(self.ws, root),
+                          "parent": _TrustFs.cfg(self.tmp)}.items():          # self.tmp holds ws and state
+            with self.subTest(name):
+                self.world = TickWorld(self.tdir, now=T(self.NOW))
+                self.world.claude_json = cfg
+                edl.remove_active()
+                rc, out, err = self.enable_cli()
+                self.assertEqual(rc, 0, err)
+
+    def test_gate_4_an_absent_or_unreadable_config_refuses_with_the_fix(self):
+        for exc in (FileNotFoundError(2, "No such file or directory"), PermissionError(13, "Permission denied"),
+                    ValueError("Expecting value: line 1 column 1 (char 0)")):
+            with self.subTest(exc=type(exc).__name__):
+                self.world = TickWorld(self.tdir, now=T(self.NOW))
+                self.world.claude_json = exc
+                out, err = self.refused()
+                self.assertIn("refused: gate 4 (folder trust): cannot read", err)
+                self.assertIn(type(exc).__name__, err)
+                self.assertIn("folder trust is unknown", err)
+                self.assertIn("start `claude` once", err)
+                self.assertIn(str(self.ws), err)
+
+    def test_gate_5_login(self):
+        now = T(self.NOW)
+        cases = [
+            ("expired", now - timedelta(hours=1), (), "refused: gate 5 (login): the Claude login expired at"),
+            ("within 7 days", now + timedelta(days=6), (), "expires in 6 days (2026-11-30T10:00:00Z), within --login-days 7"),
+            ("within --login-days 30", now + timedelta(days=20), ("--login-days", "30"), "within --login-days 30"),
+            ("expired even with 0", now - timedelta(hours=1), ("--login-days", "0"), "expired at"),
+        ]
+        for name, exp, argv, text in cases:
+            with self.subTest(name):
+                self.world = TickWorld(self.tdir, now=now)
+                self.world.login_expires_at = exp
+                out, err = self.refused(*argv)
+                self.assertIn(text, err)
+                self.assertIn("run /login in claude", err)
+                self.assertEqual(self.world.notifies, [])
+        for name, exp, argv, text in [
+                ("8 days", now + timedelta(days=8), (), "the Claude login expires 2026-12-02T10:00:00Z (in 8 days)"),
+                ("--login-days 0", now + timedelta(days=1), ("--login-days", "0"), "(in 1 days)"),
+                ("no login known", None, (), "no claude.ai login expiry in")]:
+            with self.subTest(name):
+                self.world = TickWorld(self.tdir, now=now)
+                self.world.login_expires_at = exp
+                edl.remove_active()
+                rc, out, err = self.cli("enable", self.lpath, *argv)
+                self.assertEqual(rc, 0, err)
+                self.assertIn(text, out)
+
+    def test_login_days_must_be_a_whole_non_negative_number(self):
+        for bad in ("-1", "x", "1.5"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr", io.StringIO()):
+                    CLI.parse(["enable", self.lpath, "--login-days", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+
+class TestSshWarningSourcedLib50_13(_Base):
+    """The optional fix: a script whose ssh goes through a sourced lib that applies the options."""
+
+    def write_script(self, name, text):
+        p = self.plan / "checks" / name
+        p.parent.mkdir(exist_ok=True)
+        p.write_text(text)
+        p.chmod(0o755)
+        return f"checks/{name}"
+
+    def warnings(self, run):
+        d = self.ledger_dict([self.step("A", role="driver", check=run)])
+        _, _, warnings = edl.validate_ledger(self.write(d), self.world)
+        return [w for w in warnings if w.category == edl.W_SSH_NO_TIMEOUT]
+
+    def test_sourced_lib_with_the_options_silences_the_warning(self):
+        self.write_script("lib.sh", 'x_ssh() { local o="${EPIC_DRIVER_SSH_OPTS:--o ConnectTimeout=5}"; ssh $o "$@"; }\n')
+        for form in ('. "$(dirname "$0")/lib.sh"', "source $(dirname $0)/lib.sh", ". checks/lib.sh",
+                     '. "${0%/*}/lib.sh"'):
+            with self.subTest(form=form):
+                run = self.write_script("c.sh", f'#!/bin/sh\n{form}\nres="$(x_ssh h true)" || echo "ssh h failed"\n')
+                self.assertEqual(self.warnings(run), [])
+
+    def test_still_warns_without_such_a_lib(self):
+        self.write_script("plain.sh", "helper() { :; }\n")
+        for text in ('#!/bin/sh\nssh h true\n',
+                     '#!/bin/sh\n. "$(dirname "$0")/plain.sh"\nssh h true\n',
+                     '#!/bin/sh\n. "$(dirname "$0")/missing.sh"\nssh h true\n',
+                     '#!/bin/sh\n. "$LIBDIR/lib.sh"\nssh h true\n'):
+            with self.subTest(text=text):
+                self.assertEqual(len(self.warnings(self.write_script("c.sh", text))), 1)

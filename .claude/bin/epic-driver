@@ -2,7 +2,7 @@
 """``epic-driver`` — run one epic's step ledger unattended (epic 50; architecture §17, §18).
 
     epic-driver validate <ledger>                      lint only; exit 0/1
-    epic-driver enable <ledger>                        the gates of §18.1; exit 0, or 3 with the failed gate
+    epic-driver enable <ledger> [--login-days N]       the gates of §18.1; exit 0, or 3 with the failed gate
     epic-driver disable                                stop timer + inhibitor; sessions and state untouched
     epic-driver pause [--reason TEXT] | resume         the pause file; the tick still watches and alarms
     epic-driver status [--json]                        the status screen (§20)
@@ -324,6 +324,16 @@ def tick_stamp_mismatch(problem: str, environ: Any, *, notify: Any = None, err: 
         os.close(lock_fd)
 
 
+def _non_negative_int(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a whole number: {text!r}") from None
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more: {n}")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="epic-driver", description="Run one epic's step ledger unattended.",
                                 epilog="exit 0 ok, 1 error, 2 usage, 3 refused")
@@ -333,6 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("ledger")
     e = sub.add_parser("enable", help="turn the driver on for a ledger (§18.1 gates)")
     e.add_argument("ledger")
+    e.add_argument("--login-days", type=_non_negative_int, default=None, metavar="N",
+                   help="refuse when the Claude login expires within N days (default 7; 0: do not refuse)")
     sub.add_parser("disable", help="stop the timer and the inhibitor; sessions and state untouched")
     pa = sub.add_parser("pause", help="start nothing; the tick still watches and alarms")
     pa.add_argument("--reason", default=None)

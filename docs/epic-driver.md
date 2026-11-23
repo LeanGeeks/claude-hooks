@@ -55,8 +55,13 @@ epic-driver validate tasks/037_image_optimization/ledger.yaml   # lint only, cha
 epic-driver enable   tasks/037_image_optimization/ledger.yaml
 ```
 
+Before the first `enable`, trust the folders the driven sessions start in, once (section 4, "Folder trust"): the
+epic workspace and the state root `~/.local/state/epic-driver/` (the state root covers the worker worktrees).
+
 `enable` refuses on the first gate that fails, says why, and says what to run (exit 3). In order: no other run is
-active; the stamps agree; the ledger validates, including every `base_ref`; the questions listener is active;
+active; the stamps agree; the ledger validates, including every `base_ref`; Claude Code trusts the workspace, the
+state root (section 4); the claude.ai login does not expire within 7 days (`--login-days N`
+changes the window, `--login-days 0` turns that refusal off; an expired login always refuses); the questions listener is active;
 `claude-questions --check` passes for the epic workspace and its `[questions] sync` is not `"push"`; a test notify
 goes out; the tmux server is not inside a terminal's scope (or it is moved into its own scope); then it snapshots
 the environment, writes the run state, starts `claude-epic-driver.timer` and `claude-epic-driver-inhibit.service`,
@@ -84,7 +89,7 @@ need to open a terminal.
 
 ```
 epic-driver validate <ledger>                      lint only; exit 0/1
-epic-driver enable <ledger>                        the gates above; exit 0, or 3 with the failed gate
+epic-driver enable <ledger> [--login-days N]       the gates above; exit 0, or 3 with the failed gate
 epic-driver disable                                stop the timer and the inhibitor
 epic-driver pause [--reason TEXT] | resume
 epic-driver status [--json]                        the status screen (section 7)
@@ -188,6 +193,24 @@ The tick sends the key once per spawn or resume and dialog id, with no alarm. If
 next pass, `startup_dialog` is raised and no second key is sent. Folder trust is a security decision: put it in no
 list. `validate` rejects a duplicate `id`, a `match` that does not compile and a `key` outside those two.
 
+### Folder trust: a one-time setup
+
+Claude Code asks "Do you trust this folder?" the first time it starts in a folder nobody trusted, and the tick never
+answers that dialog. Every new worker worktree would stall on it. Trust these once, before the first `enable`:
+
+1. **The state root `~/.local/state/epic-driver/`.** It holds the wave directories of multi-repo worker steps and,
+   by default, the worktree root; trust on it covers every folder below it that is not inside a git repository.
+2. **The epic workspace** (the driver's folder).
+
+Trusting the state root once covers the worker worktrees below it. If a new worktree still shows the dialog, the
+tick's `startup_dialog` alarm reports it (the tick never answers it); then trust that folder as above.
+
+To trust a folder, open `claude` there once and answer "Yes, I trust this folder" (then exit), or set
+`projects["<absolute path>"].hasTrustDialogAccepted = true` in `~/.claude.json` yourself. Inside a git repository a
+trusted folder above the repository root does not count. `enable` checks the workspace and the state root (gate 4) and refuses with the
+folders it found untrusted; a missing or unreadable `~/.claude.json` refuses too. It never writes that file: trust is
+your decision.
+
 ## 5. Watching a run: status, attaching, talking to a session
 
 ### Attaching
@@ -273,6 +296,7 @@ The deferred dead-man (a heartbeat the relay would watch) is out of scope. What 
 | `stamp_mismatch` | `epic-driver status`, the message names the file | `./install.sh --yes` with the feature on |
 | Step due but nothing starts | `status` STEPS and ALARMS; paused? approval question open? window closed? model limited? | resolve the named reason |
 | An event is not delivered | the pane's input line has text | clear it (the tick waits for an empty line) |
-| `startup_dialog` alarm | attach, read the dialog, answer it | add a `startup_dialogs` entry if it is safe |
+| `startup_dialog` alarm | attach, read the dialog, answer it | add a `startup_dialogs` entry if it is safe; a folder-trust dialog means a folder was not trusted (section 4) |
+| `login_expiring`, `login_expired` | the days left in the alarm | run `/login` in any `claude` session; the alarm clears on the next tick |
 | `attempts_exhausted`, `halt` | the step's card and the driver's last report | fix, then `epic-driver mark <step> reset` |
 | Quiet Telegram and a stale `last tick` | `systemctl --user status claude-epic-driver.timer` | section 8 |
