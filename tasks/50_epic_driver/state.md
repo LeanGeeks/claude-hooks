@@ -193,3 +193,10 @@ Phase 0 decisions. They stay listed here for the reasoning.
 - **2026-11-23 — 50-12 blocked: awaiting the operator.** Every engineering task (50-01…50-10) is done and committed on
   `main` (not pushed). 50-12 is a `_human` live verification: no agent runs it and no live check is faked. It needs the
   operator present (a reboot, an 8 h idle window, Telegram). Summary: `agents_output/50_manager_summary.md`.
+- **2026-11-23 — 50-12 rig prepared (operator-approved), still blocked on the operator.** `main` pushed to origin
+  (fast-forward to fcca922). `./install.sh --yes --with epic-driver` installed the feature: units present, none
+  enabled. Scratch rig at `~/epic50-rig/` (workspace `ws` with questions sync off, toy ledger `ws/plan/ledger.yaml` —
+  7 steps, validates with 3 benign `context_window_default_fallback` warnings — scratch repo with a bare remote).
+  Runbook and evidence template: [50-12-signoff-evidence.md](./50-12-signoff-evidence.md). The operator fills in the
+  ssh host, runs `epic-driver enable` (it moves the shared tmux server out of the terminal's scope), and the 13 checks.
+  Report: `agents_output/50-12_rig_report.md`.

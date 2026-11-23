@@ -50,3 +50,10 @@ Per-task reports: `agents_output/50-0N_*`, `50-10_*`. Decisions taken on review 
 3. `epic-driver enable <ledger>`, then the checks: reboot + login without a terminal, 8 h no-suspend, the tmux
    server outliving its terminal, attach, killed worker resumed, forced rotate, deferred delivery, a relay question,
    a never-seen worktree, the toy ledger end to end, alarms on Telegram, liveness by hand, a startup dialog.
+
+## Update (2026-11-23, after the operator's answers)
+
+- `main` pushed (fast-forward `2a2f966..fcca922`), never forced.
+- The 50-12 rig is prepared: the feature is installed (no unit enabled), `~/epic50-rig/` holds the scratch workspace,
+  the toy ledger (validates) and a scratch repo with a bare remote. Runbook: `tasks/50_epic_driver/50-12-signoff-evidence.md`;
+  details: `agents_output/50-12_rig_report.md`. Not exercised: `enable` gates 5–6 (relay), every live check.
